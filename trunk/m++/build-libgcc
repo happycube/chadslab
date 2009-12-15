@@ -1,0 +1,4 @@
+arm-none-eabi-g++ -g -fno-rtti -Wall -mthumb -mcpu=cortex-m3 -c startup.cxx -o startup.o
+arm-none-eabi-g++ -fno-rtti -Wall -mthumb -mcpu=cortex-m3 -c startup.cxx -S 
+arm-none-eabi-ld -nostdlibs -T core.lds -Map core.map -o core.elf startup.o `arm-none-eabi-gcc -print-libgcc-file-name`  
+arm-none-eabi-objcopy -O binary core.elf core.bin
