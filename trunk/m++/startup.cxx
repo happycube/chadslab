@@ -1,4 +1,5 @@
 #include "mpp.h"
+#include "lm3.h"
 #include "l3s_serial.h"
 
 char stack[1024];
@@ -29,7 +30,7 @@ void start()
         while (bssp != &ebss) {
                  *bssp++ = 0;
         }
-	_GLOBAL__I_stack();
+//	_GLOBAL__I_stack();
 	main();
    
 	while (1);
@@ -47,6 +48,16 @@ void svcall_isr()
 {
 }
 
+void busfault_isr()
+{
+while (1);
+}
+
+void usagefault_isr()
+{
+while (1);
+}
+
 /* These interrupt vectors are forced to 0x00000000 by the linker script */
 
 __attribute__ ((section(".vectors")))
@@ -56,8 +67,8 @@ void *vectors[] = {
         (void *)nmi_isr,
         (void *)hardfault_isr,
         0, /* mpu_isr */
-        0, /* busfault_isr */
-        0, /* usagefault_isr */
+        (void *)busfault_isr, /* busfault_isr */
+        (void *)usagefault_isr, /* usagefault_isr */
         0, 0, 0, 0, /* reserved vectors */
         (void *)svcall_isr, /*  */
         0, /* debugmonitor_isr */
@@ -96,13 +107,42 @@ int num2 = 0x50;
 int result = 0x0;
 int main()
 {
-	char *ptxt = txt;
+//	M_UART_Stellaris uart;
+
+	byte *ptxt = (byte *)txt;
+	volatile register unsigned long x;
+
+	w(LM3_SYS_RCC1, LM3_9B92_STARTOSC1);
+	/* need osc to settle in */
+	for (x = 0; x < 10000; x++);
+	w(LM3_SYS_RCC2, LM3_9B92_SETOSC2);
+
+	/* power up pll */
+	w(LM3_SYS_RCC1, LM3_9B92_STARTPLL1);
+	w(LM3_SYS_RCC2, LM3_9B92_STARTPLL2);
+
+	while (!(r(LM3_SYS_RIS) & LM3_SYS_RIS_PLLLOCK));
+	/* pll is ready, go to 50mhz */
+	w(LM3_SYS_RCC1, LM3_9B92_SETPLL1);
+	/* 100mhz oc */
+//	w(LM3_SYS_RCC1, 0x00841540);
+
+	w(LM3_SYS_RCGC1, 0x00000001);
+	w(LM3_SYS_RCGC2, 0x00000001);
+
+	uart.setBaud(115200);
 
 	while (*ptxt) {	
-		while (!uart.Write(*ptxt));
-		ptxt++;
+		ptxt += uart.write(ptxt, 1);
+	}
+	while (1) {
+		if (uart.read(ptxt, 1)) {
+			uart.write(ptxt, 1);
+			uart.write(ptxt, 1);
+		}
 	}
         result = num1 + num2;
         return 0;
 }
+
 
