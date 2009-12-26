@@ -30,13 +30,14 @@
 
 class M_UART_Stellaris : public M_UART {
 	protected:
-		uint32 *regbase32;
+		volatile uint32 *regbase32;
 		uint32 uart_sysclock;
 		bool setEnable(bool en);
+		bool rxPoll();
 	public:
-		M_UART_Stellaris(uint32 clock = 2*(10^7), byte *rb = (byte *)0x4000c000);
+		M_UART_Stellaris(uint32 clock = 200000000/3, byte *rb = (byte *)0x4000c000);
 		virtual uint32 setBaud(uint32 baud = 115200);
-		virtual bool rxPoll();
-		virtual int32 Read();
-		virtual bool Write(byte val);
+		virtual int write(byte *ptr, int num);
+		virtual int read(byte *ptr, int num);
+		virtual int wait() {return 0;}
 };
