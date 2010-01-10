@@ -1,0 +1,4 @@
+arm-none-eabi-gcc -DQEMU -g -Wall -mthumb -mcpu=cortex-m3 -c m3.c -o m3.o
+arm-none-eabi-gcc -DQEMU -g -Wall -mthumb -mcpu=cortex-m3 -c lm3.c -o lm3.o
+arm-none-eabi-ld -nostdlibs -T core.lds -Map core.map -o core.elf m3.o lm3.o   
+arm-none-eabi-objcopy -O binary core.elf core.bin

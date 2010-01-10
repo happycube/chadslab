@@ -4,6 +4,7 @@
 volatile uint32 x, y;
 void platform_init()
 {
+#ifndef QEMU
 	/* need settling time after reset */
 	for (x = 0; x < 500000; x++);
 	w(LM3_SYS_RCC1, LM3_9B92_STARTOSC1);
@@ -23,6 +24,7 @@ void platform_init()
 
 	w(LM3_SYS_RCGC1, 0x00000001);
 	w(LM3_SYS_RCGC2, 0x00000001);
+#endif
 }
 
 bool pl011_setEnable(bool en) {
@@ -36,7 +38,9 @@ bool pl011_setEnable(bool en) {
 	return true;
 };
 
-void uart_setbaud(int n, int baud) {
+/* TODO:  Actually calculate baud rate */
+
+int uart_setbaud(int n, int baud) {
 	uint32 baud16, frac;
 
 	pl011_setEnable(false);
@@ -46,7 +50,7 @@ void uart_setbaud(int n, int baud) {
 	/* 16mhz values */
 //	w(0x4000c024, 0x08);
 //	w(0x4000c028, 0x2c); 
-	/* 50mhz values */
+	/* 115200 @ 50mhz */
 	w(0x4000c024, 27);
 	w(0x4000c028, 8); 
 	/* 100mhz values */
@@ -64,26 +68,29 @@ void uart_setbaud(int n, int baud) {
 	regbase32[MUS_UARTFBRD] = (frac > 63) ? 63 : frac;
 #endif
 	pl011_setEnable(true);
-	return 0;
+	return 115200;
 }
 
 int uart_rxpoll(int n) {
 	return !(r(0x4000c018) & PL011_FR_RXFE);
 }
 
+/* Read and write calls are not mandated to handle 'num' bytes */
 int uart_read(int n, byte *ptr, int num) {
+	int i = 0;
+
 	/* TODO:  Error handling */
-	if (uart_rxpoll(n)) return 0;
-	
-	*ptr = r(0x4000c000) & 0xff;
-	return 1;
+	while (uart_rxpoll(n)) { 
+		*ptr++ = r(0x4000c000) & 0xff;
+		i++;
+	}
+	return i;
 }
 
 int uart_write(int n, byte *ptr, int num) {
 	int i;
 	
-	for (i = 0; i < num; i++, ptr++) {
-		while (r(0x4000c018) & PL011_FR_TXFF);
+	for (i = 0; i < num && (!(r(0x4000c018) & PL011_FR_TXFF)); i++, ptr++) {
 		w(0x4000c000, (uint32)*ptr);
 	}
 	return i;
