@@ -27,6 +27,6 @@ static inline void w(uint32 ptr, uint32 val)
 }
 
 void platform_init();
-void uart_setbaud(int n, int baud);
+int uart_setbaud(int n, int baud);
 int uart_write(int n, byte *b, int len);
 int uart_read(int n, byte *b, int len);

@@ -106,6 +106,7 @@ void writenum(uint32 i)
 int main()
 {
 	byte *ptxt = (byte *)txt;
+	byte b;
 	uint32 p, i;
 
 	platform_init();
@@ -114,15 +115,17 @@ int main()
 	while (*ptxt) {	
 		ptxt += uart_write(0, ptxt, 1);
 	}
-
+#if 0
 	writenum(1);
 	writenum(2);
 	for (p = 5; p < (2<<30); p += 2) {
 		for (i = 3; ((i * 2) < p) && (p % i); i+= 2);
 		if (p % i) writenum(p);
 	} 
-
-	while(1);
+#endif
+	while(1) {
+		if (uart_read(0, &b, 1) == 1) uart_write(0, &b, 1);
+	}
         return 0;
 }
 
