@@ -72,15 +72,21 @@ inline unsigned short read16(u16 addr)
 
 inline u16 addr_abs(u8 n)
 {
-	u16 rv = (mread(pc++) + (mread(pc++) << 8) + n);
+	u16 rv;
+
+	rv  = mread(pc++);
+	rv += (mread(pc++) << 8) + n;
 	if (trace) printf("abs rv %02x pc %04x\n", rv, pc - 2); 
 	return rv;
 }
 
 inline u16 addr_absind(u8 n)
 {
-	u16 addr = (mread(pc++) + (mread(pc++) << 8) + n);
-	u16 rv = mread(addr) + (mread(addr) << 8);
+	u16 addr, rv;
+
+	addr = mread(pc++);
+	addr += (mread(pc++) << 8) + n;
+	rv = mread(addr) + (mread(addr) << 8);
 	if (trace) printf("absind rv %02x pc %04x\n", rv, pc - 2); 
 	return rv;
 }
@@ -149,7 +155,7 @@ inline void do_cmp(u8 reg, int n)
 
 void step()
 {
-	u8 i, aaa, bbb, cc, tmp;
+	u8 i, aaa, bbb, cc;
 	u8 val;
 	u16 addr = 0;
 
@@ -282,7 +288,10 @@ notjump:
 		
 	if ((i & 0xdf) == 0x4c) { // 0x4c:JMP abs 0x6c:JMP (abs)
 		addr = addr_abs(0);
-		if (i == 0x6c) addr = mread(addr++) + (mread(addr) << 8);
+		if (i == 0x6c) {
+			addr  = mread(addr++);
+			addr += (mread(addr) << 8);
+		}
 		pc = addr;
 		return;
 	}
@@ -351,7 +360,10 @@ notjump:
 		}
 		if ((aaa & 0x6) == 0x02) { // JMP
 			// handle jmp (abs)
-			if (aaa == 3) addr = mread(addr++) + (mread(addr) << 8);
+			if (aaa == 3) {
+				addr =  mread(addr++);
+				addr += (mread(addr) << 8);
+			}
 			pc = addr;
 			goto finish;
 		}
