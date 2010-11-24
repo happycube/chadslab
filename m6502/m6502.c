@@ -70,12 +70,17 @@ inline unsigned short read16(u16 addr)
 	return mread(addr) + (mread(addr + 1) << 8);
 }
 
+inline unsigned short read16p()
+{
+	int t = (mread(pc++));
+	return t + (mread(pc++) << 8);
+}
+
 inline u16 addr_abs(u8 n)
 {
 	u16 rv;
 
-	rv  = mread(pc++);
-	rv += (mread(pc++) << 8) + n;
+	rv = read16p();
 	if (trace) printf("abs rv %02x pc %04x\n", rv, pc - 2); 
 	return rv;
 }
@@ -208,7 +213,7 @@ void step()
 			case 0x00: f = flags && F_NEG; ITRACE("BPL"); break; // 0x10/0x30:  BPL/BMI
 			case 0x40: f = flags && F_OVF; ITRACE("BVC"); break; // 0x50/0x70:  BVC/BVS 
 			case 0x80: f = flags && F_CARRY; ITRACE("BCC"); break; // 0x90/0xB0:BCC:BCS
-			case 0xc0: f = flags && F_ZERO; ITRACE("BNE"); break; // 0xD0/0xF0: BNE:BEQ
+			case 0xc0: f = flags && F_ZERO; ITRACE("BNE/BEQ"); break; // 0xD0/0xF0: BNE:BEQ
 			default: goto notjump; 
 		}	
 		if (f != (i && 0x20)) {
@@ -289,8 +294,7 @@ notjump:
 	if ((i & 0xdf) == 0x4c) { // 0x4c:JMP abs 0x6c:JMP (abs)
 		addr = addr_abs(0);
 		if (i == 0x6c) {
-			addr  = mread(addr++);
-			addr += (mread(addr) << 8);
+			addr = read16(addr);
 		}
 		pc = addr;
 		return;
@@ -361,8 +365,7 @@ notjump:
 		if ((aaa & 0x6) == 0x02) { // JMP
 			// handle jmp (abs)
 			if (aaa == 3) {
-				addr =  mread(addr++);
-				addr += (mread(addr) << 8);
+				addr = read16(addr);
 			}
 			pc = addr;
 			goto finish;
