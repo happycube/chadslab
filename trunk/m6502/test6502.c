@@ -14,7 +14,7 @@ inline unsigned char mread(unsigned short addr)
 inline void mwrite(u16 addr, u8 b)
 {
 	if (trace) printf("write %04x %02x\n", addr, b);
- 	if (addr == 0xd013) {
+ 	if (addr == 0xd012) {
 		printf("%c", b);
 	} else 
 		mem[addr] = b;
@@ -24,6 +24,8 @@ void main()
 {
 	FILE *f = fopen("wozmon.txt", "r");
 	int rv, i;
+
+	memset(mem, 0, 65536);
 
 	do {
 		unsigned short addr;
