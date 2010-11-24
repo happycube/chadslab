@@ -22,8 +22,21 @@ inline void mwrite(u16 addr, u8 b)
 
 void main()
 {
-	int fd = open("replica13a.bin", O_RDONLY);
-	read(fd, &mem[0xe000], 0x2000);
+	FILE *f = fopen("wozmon.txt", "r");
+	int rv, i;
+
+	do {
+		unsigned short addr;
+		unsigned char c[8];
+
+		// rv = fscanf(f, "%4.4x: %2.2x %2.2x %2.2x %2.2x %2.2x %2.2x %2.2x %2.2x", &addr, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+		rv = fscanf(f, "%4hx: %2hhx %2hhx %2hhx %2hhx %2hhx %2hhx %2hhx %2hhx", &addr, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+
+		for (i = 0; i < rv - 1; i++) {
+			mem[addr + i] = c[i];
+		} 
+	} while (rv > 0);
+//	read(fd, &mem[0xff00], 0x2000);
 	pc = mread(0xfffc) + (mread(0xfffd) << 8);
 	trace = 0;
 	while (1) {
