@@ -1,9 +1,16 @@
 /* 
  * m6502.c - mini 6502 emulator
  *
- * Copyright (C) 2009 Chad Page
- *
- * This is licensed under the 2-clause BSD license.  Legal boilerplate goes here.
+
+Copyright (C) 2009-2010 Chad Page. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+   1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
  */
 
 /* Logic based off http://www.llx.com/~nparker/a2/opcodes.html */
@@ -20,10 +27,10 @@ char *tr_ins, *tr_add;
 #define ATRACE(a)
 #endif
 
-u8 a = 0, x = 0, y = 0, flags = 0, sp = 0;
+u8 a = 0, x = 0, y = 0, flags = 0, sp = 0xfd;
 u16 pc;
 
-int trace = 0;
+int trace = 1;
 
 #if 0
 u8 mem[65536];
@@ -46,23 +53,21 @@ inline u8 addr_imm()
 	return rv;
 }
 
-inline u8 addr_zp(u8 n)
+inline short addr_zp(u8 n)
 {
-	u8 rv = mread(mread(pc++ + n) & 0xff); 
-	if (trace) printf("zp rv %02x pc %04x\n", rv, pc - 1); 
-	return rv;
+	return (mread(pc++) + n) & 0xff; 
 }
 
-inline unsigned char addr_zpix()
+inline unsigned short addr_zpix()
 {
 	int baseaddr = (mread(pc++) + x) & 0xff; 
-	return mread(mread(baseaddr) + (mread(baseaddr + 1) << 8)); 
+	return (mread(baseaddr) + (mread(baseaddr + 1) << 8)); 
 }
 
-inline unsigned char addr_zpiy()
+inline unsigned short addr_zpiy()
 {
 	int baseaddr = mread(pc++); 
-	return mread(mread(baseaddr) + (mread(baseaddr + 1) << 8) + y); 
+	return (mread(baseaddr) + (mread(baseaddr + 1) << 8) + y); 
 }
 
 inline unsigned short read16(u16 addr)
@@ -80,7 +85,7 @@ inline u16 addr_abs(u8 n)
 {
 	u16 rv;
 
-	rv = read16p();
+	rv = read16p() + n;
 	if (trace) printf("abs rv %02x pc %04x\n", rv, pc - 2); 
 	return rv;
 }
@@ -91,36 +96,39 @@ inline u16 addr_absind(u8 n)
 
 	addr = mread(pc++);
 	addr += (mread(pc++) << 8) + n;
-	rv = mread(addr) + (mread(addr) << 8);
-	if (trace) printf("absind rv %02x pc %04x\n", rv, pc - 2); 
-	return rv;
+	return mread(addr) + (mread(addr) << 8);
 }
 
 /* All register-changing insns change f_zero and f_neg */
 inline void set(u8 *reg, u8 n)
 {
 	*reg = n;
-	flags &= ~(F_NEG || F_ZERO);
+	flags &= ~(F_NEG | F_ZERO);
 	
-	if (n == 0) flags |= F_ZERO; 
-	if (n & 0x80) flags |= F_NEG; 
+	if (n == 0) {
+		flags |= F_ZERO; 
+	} else if (n & 0x80) {
+		flags |= F_NEG; 
+	}
 }
 
 inline u8 do_adc(u8 reg, int n)
 {
-	if (flags && F_BCD) {
-		int val = ((reg >> 4) * 10) + reg + n + (flags && F_CARRY);
+	if (flags & F_BCD) {
+		int val = ((reg >> 4) * 10) + reg + n + ((flags && F_CARRY) != 0);
 
 		flags &= ~F_CARRY;
+		printf("adcd %x\n", val);
 		if (val > 100) {flags |= F_CARRY; val -= 100;}
 
 		return ((val / 10) << 4) + (val % 10);
 	} else {
-		int tmp = reg + n + (flags && F_CARRY);
+		u8 tmp = (u16)reg + (u16)n + ((flags & F_CARRY) != 0);
 	
-		flags &= ~(F_OVF || F_CARRY);
-		if (tmp >= 0x100) {flags |= F_CARRY; tmp -= 0x100;} 
-		if ((reg & 0x80) != (tmp & 0x80)) flags |= F_OVF;
+		printf("adc %x %x %d\n", tmp, flags, flags & F_CARRY);
+		flags &= ~(F_OVF | F_CARRY);
+		if (tmp < reg) {flags |= F_CARRY;} 
+		if ((tmp & 0x80) != (reg & 0x80)) flags |= F_OVF;
 
 		return tmp;
 	}
@@ -128,19 +136,23 @@ inline u8 do_adc(u8 reg, int n)
 
 inline u8 do_sbc(u8 reg, int n)
 {
-	if (flags && F_BCD) {
-		int val = ((reg >> 4) * 10) + reg - n - (flags && F_CARRY);
+	if (flags & F_BCD) {
+		int val = ((reg >> 4) * 10) + reg - n;
 
+		printf("tmpd %d\n", val);
 		flags &= ~F_CARRY;
 		if (val < 0) {flags |= F_CARRY; val += 100;}
 
 		return ((val / 10) << 4) + (val % 10);
 	} else {
-		int tmp = reg - n - (!(flags && F_CARRY));
+		u8 tmp = reg - (n + ((flags & F_CARRY) == 0));
 	
-		flags &= ~(F_OVF || F_CARRY);
-		if (tmp < 0) {flags |= F_CARRY; tmp = 256 - tmp;} 
-		if ((reg & 0x80) != (tmp & 0x80)) flags |= F_OVF;
+		printf("tmp %d\n", tmp);
+		flags |= F_CARRY;
+		if (tmp > reg) {flags &= ~F_CARRY;} 
+		flags &= ~(F_OVF);
+		if ( ((tmp < 0x80) && (reg >= 0x80)) != (n >= 0x80) ) flags |= F_OVF;
+		// if ((tmp & 0x80) != (reg & 0x80)) flags |= F_OVF;
 
 		return tmp;
 	}
@@ -151,9 +163,9 @@ inline void do_cmp(u8 reg, int n)
 	u8 scratch;
 
 	set(&scratch, (reg - n));
-	
+
 	flags &= ~F_CARRY;
-	if (reg > n) flags |= F_CARRY;
+	if (reg >= n) flags |= F_CARRY;
 
 	return;
 }
@@ -188,36 +200,39 @@ void step()
 		/* The other jumps are branches, form xxy10000.  xx = type, y = match */
 		switch (i) {
 			case 0x00: // BRK
-				mwrite(--sp + 0x100, flags);
+				mwrite(sp-- + 0x100, flags);
 				addr = read16(0xfffe);
 				pc += 2;
 				ITRACE("BRK");
 			case 0x20: // JSR abs
 				if (i == 0x20) {addr = addr_abs(0); ITRACE("JSR");}
-				mwrite(--sp + 0x100, pc & 0xff); 
-				mwrite(--sp + 0x100, pc >> 8); 
+				mwrite(sp-- + 0x100, pc & 0xff); 
+				mwrite(sp-- + 0x100, pc >> 8); 
 				pc = addr;	
 				goto finish;
 			case 0x40: // RTI
-				flags = mread(sp++ + 0x100);
+				flags = mread(++sp + 0x100);
 				ITRACE("RTI");
 			case 0x60: // RTS
 				if (0x60) ITRACE("RTS");
-	                        pc = mread(sp++ + 0x100) << 8;
-       		                pc += mread(sp++ + 0x100);
+	                        pc = mread(++sp + 0x100) << 8;
+       		                pc += mread(++sp + 0x100);
 				goto finish;
 			default: break;
 		}
 		u16 v = mread(pc++);
-		switch (i & 0xc0) {
-			case 0x00: f = flags && F_NEG; ITRACE("BPL"); break; // 0x10/0x30:  BPL/BMI
-			case 0x40: f = flags && F_OVF; ITRACE("BVC"); break; // 0x50/0x70:  BVC/BVS 
-			case 0x80: f = flags && F_CARRY; ITRACE("BCC"); break; // 0x90/0xB0:BCC:BCS
-			case 0xc0: f = flags && F_ZERO; ITRACE("BNE/BEQ"); break; // 0xD0/0xF0: BNE:BEQ
-			default: goto notjump; 
-		}	
-		if (f != (i && 0x20)) {
-			if (v && 0x80) 
+		switch (i) {
+			case 0x10: f = !(flags & F_NEG); break;
+			case 0x30: f = flags & F_NEG; break;
+			case 0x50: f = !(flags & F_OVF); break;
+			case 0x70: f = (flags & F_OVF); break;
+			case 0x90: f = !(flags & F_CARRY); break;
+			case 0xb0: f = (flags & F_CARRY); break;
+			case 0xd0: f = !(flags & F_ZERO); break;
+			case 0xf0: f = (flags & F_ZERO); break;
+		}
+		if (f) {
+			if (v & 0x80) 
 				pc -= (0x100 - v);
 			else
 				pc += (v & 0x7f);
@@ -228,14 +243,14 @@ notjump:
 	/* single-byte instructions are 0x*8 and 0x[8-e]a */
 	if ((i & 0x0f) == 0x08) {	
 		switch (i >> 4) {
-			case 0x0: mwrite(--sp + 0x100, flags); goto finish;  
-			case 0x2: flags = mread(sp++ + 0x100); goto finish;  
-			case 0x4: mwrite(--sp + 0x100, a); goto finish;  
-			case 0x6: set(&a, mread(sp++ + 0x100)); goto finish;  
+			case 0x0: mwrite(sp-- + 0x100, flags); goto finish;  
+			case 0x2: flags = mread(++sp + 0x100); printf("flags %x\n", flags); goto finish;  
+			case 0x4: mwrite(sp-- + 0x100, a); goto finish;  
+			case 0x6: set(&a, mread(++sp + 0x100)); goto finish;  
 			case 0x8: set(&y, y - 1); goto finish;
 			case 0x9: set(&a, y); goto finish;
 			case 0xa: set(&y, a); goto finish;
-			case 0xc: set(&x, x - 1); goto finish;
+			case 0xc: set(&y, y + 1); goto finish;
 			case 0xe: set(&x, x + 1); goto finish;
 			case 0x1: flags &= ~F_CARRY; goto finish; // CLC
 			case 0x3: flags |= F_CARRY; goto finish; // SEC
@@ -250,10 +265,20 @@ notjump:
 
 	if ((i & 0x0f) == 0x0a) {
 		switch (i >> 4) {
-			case 0x8: set(&x, a); goto finish;
-			case 0x9: set(&x, sp); goto finish;
-			case 0xa: set(&a, x); goto finish;
-			case 0xb: set(&sp, x); goto finish;
+			case 0x0: 
+				flags &= ~F_CARRY;
+				if (a & 0x80) flags |= F_CARRY;
+				set(&a, a << 1); 
+				goto finish;
+			case 0x4: 
+				flags &= ~F_CARRY;
+				if (a & 0x01) flags |= F_CARRY;
+				set(&a, a >> 1); 
+				goto finish;
+			case 0x8: set(&a, x); goto finish;
+			case 0x9: set(&sp, x); goto finish;
+			case 0xa: set(&x, a); goto finish;
+			case 0xb: set(&x, sp); goto finish;
 			case 0xc: set(&x, x - 1); goto finish;
 			case 0xd: goto finish;
 			case 0xe: goto finish;
@@ -263,7 +288,7 @@ notjump:
 
 	if (cc == 0x01) {
 		switch (bbb) {
-			case 0x00: addr = addr_zpix(); ATRACE("zp, x"); break; 
+			case 0x00: addr = addr_zpix(); ATRACE("zpi, x"); break; 
 			case 0x01: addr = addr_zp(0); ATRACE("zp"); break; 
 			case 0x02: val = addr_imm(); ATRACE("imm"); break; 
 			case 0x03: addr = addr_abs(0); ATRACE("abs"); break; 
@@ -281,7 +306,7 @@ notjump:
 			case 0x00: set(&a, a | val); break;
 			case 0x01: set(&a, a & val); break;
 			case 0x02: set(&a, a ^ val); break;
-			case 0x03: set(&a, a + val); break;
+			case 0x03: set(&a, do_adc(a, val)); break;
 			case 0x04: mwrite(addr, a); break;
 			case 0x05: set(&a, val); break;
 			case 0x06: do_cmp(a, val); break; 
@@ -309,22 +334,37 @@ notjump:
 		case 0x07: addr = addr_abs(x); ATRACE("abs, x"); break; 
 		default: break;
 	};
-	if (bbb == 0x00) {val = addr_imm(); ATRACE("imm");} 
-	else if (bbb == 0x02) val = a; // not used when cc == 0x03	
-	else val = mread(addr);
+
+	if (bbb == 0x00) {
+		val = addr_imm(); 
+		ATRACE("imm2");
+	} else if (bbb == 0x02) {
+		val = a; // not used when cc == 0x03	
+	} else {
+		val = mread(addr);
+	}
 	
 	if (cc == 0x02) {
-		u8 out, oc = flags && F_CARRY;
-		u16 addr = 0;
+		u8 out, oc = (flags & F_CARRY) != 0;
+//		u16 addr = 0;
 
 		if (aaa < 0x04) {
 			u8 cbit, ocbit = 0;
 
-			cbit = (aaa && 0x02) ? 0x01 : 0x80;
-			if (aaa && 0x01) ocbit = (aaa && 0x02) ? 0x80 : 0x01;
+			cbit = (aaa >= 0x02) ? 0x01 : 0x80;
+			if (aaa & 0x01) ocbit = (aaa & 0x02) ? 0x80 : 0x01;
 			flags &= ~F_CARRY;
 			if (val & cbit) flags |= F_CARRY;
-			set(&out, ((aaa && 0x02) ? (val << 1) : (val >> 1)) | ocbit); 
+			printf("tmpx %x %x %d ", aaa >= 0x02, val, oc );
+			if (aaa >= 0x02)
+				val = val >> 1;
+			else
+				val = val << 1;
+			if (((aaa & 0x01) != 0) && oc) {
+				val |= ocbit;
+			}
+			set(&out, val); 
+			printf("%x\n", out);
 			if (bbb != 0x02) 
 				mwrite(addr, out);
 			else
@@ -336,19 +376,24 @@ notjump:
 		// STX, LDX
 		if (aaa < 0x06) {
 			// override addressing modes - y-based
-			if (bbb == 0x05) addr = addr_zp(y);
-			else if (bbb == 0x07) addr = addr_abs(y);
+			if (bbb == 0x05 || bbb == 0x07) {
+				addr = addr - x + y;
+				val = mread(addr);
+			}
 
 			if (aaa == 0x04) 
 				mwrite(addr, x);
-			else
-				set(&x, mread(addr));
+			else // if (bbb) // 0x05
+//				set(&x, mread(addr));
+//			else
+				set(&x, val);
 
 			goto finish;
 		}
 
 		// DEC, INC	
-		set(&out, val + ((aaa == 0x06) ? 1 : -1));
+		printf("tmpincdec %x %d\n", val, aaa);
+		set(&out, val + ((aaa == 0x06) ? -1 : 1));
 		mwrite(addr, out);	
 		return;
 	}
@@ -356,7 +401,7 @@ notjump:
 	if (cc == 0x00) {
 		if (bbb == 0x02) return;
 		if (aaa == 0x01) { // BIT
-			flags &= ~(F_ZERO || F_OVF || F_NEG); 
+			flags &= ~(F_ZERO | F_OVF | F_NEG); 
 			if (val & 0x80) flags |= F_NEG;
 			if (val & 0x40) flags |= F_OVF;
 			if (!(a & val)) flags |= F_ZERO;
