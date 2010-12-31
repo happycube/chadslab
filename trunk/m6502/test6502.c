@@ -32,7 +32,7 @@ inline void mwrite(u16 addr, u8 b)
 	} else 
 		mem[addr] = b;
 }
-#if 0
+#if 1
 void main()
 {
 //	FILE *f = fopen("TTL6502.BIN", "r");
@@ -58,7 +58,7 @@ void main()
 	pc = mread(0xfffc) + (mread(0xfffd) << 8);
 	trace = 1;
 	while (1) {
-		if (1 || trace) printf("a %02x x %02x y %02x flags %02x sp %02x pc %04x:%02x %02x %02x\n", a, x, y, flags, sp, pc, mem[pc], mem[pc + 1], mem[pc + 2]);
+		printf("a %02x x %02x y %02x flags %02x sp %02x pc %04x:%02x %02x %02x\n", a, x, y, flags, sp, pc, mem[pc], mem[pc + 1], mem[pc + 2]);
 		step();
 	}
 }

@@ -125,7 +125,6 @@ inline u8 do_adc(u8 reg, int n)
 	} else {
 		u8 tmp = (u16)reg + (u16)n + ((flags & F_CARRY) != 0);
 	
-		printf("adc %x %x %d\n", tmp, flags, flags & F_CARRY);
 		flags &= ~(F_OVF | F_CARRY);
 		if (tmp < reg) {flags |= F_CARRY;} 
 		if ((tmp & 0x80) != (reg & 0x80)) flags |= F_OVF;
@@ -139,7 +138,6 @@ inline u8 do_sbc(u8 reg, int n)
 	if (flags & F_BCD) {
 		int val = ((reg >> 4) * 10) + reg - n;
 
-		printf("tmpd %d\n", val);
 		flags &= ~F_CARRY;
 		if (val < 0) {flags |= F_CARRY; val += 100;}
 
@@ -147,12 +145,10 @@ inline u8 do_sbc(u8 reg, int n)
 	} else {
 		u8 tmp = reg - (n + ((flags & F_CARRY) == 0));
 	
-		printf("tmp %d\n", tmp);
 		flags |= F_CARRY;
 		if (tmp > reg) {flags &= ~F_CARRY;} 
 		flags &= ~(F_OVF);
 		if ( ((tmp < 0x80) && (reg >= 0x80)) != (n >= 0x80) ) flags |= F_OVF;
-		// if ((tmp & 0x80) != (reg & 0x80)) flags |= F_OVF;
 
 		return tmp;
 	}
@@ -197,7 +193,7 @@ void step()
 	if (((i & 0x0f) == 0x00) && (i != 0x80) && (i != 0xa0) && (i != 0xc0) && (i != 0xe0)) {
 		unsigned char f;
 
-		/* The other jumps are branches, form xxy10000.  xx = type, y = match */
+		/* The jumps aside from these 4 are branches, form xxy10000.  xx = type, y = match */
 		switch (i) {
 			case 0x00: // BRK
 				mwrite(sp-- + 0x100, flags);
@@ -221,16 +217,13 @@ void step()
 			default: break;
 		}
 		u16 v = mread(pc++);
-		switch (i) {
+		switch (i & 0xdf) {
 			case 0x10: f = !(flags & F_NEG); break;
-			case 0x30: f = flags & F_NEG; break;
 			case 0x50: f = !(flags & F_OVF); break;
-			case 0x70: f = (flags & F_OVF); break;
 			case 0x90: f = !(flags & F_CARRY); break;
-			case 0xb0: f = (flags & F_CARRY); break;
 			case 0xd0: f = !(flags & F_ZERO); break;
-			case 0xf0: f = (flags & F_ZERO); break;
 		}
+		if (i & 0x20) f = !f;
 		if (f) {
 			if (v & 0x80) 
 				pc -= (0x100 - v);
@@ -244,7 +237,7 @@ notjump:
 	if ((i & 0x0f) == 0x08) {	
 		switch (i >> 4) {
 			case 0x0: mwrite(sp-- + 0x100, flags); goto finish;  
-			case 0x2: flags = mread(++sp + 0x100); printf("flags %x\n", flags); goto finish;  
+			case 0x2: flags = mread(++sp + 0x100); goto finish;  
 			case 0x4: mwrite(sp-- + 0x100, a); goto finish;  
 			case 0x6: set(&a, mread(++sp + 0x100)); goto finish;  
 			case 0x8: set(&y, y - 1); goto finish;
@@ -265,16 +258,6 @@ notjump:
 
 	if ((i & 0x0f) == 0x0a) {
 		switch (i >> 4) {
-			case 0x0: 
-				flags &= ~F_CARRY;
-				if (a & 0x80) flags |= F_CARRY;
-				set(&a, a << 1); 
-				goto finish;
-			case 0x4: 
-				flags &= ~F_CARRY;
-				if (a & 0x01) flags |= F_CARRY;
-				set(&a, a >> 1); 
-				goto finish;
 			case 0x8: set(&a, x); goto finish;
 			case 0x9: set(&sp, x); goto finish;
 			case 0xa: set(&x, a); goto finish;
@@ -346,29 +329,31 @@ notjump:
 	
 	if (cc == 0x02) {
 		u8 out, oc = (flags & F_CARRY) != 0;
-//		u16 addr = 0;
 
 		if (aaa < 0x04) {
 			u8 cbit, ocbit = 0;
 
-			cbit = (aaa >= 0x02) ? 0x01 : 0x80;
-			if (aaa & 0x01) ocbit = (aaa & 0x02) ? 0x80 : 0x01;
+			cbit = (aaa & 0x02) ? 0x01 : 0x80;
+			if (aaa & 0x01) 
+				ocbit = (aaa & 0x02) ? 0x80 : 0x01;
+
 			flags &= ~F_CARRY;
-			if (val & cbit) flags |= F_CARRY;
-			printf("tmpx %x %x %d ", aaa >= 0x02, val, oc );
-			if (aaa >= 0x02)
+			if (val & cbit)
+				flags |= F_CARRY;
+
+			if (aaa & 0x02)
 				val = val >> 1;
 			else
 				val = val << 1;
-			if (((aaa & 0x01) != 0) && oc) {
-				val |= ocbit;
-			}
-			set(&out, val); 
-			printf("%x\n", out);
-			if (bbb != 0x02) 
+		
+			if (oc) val |= ocbit;
+	
+			if (bbb == 0x02) 
+				set(&a, val); 
+			else {
+				set(&out, val); 
 				mwrite(addr, out);
-			else
-				a = out;
+			}
 	
 			goto finish;
 		}
@@ -383,18 +368,15 @@ notjump:
 
 			if (aaa == 0x04) 
 				mwrite(addr, x);
-			else // if (bbb) // 0x05
-//				set(&x, mread(addr));
-//			else
+			else // 0x05
 				set(&x, val);
 
 			goto finish;
 		}
 
 		// DEC, INC	
-		printf("tmpincdec %x %d\n", val, aaa);
 		set(&out, val + ((aaa == 0x06) ? -1 : 1));
-		mwrite(addr, out);	
+		mwrite(addr, out);
 		return;
 	}
 
