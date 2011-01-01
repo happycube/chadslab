@@ -115,13 +115,14 @@ inline void set(u8 *reg, u8 n)
 inline u8 do_adc(u8 reg, int n)
 {
 	if (flags & F_BCD) {
-		int nd = ((n >> 4) * 10) + (n & 0x0f);
-		int val = ((reg >> 4) * 10) + (reg & 0x0f) + nd + ((flags & F_CARRY) != 0);
+		u8 p1 = ((flags & F_CARRY) != 0) + (reg & 0x0f) + (n & 0x0f);
+		u8 p2 = (p1 >= 10) + (reg >> 4) + (n >> 4);
 
-		flags &= ~F_CARRY;
-		if (val >= 100) {flags |= F_CARRY; val -= 100;}
-
-		return ((val / 10) << 4) + (val % 10);
+		flags &= ~(F_CARRY);
+		if (p1 >= 10) p1 -= 10;
+		if (p2 >= 10) {flags |= F_CARRY; p2 -= 10;}
+	
+		return (p2 << 4) + p1;
 	} else {
 		u8 tmp = (u16)reg + (u16)n + ((flags & F_CARRY) != 0);
 	
