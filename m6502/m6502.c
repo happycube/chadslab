@@ -115,11 +115,11 @@ inline void set(u8 *reg, u8 n)
 inline u8 do_adc(u8 reg, int n)
 {
 	if (flags & F_BCD) {
-		int val = ((reg >> 4) * 10) + reg + n + ((flags && F_CARRY) != 0);
+		int nd = ((n >> 4) * 10) + (n & 0x0f);
+		int val = ((reg >> 4) * 10) + (reg & 0x0f) + nd + ((flags & F_CARRY) != 0);
 
 		flags &= ~F_CARRY;
-		printf("adcd %x\n", val);
-		if (val > 100) {flags |= F_CARRY; val -= 100;}
+		if (val >= 100) {flags |= F_CARRY; val -= 100;}
 
 		return ((val / 10) << 4) + (val % 10);
 	} else {
@@ -136,7 +136,8 @@ inline u8 do_adc(u8 reg, int n)
 inline u8 do_sbc(u8 reg, int n)
 {
 	if (flags & F_BCD) {
-		int val = ((reg >> 4) * 10) + reg - n;
+		int nd = ((n >> 4) * 10) + (n & 0x0f);
+		int val = ((reg >> 4) * 10) + (reg & 0x0f) - nd;
 
 		flags &= ~F_CARRY;
 		if (val < 0) {flags |= F_CARRY; val += 100;}
@@ -195,22 +196,22 @@ void step()
 
 		/* The jumps aside from these 4 are branches, form xxy10000.  xx = type, y = match */
 		switch (i) {
-			case 0x00: // BRK
-				mwrite(sp-- + 0x100, flags);
-				addr = read16(0xfffe);
-				pc += 2;
-				ITRACE("BRK");
 			case 0x20: // JSR abs
-				if (i == 0x20) {addr = addr_abs(0); ITRACE("JSR");}
+			case 0x00: // BRK
 				mwrite(sp-- + 0x100, pc & 0xff); 
 				mwrite(sp-- + 0x100, pc >> 8); 
+				if (i == 0x20) {
+					addr = addr_abs(0); ITRACE("JSR");
+				} else {
+					addr = read16(0xfffe);	
+					mwrite(sp-- + 0x100, flags | 0x20);
+				}
 				pc = addr;	
 				goto finish;
 			case 0x40: // RTI
 				flags = mread(++sp + 0x100);
 				ITRACE("RTI");
 			case 0x60: // RTS
-				if (0x60) ITRACE("RTS");
 	                        pc = mread(++sp + 0x100) << 8;
        		                pc += mread(++sp + 0x100);
 				goto finish;
@@ -236,7 +237,7 @@ notjump:
 	/* single-byte instructions are 0x*8 and 0x[8-e]a */
 	if ((i & 0x0f) == 0x08) {	
 		switch (i >> 4) {
-			case 0x0: mwrite(sp-- + 0x100, flags); goto finish;  
+			case 0x0: mwrite(sp-- + 0x100, flags | 0x20); goto finish;  
 			case 0x2: flags = mread(++sp + 0x100); goto finish;  
 			case 0x4: mwrite(sp-- + 0x100, a); goto finish;  
 			case 0x6: set(&a, mread(++sp + 0x100)); goto finish;  
