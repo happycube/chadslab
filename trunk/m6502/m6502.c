@@ -124,7 +124,7 @@ inline u8 do_adc(u8 reg, int n)
 	
 		return (p2 << 4) + p1;
 	} else {
-		u8 tmp = (u16)reg + (u16)n + ((flags & F_CARRY) != 0);
+		u8 tmp = reg + n + ((flags & F_CARRY) != 0);
 	
 		flags &= ~(F_OVF | F_CARRY);
 		if (tmp < reg) {flags |= F_CARRY;} 
@@ -193,14 +193,19 @@ void step()
 
 	/* most 0x*0 are jumps of some sort */
 	if (((i & 0x0f) == 0x00) && (i != 0x80) && (i != 0xa0) && (i != 0xc0) && (i != 0xe0)) {
-		unsigned char f;
+		unsigned char f = 0;
 
 		/* The jumps aside from these 4 are branches, form xxy10000.  xx = type, y = match */
 		switch (i) {
 			case 0x20: // JSR abs
 			case 0x00: // BRK
-				mwrite(sp-- + 0x100, (pc + 1) & 0xff); 
-				mwrite(sp-- + 0x100, (pc >> 8)); 
+				if ((pc & 0xff) == 0xff) {
+					mwrite(sp-- + 0x100, 0); 
+					mwrite(sp-- + 0x100, (pc >> 8) + 1); 
+				} else {
+					mwrite(sp-- + 0x100, (pc + 1) & 0xff); 
+					mwrite(sp-- + 0x100, (pc >> 8)); 
+				}
 				if (i == 0x20) {
 					addr = addr_abs(0); ITRACE("JSR");
 				} else {
@@ -218,7 +223,7 @@ void step()
 				goto finish;
 			default: break;
 		}
-		u16 v = mread(pc++);
+		u8 v = mread(pc++);
 		switch (i & 0xdf) {
 			case 0x10: f = !(flags & F_NEG); break;
 			case 0x50: f = !(flags & F_OVF); break;
