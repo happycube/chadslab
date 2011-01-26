@@ -2,7 +2,7 @@
  * m6502.c - mini 6502 emulator
  *
 
-Copyright (C) 2009-2010 Chad Page. All rights reserved.
+Copyright (C) 2009-2011 Chad Page. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
@@ -13,7 +13,13 @@ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED WAR
 
  */
 
-/* Logic based off http://www.llx.com/~nparker/a2/opcodes.html */
+/* 
+ * Logic based off http://www.llx.com/~nparker/a2/opcodes.html 
+ *
+ * I break instructions up according to the writeup there, [aaabbbcc].  This
+ * allows separate handling of addressing mode and actual operation, saving
+ * space.
+ */
 
 #include <stdio.h>
 #include "m6502.h"
@@ -27,29 +33,20 @@ char *tr_ins, *tr_add;
 #define ATRACE(a)
 #endif
 
+typedef short int s16;
+
 u8 a = 0, x = 0, y = 0, flags = 0, sp = 0xfd;
 u16 pc;
 
 int trace = 1;
 
-#if 0
-u8 mem[65536];
-
-inline unsigned char mread(unsigned short addr)
-{
-	return mem[addr];
-}
-
-inline void mwrite(u16 addr, u8 b)
-{
-	mem[addr] = b;
-}
-#endif
-
+/* Addressing mode handling.  Functions can be inlined for best performance */
 inline u8 addr_imm()
 {
 	u8 rv = mread(pc++); 
+#ifdef DEBUG
 	if (trace) printf("imm rv %02x pc %04x\n", rv, pc - 1); 
+#endif
 	return rv;
 }
 
@@ -86,7 +83,9 @@ inline u16 addr_abs(u8 n)
 	u16 rv;
 
 	rv = read16p() + n;
+#ifdef DEBUG
 	if (trace) printf("abs rv %02x pc %04x\n", rv, pc - 2); 
+#endif
 	return rv;
 }
 
@@ -125,10 +124,15 @@ inline u8 do_adc(u8 reg, int n)
 		return (p2 << 4) + p1;
 	} else {
 		u8 tmp = reg + n + ((flags & F_CARRY) != 0);
+		u8 v1 = ((n >= 128) + (reg >= 128));
 	
 		flags &= ~(F_OVF | F_CARRY);
 		if (tmp < reg) {flags |= F_CARRY;} 
-		if ((tmp & 0x80) != (reg & 0x80)) flags |= F_OVF;
+
+		if ((v1 != 1) && ((reg >= 128) != (tmp >= 128))) {
+//			fprintf(stdout, "ovf %d %d %d %d\n", v1, reg, n, tmp);
+			flags |= F_OVF;
+		}
 
 		return tmp;
 	}
@@ -146,11 +150,16 @@ inline u8 do_sbc(u8 reg, int n)
 		return ((val / 10) << 4) + (val % 10);
 	} else {
 		u8 tmp = reg - (n + ((flags & F_CARRY) == 0));
+		u8 v1 = ((n >= 128) + (reg >= 128));
 	
 		flags |= F_CARRY;
 		if (tmp > reg) {flags &= ~F_CARRY;} 
 		flags &= ~(F_OVF);
-		if ( ((tmp < 0x80) && (reg >= 0x80)) != (n >= 0x80) ) flags |= F_OVF;
+
+		if ((v1 == 1) && ((reg >= 128) != (tmp >= 128))) {
+//			fprintf(stdout, "ovf %d %d %d %d\n", v1, reg, n, tmp);
+			flags |= F_OVF;
+		}
 
 		return tmp;
 	}
@@ -170,7 +179,8 @@ inline void do_cmp(u8 reg, int n)
 
 void step()
 {
-	u8 i, aaa, bbb, cc;
+	u8 i;
+	register u8 aaa, bbb, cc;
 	u8 val;
 	u16 addr = 0;
 
