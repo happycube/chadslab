@@ -210,11 +210,11 @@ void step()
 			case 0x20: // JSR abs
 			case 0x00: // BRK
 				if ((pc & 0xff) == 0xff) {
-					mwrite(sp-- + 0x100, 0); 
 					mwrite(sp-- + 0x100, (pc >> 8) + 1); 
+					mwrite(sp-- + 0x100, 0); 
 				} else {
-					mwrite(sp-- + 0x100, (pc + 1) & 0xff); 
 					mwrite(sp-- + 0x100, (pc >> 8)); 
+					mwrite(sp-- + 0x100, (pc + 1) & 0xff); 
 				}
 				if (i == 0x20) {
 					addr = addr_abs(0); ITRACE("JSR");
@@ -228,8 +228,8 @@ void step()
 				flags = mread(++sp + 0x100);
 				ITRACE("RTI");
 			case 0x60: // RTS
-	                        pc = mread(++sp + 0x100) << 8;
-       		                pc += mread(++sp + 0x100) + ((i & 0x20) != 0);
+       		                pc = mread(++sp + 0x100) + ((i & 0x20) != 0);
+	                        pc += mread(++sp + 0x100) << 8;
 				goto finish;
 			default: break;
 		}
