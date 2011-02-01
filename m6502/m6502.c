@@ -149,8 +149,9 @@ inline u8 do_sbc(u8 reg, int n)
 
 		return ((val / 10) << 4) + (val % 10);
 	} else {
-		u8 tmp = reg - (n + ((flags & F_CARRY) == 0));
-		u8 v1 = ((n >= 128) + (reg >= 128));
+		u8 sub = n + ((flags & F_CARRY) ? 0 : 1);
+		u8 tmp = reg - sub;
+		u8 v1 = ((sub >= 128) + (reg >= 128));
 	
 		flags |= F_CARRY;
 		if (tmp > reg) {flags &= ~F_CARRY;} 
