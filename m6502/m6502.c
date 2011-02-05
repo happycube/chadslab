@@ -111,60 +111,55 @@ inline void set(u8 *reg, u8 n)
 	}
 }
 
-inline u8 do_adc(u8 reg, int n)
-{
-	if (flags & F_BCD) {
-		u8 p1 = ((flags & F_CARRY) != 0) + (reg & 0x0f) + (n & 0x0f);
-		u8 p2 = (p1 >= 10) + (reg >> 4) + (n >> 4);
+/* Bug-fixed code from jesari on the 6502.org forum */
+inline u8 do_adc(u8 reg, int n) 
+{ 
+   if (flags & F_BCD) { 
+      u8 p1 = ((flags & F_CARRY) != 0) + (reg & 0x0f) + (n & 0x0f); 
+      u8 p2 = (p1 >= 10) + (reg >> 4) + (n >> 4); 
 
-		flags &= ~(F_CARRY);
-		if (p1 >= 10) p1 -= 10;
-		if (p2 >= 10) {flags |= F_CARRY; p2 -= 10;}
-	
-		return (p2 << 4) + p1;
-	} else {
-		u8 tmp = reg + n + ((flags & F_CARRY) != 0);
-		u8 v1 = ((n >= 128) + (reg >= 128));
-	
-		flags &= ~(F_OVF | F_CARRY);
-		if (tmp < reg) {flags |= F_CARRY;} 
+      flags &= ~(F_CARRY); 
+      if (p1 >= 10) p1 -= 10; 
+      if (p2 >= 10) {flags |= F_CARRY; p2 -= 10;} 
+    
+      return (p2 << 4) + p1; 
+   } else { 
+      u16 tmp=reg+n; 
+      if (flags & F_CARRY) tmp++; 
 
-		if ((v1 != 1) && ((reg >= 128) != (tmp >= 128))) {
-//			fprintf(stdout, "ovf %d %d %d %d\n", v1, reg, n, tmp);
-			flags |= F_OVF;
-		}
+      if (tmp&0x100) flags |= F_CARRY; else flags &= ~F_CARRY; 
+      tmp&=0xff; 
+      if ( !((reg^n)&0x80) && ((reg^tmp)&0x80) ) 
+         flags |= F_OVF; else flags &= ~(F_OVF); 
+          
+      return tmp; 
+       
+   } 
+} 
 
-		return tmp;
-	}
-}
+inline u8 do_sbc(u8 reg, int n) 
+{ 
+   if (flags & F_BCD) { 
+      int nd = ((n >> 4) * 10) + (n & 0x0f); 
+      if (!(flags & F_CARRY)) nd++; 
+      int val = ((reg >> 4) * 10) + (reg & 0x0f) - nd; 
 
-inline u8 do_sbc(u8 reg, int n)
-{
-	if (flags & F_BCD) {
-		int nd = ((n >> 4) * 10) + (n & 0x0f);
-		int val = ((reg >> 4) * 10) + (reg & 0x0f) - nd;
+      flags |= F_CARRY; 
+      if (val < 0) {flags &= ~F_CARRY; val += 100;} 
 
-		flags &= ~F_CARRY;
-		if (val < 0) {flags |= F_CARRY; val += 100;}
+      return ((val / 10) << 4) + (val % 10); 
+   } else { 
+      u16 tmp=reg+(n^0xff); 
+      if (flags & F_CARRY) tmp++; 
 
-		return ((val / 10) << 4) + (val % 10);
-	} else {
-		u8 sub = n + ((flags & F_CARRY) ? 0 : 1);
-		u8 tmp = reg - sub;
-		u8 v1 = ((sub >= 128) + (reg >= 128));
-	
-		flags |= F_CARRY;
-		if (tmp > reg) {flags &= ~F_CARRY;} 
-		flags &= ~(F_OVF);
-
-		if ((v1 == 1) && ((reg >= 128) != (tmp >= 128))) {
-//			fprintf(stdout, "ovf %d %d %d %d\n", v1, reg, n, tmp);
-			flags |= F_OVF;
-		}
-
-		return tmp;
-	}
-}
+      if (tmp&0x100) flags |= F_CARRY; else flags &= ~F_CARRY; 
+      tmp&=0xff; 
+      if ( ((reg^n)&0x80) && ((reg^tmp)&0x80) ) 
+         flags |= F_OVF; else flags &= ~(F_OVF); 
+          
+      return tmp; 
+   } 
+} 
 
 inline void do_cmp(u8 reg, int n)
 {
