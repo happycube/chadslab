@@ -1,0 +1,1 @@
+My first google code project - random pieces of source code'll get posted here.
