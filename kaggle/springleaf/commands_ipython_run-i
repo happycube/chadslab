@@ -1,0 +1,10 @@
+import sl2; import sl2a
+sl2.startup()
+reload(sl2a) ; sl2a.data_test = sl2.data_test; sl2a.data_train = sl2.data_train; sl2a.data_comb = sl2.data_comb
+sl2a.combine(); sl2a.binify(sl2.data_comb)
+wd = sl2a.feature_words(sl2.data_comb)
+sl2a.bin2mat(sl2.data_comb, exclude=[492], extras=[wd])
+tlen = len(sl2.data_comb['data'][1933])
+#x = sl2a.buildxgb(sl2.data_comb['binmatrix'][tlen-15000:tlen], sl2.data_comb['data'][1933][tlen-15000:tlen], sl2.data_comb['binmatrix'][0:15000], sl2.data_comb['data'][1933][0:15000], num_rounds=1200)
+x = sl2a.buildxgb(sl2.data_comb['binmatrix'][0:tlen], sl2.data_comb['data'][1933][0:tlen], num_rounds=9001)
+sl2a.dosub(x)

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include <string.h>
 
@@ -26,8 +27,8 @@ enum Type {
 // Part of output format
 struct FieldInfo {
 	char f_name[MAXLABEL];  
-	int f_offset;
-	int f_strlen;		// Longest observed string for the field (rounded up?)
+	long f_begin;		// Beginning of data in file 
+	long f_length;		// Length of each entry (2,4,8, and ? for string) 
 	Type f_type;	
 };
 
@@ -35,6 +36,12 @@ long DataStart = 0;
 long RecordLen = 0; // part of format 
 int NFields = 0;
 FieldInfo Field[MAXKEYS];
+
+void *FieldData[MAXKEYS];
+
+long flen = 0;
+
+int maxlen = 500000;
 
 int PreProcessLabelLine(unsigned char *data, int len)
 {
@@ -99,14 +106,19 @@ int PreProcessLine(unsigned char *data, int len)
 			} else {
 				int strlength = (i - strstart) + 1;
 
-				if (Field[cfield].f_strlen < strlength) {
-					//fprintf(stderr, "%d %d %d\n", cfield, Field[cfield].f_strlen, strlength);
-					Field[cfield].f_strlen = strlength;
+				if (Field[cfield].f_length < strlength) {
+					//fprintf(stderr, "%d %d %d\n", cfield, Field[cfield].f_length, strlength);
+					Field[cfield].f_length = strlength;
 				}
 			}
 		}
 
 		if (!inQuote && ((data[i] == ',') || (i == (len - 1)))) {
+			if (Field[cfield].f_type == T_INT) {
+				long tmp_abs = abs(atoi((const char *)&data[cstart]));
+
+				if (tmp_abs > Field[cfield].f_length) Field[cfield].f_length = tmp_abs; 
+			} 
 			cstart = i + 1;
 			cfield++;
 		}
@@ -134,7 +146,7 @@ int PreProcess(unsigned char *data, int len)
 				num = PreProcessLine(&data[begin], i - begin);
 				lines++;
 
-//				if (lines >= 1000) return lines;
+				if (lines >= maxlen) return lines;
 			} else {
 				num = PreProcessLabelLine(&data[begin], i - begin);
 			}
@@ -145,63 +157,72 @@ int PreProcess(unsigned char *data, int len)
 	return lines;
 }
 
+long DetermineLength(int nLines)
+{
+	int offset = (NFields * sizeof(FieldInfo));
+
+	offset = ((offset / 4096) + 1) * 4096;
+
+	for (int cfield = 0; cfield < NFields; cfield++) {
+		switch (Field[cfield].f_type) {
+			case T_INT:
+				if (Field[cfield].f_length >= INT_MAX) Field[cfield].f_length = 8;
+				else if (Field[cfield].f_length > SHRT_MAX) Field[cfield].f_length = 4;
+				else Field[cfield].f_length = 2;
+
+//				offset += sizeof(long);
+				break;
+			case T_FLOAT:  
+				Field[cfield].f_length = 4;
+				break;
+			case T_STRING: 
+				Field[cfield].f_length = ((Field[cfield].f_length / 8) + 1) * 8;
+				offset += Field[cfield].f_length;
+				break;
+			default: break;
+		};
+
+		Field[cfield].f_begin = offset;
+		offset += (Field[cfield].f_length * nLines); 
+		offset = ((offset / 256) + 1) * 256;
+	}
+
+	fprintf(stderr, "length %d %d\n", nLines, offset);
+
+	return offset;
+}
+
 long ComputeLengths(int lines)
 {
 	long len = 0;
 
-	int offset = 0;
+	printf("computelengths %d \n", lines); 
 
-	for (int cfield = 0; cfield < NFields; cfield++) {
-		switch (Field[cfield].f_type) {
-			case T_INT:  offset += sizeof(long); break;
-			case T_FLOAT:  offset += sizeof(float); break;
-			case T_STRING:  {
-				Field[cfield].f_strlen = ((Field[cfield].f_strlen / 8) + 1) * 8;
-				offset += Field[cfield].f_strlen;
-				break;
-			}
-			default: break;
-		};
-	}
-	RecordLen = offset;
-	RecordLen = ((RecordLen / 32) + 1) * 32;
-
-	len += sizeof(RecordLen);
-	len += sizeof(unsigned long); // NFieldsOut
-	len += sizeof(unsigned long); // beginning of actual data
-	len += NFields * sizeof(struct FieldInfo);
+	len = 32 + (NFields * sizeof(struct FieldInfo));
 
 	// round data start to 4K	
 	len = ((len / 4096) + 1) * 4096;
 	DataStart = len;
 
-	len += lines * RecordLen;
+//	len += lines * RecordLen;
 
 	return len;
 }
 
 // Pass 2:  Write out everything
 
-void WriteHeader(unsigned char *map, long &offset)
+void WriteHeader(unsigned char *map, long nLines)
 {
 	unsigned long NFieldsOut = NFields;
 
-	*((long *)&map[offset]) = RecordLen;
-	offset += sizeof(RecordLen);
-
-	*((long *)&map[offset]) = NFieldsOut;
-	offset += sizeof(NFieldsOut);
+	*((long *)&map[0]) = NFieldsOut;
 	
-	*((long *)&map[offset]) = DataStart;
-	offset += sizeof(DataStart);
-
-	memcpy(&map[offset], Field, NFields * sizeof(struct FieldInfo));
-	offset += (sizeof(FieldInfo) * NFields);
-
-	offset = DataStart;
+	*((long *)&map[8]) = nLines;
+	
+	memcpy(&map[32], Field, NFields * sizeof(struct FieldInfo));
 }
 
-void WriteLine(unsigned char *map, long &offset, unsigned char *data, int len)
+void WriteLine(unsigned char *map, long &record, unsigned char *data, int len)
 {
 	bool inQuote = false;
 	int cfield = 0;
@@ -216,21 +237,45 @@ void WriteLine(unsigned char *map, long &offset, unsigned char *data, int len)
 			inQuote = !inQuote;
 		}
 
-		if (!inQuote && (data[i] == ',')) {
+		if (!inQuote && ((data[i] == ',') || (i == (len - 1)))) {
+			long offset = Field[cfield].f_begin + (Field[cfield].f_length * record);
+
+			if (offset > flen) {
+				fprintf(stderr, "huh %ld %ld %ld\n", offset, record, flen);
+			}
+
 			switch (Field[cfield].f_type) {
 				case T_INT:
 					intout = atol((const char *)&data[cstart]); 
-					*((long *)&map[offset]) = intout;
-					offset += sizeof(long);
+
+					switch (Field[cfield].f_length) {
+					case 2:
+						*((short *)&map[offset]) = (short)intout;
+						break;
+					case 4:
+						*((int *)&map[offset]) = (int)intout;
+						break;
+					case 8:
+						*((long *)&map[offset]) = intout;
+						break;
+					};
 					break; 
 				case T_FLOAT:
 					floatout = (float)atof((const char *)&data[cstart]); 
 					*((float *)&map[offset]) = floatout;
-					offset += sizeof(floatout);
 					break; 
-				case T_STRING:
-					memcpy(&map[offset], &data[cstart + 1], (i - cstart - 2));
-					offset += Field[cfield].f_strlen; 
+				case T_STRING: {
+					int wlen = i - cstart - 1;
+					
+					memset(&map[offset], 0, Field[cfield].f_length); 
+					if (wlen > (Field[cfield].f_length - 1)) wlen = Field[cfield].f_length - 1;
+					if (wlen > 0) {
+						memset(&map[offset], 0, Field[cfield].f_length); 
+						memcpy(&map[offset], &data[cstart + 1], wlen);
+	//					fprintf(stderr, "%s\n", &map[offset]);
+					}
+				}
+					break;
 			};
 			
 			cstart = i + 1;
@@ -238,43 +283,55 @@ void WriteLine(unsigned char *map, long &offset, unsigned char *data, int len)
 		}
 	} 
 
-	intout = 0;
-	floatout = 0;
+//	fprintf(stderr, "%d\n", cfield);
+
+	intout = -1;
+	floatout = -1;
 	memset(strout, 0, sizeof(strout));
 	for (; cfield < NFields; cfield++) {
+		long offset = Field[cfield].f_begin + (Field[cfield].f_length * record);
+		fprintf(stderr, "-1'ing %d\n", cfield);
 		switch (Field[cfield].f_type) {
 			case T_INT:
-				*((long *)&map[offset]) = intout;
-				offset += sizeof(long);
+				switch (Field[cfield].f_length) {
+				case 2:
+					*((short *)&map[offset]) = (short)intout;
+					break;
+				case 4:
+					*((int *)&map[offset]) = (int)intout;
+					break;
+				case 8:
+					*((long *)&map[offset]) = intout;
+					break;
+				};
 				break; 
 			case T_FLOAT:
 				*((float *)&map[offset]) = floatout;
-				offset += sizeof(float);
 				break; 
 			case T_STRING:
-				memset(&map[offset], 0, Field[cfield].f_strlen);
-				offset += Field[cfield].f_strlen; 
+				memset(&map[offset], 0, Field[cfield].f_length);
 				break; 
 		};
 	}
 }
 
-void Process(unsigned char *map, long &offset, unsigned char *data, int len)
+void Process(unsigned char *map, long &record, unsigned char *data, int len)
 {
 	int begin = 0;
 	int linecount = 0;
 
-	WriteHeader(map, offset);
-
 	for (int i = 0; i < len; i++) {
 		if (data[i] == '\n') {
 			if (begin != 0) { 
-				WriteLine(map, offset, &data[begin], i - begin);
+				WriteLine(map, record, &data[begin], i - begin);
 				linecount++;
+				record++;
 				if (!(linecount % 1000)) {
-					fprintf(stderr, "Line %d %ld\n", linecount, offset);
-					msync(map, (offset / 4096) * 4096, MS_ASYNC);
+					fprintf(stderr, "Line %d\n", linecount);
+//					return;
 				}
+
+				if (linecount >= maxlen) return;
 			}
 	
 			begin = i;
@@ -291,6 +348,7 @@ int main(int argc, char *argv[])
 	struct stat st[MAX_FILES];
 	void *map[MAX_FILES];
 	int nrec[MAX_FILES];
+	int ntotal = 0;
 
 	for (int i = 1; (i < argc) && (i <= MAX_FILES); i++) {
 		// fstat will fail with -EBADF if open does
@@ -306,35 +364,38 @@ int main(int argc, char *argv[])
 	for (int i = 1; (i < argc) && (i <= MAX_FILES); i++) {
 		fprintf(stderr, "Pre-processing %s\n", argv[i]);
 		nrec[i] = PreProcess((unsigned char *)map[i], st[i].st_size);
+		ntotal += nrec[i];
 	}
+
+	flen = DetermineLength(ntotal);
+
+	char outfile[256];
+
+	sprintf(outfile, "output-test.bin");
+
+	int out_fd = open(outfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IROTH);
+	if (out_fd < 0) {
+		perror(outfile); 
+		exit(-1);
+	}
+	
+	ftruncate(out_fd, flen);
+
+	void *outmap = mmap(NULL, flen, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
+	if (outmap == MAP_FAILED) return -2;
+
+	memset(outmap, 0, flen);
+
+	WriteHeader((unsigned char *)outmap, ntotal);
+		
+	long linesoutput = 0;
 
 	for (int i = 1; (i < argc) && (i <= MAX_FILES); i++) {
-		char outfile[256];
-		long offset = 0;
-
-		sprintf(outfile, "%s.out", argv[i]);
-	
-		long len = ComputeLengths(nrec[i]);
-
-		int out_fd = open(outfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IROTH);
-		if (out_fd < 0) {
-			perror(outfile); 
-			exit(-1);
-		}
-		
-		ftruncate(out_fd, len);
-	
-		void *outmap = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
-		if (outmap == MAP_FAILED) return -2;
-
-		fprintf(stderr, "Processing %s %ld\n", outfile, len);
-
-		Process((unsigned char *)outmap, offset, (unsigned char *)map[i], st[i].st_size);
-		
-		msync(outmap, len, MS_SYNC);
-		munmap(outmap, len);
-		close(out_fd);
+		Process((unsigned char *)outmap, linesoutput, (unsigned char *)map[i], st[i].st_size);
 	}
+
+	munmap(outmap, flen);
+	close(out_fd);
 	
 	for (int i = 1; (i < argc) && (i <= MAX_FILES); i++) {
 		munmap(map[i], st[i].st_size);
