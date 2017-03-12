@@ -1,0 +1,10 @@
+[Unit]
+Description=Use nvidia-settings binary to get fan up to 75 percent
+After=dummyxserver.service
+
+[Service]
+ExecStart=/usr/local/sbin/fancontrol 75 
+
+[Install]
+Wanted-By=multi-user.target
+

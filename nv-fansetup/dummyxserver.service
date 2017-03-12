@@ -1,0 +1,11 @@
+[Unit]
+Description=Dummy X11 server to keep nvidia-settings happy
+After=sysinit.target
+
+[Service]
+ExecStart=/usr/bin/X
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+Wanted-By=multi-user.target
+

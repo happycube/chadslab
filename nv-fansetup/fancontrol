@@ -1,0 +1,6 @@
+#!/bin/bash
+export DISPLAY=:0
+nvidia-settings -a GPUFanControlState=1
+nvidia-settings -a GPUTargetFanSpeed=$1
+nvidia-settings -a GPUPowerMizerMode=0
+
