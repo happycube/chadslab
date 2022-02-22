@@ -1,0 +1,5 @@
+nc-firstrun.tgz is an NFS root directory that's bootable on a Pace DSL4000 (and
+probably other Acorn ARM7500FE NC's with Ethernet) - you'll have to configure
+the IP on the box accordingly (hold down select when booting the DSL4000 to get
+the settings menu) which is all standardish IPv4 stuff that I should go into
+but am a tad too lazy to at the moment.

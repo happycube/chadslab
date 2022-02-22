@@ -1,0 +1,9 @@
+This is a bunch of misc. projects I've randomly done.  
+
+m6502 is probably the most interesting subdir, it's a small logic-based 6502 emulator
+that could be used to emulate an Apple I in a small (possibly even AVR) microcontroller.
+(and it, among many others, could certainly run on a Pi Pico/STM32/RISC-V)
+
+ancientARMs is a subproject which I may or may not break out someday with usage
+notes for old ARM kit.  (First up is a NFS boot directory that gets a GUI mostly
+working on an obscure Pace STB) 
