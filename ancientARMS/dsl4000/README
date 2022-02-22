@@ -3,3 +3,19 @@ probably other Acorn ARM7500FE NC's with Ethernet) - you'll have to configure
 the IP on the box accordingly (hold down select when booting the DSL4000 to get
 the settings menu) which is all standardish IPv4 stuff that I should go into
 but am a tad too lazy to at the moment.
+
+Note that I don't have it opening the NFS directory yet so it's not fully useful,
+I just wanted to snapshot something that booted ;)  I'm hoping to netboot an
+older Linux and/or NetBSD next...
+
+Some other notes:
+
+- The DSL4000 is closer to an Acorn NC than a Bush box - it has ethernet 
+  and PS/2 mouse+keyboard, but does not have VGA out.
+
+- There's also an MPEG2 decoder with ROM modules for it, so there might be a
+  way to use it to play video.
+
+- I followed https://heyrick.eu/assembler/resources/bushstb.html and changed
+  the file locations to point to NFS::NFSBoot.$ 
+
