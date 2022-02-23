@@ -19,3 +19,5 @@ Some other notes:
 - I followed https://heyrick.eu/assembler/resources/bushstb.html and changed
   the file locations to point to NFS::NFSBoot.$ 
 
+- The posted version doesn't run DeskStart,fea so you'll need to hit F12
+  and run "Filer_OpenDir NFS::NFSBoot.$" to see the NFS folder.
