@@ -56,7 +56,7 @@ in-process quantization step, vLLM-friendly).
 
 | mode | result | model footprint | load time |
 |---|---|---|---|
-| ``` (no quant) | expected ~24 GB | — | — |
+| bf16 (no quant) | expected ~24 GB | — | — |
 | `--quant int8` | loads + generates; torchao Int8Tensor | 23.9 GB reported* | 242 s |
 | `--quant nf4` | **loads + generates; real 4-bit (Params4bit, uint8)** | **7.50 GB** | 306 s |
 | `--quant int4` | **fails on CPU**: `ImportError: Requires mslk >= 1.0.0` | — | — |
@@ -89,7 +89,9 @@ gemma4-12b-qat-pytorch/
 │   ├── check_env.py         # verify versions + load config/processor (no weights)
 │   ├── download_model.py    # snapshot_download the checkpoint (~24 GB)
 │   ├── inspect_weights.py   # safetensors dtype/size histogram
-│   └── chat.py              # load + generate, with quantization options
+│   ├── chat.py              # load + generate, with quantization options
+│   ├── capture_trace.py     # dump per-layer intermediates for one token
+│   └── compare_trace.py     # diff two captured traces
 ├── .venv/                   # the virtualenv            (gitignored)
 └── .cache/                  # uv / pip / Hugging Face caches (gitignored)
 ```
@@ -161,6 +163,58 @@ torchao 0.18 routes int4 weight-only through Meta's **MSLK** kernels, and mslk o
 ships per-CUDA wheels under `https://download.pytorch.org/whl/` (there is no CPU
 build). setup.sh installs mslk automatically when TORCH_VARIANT is a CUDA channel.
 On a CPU box, use **--quant nf4** for 4-bit or **--quant int8**.
+
+## Capturing intermediates (for comparison)
+
+`scripts/capture_trace.py` runs one forward pass and dumps every intermediate for a
+chosen token position to `traces/<name>/tensors.safetensors` plus a `manifest.json`.
+Tensors are float32 with the batch dim dropped, so shapes are unambiguous.
+
+```bash
+# golden bf16 reference for a single bos token, whole sequence
+python scripts/capture_trace.py --token-id 2 --quant bf16 --all-positions
+
+# a real prompt, capturing the position that predicts the first generated token
+python scripts/capture_trace.py --prompt "The capital of France is" --position -1
+
+# 4-bit capture plus attention probabilities (forces eager attention)
+python scripts/capture_trace.py --prompt "Hello" --quant nf4 --attentions
+```
+
+Captured tensors:
+
+| Key | Meaning |
+|---|---|
+| `inputs_embeds`, `embed_tokens` | embedding output (full sequence / one position) |
+| `layers.NN.input_layernorm` | pre-attention RMSNorm |
+| `layers.NN.self_attn.{q,k,v,o}_proj` | attention projections |
+| `layers.NN.self_attn.{q,k}_norm` | per-head Q/K RMSNorm, shape (heads, head_dim) |
+| `layers.NN.post_attention_layernorm` | post-attention RMSNorm |
+| `layers.NN.pre_feedforward_layernorm` | pre-MLP RMSNorm |
+| `layers.NN.post_feedforward_layernorm` | post-MLP RMSNorm |
+| `layers.NN.mlp.{gate,up,down}_proj` | GeGLU MLP |
+| `layers.NN.out` | residual stream out of decoder block NN |
+| `norm`, `last_hidden_state` | final RMSNorm output (position / full sequence) |
+| `lm_head` | raw logits BEFORE `final_logit_softcapping` |
+| `logits`, `logits_last` | softcapped logits at `--position` and at the last position |
+| `attn.NN` | attention probabilities, shape (heads, kv), with `--attentions` |
+
+`NN` is zero-padded to two digits (`layers.00` ... `layers.47`). The manifest records
+the model, quantization, versions, prompt, input ids, the captured position, top-5
+next-token predictions, and every tensor's shape and dtype.
+
+Compare a from-scratch run against a reference:
+
+```bash
+python scripts/compare_trace.py --ref traces/ref --cand traces/mine
+# optional key translation: map candidate names to reference names
+python scripts/compare_trace.py --ref traces/ref --cand traces/mine --key-map keys.json --out compare.json
+```
+
+It prints max-abs, mean-abs, relative-L2 and cosine similarity per tensor, largest
+error first. Use `--quant bf16` for the golden reference; quantized captures (nf4/int8)
+differ by construction. Gemma 4 applies `final_logit_softcapping=30.0`, so `lm_head`
+is the pre-softcap tensor while `logits` is the model's actual output.
 
 ## Hardware notes
 

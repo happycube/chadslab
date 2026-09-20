@@ -1,4 +1,14 @@
-"""End-to-end chat with the NumPy runtime: text -> tokens -> forward -> text."""
+"""Run one chat prompt from start to finish.
+
+The script does four steps:
+1. Change the prompt text into token ids.
+2. Run the model.
+3. Change the new token ids into text.
+4. Print the text.
+
+Use --dry-run to test the tokenizer only. Use --cache-weights to keep the
+weights in memory during the run.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +18,7 @@ from np_gemma import Config, Model, SafeTensors, Tokenizer
 
 
 def resolve_paths(args):
+    """Return the config path, the weights path, and the tokenizer path."""
     if args.snapshot:
         snap = Path(args.snapshot)
         return (args.config or str(snap / "config.json"),
@@ -29,6 +40,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=1)
     ap.add_argument("--thinking", action="store_true")
     ap.add_argument("--cache-weights", action="store_true")
+    ap.add_argument("--dtype", choices=("bf16", "f32"), default="f32",
+                    help="f32 is fast and uses about 70 GB. bf16 uses about 24 GB and is slower.")
     ap.add_argument("--dry-run", action="store_true", help="only tokenize; do not load weights")
     args = ap.parse_args()
     config_path, weights_path, tok_path = resolve_paths(args)
@@ -49,6 +62,8 @@ def main():
     cfg = Config.load(config_path)
     with SafeTensors(weights_path) as st:
         model = Model(st, cfg)
+        if args.cache_weights:
+            model.load_all(dtype=args.dtype)
         out = model.generate(ids, max_new_tokens=args.max_new_tokens,
                              eos_ids=[tokenizer.eos_id, 106],
                              cache_weights=args.cache_weights)

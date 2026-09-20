@@ -1,20 +1,33 @@
-"""Pure-Python (NumPy-only project) Gemma 4 tokenizer: HF BPE + byte fallback + chat template.
+"""Change text into token ids. Change token ids back into text.
 
-Reproduces the pipeline in tokenizer.json:
-  normalizer  : Replace(" ", U+2581)
-  pre_tokenizer: Split(" ")  (no-op after normalization)
-  model       : BPE, byte_fallback=true
-  decoder     : Replace(U+2581, " ") -> ByteFallback -> Fuse
+The tokenizer uses the BPE data in tokenizer.json. The pipeline has four steps:
+1. Replace each space with the character U+2581.
+2. Split the text. After step 1, this step does nothing.
+3. Apply the BPE merges. Use byte fallback for a character that is not in the
+   vocabulary.
+4. Decode the ids. The decoder replaces U+2581 with a space, joins the byte
+   tokens, and joins the parts.
+
+This module also supplies the chat template.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-SPACE = "\u2581"
+# The sentence-piece space character.
+SPACE = "▁"
 
 
 class Tokenizer:
+    """Convert text to token ids and back.
+
+    The constructor reads these parts from tokenizer.json:
+        vocab          The token strings and their ids.
+        merges         The BPE merge rules and their ranks.
+        added_tokens   The special tokens.
+    """
+
     def __init__(self, tokenizer_json):
         data = json.loads(Path(tokenizer_json).read_text())
         m = data["model"]
@@ -32,6 +45,7 @@ class Tokenizer:
         self.byte_fallback = bool(m.get("byte_fallback", False))
         self.unk_token = m.get("unk_token")
         self.unk_id = self.vocab.get(self.unk_token)
+        # Make the byte token name for each byte value. For example: <0x1F>.
         self.byte_tokens = {b: "<0x" + format(b, "02X") + ">" for b in range(256)}
         self.added = {}
         self.special_ids = set()
@@ -39,6 +53,7 @@ class Tokenizer:
             self.added[a["content"]] = a["id"]
             if a.get("special"):
                 self.special_ids.add(a["id"])
+        # Sort the special tokens by length. Test the longest token first.
         self._added_sorted = sorted(self.added, key=len, reverse=True)
         self.bos_id = self.added.get("<bos>", self.vocab.get("<bos>"))
         self.eos_id = self.added.get("<eos>", self.vocab.get("<eos>"))
@@ -46,9 +61,15 @@ class Tokenizer:
 
     # ---- encoding ----------------------------------------------------------
     def _normalize(self, text):
+        """Replace each space with U+2581."""
         return text.replace(" ", SPACE)
 
     def _initial(self, piece):
+        """Make the first symbol list for one piece of text.
+
+        Use one symbol for each character. If the character is not in the
+        vocabulary, use the byte tokens of its UTF-8 bytes.
+        """
         out = []
         for ch in piece:
             if ch in self.vocab:
@@ -62,6 +83,11 @@ class Tokenizer:
         return out
 
     def _bpe(self, piece):
+        """Merge adjacent symbols.
+
+        Always merge the pair with the lowest rank. Stop when no adjacent pair
+        has a rank.
+        """
         syms = self._initial(piece)
         while len(syms) > 1:
             best_rank = None
@@ -77,12 +103,21 @@ class Tokenizer:
         return syms
 
     def _matches_added(self, text, i):
+        """Return the special token that starts at position i.
+
+        Return None when no special token starts at that position.
+        """
         for token in self._added_sorted:
             if text.startswith(token, i):
                 return token
         return None
 
     def encode(self, text, add_special_tokens=False):
+        """Change text into token ids.
+
+        Keep each special token as one id. Apply the normalizer and the BPE to
+        the other parts.
+        """
         ids = []
         i = 0
         n = len(text)
@@ -103,6 +138,7 @@ class Tokenizer:
 
     # ---- decoding ----------------------------------------------------------
     def _token_string(self, i):
+        """Return the token string for one id. Return an empty string for an unknown id."""
         if i in self.ids_to_tokens:
             return self.ids_to_tokens[i]
         for content, tid in self.added.items():
@@ -111,6 +147,11 @@ class Tokenizer:
         return ""
 
     def decode(self, ids, skip_special_tokens=False):
+        """Change token ids into text.
+
+        Join adjacent byte tokens first. Then decode the bytes as UTF-8.
+        Replace an invalid byte sequence with the replacement character.
+        """
         tokens = []
         for i in ids:
             if skip_special_tokens and i in self.special_ids:
@@ -125,6 +166,7 @@ class Tokenizer:
                 pending.clear()
 
         for t in tokens:
+            # A byte token has the form <0xXX>. Collect its byte value.
             if len(t) == 6 and t.startswith("<0x") and t.endswith(">"):
                 try:
                     pending.append(int(t[3:5], 16))
@@ -138,6 +180,12 @@ class Tokenizer:
 
     # ---- chat --------------------------------------------------------------
     def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False):
+        """Build the chat prompt from the message list.
+
+        Add one turn for each message. Change the role "assistant" to "model".
+        Add a system turn. If thinking is true, open the system turn with the
+        think token. If thinking is false, close an empty thought channel.
+        """
         parts = ["<bos>"]
         system = [m for m in messages if m.get("role") == "system"]
         if thinking:
