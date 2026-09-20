@@ -1,0 +1,30 @@
+# Runtime for Google Gemma 4 12B QAT in PyTorch.
+#
+# torch, torchvision and torchaudio are NOT listed here: setup.sh installs them
+# from the matching wheel channel (CPU or CUDA) so a CPU box never pulls
+# multi-GB CUDA wheels.
+#   torch==2.14.0  (+cpu or +cu130)
+#   torchvision==0.29.0, torchaudio==2.11.0
+
+transformers==5.17.0
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface_hub==1.32.0
+sentencepiece==0.2.2
+protobuf>=5.28
+numpy>=2.0
+
+# Multimodal input support: Gemma 4 12B "Unified" is text + image + audio.
+pillow>=10.4
+soundfile>=0.12
+librosa>=0.10
+
+# PyTorch-native quantization for the QAT checkpoint.
+#   torchao int4/int8 weight-only  (int4 needs mslk; CUDA wheels only)
+#   bitsandbytes NF4               (works on CPU and CUDA; the CPU 4-bit path)
+torchao==0.18.0
+bitsandbytes==0.50.2
+
+# Optional: load pre-quantized compressed-tensors w4a16 checkpoints such as
+# google/gemma-4-12B-it-qat-w4a16-ct.
+compressed-tensors==0.18.0

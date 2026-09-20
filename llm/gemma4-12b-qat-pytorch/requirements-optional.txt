@@ -1,0 +1,4 @@
+# Optional extras:
+#   uv pip install --python .venv/bin/python -r requirements-optional.txt
+hf_xet>=1.0               # fast chunked downloads from the Hub
+matplotlib>=3.9           # plotting for the runtime-learning notebook work

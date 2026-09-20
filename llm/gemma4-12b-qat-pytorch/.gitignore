@@ -1,0 +1,7 @@
+# Local-only artifacts
+.venv/
+.cache/
+models/
+outputs/
+__pycache__/
+*.pyc
