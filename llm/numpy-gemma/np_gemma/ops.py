@@ -198,6 +198,26 @@ def linear_q6k(x, w_bytes, cols):
 ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
 
 
+def router_ready():
+    """Return True when the fused router kernel is ready."""
+    return _cops is not None and _cops.available()
+
+
+def router(x, scale, proj, per_expert, top_k, eps, hscale):
+    """Run the router for one token. Return the weights and the expert indices."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    scale = np.ascontiguousarray(scale, dtype=np.float32)
+    proj = np.ascontiguousarray(proj, dtype=np.float32)
+    per_expert = np.ascontiguousarray(per_expert, dtype=np.float32)
+    hidden = x.shape[1]
+    experts = proj.shape[0]
+    val = np.empty((1, top_k), dtype=np.float32)
+    idx = np.empty((1, top_k), dtype=np.int32)
+    _cops.router(x[0], scale, proj, per_expert, hidden, experts, top_k, eps, hscale,
+                 val.reshape(-1), idx.reshape(-1))
+    return val, idx.astype(np.int64)
+
+
 def int4_multi4_ready():
     """Return True when the fused multi-matrix kernel is ready."""
     return _cops is not None and _cops.available()

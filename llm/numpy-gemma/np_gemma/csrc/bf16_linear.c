@@ -2702,6 +2702,81 @@ void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
 
 #endif  /* GEMMA_X86 */
 
+/* ---------- mixture-of-experts router ----------
+ * The router for one token does a small matrix product, a softmax, and a
+ * top-k. The matrices are small, and the NumPy path then costs more in the
+ * call of each small function than in the work. This kernel does the full
+ * step. The parallel loop covers the experts.
+ */
+void gemma_router(const float *x, const float *scale, const float *proj,
+                  const float *per_expert, int hidden, int experts, int top_k,
+                  float eps, float hscale, float *val, int *idx)
+{
+    float r[hidden];
+    float logits[experts];
+    float ss = 0.0f;
+    for (int k = 0; k < hidden; ++k) {
+        ss += x[k] * x[k];
+    }
+    float inv = 1.0f / sqrtf(ss / (float)hidden + eps);
+    for (int k = 0; k < hidden; ++k) {
+        r[k] = x[k] * inv * scale[k] * hscale;
+    }
+    #pragma omp parallel for schedule(static)
+    for (int e = 0; e < experts; ++e) {
+        const float *pe = proj + (size_t)e * (size_t)hidden;
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        int k = 0;
+        for (; k + 3 < hidden; k += 4) {
+            a0 += r[k] * pe[k];
+            a1 += r[k + 1] * pe[k + 1];
+            a2 += r[k + 2] * pe[k + 2];
+            a3 += r[k + 3] * pe[k + 3];
+        }
+        float a = (a0 + a1) + (a2 + a3);
+        for (; k < hidden; ++k) {
+            a += r[k] * pe[k];
+        }
+        logits[e] = a;
+    }
+    float m = logits[0];
+    for (int e = 1; e < experts; ++e) {
+        if (logits[e] > m) {
+            m = logits[e];
+        }
+    }
+    float sum = 0.0f;
+    for (int e = 0; e < experts; ++e) {
+        logits[e] = expf(logits[e] - m);
+        sum += logits[e];
+    }
+    float invs = 1.0f / sum;
+    for (int e = 0; e < experts; ++e) {
+        logits[e] *= invs;
+    }
+    for (int j = 0; j < top_k; ++j) {
+        int best = 0;
+        float bv = logits[0];
+        for (int e = 1; e < experts; ++e) {
+            if (logits[e] > bv) {
+                bv = logits[e];
+                best = e;
+            }
+        }
+        val[j] = bv;
+        idx[j] = best;
+        logits[best] = -1.0f;
+    }
+    float vs = 0.0f;
+    for (int j = 0; j < top_k; ++j) {
+        vs += val[j];
+    }
+    float invv = 1.0f / vs;
+    for (int j = 0; j < top_k; ++j) {
+        val[j] = val[j] * invv * per_expert[idx[j]];
+    }
+}
+
 /* ---------- fused attention for one query token ----------
  * A decode step makes one query token for each layer. The NumPy path then
  * builds a score matrix and calls a batched matrix product for a very small

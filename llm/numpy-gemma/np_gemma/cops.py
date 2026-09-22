@@ -158,6 +158,10 @@ try:
         _lib.gemma_attn_decode.restype = None
         _lib.gemma_int4_multi4.argtypes = ([_void_p, _void_p, _void_p, _int] * 4) + [_void_p, _int]
         _lib.gemma_int4_multi4.restype = None
+        _lib.gemma_router.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                      _int, _int, _int, ctypes.c_float, ctypes.c_float,
+                                      _void_p, _void_p]
+        _lib.gemma_router.restype = None
         _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
@@ -419,6 +423,15 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def router(x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale, val, idx):
+    """Run the mixture-of-experts router for one token."""
+    _lib.gemma_router(x.ctypes.data, scale.ctypes.data, proj.ctypes.data,
+                      per_expert.ctypes.data, ctypes.c_int(hidden),
+                      ctypes.c_int(experts), ctypes.c_int(top_k),
+                      ctypes.c_float(eps), ctypes.c_float(hscale),
+                      val.ctypes.data, idx.ctypes.data)
 
 
 def int4_multi4(mats, x, cols):

@@ -489,6 +489,10 @@ class Model:
         softmax uses float32.
         """
         eps = self.cfg.rms_norm_eps
+        if x.shape[0] == 1 and ops.router_ready():
+            return ops.router(x, w["router.scale"], w["router.proj"],
+                              w["router.per_expert_scale"], self.cfg.top_k_experts,
+                              eps, self.cfg.hidden_size ** -0.5)
         r = ops.rms_norm(x, None, eps)
         r = r * w["router.scale"] * (self.cfg.hidden_size ** -0.5)
         logits = ops.linear(r, w["router.proj"])
