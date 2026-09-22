@@ -667,26 +667,38 @@ class Model:
             kf = self.linear(x, w["self_attn.k_proj"])
             vf = None if plan.k_eq_v else self.linear(x, w["self_attn.v_proj"])
 
-        q = qf.reshape(t, plan.num_q_heads, hd)
         emit(hook, p + "self_attn.q_proj", qf)
-        q = ops.rms_norm(q, w["self_attn.q_norm"], eps)
-        emit(hook, p + "self_attn.q_norm", q)
-
-        k_raw = kf
-        k = k_raw.reshape(t, plan.num_kv_heads, hd)
-        emit(hook, p + "self_attn.k_proj", k_raw)
-        k = ops.rms_norm(k, w["self_attn.k_norm"], eps)
-        emit(hook, p + "self_attn.k_norm", k)
-
+        emit(hook, p + "self_attn.k_proj", kf)
+        q2 = np.ascontiguousarray(qf).reshape(t * plan.num_q_heads, hd)
+        k2 = np.ascontiguousarray(kf).reshape(t * plan.num_kv_heads, hd)
         if plan.k_eq_v:
-            # The global layers have no v_proj. Use the raw key data. Apply RMSNorm.
-            v = ops.rms_norm(k_raw.reshape(t, plan.num_kv_heads, hd), None, eps)
+            # The global layers have no v_proj. The value is the raw key data
+            # with RMSNorm and no weight. Copy the key before the key norm.
+            v2 = k2.copy()
         else:
             emit(hook, p + "self_attn.v_proj", vf)
-            v = ops.rms_norm(vf.reshape(t, plan.num_kv_heads, hd), None, eps)
+            v2 = np.ascontiguousarray(vf).reshape(t * plan.num_kv_heads, hd)
 
-        q = rope_mod.apply(q, cos, sin)
-        k = rope_mod.apply(k, cos, sin)
+        if ops.qkv_ready():
+            # One call for the three norms and one call for the two rotations.
+            ops.qkv_norm(q2, w["self_attn.q_norm"], k2, w["self_attn.k_norm"], v2, eps)
+            emit(hook, p + "self_attn.q_norm", q2)
+            emit(hook, p + "self_attn.k_norm", k2)
+            ops.rope_apply(q2, k2, cos, sin, plan.num_q_heads, plan.num_kv_heads, hd)
+            q = q2.reshape(t, plan.num_q_heads, hd)
+            k = k2.reshape(t, plan.num_kv_heads, hd)
+            v = v2.reshape(t, plan.num_kv_heads, hd)
+        else:
+            q = ops.rms_norm(q2.reshape(t, plan.num_q_heads, hd), w["self_attn.q_norm"], eps)
+            emit(hook, p + "self_attn.q_norm", q)
+            k = ops.rms_norm(k2.reshape(t, plan.num_kv_heads, hd), w["self_attn.k_norm"], eps)
+            emit(hook, p + "self_attn.k_norm", k)
+            if plan.k_eq_v:
+                v = ops.rms_norm(k2.reshape(t, plan.num_kv_heads, hd), None, eps)
+            else:
+                v = ops.rms_norm(v2.reshape(t, plan.num_kv_heads, hd), None, eps)
+            q = rope_mod.apply(q, cos, sin)
+            k = rope_mod.apply(k, cos, sin)
 
         if cache is not None:
             start = positions[0]

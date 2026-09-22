@@ -198,6 +198,25 @@ def linear_q6k(x, w_bytes, cols):
 ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
 
 
+def qkv_ready():
+    """Return True when the fused norm and RoPE kernels are ready."""
+    return _cops is not None and _cops.available()
+
+
+def qkv_norm(q, q_w, k, k_w, v, eps):
+    """Apply the RMSNorm of the query, the key, and the value in place."""
+    _cops.qkv_norm(q, np.ascontiguousarray(q_w, dtype=np.float32), q.shape[0],
+                   k, np.ascontiguousarray(k_w, dtype=np.float32), k.shape[0],
+                   v, 0 if v is None else v.shape[0], q.shape[1], eps)
+
+
+def rope_apply(q, k, cos, sin, q_heads, k_heads, head_dim):
+    """Apply RoPE to the query and the key in place."""
+    _cops.rope_apply(q, q.shape[0], q_heads, k, k.shape[0], k_heads,
+                     np.ascontiguousarray(cos, dtype=np.float32),
+                     np.ascontiguousarray(sin, dtype=np.float32), head_dim)
+
+
 def router_ready():
     """Return True when the fused router kernel is ready."""
     return _cops is not None and _cops.available()

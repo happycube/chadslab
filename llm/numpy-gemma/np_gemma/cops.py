@@ -162,6 +162,12 @@ try:
                                       _int, _int, _int, ctypes.c_float, ctypes.c_float,
                                       _void_p, _void_p]
         _lib.gemma_router.restype = None
+        _lib.gemma_qkv_norm.argtypes = [_void_p, _void_p, _int, _void_p, _void_p, _int,
+                                        _void_p, _int, _int, ctypes.c_float]
+        _lib.gemma_qkv_norm.restype = None
+        _lib.gemma_rope.argtypes = [_void_p, _int, _int, _void_p, _int, _int,
+                                    _void_p, _void_p, _int]
+        _lib.gemma_rope.restype = None
         _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
@@ -423,6 +429,21 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def qkv_norm(q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps):
+    """Apply the RMSNorm of the query, the key, and the value in place."""
+    _lib.gemma_qkv_norm(q.ctypes.data, q_w.ctypes.data, ctypes.c_int(q_rows),
+                        k.ctypes.data, k_w.ctypes.data, ctypes.c_int(k_rows),
+                        None if v is None else v.ctypes.data, ctypes.c_int(v_rows),
+                        ctypes.c_int(head_dim), ctypes.c_float(eps))
+
+
+def rope_apply(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim):
+    """Apply RoPE to the query and the key in place."""
+    _lib.gemma_rope(q.ctypes.data, ctypes.c_int(q_rows), ctypes.c_int(q_heads),
+                    k.ctypes.data, ctypes.c_int(k_rows), ctypes.c_int(k_heads),
+                    cos.ctypes.data, sin.ctypes.data, ctypes.c_int(head_dim))
 
 
 def router(x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale, val, idx):
