@@ -50,10 +50,11 @@ def main():
     cache = KVCache(cfg, max_len=len(ids) + args.max_new_tokens + 4)
     t0 = time.perf_counter()
     x = model.prefill(ids, cache)
-    print("prefill %d tokens %.2f s" % (len(ids), time.perf_counter() - t0), flush=True)
+    prefill_s = time.perf_counter() - t0
     nxt = int(np.argmax(model.logits(x[-1:])[0]))
     out = list(ids)
     gens = []
+    t0 = time.perf_counter()
     for k in range(args.max_new_tokens):
         gens.append(nxt)
         out.append(nxt)
@@ -61,6 +62,9 @@ def main():
             break
         x = model.forward([nxt], cache=cache, start_pos=len(out) - 1)
         nxt = int(np.argmax(model.logits(x)[0]))
+    decode_s = time.perf_counter() - t0
+    print("prefill %4d tokens %7.2f s  %6.2f tok/s" % (len(ids), prefill_s, len(ids) / prefill_s), flush=True)
+    print("decode  %4d tokens %7.2f s  %6.2f tok/s" % (len(gens), decode_s, len(gens) / decode_s), flush=True)
     print("prompt_ids %s" % ids)
     print("gen_ids %s" % gens)
     print("text %r" % tok.decode(gens))

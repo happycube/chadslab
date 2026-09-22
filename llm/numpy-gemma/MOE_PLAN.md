@@ -187,9 +187,14 @@ The embedding table must stay at Q6_K precision. A 4-bit output head changes
 the first token and the text becomes " is is is". The GGUF reader sets
 keep_embedding_bf16.
 
-The model is slow. The decode is about 0.3 tokens for each second on a loaded
-machine. The Python loop over 128 experts controls the time. The next work is
-the expert grouping of Phase 6.
+The model is slow. The decode is about 3.5 tokens for each second on a quiet
+machine. The Python loop over 128 experts controls the time. The scan now
+visits the selected experts only.
+
+Phase 6 is done. A new int4 tile gives a small group of tokens to one expert.
+It reads the x block one time for 16 rows and decodes each weight group one
+time for up to 16 tokens. A test at 16 tokens gave 3.1 times more speed for the
+expert shapes. ops.linear_int4 uses the tile for a group of 8 tokens or more.
 
 ### Phase 1: get the file and confirm the layout
 

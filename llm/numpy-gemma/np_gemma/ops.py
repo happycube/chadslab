@@ -242,9 +242,15 @@ def linear_int4(x, packed, scales):
         group = int4_group(packed, scales)
         # The C kernel uses the block-32 layout. Use NumPy for another group.
         if group == INT4_GROUP:
-            if x.shape[0] >= _INT4_GEMM_TOKENS:
+            tokens = x.shape[0]
+            if tokens >= _INT4_GEMM_TOKENS:
                 xt = np.ascontiguousarray(x.T)
                 return _cops.linear_int4_gemm(x, xt, packed, scales, group)
+            if tokens >= _cops.INT4_TILE_TOKENS:
+                # A small group of tokens. Use the token-vectorized tile. It
+                # reads the x block one time for several weight rows.
+                xt = np.ascontiguousarray(x.T)
+                return _cops.linear_int4_tile(x, xt, packed, scales, group)
             return _cops.linear_int4(x, packed, scales, group)
     return linear_int4_numpy(x, packed, scales)
 

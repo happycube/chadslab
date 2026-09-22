@@ -101,6 +101,9 @@ def _build(flags=None):
 # NP_GEMMA_ARCH=avx2 or avx512 forces one library. The default detects the CPU.
 _ENV_ARCH = os.environ.get("NP_GEMMA_ARCH", "").lower()
 AVX512 = True if _ENV_ARCH == "avx512" else (False if _ENV_ARCH == "avx2" else have_avx512())
+# The smallest token group for the int4 tile. A smaller group uses the four-row
+# dot. The AVX-512 tile masks a partial token block, so a small group is fine.
+INT4_TILE_TOKENS = 8
 _lib = None
 try:
     _path = _build(_FLAGS_AVX512 if AVX512 else _FLAGS)
@@ -142,6 +145,8 @@ try:
         _lib.gemma_int4_linear.restype = None
         _lib.gemma_int4_gemm.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int4_gemm.restype = None
+        _lib.gemma_int4_gemm_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_int4_gemm_tile_run.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -360,6 +365,24 @@ def linear_int4_gemm(x, xt, packed, scales, group):
                          xt.ctypes.data, out.ctypes.data,
                          ctypes.c_int(rows), ctypes.c_int(x.shape[1]),
                          ctypes.c_int(x.shape[0]))
+    return out
+
+
+def linear_int4_tile(x, xt, packed, scales, group):
+    """Multiply x by W for a small group of tokens. W is packed 4-bit data.
+
+    The tile reads the x block one time for several weight rows. Use it for a
+    group of tokens that is smaller than the token block of the multi-level
+    GEMM. xt is x transposed, that is (cols, tokens).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    xt = np.ascontiguousarray(xt, dtype=np.float32)
+    rows = packed.shape[0]
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.gemma_int4_gemm_tile_run(packed.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                                  xt.ctypes.data, out.ctypes.data,
+                                  ctypes.c_int(rows), ctypes.c_int(x.shape[1]),
+                                  ctypes.c_int(x.shape[0]))
     return out
 
 

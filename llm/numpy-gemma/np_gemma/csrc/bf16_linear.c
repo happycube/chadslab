@@ -1662,6 +1662,188 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
 }
 #endif
 
+/* ---------- int4 tile for a small group of tokens ----------
+ * A mixture-of-experts layer gives a small group of tokens to each expert.
+ * The group is often smaller than the token block of the multi-level GEMM. The
+ * one-row dot then reads x again for each weight row. This tile reads the x
+ * block one time for I4T_MR rows. It also decodes each weight group one time
+ * for I4T_TB tokens.
+ */
+
+#if GEMMA_X86 && defined(__AVX512F__)
+#define I4T_MR 16
+#define I4T_TB 16
+#elif GEMMA_X86
+#define I4T_MR 8
+#define I4T_TB 8
+#else
+#define I4T_MR 1
+#define I4T_TB 1
+#endif
+
+#if GEMMA_X86 && defined(__AVX512F__)
+static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
+                                        const float *xt, float *out,
+                                        int rows, int cols, int tokens,
+                                        int i0, int t0)
+{
+    __m512 acc[I4T_MR];
+    for (int r = 0; r < I4T_MR; ++r) {
+        acc[r] = _mm512_setzero_ps();
+    }
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i b8 = _mm_set1_epi8(8);
+    const int groups = cols / 32;
+    const int stride = cols / 2;
+    /* Mask the token lanes that pass the end of the group. */
+    int ntok = tokens - t0;
+    if (ntok > I4T_TB) {
+        ntok = I4T_TB;
+    }
+    const __mmask16 km = ntok >= I4T_TB ? (__mmask16)0xFFFF : (__mmask16)((1u << ntok) - 1);
+    for (int g = 0; g < groups; ++g) {
+        float wf[I4T_MR][32];
+        for (int r = 0; r < I4T_MR; ++r) {
+            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 16;
+            const float sc = scales[(size_t)(i0 + r) * groups + g];
+            __m128i b = _mm_loadu_si128((const __m128i *)p);
+            __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
+            __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
+            _mm512_storeu_ps(wf[r] + 0, _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)), _mm512_set1_ps(sc)));
+            _mm512_storeu_ps(wf[r] + 16, _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)), _mm512_set1_ps(sc)));
+        }
+        for (int k = 0; k < 32; ++k) {
+            __m512 xv = _mm512_maskz_loadu_ps(km, xt + (size_t)(g * 32 + k) * tokens + t0);
+            for (int r = 0; r < I4T_MR; ++r) {
+                acc[r] = _mm512_fmadd_ps(_mm512_set1_ps(wf[r][k]), xv, acc[r]);
+            }
+        }
+    }
+    float tmp[I4T_TB];
+    for (int r = 0; r < I4T_MR; ++r) {
+        _mm512_storeu_ps(tmp, acc[r]);
+        for (int t = 0; t < ntok; ++t) {
+            out[(size_t)(t0 + t) * rows + i0 + r] = tmp[t];
+        }
+    }
+}
+#elif GEMMA_X86
+static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
+                                        const float *xt, float *out,
+                                        int rows, int cols, int tokens,
+                                        int i0, int t0)
+{
+    __m256 acc[I4T_MR];
+    for (int r = 0; r < I4T_MR; ++r) {
+        acc[r] = _mm256_setzero_ps();
+    }
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i b8 = _mm_set1_epi8(8);
+    const int groups = cols / 32;
+    const int stride = cols / 2;
+    for (int g = 0; g < groups; ++g) {
+        float wf[I4T_MR][32];
+        for (int r = 0; r < I4T_MR; ++r) {
+            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 16;
+            const float sc = scales[(size_t)(i0 + r) * groups + g];
+            __m128i b = _mm_loadu_si128((const __m128i *)p);
+            __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
+            __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
+            __m256 scv = _mm256_set1_ps(sc);
+            _mm256_storeu_ps(wf[r] + 0, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), scv));
+            _mm256_storeu_ps(wf[r] + 8, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), scv));
+            _mm256_storeu_ps(wf[r] + 16, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), scv));
+            _mm256_storeu_ps(wf[r] + 24, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), scv));
+        }
+        for (int k = 0; k < 32; ++k) {
+            __m256 xv = _mm256_loadu_ps(xt + (size_t)(g * 32 + k) * tokens + t0);
+            for (int r = 0; r < I4T_MR; ++r) {
+                acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(wf[r][k]), xv, acc[r]);
+            }
+        }
+    }
+    float tmp[I4T_TB];
+    for (int r = 0; r < I4T_MR; ++r) {
+        _mm256_storeu_ps(tmp, acc[r]);
+        for (int t = 0; t < I4T_TB; ++t) {
+            out[(size_t)(t0 + t) * rows + i0 + r] = tmp[t];
+        }
+    }
+}
+#else
+static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
+                                        const float *xt, float *out,
+                                        int rows, int cols, int tokens,
+                                        int i0, int t0)
+{
+    (void)w; (void)scales; (void)xt; (void)out; (void)rows; (void)cols;
+    (void)tokens; (void)i0; (void)t0;
+}
+#endif
+
+void gemma_int4_gemm_tile_run(const uint8_t *w, const float *scales,
+                              const float *x, const float *xt, float *out,
+                              int rows, int cols, int tokens)
+{
+    const int stride = cols / 2;
+    const int groups = cols / 32;
+    const int mr = rows / I4T_MR * I4T_MR;
+#if GEMMA_X86 && defined(__AVX512F__)
+    /* The tile masks the token lanes past the end of the group. Thus it
+     * handles every token count. */
+    const int tb = tokens;
+#else
+    const int tb = tokens / I4T_TB * I4T_TB;
+#endif
+#if GEMMA_X86
+    if (tb > 0 && mr > 0) {
+        const int nt = (tb + I4T_TB - 1) / I4T_TB;
+        #pragma omp parallel for schedule(static) collapse(2)
+        for (int bi = 0; bi < mr / I4T_MR; ++bi) {
+            for (int bt = 0; bt < nt; ++bt) {
+                gemma_int4_gemm_tile(w, scales, xt, out, rows, cols, tokens,
+                                     bi * I4T_MR, bt * I4T_TB);
+            }
+        }
+    }
+#endif
+    /* The rows that do not fill a tile and the token tail use the four-row
+     * dot. */
+    const int blocks = (rows + 3) / 4;
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < blocks; ++b) {
+        const int i = b * 4;
+        const int nrow = rows - i < 4 ? rows - i : 4;
+        for (int t = 0; t < tokens; ++t) {
+            if (i < mr && t < tb) {
+                continue;
+            }
+            if (nrow == 4) {
+                float r[4];
+                dot4_i4_f32(w + (size_t)i * stride, stride, scales + (size_t)i * groups,
+                            x + (size_t)t * cols, cols, r);
+                out[(size_t)t * rows + i + 0] = r[0];
+                out[(size_t)t * rows + i + 1] = r[1];
+                out[(size_t)t * rows + i + 2] = r[2];
+                out[(size_t)t * rows + i + 3] = r[3];
+            } else {
+                for (int j = 0; j < nrow; ++j) {
+                    out[(size_t)t * rows + i + j] =
+                        dot_i4_f32(w + (size_t)(i + j) * stride,
+                                   scales + (size_t)(i + j) * groups,
+                                   x + (size_t)t * cols, cols);
+                }
+            }
+        }
+    }
+}
+
 static int gemma_int4_rows4 = 1;
 
 /* Select the four-row loop (1) or the one-row loop (0). Use this for a test. */
