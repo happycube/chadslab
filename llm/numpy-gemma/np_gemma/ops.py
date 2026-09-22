@@ -411,7 +411,7 @@ def linear_int4_numpy(x, packed, scales):
 # row block to float32 one time and reuses it for every token block. The one
 # row dot decodes the weights again for each token. Below one full token block
 # the GEMM does no work, so use the one-row dot.
-_INT4_GEMM_TOKENS = 64
+_INT4_GEMM_TOKENS = int(os.environ.get("NP_GEMMA_INT4_GEMM_TOKENS", "64"))
 
 
 def linear_int4(x, packed, scales):

@@ -103,7 +103,11 @@ _ENV_ARCH = os.environ.get("NP_GEMMA_ARCH", "").lower()
 AVX512 = True if _ENV_ARCH == "avx512" else (False if _ENV_ARCH == "avx2" else have_avx512())
 # The smallest token group for the int4 tile. A smaller group uses the four-row
 # dot. The AVX-512 tile masks a partial token block, so a small group is fine.
-INT4_TILE_TOKENS = 8
+# The smallest token group that uses the int4 tile. The one-row dot decodes
+# the weights again for each token. The tile decodes a weight block one time
+# for a group of tokens. A mixture-of-experts layer gives a small group of
+# tokens to each expert, so the tile is the better kernel for it.
+INT4_TILE_TOKENS = int(os.environ.get("NP_GEMMA_INT4_TILE_TOKENS", "2"))
 _lib = None
 try:
     _path = _build(_FLAGS_AVX512 if AVX512 else _FLAGS)
