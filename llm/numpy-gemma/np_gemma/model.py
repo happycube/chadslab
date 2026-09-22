@@ -296,7 +296,9 @@ class Model:
         if dtype not in ("f32", "bf16", "int8", "int4"):
             raise ValueError("dtype must be f32, bf16, int8, or int4")
         if dtype in ("int8", "int4") and self._use_cache:
-            cache = WeightCache(self.st.path, dtype)
+            # The int4 layout changed to the block layout of Q4_0. Use a new
+            # cache key.
+            cache = WeightCache(self.st.path, dtype, extra="blk" if dtype == "int4" else "")
             if cache.ready():
                 self._cache = cache
             else:
@@ -333,7 +335,7 @@ class Model:
         if self._cache_write is not None:
             self._cache_write.close_write()
             self._cache_write = None
-            self._cache = WeightCache(self.st.path, dtype)
+            self._cache = WeightCache(self.st.path, dtype, extra="blk" if dtype == "int4" else "")
         self._dtype = dtype
         self.keep_weights = True
         if dtype in ("int8", "int4"):

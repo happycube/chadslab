@@ -143,6 +143,17 @@ def linear_bf16(x, w_u16, chunk=LINEAR_BF16_CHUNK):
 INT4_GROUP = 32
 
 
+def pack_int4_blocks(scale, qs):
+    """Join a scale and 16 nibble bytes into the Q4_0 block layout.
+
+    Return an array of shape (..., 18) of uint8. Bytes 0 and 1 hold the scale
+    as float16. Bytes 2 to 17 hold the 16 nibble bytes. A nibble holds the
+    value plus 8. This is the layout of the Q4_0 type of the GGUF format.
+    """
+    head = scale.astype(np.float16).view(np.uint8).reshape(scale.shape + (2,))
+    return np.concatenate([head, qs], axis=-1)
+
+
 def quantize_int4(w, group=INT4_GROUP):
     """Quantize W to 4-bit. Return the packed data and the float32 scales.
 
@@ -160,15 +171,14 @@ def quantize_int4(w, group=INT4_GROUP):
     group = cols if group is None else group
     groups = cols // group
     wg = w.reshape(rows, groups, group)
-    scale = np.max(np.abs(wg), axis=2) / 7.0
+    # Use the offset-8 nibble and the block layout of Q4_0. Thus a Q4_0 file
+    # needs no change of the nibbles.
+    scale = np.max(np.abs(wg), axis=2) / 8.0
     scale = np.where(scale == 0.0, 1e-12, scale).astype(np.float32)
-    q = np.rint(wg / scale[:, :, None]).clip(-7.0, 7.0).astype(np.int8).reshape(rows, cols)
-    # Pack in blocks of 32 values (16 bytes). Block bo holds values bo*32 .. bo*32+31.
-    qb = q.reshape(rows, cols // 32, 2, 16)
-    lo = qb[:, :, 0, :].astype(np.uint8) & 0x0F
-    hi = qb[:, :, 1, :].astype(np.uint8) & 0x0F
-    packed = (lo | (hi << 4)).astype(np.uint8).reshape(rows, cols // 2)
-    return packed, scale
+    q = np.rint(wg / scale[:, :, None]).clip(-8.0, 7.0).astype(np.int16)
+    qb = (q + 8).astype(np.uint8).reshape(rows, groups, 2, group // 2)
+    qs = (qb[:, :, 0, :] | (qb[:, :, 1, :] << 4)).astype(np.uint8)
+    return pack_int4_blocks(scale, qs), scale
 
 
 def convert_w4a16(packed_i32, scale_bf16):
@@ -187,35 +197,35 @@ def convert_w4a16(packed_i32, scale_bf16):
     vals = np.empty((rows, cols), dtype=np.uint8)
     vals[:, 0::2] = b & 0x0F
     vals[:, 1::2] = (b >> 4) & 0x0F
-    signed = (vals.astype(np.int16) - 8).astype(np.int8)
-    qb = signed.reshape(rows, cols // 32, 2, 16)
-    lo = qb[:, :, 0, :].astype(np.uint8) & 0x0F
-    hi = qb[:, :, 1, :].astype(np.uint8) & 0x0F
-    packed = (lo | (hi << 4)).astype(np.uint8).reshape(rows, cols // 2)
+    # The w4a16 nibble is already the offset-8 nibble. Reorder the pairs of
+    # columns to the block layout. The value of a nibble stays the same.
+    groups = cols // 32
+    qb = vals.reshape(rows, groups, 2, 16)
+    qs = (qb[:, :, 0, :] | (qb[:, :, 1, :] << 4)).astype(np.uint8)
     scale = np.ascontiguousarray(scale_bf16, dtype=np.float32)
-    return packed, scale
+    return pack_int4_blocks(scale, qs), scale
 
 
 def dequantize_int4(packed, scales):
     """Return float32 values from packed 4-bit data."""
-    rows, half = packed.shape
-    cols = half * 2
-    group = cols // scales.shape[1]
-    lo = (packed & 0x0F).astype(np.int8)
-    hi = ((packed >> 4) & 0x0F).astype(np.int8)
-    lo = np.where(lo >= 8, lo - 16, lo).astype(np.int8)
-    hi = np.where(hi >= 8, hi - 16, hi).astype(np.int8)
-    qb = np.empty((rows, cols // 32, 2, 16), dtype=np.int8)
-    qb[:, :, 0, :] = lo.reshape(rows, cols // 32, 16)
-    qb[:, :, 1, :] = hi.reshape(rows, cols // 32, 16)
-    q = qb.reshape(rows, cols)
-    scale = scales if scales.ndim == 2 else scales.reshape(rows, -1)
-    return q.astype(np.float32) * scale.repeat(group, axis=1)
+    # packed holds blocks of 18 bytes: a float16 scale and 16 nibble bytes.
+    # The value of a nibble is the nibble minus 8.
+    rows = packed.shape[0]
+    groups = int(np.prod(packed.shape[1:-1]))
+    qs = packed.reshape(rows, groups, 18)[:, :, 2:18]
+    lo = (qs & 0x0F).astype(np.int8) - 8
+    hi = ((qs >> 4) & 0x0F).astype(np.int8) - 8
+    qb = np.empty((rows, groups, 2, 16), dtype=np.int8)
+    qb[:, :, 0, :] = lo
+    qb[:, :, 1, :] = hi
+    q = qb.reshape(rows, groups * 32)
+    scale = scales.reshape(rows, groups)
+    return q.astype(np.float32) * np.repeat(scale, 32, axis=1)
 
 
 def int4_group(packed, scales):
     """Return the number of columns in one int4 scale group."""
-    return (packed.shape[1] * 2) // scales.shape[1]
+    return INT4_GROUP
 
 
 def linear_int4_numpy(x, packed, scales):

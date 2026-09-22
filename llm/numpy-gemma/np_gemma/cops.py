@@ -343,7 +343,7 @@ def linear_int4(x, packed, scales, group):
     """Multiply x by W. W is packed 4-bit data. scales gives one scale for each group."""
     x = np.ascontiguousarray(x, dtype=np.float32)
     rows = packed.shape[0]
-    cols = packed.shape[1] * 2
+    cols = packed.shape[1] * 32
     out = np.empty((x.shape[0], rows), dtype=np.float32)
     _lib.gemma_int4_linear(packed.ctypes.data, scales.ctypes.data, x.ctypes.data, out.ctypes.data,
                            ctypes.c_int(rows), ctypes.c_int(cols),

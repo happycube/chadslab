@@ -181,7 +181,9 @@ All phases are done. The model answers "The capital of France is **Paris**."
 The code reads the Q4_0 data of the GGUF directly. It does not build the
 on-disk weight cache for the GGUF. The local copy of the file is at
 ~/.cache/np_gemma/models/gemma-4-26B-qat-q4_0. The load from the local disk is
-16 s. The load from the network mount is 206 s. The tokenizer comes from the
+10.5 s. The load from the network mount is 206 s. The runtime int4 format is
+the block layout of Q4_0. Thus the reader uses the packed bytes of the file as
+a view. It copies no data. The tokenizer comes from the
 GGUF metadata. No tokenizer.json file is necessary.
 
 The embedding table must stay at Q6_K precision. A 4-bit output head changes

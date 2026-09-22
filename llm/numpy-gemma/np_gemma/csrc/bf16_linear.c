@@ -1470,12 +1470,12 @@ void gemma_int8_gemm(const int8_t *w, const float *scales, const float *x,
  */
 
 /* Turn packed nibbles into signed bytes. A value is a 4-bit two's complement
- * number, so (nibble ^ 8) - 8 sign-extends it. Do this in the byte lanes before
+ * number, so nibble - 8 sign-extends it. Do this in the byte lanes before
  * the widening. The operation is then 2 instructions for 16 values, not 2
  * instructions for each widened vector. */
 static inline __m128i i4_sign_bytes(__m128i nib, __m128i b8)
 {
-    return _mm_sub_epi8(_mm_xor_si128(nib, b8), b8);
+    return _mm_sub_epi8(nib, b8);
 }
 
 #if GEMMA_X86 && defined(__AVX512F__)
@@ -1490,7 +1490,7 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
     const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
-        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
+        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 18 + 2));
         __m512 lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
             i4_sign_bytes(_mm_and_si128(b, mask), b8)));
         __m512 hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
@@ -1513,7 +1513,7 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
     const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
-        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
+        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 18 + 2));
         __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
         __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
         __m256 l0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
@@ -1537,9 +1537,9 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
     for (int k = 0; k < n; ++k) {
         int g = k / 32;
         int p = k % 32;
-        int byte = w[(size_t)g * 16 + (p & 15)];
+        int byte = w[(size_t)g * 18 + 2 + (p & 15)];
         int nib = (p < 16) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-        acc += x[k] * (float)((nib ^ 8) - 8) * scales[g];
+        acc += x[k] * (float)(nib - 8) * scales[g];
     }
     return acc;
 }
@@ -1575,7 +1575,7 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
     for (int g = 0; g < groups; ++g) {
         __m512 xlo = _mm512_loadu_ps(x + (size_t)g * 32);
         __m512 xhi = _mm512_loadu_ps(x + (size_t)g * 32 + 16);
-        const uint8_t *p = w + (size_t)g * 16;
+        const uint8_t *p = w + (size_t)g * 18 + 2;
         __m128i b0 = _mm_loadu_si128((const __m128i *)(p));
         __m128i b1 = _mm_loadu_si128((const __m128i *)(p + stride));
         __m128i b2 = _mm_loadu_si128((const __m128i *)(p + (size_t)2 * stride));
@@ -1636,7 +1636,7 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
         __m256 x1 = _mm256_loadu_ps(x + (size_t)g * 32 + 8);
         __m256 x2 = _mm256_loadu_ps(x + (size_t)g * 32 + 16);
         __m256 x3 = _mm256_loadu_ps(x + (size_t)g * 32 + 24);
-        const uint8_t *p = w + (size_t)g * 16;
+        const uint8_t *p = w + (size_t)g * 18 + 2;
         a0 = _mm256_fmadd_ps(i4_row256(p, x0, x1, x2, x3, mask, b8),
                              _mm256_set1_ps(scales[g]), a0);
         a1 = _mm256_fmadd_ps(i4_row256(p + stride, x0, x1, x2, x3, mask, b8),
@@ -1694,7 +1694,7 @@ static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
     const __m128i mask = _mm_set1_epi8(0x0F);
     const __m128i b8 = _mm_set1_epi8(8);
     const int groups = cols / 32;
-    const int stride = cols / 2;
+    const int stride = (cols / 32) * 18;
     /* Mask the token lanes that pass the end of the group. */
     int ntok = tokens - t0;
     if (ntok > I4T_TB) {
@@ -1704,7 +1704,7 @@ static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
     for (int g = 0; g < groups; ++g) {
         float wf[I4T_MR][32];
         for (int r = 0; r < I4T_MR; ++r) {
-            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 16;
+            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 18 + 2;
             const float sc = scales[(size_t)(i0 + r) * groups + g];
             __m128i b = _mm_loadu_si128((const __m128i *)p);
             __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
@@ -1742,11 +1742,11 @@ static inline void gemma_int4_gemm_tile(const uint8_t *w, const float *scales,
     const __m128i mask = _mm_set1_epi8(0x0F);
     const __m128i b8 = _mm_set1_epi8(8);
     const int groups = cols / 32;
-    const int stride = cols / 2;
+    const int stride = (cols / 32) * 18;
     for (int g = 0; g < groups; ++g) {
         float wf[I4T_MR][32];
         for (int r = 0; r < I4T_MR; ++r) {
-            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 16;
+            const uint8_t *p = w + (size_t)(i0 + r) * stride + (size_t)g * 18 + 2;
             const float sc = scales[(size_t)(i0 + r) * groups + g];
             __m128i b = _mm_loadu_si128((const __m128i *)p);
             __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
@@ -1791,7 +1791,7 @@ void gemma_int4_gemm_tile_run(const uint8_t *w, const float *scales,
                               const float *x, const float *xt, float *out,
                               int rows, int cols, int tokens)
 {
-    const int stride = cols / 2;
+    const int stride = (cols / 32) * 18;
     const int groups = cols / 32;
     const int mr = rows / I4T_MR * I4T_MR;
 #if GEMMA_X86 && defined(__AVX512F__)
@@ -1859,7 +1859,7 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
      * group size. */
     (void)group;
     int groups = cols / 32;
-    int stride = cols / 2;
+    int stride = (cols / 32) * 18;
     if (gemma_int4_rows4 && tokens == 1) {
         int blocks = (rows + 3) / 4;
         #pragma omp parallel for schedule(static)
@@ -1929,7 +1929,7 @@ static inline void i4_decode_row(const uint8_t *w, const float *scales,
     const __m128i mask = _mm_set1_epi8(0x0F);
     const __m128i b8 = _mm_set1_epi8(8);
     for (int g = 0; g < ng; ++g) {
-        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
+        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 18 + 2));
         float sc = scales[g];
         __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
         __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
@@ -2030,9 +2030,9 @@ void gemma_int4_gemm(const uint8_t *w, const float *scales, const float *x,
                     int g0 = k0 / 32;
                     /* Decode the A panel one time for all the token blocks. */
                     for (int mm = 0; mm < I4_MC; ++mm) {
-                        const uint8_t *wi = w + (size_t)(m0 + mm) * (size_t)(cols / 2);
+                        const uint8_t *wi = w + (size_t)(m0 + mm) * ((size_t)(cols / 32) * 18);
                         const float *si = scales + (size_t)(m0 + mm) * (size_t)(cols / 32);
-                        i4_decode_row(wi + (size_t)g0 * 16, si + g0, kfast / 32,
+                        i4_decode_row(wi + (size_t)g0 * 18, si + g0, kfast / 32,
                                       I4_MC, abuf + mm);
                     }
                     /* The columns that do not fill a group of 32 use scalar code. */
@@ -2040,11 +2040,11 @@ void gemma_int4_gemm(const uint8_t *w, const float *scales, const float *x,
                         int g = (k0 + kk) / 32;
                         int p = (k0 + kk) % 32;
                         for (int mm = 0; mm < I4_MC; ++mm) {
-                            const uint8_t *wi = w + (size_t)(m0 + mm) * (size_t)(cols / 2);
+                            const uint8_t *wi = w + (size_t)(m0 + mm) * ((size_t)(cols / 32) * 18);
                             const float *si = scales + (size_t)(m0 + mm) * (size_t)(cols / 32);
-                            int byte = wi[(size_t)g * 16 + (p & 15)];
+                            int byte = wi[(size_t)g * 18 + 2 + (p & 15)];
                             int nib = (p < 16) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-                            abuf[(size_t)kk * I4_MC + mm] = (float)((nib ^ 8) - 8) * si[g];
+                            abuf[(size_t)kk * I4_MC + mm] = (float)(nib - 8) * si[g];
                         }
                     }
                     for (int ni = 0; ni < nb; ++ni) {
@@ -2070,7 +2070,7 @@ void gemma_int4_gemm(const uint8_t *w, const float *scales, const float *x,
     /* The rows and the tokens that do not fill a block use the one-row dot. */
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; ++i) {
-        const uint8_t *wi = w + (size_t)i * (size_t)(cols / 2);
+        const uint8_t *wi = w + (size_t)i * ((size_t)(cols / 32) * 18);
         const float *si = scales + (size_t)i * (size_t)(cols / 32);
         int t0 = (i < mb * I4_MC) ? nb * I4_NC : 0;
         for (int t = t0; t < tokens; ++t) {

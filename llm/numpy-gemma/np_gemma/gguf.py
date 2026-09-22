@@ -271,10 +271,12 @@ class GGUF:
         self._fh.close()
 
     def release_pages(self):
-        try:
-            self._mm.madvise(mmap.MADV_DONTNEED)
-        except (AttributeError, OSError):
-            pass
+        """Do nothing.
+
+        The int4 data of the model is a view into the file map. The pages must
+        stay in the map. The system can drop a clean page at any time and read
+        it again when the code needs it.
+        """
 
     def names(self):
         """Return all tensor names of this runtime."""
@@ -340,10 +342,10 @@ class GGUF:
         Return (packed, scales). packed is uint8 with two values in each byte.
         scales is float32 with one value for each group of 32 columns.
 
-        The Q4_0 nibble is the two's complement nibble flipped at bit 3. The
-        runtime nibble is the two's complement nibble. Thus the function flips
-        bit 3 of each nibble, that is bit 0x88 of each byte. The group scale of
-        Q4_0 is then the group scale of the runtime. No other change is needed.
+        The runtime uses the block layout of Q4_0. One block holds 32 values in
+        18 bytes: a float16 scale and 16 nibble bytes. The value of a nibble is
+        the nibble minus 8. The layout is the same. Thus the function copies no
+        data. packed is a view into the file map.
         """
         dims, t, _o = self.tensors[self._gguf(hf_name)]
         if t != Q4_0:
@@ -352,9 +354,10 @@ class GGUF:
         count = int(np.prod(dims))
         nblk = count // 32
         raw = self._blocks(hf_name, 0, nblk)
-        packed = (raw["qs"] ^ 0x88).reshape(shape[:-1] + (shape[-1] // 2,))
-        scales = raw["d"].astype(np.float32).reshape(shape[:-1] + (shape[-1] // 32,))
-        return np.ascontiguousarray(packed), np.ascontiguousarray(scales)
+        groups = shape[-1] // 32
+        packed = raw.view(np.uint8).reshape(shape[:-1] + (groups, 18))
+        scales = raw["d"].astype(np.float32).reshape(shape[:-1] + (groups,))
+        return packed, np.ascontiguousarray(scales)
 
     def int4_row_slice(self, hf_name, start, stop):
         """Return the Q4_0 rows [start, stop) in the int4 layout.
@@ -369,9 +372,9 @@ class GGUF:
         nblk_row = shape[-1] // 32
         first = start * shape[1] * nblk_row
         raw = self._blocks(hf_name, first, (stop - start) * shape[1] * nblk_row)
-        packed = (raw["qs"] ^ 0x88).reshape((stop - start, shape[1], shape[-1] // 2))
-        scales = raw["d"].astype(np.float32).reshape((stop - start, shape[1], shape[-1] // 32))
-        return packed, scales
+        packed = raw.view(np.uint8).reshape((stop - start, shape[1], nblk_row, 18))
+        scales = raw["d"].astype(np.float32).reshape((stop - start, shape[1], nblk_row))
+        return packed, np.ascontiguousarray(scales)
 
     # ---- the configuration ------------------------------------------------
 
