@@ -152,6 +152,10 @@ try:
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                              _int, _void_p, _int, _int, _int]
         _lib.gemma_int4_moe_gemv.restype = None
+        _lib.gemma_attn_decode.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                           _void_p, _void_p, _void_p, _void_p,
+                                           _int, _int, _int, _int]
+        _lib.gemma_attn_decode.restype = None
         _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
@@ -413,6 +417,15 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
+                q_heads, kv_heads, head_dim, n):
+    """Run the fused attention for one query token. All arrays must be ready."""
+    _lib.gemma_attn_decode(qq.ctypes.data, qs.ctypes.data, kq.ctypes.data, ks.ctypes.data,
+                           vq.ctypes.data, vs.ctypes.data, scores.ctypes.data, out.ctypes.data,
+                           ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
+                           ctypes.c_int(head_dim), ctypes.c_int(n))
 
 
 def int4_moe_gemv(w, scales, x, ids, rows, cols, xstride):

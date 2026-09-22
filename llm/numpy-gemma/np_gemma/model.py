@@ -72,6 +72,10 @@ class KVCache:
         n = cfg.num_hidden_layers
         self.k = [None] * n
         self.v = [None] * n
+        self.kq = [None] * n     # int8 copy of k for the fused attention
+        self.ks = [None] * n     # one float32 scale for each group of 32
+        self.vq = [None] * n     # int8 copy of v for the fused attention
+        self.vs = [None] * n
         self.base = [0] * n      # absolute position of buffer row 0
         self.end = [0] * n       # absolute position after the last stored row
 
@@ -79,9 +83,24 @@ class KVCache:
         plan = self.cfg.plan[layer]
         return (cap, plan.num_kv_heads, plan.head_dim)
 
+    def _shape_q(self, layer, cap):
+        plan = self.cfg.plan[layer]
+        return (cap, plan.num_kv_heads, plan.head_dim)
+
+    def _shape_s(self, layer, cap):
+        plan = self.cfg.plan[layer]
+        return (cap, plan.num_kv_heads, plan.head_dim // 32)
+
+    def _alloc_q(self, layer, cap):
+        self.kq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        self.ks[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
+        self.vq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        self.vs[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
+
     def _alloc(self, layer, cap):
         self.k[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
         self.v[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
+        self._alloc_q(layer, cap)
 
     def _grow(self, layer, cap):
         old = 0 if self.k[layer] is None else self.k[layer].shape[0]
@@ -92,6 +111,20 @@ class KVCache:
             nv[:old] = self.v[layer][:old]
         self.k[layer] = nk
         self.v[layer] = nv
+        ok = 0 if self.kq[layer] is None else self.kq[layer].shape[0]
+        qk = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        qks = np.empty(self._shape_s(layer, cap), dtype=np.float32)
+        qv = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        qvs = np.empty(self._shape_s(layer, cap), dtype=np.float32)
+        if ok:
+            qk[:ok] = self.kq[layer][:ok]
+            qks[:ok] = self.ks[layer][:ok]
+            qv[:ok] = self.vq[layer][:ok]
+            qvs[:ok] = self.vs[layer][:ok]
+        self.kq[layer] = qk
+        self.ks[layer] = qks
+        self.vq[layer] = qv
+        self.vs[layer] = qvs
 
     def write(self, layer, start_pos, k, v):
         """Store a block of keys and values. start_pos is the position of k[0]."""
@@ -111,6 +144,10 @@ class KVCache:
                 if rows > 0:
                     self.k[layer][:rows] = self.k[layer][off:off + rows]
                     self.v[layer][:rows] = self.v[layer][off:off + rows]
+                    self.kq[layer][:rows] = self.kq[layer][off:off + rows]
+                    self.ks[layer][:rows] = self.ks[layer][off:off + rows]
+                    self.vq[layer][:rows] = self.vq[layer][off:off + rows]
+                    self.vs[layer][:rows] = self.vs[layer][off:off + rows]
                 self.base[layer] = keep
             need = end - self.base[layer]
             if need > self.k[layer].shape[0]:
@@ -127,11 +164,33 @@ class KVCache:
             self.k[layer][start_pos:end] = k
             self.v[layer][start_pos:end] = v
         self.end[layer] = end
+        # Keep an int8 copy for the fused attention of a decode step.
+        self._store_q8(layer, start_pos - self.base[layer], k, v)
+
+    def _store_q8(self, layer, start, k, v):
+        """Store the int8 copy of a block of keys and values."""
+        t = k.shape[0]
+        plan = self.cfg.plan[layer]
+        g = plan.head_dim // 32
+        nkv = plan.num_kv_heads
+        kq, ks = ops.quantize_q8(k.reshape(t, nkv, g, 32))
+        vq, vs = ops.quantize_q8(v.reshape(t, nkv, g, 32))
+        self.kq[layer][start:start + t] = kq.reshape(t, nkv, g * 32)
+        self.ks[layer][start:start + t] = ks
+        self.vq[layer][start:start + t] = vq.reshape(t, nkv, g * 32)
+        self.vs[layer][start:start + t] = vs
 
     def read(self, layer, end):
         """Return the keys, the values, and the position of the first row."""
         base = self.base[layer]
         return self.k[layer][:end - base], self.v[layer][:end - base], base
+
+    def read_q8(self, layer, end):
+        """Return the int8 keys, the int8 values, and the position of row 0."""
+        base = self.base[layer]
+        n = end - base
+        return (self.kq[layer][:n], self.ks[layer][:n],
+                self.vq[layer][:n], self.vs[layer][:n], base)
 
     def length(self, layer):
         """Return the number of stored positions in one layer."""
@@ -600,6 +659,14 @@ class Model:
         if cache is not None:
             start = positions[0]
             cache.write(i, start, k, v)
+            if t == 1 and ops.attn_ready():
+                kq, ks, vq, vs, _b = cache.read_q8(i, start + t)
+                n = kq.shape[0]
+                o = ops.attn_decode(q[0], kq, ks, vq, vs,
+                                    plan.num_q_heads, plan.num_kv_heads, hd, n)
+                out = self.linear(o.reshape(1, plan.q_dim), w["self_attn.o_proj"])
+                emit(hook, p + "self_attn.o_proj", out)
+                return out
             K, V, base = cache.read(i, start + t)
         else:
             K, V, base = k, v, positions[0]

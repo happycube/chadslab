@@ -147,6 +147,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel.
     OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
+    NP_GEMMA_ATTN          1                       1 uses the int8 cache and the fused attention. 0 uses the float32 cache and NumPy.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
     NP_GEMMA_ARCH          auto                    avx2 or avx512 forces one C library.

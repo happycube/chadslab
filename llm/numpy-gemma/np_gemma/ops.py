@@ -193,6 +193,50 @@ def linear_q6k(x, w_bytes, cols):
     return linear_q6k_numpy(x, w_bytes, cols)
 
 
+def attn_ready():
+    """Return True when the fused attention kernel is ready.
+
+    Set NP_GEMMA_ATTN=0 to use the float32 key and value cache and the NumPy
+    attention path. That path matches the reference more closely.
+    """
+    if os.environ.get("NP_GEMMA_ATTN", "1") == "0":
+        return False
+    return _cops is not None and _cops.available()
+
+
+def quantize_q8(x):
+    """Quantize the last axis of x to int8.
+
+    The length of the last axis must be a multiple of 32. Return the int8 data
+    and one float32 scale for each group of 32 values.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    shape = x.shape
+    flat = x.reshape(-1, 32)
+    amax = np.max(np.abs(flat), axis=1)
+    scale = np.where(amax > 0.0, amax / 127.0, 1e-12).astype(np.float32)
+    q = np.rint(flat / scale[:, None]).clip(-127.0, 127.0).astype(np.int8)
+    return q.reshape(shape), scale.reshape(shape[:-1])
+
+
+def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
+    """Run the fused attention for one query token.
+
+    q is the query after RoPE, with the shape (q_heads, head_dim). The key and
+    value caches hold int8 values and one float32 scale for each group of 32.
+    Return the attention output, with the shape (q_heads, head_dim).
+    """
+    g = head_dim // 32
+    qq, qs = quantize_q8(q.reshape(q_heads, g, 32))
+    qq = np.ascontiguousarray(qq).reshape(q_heads, head_dim)
+    qs = np.ascontiguousarray(qs)
+    scores = np.empty((q_heads, n), dtype=np.float32)
+    out = np.empty((q_heads, head_dim), dtype=np.float32)
+    _cops.attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
+                      q_heads, kv_heads, head_dim, n)
+    return out
+
+
 def int4_moe_ready():
     """Return True when the fused expert kernel is ready."""
     return _cops is not None and _cops.available()
