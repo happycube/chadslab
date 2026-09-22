@@ -173,11 +173,20 @@ def _dequant(raw, t, count):
 
 
 def to_bf16(x):
-    """Round a float32 array to bfloat16. Return the raw uint16 values."""
-    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
-    # Round to the nearest even value before the shift.
-    u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
-    return u.astype(np.uint16)
+    """Round a float32 array to bfloat16. Return the raw uint16 values.
+
+    Work in chunks. A chunk of the float32 data stays in the cache. Thus the
+    function needs fewer passes over the full array.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    flat = x.reshape(-1).view(np.uint32)
+    out = np.empty(flat.shape, dtype=np.uint16)
+    step = 1 << 20
+    for i in range(0, flat.size, step):
+        u = flat[i:i + step]
+        # Round to the nearest even value before the shift.
+        out[i:i + step] = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    return out.reshape(x.shape)
 
 
 class GGUF:
@@ -314,8 +323,22 @@ class GGUF:
         return arr
 
     def get_bf16(self, hf_name):
-        """Return the tensor as raw bfloat16 values."""
-        return to_bf16(self.get(hf_name))
+        """Return the tensor as raw bfloat16 values.
+
+        For a Q6_K tensor, dequantize a block range and convert it to bfloat16
+        at once. Then the float32 data stays in the cache.
+        """
+        dims, t, _o = self.tensors[self._gguf(hf_name)]
+        if t != Q6_K:
+            return to_bf16(self.get(hf_name))
+        nb = int(np.prod(dims)) // 256
+        out = np.empty(nb * 256, dtype=np.uint16)
+        step = 1 << 12
+        for b0 in range(0, nb, step):
+            n = min(step, nb - b0)
+            f = _dequant(self._blocks(hf_name, b0, n), Q6_K, n * 256)
+            out[b0 * 256:(b0 + n) * 256] = to_bf16(f)
+        return out.reshape(tuple(reversed(dims)))
 
     def get_rows(self, hf_name, start, stop, dtype=np.float32):
         """Return a row range of a 2-D tensor."""
