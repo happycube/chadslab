@@ -169,6 +169,8 @@ class Model:
         self._embed_bf16 = None
         self._embed_q = None
         self._embed_s = None
+        self._embed_q6k = None
+        self._embed_q6k_bytes = None
         self._norm_w = None
         self._dtype = "f32"
         self._cache = None
@@ -284,6 +286,19 @@ class Model:
             return self.st.get_bf16(src)
         return self.st.get(src)
 
+    def _is_q6k_embed(self, hf_name):
+        """Return True when the source table is Q6_K.
+
+        Only a GGUF file sets keep_embedding_bf16. The QAT GGUFs keep the tied
+        output head in Q6_K.
+        """
+        if not getattr(self.st, "keep_embedding_bf16", False):
+            return False
+        try:
+            return self.st.dtype(hf_name) == "Q6_K"
+        except (KeyError, AttributeError, ValueError):
+            return False
+
     def load_all(self, dtype="f32"):
         """Load all layers and the embedding table. Keep the data in memory.
 
@@ -311,27 +326,35 @@ class Model:
         self._embed_bf16 = None
         self._embed_q = None
         self._embed_s = None
-        if dtype == "bf16":
-            self._embed_bf16 = self.st.get_bf16(PREFIX + "embed_tokens.weight")
+        self._embed_q6k = None
+        self._embed_q6k_bytes = None
+        src = PREFIX + "embed_tokens.weight"
+        keep_head = getattr(self.st, "keep_embedding_bf16", False)
+        if dtype in ("bf16", "int8", "int4") and self._is_q6k_embed(src):
+            # The file keeps the tied output head in Q6_K. Hold the blocks in
+            # place. The load step then does no dequantize of the table, and
+            # the kernel reads 6.05 bits for each weight.
+            self._embed_q6k = self.st.q6k_blocks(src)
+            self._embed_q6k_bytes = self.st.q6k_bytes(src)
+        elif dtype == "bf16":
+            self._embed_bf16 = self.st.get_bf16(src)
+        elif dtype == "int4" and (self._w4a16 or keep_head):
+            # The source keeps the embedding at a higher precision. Do not
+            # quantize the tied output head to 4 bits.
+            self._embed_bf16 = self.st.get_bf16(src)
         elif dtype in ("int8", "int4"):
-            if dtype == "int4" and (self._w4a16 or getattr(self.st, "keep_embedding_bf16", False)):
-                # The source keeps the embedding at a higher precision. Do not
-                # quantize the tied output head to 4 bits.
-                self._embed_bf16 = self.st.get_bf16(PREFIX + "embed_tokens.weight")
+            quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
+            suffix = ".q" if dtype == "int8" else ".q4"
+            if self._cache is not None:
+                self._embed_q = self._cache.read(src + suffix)
+                self._embed_s = self._cache.read(src + ".scale")
             else:
-                quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
-                suffix = ".q" if dtype == "int8" else ".q4"
-                src = PREFIX + "embed_tokens.weight"
-                if self._cache is not None:
-                    self._embed_q = self._cache.read(src + suffix)
-                    self._embed_s = self._cache.read(src + ".scale")
-                else:
-                    self._embed_q, self._embed_s = quant(self.st.get(src))
-                    if self._cache_write is not None:
-                        self._cache_write.write(src + suffix, self._embed_q)
-                        self._cache_write.write(src + ".scale", self._embed_s)
+                self._embed_q, self._embed_s = quant(self.st.get(src))
+                if self._cache_write is not None:
+                    self._cache_write.write(src + suffix, self._embed_q)
+                    self._cache_write.write(src + ".scale", self._embed_s)
         else:
-            self._embed = self.st.get(PREFIX + "embed_tokens.weight")
+            self._embed = self.st.get(src)
         if self._cache_write is not None:
             self._cache_write.close_write()
             self._cache_write = None
@@ -350,6 +373,8 @@ class Model:
         self._embed_bf16 = None
         self._embed_q = None
         self._embed_s = None
+        self._embed_q6k = None
+        self._embed_q6k_bytes = None
         self._norm_w = None
         self._dtype = "f32"
         self.keep_weights = False
@@ -431,6 +456,8 @@ class Model:
     def embed(self, input_ids):
         """Return the input embeddings for the token ids. Multiply by the embedding scale."""
         ids = np.asarray(input_ids, dtype=np.int64)
+        if self._embed_q6k is not None:
+            return self.st.q6k_dequant(self._embed_q6k[ids], self.cfg.hidden_size) * self.cfg.embed_scale
         if self._embed_q is not None:
             if self._dtype == "int4":
                 w = ops.dequantize_int4(self._embed_q[ids], self._embed_s[ids])
@@ -588,7 +615,9 @@ class Model:
         Use the embedding table. The embeddings are tied to the output head.
         Apply the softcap when requested.
         """
-        if self._embed_q is not None:
+        if self._embed_q6k is not None:
+            out = ops.linear_q6k(x, self._embed_q6k_bytes, self.cfg.hidden_size)
+        elif self._embed_q is not None:
             if self._dtype == "int4":
                 out = ops.linear_int4(x, self._embed_q, self._embed_s)
             else:

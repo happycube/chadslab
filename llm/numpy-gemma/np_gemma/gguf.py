@@ -340,6 +340,42 @@ class GGUF:
             out[b0 * 256:(b0 + n) * 256] = to_bf16(f)
         return out.reshape(tuple(reversed(dims)))
 
+    def q6k_blocks(self, hf_name):
+        """Return the Q6_K blocks of a 2-D tensor as a view.
+
+        The result has shape (rows, blocks in one row). The data points into
+        the file map. Do not change it.
+        """
+        dims, t, _o = self.tensors[self._gguf(hf_name)]
+        if t != Q6_K:
+            raise ValueError("%s is %s, not Q6_K" % (hf_name, _TYPE_NAME.get(t, t)))
+        if len(dims) != 2:
+            raise ValueError("%s is not a 2-D tensor" % hf_name)
+        cols = int(dims[0])
+        rows = int(dims[1])
+        if cols % 256:
+            raise ValueError("%s has %d columns, not a multiple of 256" % (hf_name, cols))
+        bpr = cols // 256
+        return self._blocks(hf_name, 0, rows * bpr).reshape(rows, bpr)
+
+    def q6k_bytes(self, hf_name):
+        """Return the Q6_K blocks of a 2-D tensor as bytes.
+
+        The result has shape (rows, blocks in one row * 210). Give it to the C
+        kernel. The data points into the file map. Do not change it.
+        """
+        blocks = self.q6k_blocks(hf_name)
+        return blocks.view(np.uint8).reshape(blocks.shape[0], blocks.shape[1] * 210)
+
+    def q6k_dequant(self, blocks, cols):
+        """Return float32 values from a Q6_K block slice.
+
+        blocks has one row for each output row. cols is the value count in one
+        row.
+        """
+        flat = np.asarray(blocks).reshape(-1)
+        return _dequant(flat, Q6_K, flat.size * 256).reshape(-1, cols)
+
     def get_rows(self, hf_name, start, stop, dtype=np.float32):
         """Return a row range of a 2-D tensor."""
         dims, t, _o = self.tensors[self._gguf(hf_name)]

@@ -7,6 +7,8 @@ Functions:
     linear        Multiply x by W.
     bf16_to_f32   Convert bfloat16 data to float32 data.
     linear_bf16   Multiply x by W. W is in bfloat16 format.
+    linear_q6k    Multiply x by W. W is in the Q6_K block format.
+    dequantize_q6k  Change Q6_K block bytes into float32 values.
     gelu_tanh     Apply the GELU activation function.
     softmax       Change scores into probabilities.
     softcap       Limit the size of the logits.
@@ -137,6 +139,53 @@ def linear_bf16(x, w_u16, chunk=LINEAR_BF16_CHUNK):
         if mode in ("auto", "numba") and _numba_ops is not None and _numba_ops.enabled():
             return _numba_ops.linear_bf16(x, w_u16)
     return linear_bf16_numpy(x, w_u16, chunk=chunk)
+
+
+def dequantize_q6k(w_bytes, cols):
+    """Return float32 values from raw Q6_K block bytes.
+
+    w_bytes holds blocks of 210 bytes. One block gives 256 values. cols is the
+    value count in one row. Use this function when the C kernel is not ready.
+    """
+    raw = np.ascontiguousarray(w_bytes, dtype=np.uint8).reshape(-1, 210)
+    nb = raw.shape[0]
+    ql = raw[:, 0:128].reshape(nb, 2, 64)
+    qh = raw[:, 128:192].reshape(nb, 2, 32)
+    sc = np.ascontiguousarray(raw[:, 192:208]).view(np.int8).astype(np.int16).reshape(nb, 2, 8)
+    d = np.ascontiguousarray(raw[:, 208:210]).view("<f2").astype(np.float32).reshape(nb)
+    q1 = ((ql[:, :, 0:32] & 0x0F) | (((qh >> 0) & 3) << 4)).astype(np.int16) - 32
+    q2 = ((ql[:, :, 32:64] & 0x0F) | (((qh >> 2) & 3) << 4)).astype(np.int16) - 32
+    q3 = ((ql[:, :, 0:32] >> 4) | (((qh >> 4) & 3) << 4)).astype(np.int16) - 32
+    q4 = ((ql[:, :, 32:64] >> 4) | (((qh >> 6) & 3) << 4)).astype(np.int16) - 32
+    out = np.concatenate([
+        q1 * np.repeat(sc[:, :, 0:2], 16, axis=2),
+        q2 * np.repeat(sc[:, :, 2:4], 16, axis=2),
+        q3 * np.repeat(sc[:, :, 4:6], 16, axis=2),
+        q4 * np.repeat(sc[:, :, 6:8], 16, axis=2),
+    ], axis=2)
+    out = out.reshape(nb, 256).astype(np.float32) * d[:, None]
+    return out.reshape(-1)
+
+
+def linear_q6k_numpy(x, w_bytes, cols):
+    """Multiply x by W with NumPy. W is raw Q6_K block bytes."""
+    x = np.asarray(x, dtype=np.float32)
+    rows = w_bytes.shape[0]
+    w = dequantize_q6k(w_bytes, cols).reshape(rows, cols)
+    return x @ w.T
+
+
+def linear_q6k(x, w_bytes, cols):
+    """Multiply x by W. W is the raw Q6_K block data of a 2-D tensor.
+
+    w_bytes has shape (rows, blocks in one row * 210). cols is the value count
+    in one row. The C kernel keeps the weights in the Q6_K format. Thus the
+    output head reads 6.05 bits for each weight in place of 16 bits.
+    """
+    mode = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
+    if mode != "numpy" and _cops is not None and _cops.available():
+        return _cops.linear_q6k(x, w_bytes, cols)
+    return linear_q6k_numpy(x, w_bytes, cols)
 
 
 # The number of columns in one int4 scale group.

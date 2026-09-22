@@ -147,6 +147,8 @@ try:
         _lib.gemma_int4_gemm.restype = None
         _lib.gemma_int4_gemm_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int4_gemm_tile_run.restype = None
+        _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_q6k_linear.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -348,6 +350,21 @@ def linear_int4(x, packed, scales, group):
     _lib.gemma_int4_linear(packed.ctypes.data, scales.ctypes.data, x.ctypes.data, out.ctypes.data,
                            ctypes.c_int(rows), ctypes.c_int(cols),
                            ctypes.c_int(x.shape[0]), ctypes.c_int(group))
+    return out
+
+
+def linear_q6k(x, w_bytes, cols):
+    """Multiply x by W. W is the raw Q6_K block data of a 2-D tensor.
+
+    w_bytes has shape (rows, blocks in one row * 210). cols is the value count
+    in one row. The kernel decodes the blocks.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    rows = w_bytes.shape[0]
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.gemma_q6k_linear(w_bytes.ctypes.data, x.ctypes.data, out.ctypes.data,
+                          ctypes.c_int(rows), ctypes.c_int(cols),
+                          ctypes.c_int(x.shape[0]))
     return out
 
 

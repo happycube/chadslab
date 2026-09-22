@@ -594,6 +594,10 @@ These facts are necessary. A generic transformer will give wrong output.
   Layer 47 has 0.0496. Multiply the layer output by this scalar.
 * The embedding table and the output head are tied. Apply the final logit
   softcap: tanh(logits / 30) * 30.
+* A GGUF QAT file keeps the tied embedding table in the Q6_K type. The code
+  reads the 210-byte blocks in place. The output head then reads 6.05 bits for
+  each weight in place of 16 bits. The load step does no dequantize of the
+  table. For the 26B model this step was 6.6 s.
 * The attention mask is causal. A sliding layer also masks keys that are older
   than 1024 positions.
 * The tokenizer replaces each space with the character U+2581. It uses BPE with

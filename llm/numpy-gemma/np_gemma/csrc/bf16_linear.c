@@ -13,6 +13,9 @@
  *   5. An integer int8 kernel that quantizes the activations too. It is off by
  *      default.
  *   6. A float32 kernel for a comparison.
+ *   7. A Q6_K kernel for the tied output head. It decodes a 210-byte block in
+ *      the registers. It reads the weights in place. Thus the load step does
+ *      no dequantize of the head.
  *
  * Each kernel has an AVX-512 version and an AVX2 version. The code selects the
  * AVX-512 version at run time. If the CPU does not give AVX-512, the code uses
@@ -2304,6 +2307,286 @@ void gemma_int8_pair(const int8_t *w, const float *scales, const float *x, float
         gemma_int8_pair_avx2(w, scales, x, out, rows, cols, tokens);
     }
 }
+
+/* ---------- Q6_K kernel ----------
+ * The Q6_K type holds 256 values in a 210-byte block. One block gives ql[128],
+ * qh[64], sc[16] as int8, and d as float16. The low 4 bits of a value are in
+ * ql, the top 2 bits are in qh, and one int8 scale covers each group of 16.
+ * The value is the 6 bits minus 32.
+ *
+ * The QAT files keep the tied embedding table in Q6_K. The model thus reads
+ * 6.05 bits for each weight of the output head in place of 16 bits. The load
+ * step does not dequantize the table.
+ *
+ * The kernel decodes a block in registers. It does not write the values to a
+ * temporary array. For one token the cost is then near the memory limit.
+ */
+
+/* Convert a float16 bit pattern to a float32 value. */
+static inline float fp16_to_f32(uint16_t bits)
+{
+    uint32_t sign = (uint32_t)(bits & 0x8000u) << 16;
+    uint32_t exp = (bits >> 10) & 0x1Fu;
+    uint32_t man = bits & 0x03FFu;
+    uint32_t u;
+    if (exp == 0u) {
+        if (man == 0u) {
+            u = sign;
+        } else {
+            exp = 113u;
+            while ((man & 0x0400u) == 0u) { man <<= 1; --exp; }
+            man &= 0x03FFu;
+            u = sign | (exp << 23) | (man << 13);
+        }
+    } else if (exp == 31u) {
+        u = sign | 0x7F800000u | (man << 13);
+    } else {
+        u = sign | ((exp + 112u) << 23) | (man << 13);
+    }
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+/* Decode one 256-value Q6_K block to float32 values in y. */
+static inline void q6k_decode_block(const uint8_t *blk, float *y)
+{
+    const uint8_t *ql = blk;
+    const uint8_t *qh = blk + 128;
+    const int8_t *sc = (const int8_t *)(blk + 192);
+    float d = fp16_to_f32((uint16_t)((uint16_t)blk[208] | ((uint16_t)blk[209] << 8)));
+    for (int h = 0; h < 2; ++h) {
+        const uint8_t *q0 = ql + h * 64;
+        const uint8_t *g0 = qh + h * 32;
+        const int8_t *s0 = sc + h * 8;
+        float *yh = y + h * 128;
+        for (int l = 0; l < 32; ++l) {
+            int is = l >> 4;
+            int q1 = ((q0[l] & 0x0F) | (((g0[l] >> 0) & 3) << 4)) - 32;
+            int q2 = ((q0[l + 32] & 0x0F) | (((g0[l] >> 2) & 3) << 4)) - 32;
+            int q3 = ((q0[l] >> 4) | (((g0[l] >> 4) & 3) << 4)) - 32;
+            int q4 = ((q0[l + 32] >> 4) | (((g0[l] >> 6) & 3) << 4)) - 32;
+            yh[l]      = d * (float)s0[is + 0] * (float)q1;
+            yh[l + 32] = d * (float)s0[is + 2] * (float)q2;
+            yh[l + 64] = d * (float)s0[is + 4] * (float)q3;
+            yh[l + 96] = d * (float)s0[is + 6] * (float)q4;
+        }
+    }
+}
+
+/* Return the dot product of one Q6_K row and one float32 row. Scalar form. */
+static float dot_q6k_row_scalar(const uint8_t *w, const float *x, int cols)
+{
+    int nb = cols >> 8;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        float y[256];
+        q6k_decode_block(w + (size_t)b * 210u, y);
+        const float *xb = x + (size_t)b * 256u;
+        for (int k = 0; k < 256; ++k) {
+            acc += y[k] * xb[k];
+        }
+    }
+    return acc;
+}
+
+/* Multiply x by W. W is Q6_K data. Scalar form. */
+void gemma_q6k_scalar(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    size_t row_bytes = (size_t)(cols >> 8) * 210u;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        const uint8_t *wi = w + (size_t)i * row_bytes;
+        for (int t = 0; t < tokens; ++t) {
+            out[(size_t)t * (size_t)rows + i] =
+                dot_q6k_row_scalar(wi, x + (size_t)t * (size_t)cols, cols);
+        }
+    }
+}
+
+#if GEMMA_X86
+
+/* Widen 16 signed 8-bit values to two float32 vectors. Subtract 32. */
+#define Q6K_WIDEN2(v, lo, hi) do { \
+    __m256i q6k_off = _mm256_set1_epi32(32); \
+    (lo) = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepi8_epi32(v), q6k_off)); \
+    (hi) = _mm256_cvtepi32_ps(_mm256_sub_epi32( \
+        _mm256_cvtepi8_epi32(_mm_srli_si128((v), 8)), q6k_off)); \
+} while (0)
+
+__attribute__((target("avx2,fma")))
+static float dot_q6k_row_avx2(const uint8_t *w, const float *x, int cols)
+{
+    int nb = cols >> 8;
+    float sum = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t *blk = w + (size_t)b * 210u;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        float d = fp16_to_f32((uint16_t)((uint16_t)blk[208] | ((uint16_t)blk[209] << 8)));
+        const float *xb = x + (size_t)b * 256u;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t *q0 = ql + h * 64;
+            const uint8_t *g0 = qh + h * 32;
+            const int8_t *s0 = sc + h * 8;
+            const float *xh = xb + h * 128;
+            for (int l0 = 0; l0 < 32; l0 += 16) {
+                int is = l0 >> 4;
+                __m128i a = _mm_loadu_si128((const __m128i *)(q0 + l0));
+                __m128i c = _mm_loadu_si128((const __m128i *)(q0 + 32 + l0));
+                __m128i g = _mm_loadu_si128((const __m128i *)(g0 + l0));
+                __m128i m0f = _mm_set1_epi8(0x0F);
+                __m128i m3 = _mm_set1_epi8(0x03);
+                __m128i q1 = _mm_or_si128(_mm_and_si128(a, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(g, m3), 4));
+                __m128i q2 = _mm_or_si128(_mm_and_si128(c, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 2), m3), 4));
+                __m128i q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(a, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 4), m3), 4));
+                __m128i q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(c, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 6), m3), 4));
+                __m256 k0, k1;
+                Q6K_WIDEN2(q1, k0, k1);
+                k0 = _mm256_mul_ps(k0, _mm256_set1_ps((float)s0[is + 0]));
+                k1 = _mm256_mul_ps(k1, _mm256_set1_ps((float)s0[is + 0]));
+                acc0 = _mm256_fmadd_ps(k0, _mm256_loadu_ps(xh + l0), acc0);
+                acc1 = _mm256_fmadd_ps(k1, _mm256_loadu_ps(xh + l0 + 8), acc1);
+                Q6K_WIDEN2(q2, k0, k1);
+                k0 = _mm256_mul_ps(k0, _mm256_set1_ps((float)s0[is + 2]));
+                k1 = _mm256_mul_ps(k1, _mm256_set1_ps((float)s0[is + 2]));
+                acc0 = _mm256_fmadd_ps(k0, _mm256_loadu_ps(xh + 32 + l0), acc0);
+                acc1 = _mm256_fmadd_ps(k1, _mm256_loadu_ps(xh + 32 + l0 + 8), acc1);
+                Q6K_WIDEN2(q3, k0, k1);
+                k0 = _mm256_mul_ps(k0, _mm256_set1_ps((float)s0[is + 4]));
+                k1 = _mm256_mul_ps(k1, _mm256_set1_ps((float)s0[is + 4]));
+                acc0 = _mm256_fmadd_ps(k0, _mm256_loadu_ps(xh + 64 + l0), acc0);
+                acc1 = _mm256_fmadd_ps(k1, _mm256_loadu_ps(xh + 64 + l0 + 8), acc1);
+                Q6K_WIDEN2(q4, k0, k1);
+                k0 = _mm256_mul_ps(k0, _mm256_set1_ps((float)s0[is + 6]));
+                k1 = _mm256_mul_ps(k1, _mm256_set1_ps((float)s0[is + 6]));
+                acc0 = _mm256_fmadd_ps(k0, _mm256_loadu_ps(xh + 96 + l0), acc0);
+                acc1 = _mm256_fmadd_ps(k1, _mm256_loadu_ps(xh + 96 + l0 + 8), acc1);
+            }
+        }
+        sum += d * hsum_ps_avx2(_mm256_add_ps(acc0, acc1));
+    }
+    return sum;
+}
+
+__attribute__((target("avx2,fma")))
+void gemma_q6k_avx2(const uint8_t *w, const float *x, float *out,
+                    int rows, int cols, int tokens)
+{
+    size_t row_bytes = (size_t)(cols >> 8) * 210u;
+    (void)tokens;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        out[i] = dot_q6k_row_avx2(w + (size_t)i * row_bytes, x, cols);
+    }
+}
+
+/* Widen 16 signed 8-bit values to one float32 vector. Subtract 32. */
+#define Q6K_WIDEN1_512(v, f) do { \
+    (f) = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepi8_epi32(v), \
+                                              _mm512_set1_epi32(32))); \
+} while (0)
+
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
+{
+    int nb = cols >> 8;
+    float sum = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t *blk = w + (size_t)b * 210u;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        float d = fp16_to_f32((uint16_t)((uint16_t)blk[208] | ((uint16_t)blk[209] << 8)));
+        const float *xb = x + (size_t)b * 256u;
+        __m512 acc = _mm512_setzero_ps();
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t *q0 = ql + h * 64;
+            const uint8_t *g0 = qh + h * 32;
+            const int8_t *s0 = sc + h * 8;
+            const float *xh = xb + h * 128;
+            for (int l0 = 0; l0 < 32; l0 += 16) {
+                int is = l0 >> 4;
+                __m128i a = _mm_loadu_si128((const __m128i *)(q0 + l0));
+                __m128i c = _mm_loadu_si128((const __m128i *)(q0 + 32 + l0));
+                __m128i g = _mm_loadu_si128((const __m128i *)(g0 + l0));
+                __m128i m0f = _mm_set1_epi8(0x0F);
+                __m128i m3 = _mm_set1_epi8(0x03);
+                __m128i q1 = _mm_or_si128(_mm_and_si128(a, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(g, m3), 4));
+                __m128i q2 = _mm_or_si128(_mm_and_si128(c, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 2), m3), 4));
+                __m128i q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(a, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 4), m3), 4));
+                __m128i q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(c, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 6), m3), 4));
+                __m512 k;
+                Q6K_WIDEN1_512(q1, k);
+                k = _mm512_mul_ps(k, _mm512_set1_ps((float)s0[is + 0]));
+                acc = _mm512_fmadd_ps(k, _mm512_loadu_ps(xh + l0), acc);
+                Q6K_WIDEN1_512(q2, k);
+                k = _mm512_mul_ps(k, _mm512_set1_ps((float)s0[is + 2]));
+                acc = _mm512_fmadd_ps(k, _mm512_loadu_ps(xh + 32 + l0), acc);
+                Q6K_WIDEN1_512(q3, k);
+                k = _mm512_mul_ps(k, _mm512_set1_ps((float)s0[is + 4]));
+                acc = _mm512_fmadd_ps(k, _mm512_loadu_ps(xh + 64 + l0), acc);
+                Q6K_WIDEN1_512(q4, k);
+                k = _mm512_mul_ps(k, _mm512_set1_ps((float)s0[is + 6]));
+                acc = _mm512_fmadd_ps(k, _mm512_loadu_ps(xh + 96 + l0), acc);
+            }
+        }
+        sum += d * _mm512_reduce_add_ps(acc);
+    }
+    return sum;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void gemma_q6k_avx512(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    size_t row_bytes = (size_t)(cols >> 8) * 210u;
+    (void)tokens;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        out[i] = dot_q6k_row_avx512(w + (size_t)i * row_bytes, x, cols);
+    }
+}
+
+/* Multiply x by W. W is Q6_K data. Use the AVX-512 kernel or the AVX2 kernel.
+ * A token count above one uses the scalar kernel. The output head of this
+ * model always uses one token.
+ */
+void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    if (tokens > 1) {
+        gemma_q6k_scalar(w, x, out, rows, cols, tokens);
+        return;
+    }
+    if (gemma_have_avx512()) {
+        gemma_q6k_avx512(w, x, out, rows, cols, tokens);
+    } else {
+        gemma_q6k_avx2(w, x, out, rows, cols, tokens);
+    }
+}
+
+#else  /* !GEMMA_X86 */
+
+void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    gemma_q6k_scalar(w, x, out, rows, cols, tokens);
+}
+
+#endif  /* GEMMA_X86 */
 
 /* ---------- float32 kernel for a comparison ---------- */
 
