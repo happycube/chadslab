@@ -771,17 +771,19 @@ class Model:
         return out
 
     # ---- generation --------------------------------------------------------
-    def prefill(self, ids, cache, start=0):
+    def prefill(self, ids, cache, start=0, hook=None):
         """Run the prompt. Use blocks to keep the GEMM in its fast range.
 
         The key and value cache holds the earlier blocks. The result is the
         same as one forward pass over the full prompt. start is the position
-        of ids[0]. Use it to add tokens to a cache that already has data.
+        of ids[0]. Use it to add tokens to a cache that already has data. The
+        hook gives the time of each stage of every block.
         """
         chunk = self.prefill_chunk
         x = None
         for off in range(0, len(ids), chunk):
-            x = self.forward(ids[off:off + chunk], cache=cache, start_pos=start + off)
+            x = self.forward(ids[off:off + chunk], cache=cache, start_pos=start + off,
+                             hook=hook)
         return x
 
     def generate(self, input_ids, max_new_tokens=1, eos_ids=(), cache_weights=False,

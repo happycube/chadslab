@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--dtype", default="int4")
     ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--prefill", type=int, default=256,
+                    help="The prompt length of the prefill stage report.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
@@ -53,6 +55,27 @@ def main():
     x = model.prefill(ids, cache)
     print("prefill %d tokens %.3f s" % (len(ids), time.perf_counter() - t0), flush=True)
     nxt = int(np.argmax(model.logits(x[-1:])[0]))
+
+    # The stage report of a longer prefill. A prompt of a few tokens is too
+    # short for a report.
+    text = "The quick brown fox jumps over the lazy dog. " * (args.prefill // 9 + 2)
+    pids = tok.encode(text)[:args.prefill]
+    pcache = KVCache(cfg, max_len=len(pids) + 4)
+    plast = [None]
+    pstage = defaultdict(float)
+    def phook(key, value):
+        now = time.perf_counter()
+        if plast[0] is not None:
+            pstage[group_of(key)] += now - plast[0][1]
+        plast[0] = (key, now)
+    pt0 = time.perf_counter()
+    model.prefill(pids, pcache, hook=phook)
+    ptot = time.perf_counter() - pt0
+    print("prefill %d tokens %.3f s  %.2f tok/s" % (len(pids), ptot, len(pids) / ptot))
+    ps = sum(pstage.values())
+    for k in sorted(pstage, key=lambda s: -pstage[s]):
+        print("  prefill %-10s %7.1f ms  %4.0f%%" % (k, pstage[k] * 1000.0,
+                                                     100.0 * pstage[k] / ps))
 
     # Warm up three steps. The page tables and the prefetchers need the warm-up.
     times = []
