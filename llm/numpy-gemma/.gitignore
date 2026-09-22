@@ -5,6 +5,8 @@ _libs/
 _libs/
 *.so
 .cache/
+models/
+*.gguf
 *.swp
 *.swo
 .fuse_hidden*

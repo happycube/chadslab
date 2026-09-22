@@ -146,12 +146,42 @@ and the shared MLP are already the small part.
 
 ## Work phases
 
-### Phase 1: get the checkpoint and confirm the layout
+## Weight source: the QAT q4_0 GGUF
 
-1. Download google/gemma-4-26B-A4B-it-qat-q4_0-unquantized. The size is 51.6 GB.
-2. Read config.json and the index file. Confirm the names in this plan.
-3. Run scripts/analyze_moe.py (new) to print the shape and the dtype of each
-   tensor. Compare the result with the table above.
+The plan uses the GGUF file, not the 51.6 GB bfloat16 checkpoint. The file is
+google/gemma-4-26B-A4B-it-qat-q4_0-gguf, path gemma-4-26B_q4_0-it.gguf. The
+size is 14.44 GB. Thus the disk use is small.
+
+The GGUF file holds only three data types:
+
+    part                        type
+    every projection, expert    Q4_0
+    the embedding table         Q6_K
+    norms, router, scales       F32
+
+The Q4_0 type matches the int4 layout of this runtime. One Q4_0 byte holds
+value j in the low nibble and value j+16 in the high nibble. The runtime uses
+the same order. The Q4_0 nibble is the two's complement nibble with bit 3
+flipped. Thus one XOR of 0x88 on each byte gives the runtime nibble. The Q4_0
+group scale (one fp16 value for each group of 32) is then the runtime scale.
+This step keeps the quantization of the model. It does not quantize again.
+
+The module np_gemma/gguf.py gives the reader. It maps each GGUF name to the
+name of this runtime, for example blk.5.attn_k.weight to
+model.language_model.layers.5.self_attn.k_proj.weight. The reader gives the
+same methods as SafeTensors, so the model accepts it with no change to the
+weight cache.
+
+A test of the reader gave an exact result. The Q4_0 dequant, the Q6_K dequant,
+and the int4 XOR path all agree with a scalar reference.
+
+### Phase 1: get the file and confirm the layout
+
+1. Download gemma-4-26B_q4_0-it.gguf (14.44 GB) from the GGUF repository.
+2. Read the metadata and the tensor directory. Confirm the names and the shapes
+   in this plan. The reader does this step.
+3. Test the reader. Check the Q4_0 path, the Q6_K path, and the F32 path
+   against a scalar reference.
 
 ### Phase 2: read the configuration
 
@@ -163,21 +193,27 @@ Change np_gemma/config.py.
 3. Give LayerPlan the global values for a global layer. The present code already
    holds a plan for each layer.
 
-### Phase 3: load and quantize the expert weights
+### Phase 3: load the expert weights
 
 Change np_gemma/model.py.
 
-1. Read the two 3-D expert tensors.
-2. Reshape gate_up_proj from (128, 1408, 2816) to (180224, 2816). Quantize each
-   row. Expert e then uses the rows e*1408 to e*1408+1408.
-3. Reshape down_proj from (128, 2816, 704) to (360448, 704). Expert e uses the
-   rows e*2816 to e*2816+2816.
-4. Keep the router tensors in float32. They are small.
-5. Write the expert data to the weight cache in the same way as the other
+1. Read the two 3-D expert tensors with the int4 path of the reader. The Q4_0
+   data becomes the runtime int4 data with one XOR. Do not quantize again.
+2. gate_up_proj has the shape (128, 1408, 2816). Expert e then uses the block
+   e of the first axis.
+3. down_proj has the shape (128, 2816, 704). Expert e uses the block e of the
+   first axis.
+4. Read one expert at a time. A full tensor is 507 M values. The float32 form
+   is 2 GB. A block read keeps the memory small.
+5. Keep the router tensors in float32. They are small.
+6. Write the expert data to the weight cache in the same way as the other
    tensors. The cache key covers the dtype.
 
 A row slice of a C-order array is contiguous. The present C kernel accepts the
 slice with no change. Thus the plan needs no new expert kernel.
+
+The meaning of ffn_down_exps.scale needs a test. The plan maps it to
+router.per_expert_scale. The reference trace confirms the mapping.
 
 ### Phase 4: the router and the MoE block
 

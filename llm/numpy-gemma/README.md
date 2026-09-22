@@ -22,6 +22,7 @@ The runtime does five tasks:
     │   ├── rope.py        Make the default RoPE and the proportional RoPE.
     │   ├── model.py       Give KVCache and Model. Run the forward pass.
     │   ├── tokenizer.py   Give the BPE tokenizer and the chat template.
+    │   ├── gguf.py        Read GGUF files. Map the names. Give the int4 data.
     │   ├── numba_ops.py   Give the Numba JIT kernels. Optional.
     │   ├── cops.py        Build and load the C kernels with ctypes. Optional.
     │   ├── weight_cache.py  Store the converted weights on the disk.
