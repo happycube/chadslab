@@ -86,6 +86,36 @@ def check_tile(rng, rows, cols, tokens):
     return err < 2e-5
 
 
+def check_moe(rng):
+    """Compare the fused mixture of experts with the per-expert int8 path."""
+    experts, cols, inner = 8, 64, 32
+    tokens, top_k = 6, 3
+    rows_gu = 2 * inner
+    gu_p, gu_s = ops.quantize_int4(
+        rng.standard_normal((experts * rows_gu, cols)).astype(np.float32), 32)
+    dn_p, dn_s = ops.quantize_int4(
+        rng.standard_normal((experts * cols, inner)).astype(np.float32), 32)
+    gu_p = gu_p.reshape(experts, rows_gu, cols // 32, 18)
+    gu_s = gu_s.reshape(experts, rows_gu, cols // 32)
+    dn_p = dn_p.reshape(experts, cols, inner // 32, 18)
+    dn_s = dn_s.reshape(experts, cols, inner // 32)
+    h = rng.standard_normal((tokens, cols)).astype(np.float32)
+    idx = np.stack([rng.choice(experts, size=top_k, replace=False)
+                    for _ in range(tokens)]).astype(np.int64)
+    val = rng.random((tokens, top_k)).astype(np.float32)
+    ref = np.zeros_like(h)
+    for e in np.unique(idx):
+        tok, slot = np.nonzero(idx == e)
+        act = ops.linear_int4_q8(h[tok], gu_p[e], gu_s[e])
+        act = ops.gelu_tanh(act[:, :inner]) * act[:, inner:]
+        de = ops.linear_int4_q8(act, dn_p[e], dn_s[e])
+        ref[tok] += de * val[tok, slot, None]
+    out = ops.moe_int4_q8(h, (gu_p, gu_s), (dn_p, dn_s), val, idx, inner)
+    err = np.max(np.abs(out - ref)) / (np.max(np.abs(ref)) + 1e-30)
+    print("fused moe:          rel=%.3e" % err)
+    return err < 2e-5
+
+
 def main():
     if not cops.available():
         print("no C library")
@@ -98,6 +128,7 @@ def main():
         ok = check_tile(rng, 34, 128, tokens) and ok
     ok = check_tile(rng, 17, 64, 5) and ok
     ok = check_tile(rng, 8, 32, 16) and ok
+    ok = check_moe(rng) and ok
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

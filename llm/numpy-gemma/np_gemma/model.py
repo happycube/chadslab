@@ -510,6 +510,11 @@ class Model:
         """
         if self._dtype == "int4" and h.shape[0] == 1 and ops.int4_moe_ready():
             return self._moe_one_token(h, w, val, idx)
+        if self._dtype == "int4" and h.shape[0] >= 2 and ops.int4_q8_moe_ready():
+            # One parallel region covers every expert of the layer.
+            return ops.moe_int4_q8(h, w["experts.gate_up_proj"],
+                                   w["experts.down_proj"], val, idx,
+                                   self.cfg.moe_intermediate_size)
         inner = self.cfg.moe_intermediate_size
         out = np.zeros_like(h)
         gu = w["experts.gate_up_proj"]

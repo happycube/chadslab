@@ -3149,19 +3149,21 @@ void gemma_quantize_q8_t(const float *x, int8_t *qxt, float *sx, int32_t *sumx,
  * tokens in one register. AVX2 holds eight. */
 #if GEMMA_X86 && defined(__AVX512F__)
 #define I4Q_TB 16
-#define I4Q_MR 4
+#define I4Q_MR 8
 #else
 #define I4Q_TB 8
 #define I4Q_MR 4
 #endif
 
 #if GEMMA_X86 && defined(__AVX512F__)
-/* Process one row block and one token block of the int8 tile. */
+/* Process one row block and one token block of the int8 tile. base gives the
+ * token offset of the expert in the shared scratch buffers. tokens is the token
+ * count of the expert. */
 static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
                                       const int8_t *qxt, const float *sx,
                                       const int32_t *sumx, float *out,
                                       int rows, int cols, int tokens, int stride,
-                                      int i0, int t0)
+                                      int base, int i0, int t0)
 {
     const int groups = cols / 32;
     const int wstride = groups * 18;
@@ -3192,8 +3194,8 @@ static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
              * columns 16 to 31. This matches the order of the q8 group. */
             _mm256_storeu_si256((__m256i *)exp[r], _mm256_set_m128i(hi, lo));
         }
-        const int32_t *sg = sumx + (size_t)g * (size_t)stride + t0;
-        const float *xg = sx + (size_t)g * (size_t)stride + t0;
+        const int32_t *sg = sumx + (size_t)g * (size_t)stride + base + t0;
+        const float *xg = sx + (size_t)g * (size_t)stride + base + t0;
         __m512 sumf = _mm512_cvtepi32_ps(_mm512_loadu_si512((const void *)sg));
         __m512 sxv = _mm512_loadu_ps(xg);
         for (int r = 0; r < nrow; ++r) {
@@ -3201,7 +3203,8 @@ static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
             for (int q4 = 0; q4 < 8; ++q4) {
                 __m512i wv = _mm512_set1_epi32(*(const int32_t *)(exp[r] + q4 * 4));
                 __m512i qv = _mm512_loadu_si512((const void *)(
-                    qxt + (((size_t)g * 8 + q4) * (size_t)stride + t0) * 4));
+                    qxt + (((size_t)g * 8 + q4) * (size_t)stride
+                           + base + t0) * 4));
                 __m512i p = _mm512_maddubs_epi16(wv, qv);
                 acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p, ones));
             }
@@ -3216,7 +3219,7 @@ static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
         float tmp[I4Q_TB];
         _mm512_storeu_ps(tmp, outf[r]);
         for (int t = 0; t < ntok; ++t) {
-            out[(size_t)(t0 + t) * (size_t)rows + (size_t)i0 + r] = tmp[t];
+            out[(size_t)(base + t0 + t) * (size_t)rows + (size_t)i0 + r] = tmp[t];
         }
     }
 }
@@ -3227,7 +3230,7 @@ static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
                                       const int8_t *qxt, const float *sx,
                                       const int32_t *sumx, float *out,
                                       int rows, int cols, int tokens, int stride,
-                                      int i0, int t0)
+                                      int base, int i0, int t0)
 {
     const int groups = cols / 32;
     const int wstride = groups * 18;
@@ -3237,20 +3240,18 @@ static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
             for (int g = 0; g < groups; ++g) {
                 const uint8_t *b = w + (size_t)(i0 + r) * (size_t)wstride
                                    + (size_t)g * 18 + 2;
-                const int8_t *qt = qxt + (((size_t)g * 8) * (size_t)stride + (t0 + t)) * 4;
                 int32_t dot = 0;
                 for (int k = 0; k < 32; ++k) {
                     const int8_t *qd = qxt + (((size_t)g * 8 + k / 4) * (size_t)stride
-                                              + (t0 + t)) * 4 + (k % 4);
+                                              + base + t0 + t) * 4 + (k % 4);
                     int nib = (k < 16) ? (b[k] & 0x0F) : ((b[k - 16] >> 4) & 0x0F);
                     dot += nib * (int32_t)*qd;
                 }
-                (void)qt;
-                dot -= 8 * sumx[(size_t)g * (size_t)stride + t0 + t];
+                dot -= 8 * sumx[(size_t)g * (size_t)stride + base + t0 + t];
                 acc += (float)dot * scales[(size_t)(i0 + r) * (size_t)groups + g]
-                       * sx[(size_t)g * (size_t)stride + t0 + t];
+                       * sx[(size_t)g * (size_t)stride + base + t0 + t];
             }
-            out[(size_t)(t0 + t) * (size_t)rows + (size_t)i0 + r] = acc;
+            out[(size_t)(base + t0 + t) * (size_t)rows + (size_t)i0 + r] = acc;
         }
     }
 }
@@ -3269,9 +3270,103 @@ void gemma_int4_q8_tile_run(const uint8_t *w, const float *scales,
     for (int rb = 0; rb < nrb; ++rb) {
         for (int tb = 0; tb < ntb; ++tb) {
             gemma_int4_q8_tile(w, scales, qxt, sx, sumx, out,
-                               rows, cols, tokens, stride,
-                               rb * I4Q_MR, tb * I4Q_TB);
+                               rows, cols, tokens, stride, 0, rb * I4Q_MR,
+                               tb * I4Q_TB);
         }
     }
+}
+
+/* ---------- int8 mixture of experts for a prompt ----------
+ * The model gives each expert a different group of tokens. A call for each
+ * expert then starts a small parallel region for each expert. A group of
+ * sixteen tokens gives little work for one region, so a machine with many
+ * cores gains little.
+ *
+ * These two kernels take the list of experts. One parallel region covers the
+ * full work of all the experts. Thus the thread team is large and the caller
+ * starts two regions for the whole layer.
+ *
+ * Every expert uses its own slice of the scratch and the output. off holds the
+ * token offset of each expert and ntok holds its token count. The slices are
+ * not padded. A tile may read a few tokens past a slice, so the caller leaves a
+ * slack of I4Q_TB tokens.
+ */
+
+/* Quantize the rows of every expert to the transposed int8 layout. */
+void gemma_quantize_q8_t_moe(const float *x, int8_t *qxt, float *sx,
+                             int32_t *sumx, int cols, int stride,
+                             const int32_t *off, const int32_t *ntok, int ne)
+{
+    const int groups = cols / 32;
+    #pragma omp parallel for schedule(static)
+    for (int e = 0; e < ne; ++e) {
+        for (int t = 0; t < ntok[e]; ++t) {
+            const int row = off[e] + t;
+            const float *xt = x + (size_t)row * (size_t)cols;
+            int8_t q[32];
+            for (int g = 0; g < groups; ++g) {
+                int32_t s;
+                float sc = gemma_quant_group32(xt + (size_t)g * 32, q, &s);
+                sx[(size_t)g * (size_t)stride + row] = sc;
+                sumx[(size_t)g * (size_t)stride + row] = s;
+                for (int q4 = 0; q4 < 8; ++q4) {
+                    memcpy(qxt + (((size_t)g * 8 + q4) * (size_t)stride + row) * 4,
+                           q + q4 * 4, 4);
+                }
+            }
+        }
+    }
+}
+
+/* Multiply the selected experts of one layer by their input rows. w holds one
+ * matrix for each expert in the Q4_0 block layout. scales holds one float32
+ * scale for each group of 32 columns. eid gives the matrix index of a job. */
+void gemma_int4_q8_moe_run(const uint8_t *w, const float *scales,
+                           const int8_t *qxt, const float *sx,
+                           const int32_t *sumx, float *out,
+                           int rows, int cols, int stride,
+                           const int32_t *off, const int32_t *ntok,
+                           const int32_t *eid, int ne)
+{
+    const int groups = cols / 32;
+    const size_t wstride = (size_t)groups * 18;
+    const size_t expert_bytes = (size_t)rows * wstride;
+    const size_t expert_scales = (size_t)rows * (size_t)groups;
+    const int nrb = (rows + I4Q_MR - 1) / I4Q_MR;
+    /* Count the tasks of each expert. A task is one row block and one token
+     * block. The task list spans every expert. Thus one parallel region covers
+     * the whole layer and the thread team stays large. Parallel over the
+     * experts alone is not enough, because an expert is a long serial chain. */
+    long *start = (long *)malloc((size_t)(ne + 1) * sizeof(long));
+    long total = 0;
+    for (int e = 0; e < ne; ++e) {
+        start[e] = total;
+        total += (long)nrb * (long)((ntok[e] + I4Q_TB - 1) / I4Q_TB);
+    }
+    start[ne] = total;
+    #pragma omp parallel for schedule(static)
+    for (long t = 0; t < total; ++t) {
+        int lo = 0;
+        int hi = ne - 1;
+        int e = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            if (start[mid] <= t) {
+                e = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        const int ntb = (ntok[e] + I4Q_TB - 1) / I4Q_TB;
+        const long u = t - start[e];
+        const int rb = (int)(u / ntb);
+        const int tb = (int)(u % ntb);
+        const uint8_t *we = w + (size_t)eid[e] * expert_bytes;
+        const float *se = scales + (size_t)eid[e] * expert_scales;
+        gemma_int4_q8_tile(we, se, qxt, sx, sumx, out, rows, cols,
+                           ntok[e], stride, off[e], rb * I4Q_MR, tb * I4Q_TB);
+    }
+    free(start);
 }
 

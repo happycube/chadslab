@@ -439,6 +439,63 @@ def linear_int4_q8(x, packed, scales):
     return _cops.int4_q8_tile(qxt, sx, sumx, packed, scales, INT4_GROUP, tokens)
 
 
+def int4_q8_moe_ready():
+    """Return True when the fused int8 mixture-of-experts kernel is ready."""
+    return int4_q8_ready()
+
+
+def moe_int4_q8(h, gu, dn, val, idx, inner):
+    """Run the selected experts for a prompt with int8 activations.
+
+    h is (tokens, hidden). gu is the packed gate and up projection with one
+    matrix for each expert, plus its float32 scales. dn is the same for the down
+    projection. idx is (tokens, top_k) and val gives the router weight of each
+    expert. Return the sum of the expert outputs, weighted by the router.
+
+    The experts run in one parallel region for the gate and up projection and
+    one for the down projection. The order matches the grouped code, so the
+    result matches the code that calls one expert at a time.
+    """
+    gu_p, gu_s = gu
+    dn_p, dn_s = dn
+    tokens, hidden = h.shape
+    top_k = idx.shape[1]
+    flat_e = np.asarray(idx, dtype=np.int64).reshape(-1)
+    flat_t = np.repeat(np.arange(tokens), top_k)
+    flat_s = np.tile(np.arange(top_k), tokens)
+    order = np.argsort(flat_e, kind="stable")
+    t_all = flat_t[order]
+    eid, _first, counts = np.unique(flat_e[order], return_index=True,
+                                    return_counts=True)
+    ntok = counts.astype(np.int32)
+    off = np.zeros(eid.size, dtype=np.int32)
+    if eid.size > 1:
+        np.cumsum(ntok[:-1], out=off[1:])
+    n = tokens * top_k
+    # A tile may read one token block past the end of an expert. Leave a slack.
+    stride = n + 16
+    x = np.ascontiguousarray(h[t_all])
+    qxt, sx, sumx = _cops.quantize_q8_t_moe(x, hidden, stride, off, ntok)
+    act = _cops.int4_q8_moe(gu_p, gu_s, qxt, sx, sumx, gu_p.shape[1], hidden,
+                            stride, off, ntok, eid)[:n]
+    act = gelu_tanh(act[:, :inner]) * act[:, inner:]
+    qxt2, sx2, sumx2 = _cops.quantize_q8_t_moe(act, inner, stride, off, ntok)
+    de = _cops.int4_q8_moe(dn_p, dn_s, qxt2, sx2, sumx2, dn_p.shape[1], inner,
+                           stride, off, ntok, eid)[:n]
+    w = np.asarray(val, dtype=np.float32).reshape(-1)[order]
+    # A token appears in top_k experts, so the scatter has duplicate rows.
+    # np.add.at costs about 70 ms for each layer. An expert has no duplicate
+    # token, so add the work of one expert at a time.
+    out = np.zeros_like(h)
+    pos = 0
+    for j in range(eid.size):
+        m = int(ntok[j])
+        rows = t_all[pos:pos + m]
+        out[rows] += de[pos:pos + m] * w[pos:pos + m, None]
+        pos += m
+    return out
+
+
 # Use the int4 prompt GEMM for this many tokens or more. The GEMM decodes a
 # row block to float32 one time and reuses it for every token block. The one
 # row dot decodes the weights again for each token. Below one full token block

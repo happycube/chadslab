@@ -158,6 +158,13 @@ try:
         _lib.gemma_int4_q8_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                                 _void_p, _void_p, _int, _int, _int, _int]
         _lib.gemma_int4_q8_tile_run.restype = None
+        _lib.gemma_quantize_q8_t_moe.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                 _int, _int, _void_p, _void_p, _int]
+        _lib.gemma_quantize_q8_t_moe.restype = None
+        _lib.gemma_int4_q8_moe_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                               _void_p, _void_p, _int, _int, _int,
+                                               _void_p, _void_p, _void_p, _int]
+        _lib.gemma_int4_q8_moe_run.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
@@ -495,6 +502,52 @@ def int4_q8_tile(qxt, sx, sumx, packed, scales, group, tokens):
                                 qxt.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
                                 out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
                                 ctypes.c_int(tokens), ctypes.c_int(stride))
+    return out
+
+
+def quantize_q8_t_moe(x, cols, stride, off, ntok):
+    """Quantize every expert's rows to the transposed int8 layout.
+
+    x holds the rows of the experts, one after the other. off gives the token
+    offset of each expert and ntok its token count. stride is the token stride
+    of qxt, sx, and sumx. Leave a slack of one token block.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    groups = cols // 32
+    qxt = np.zeros(groups * 8 * stride * 4, dtype=np.int8)
+    sx = np.zeros(groups * stride, dtype=np.float32)
+    sumx = np.zeros(groups * stride, dtype=np.int32)
+    off = np.ascontiguousarray(off, dtype=np.int32)
+    ntok = np.ascontiguousarray(ntok, dtype=np.int32)
+    _lib.gemma_quantize_q8_t_moe(x.ctypes.data, qxt.ctypes.data, sx.ctypes.data,
+                                 sumx.ctypes.data, ctypes.c_int(cols),
+                                 ctypes.c_int(stride), off.ctypes.data,
+                                 ntok.ctypes.data, ctypes.c_int(off.size))
+    return (qxt.reshape(groups * 8, stride, 4), sx.reshape(groups, stride),
+            sumx.reshape(groups, stride))
+
+
+def int4_q8_moe(w, scales, qxt, sx, sumx, rows, cols, stride, off, ntok, eid):
+    """Multiply the selected experts by their rows with int8 activations.
+
+    w holds one matrix for each expert. eid gives the matrix index of each job.
+    Return one row for each token of every expert, in the same order.
+    """
+    w = np.ascontiguousarray(w, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    qxt = np.ascontiguousarray(qxt, dtype=np.int8)
+    sx = np.ascontiguousarray(sx, dtype=np.float32)
+    sumx = np.ascontiguousarray(sumx, dtype=np.int32)
+    off = np.ascontiguousarray(off, dtype=np.int32)
+    ntok = np.ascontiguousarray(ntok, dtype=np.int32)
+    eid = np.ascontiguousarray(eid, dtype=np.int32)
+    out = np.empty((stride, rows), dtype=np.float32)
+    _lib.gemma_int4_q8_moe_run(w.ctypes.data, scales.ctypes.data, qxt.ctypes.data,
+                               sx.ctypes.data, sumx.ctypes.data, out.ctypes.data,
+                               ctypes.c_int(rows), ctypes.c_int(cols),
+                               ctypes.c_int(stride), off.ctypes.data,
+                               ntok.ctypes.data, eid.ctypes.data,
+                               ctypes.c_int(eid.size))
     return out
 
 

@@ -147,14 +147,38 @@ Phase 0 and phase 1 are done. The kernel commit is 433eecf.
   The decode median did not become worse. A decode step uses the float path,
   because the tile needs a group of tokens.
 
+## The fused mixture of experts
+
+The model called one expert at a time. A group of sixteen tokens gives little
+work for one parallel region, so the MoE stage gained only 1.38 times. The new
+kernels take the list of experts, and one parallel region covers the full work
+of the layer:
+
+- gemma_quantize_q8_t_moe quantizes the rows of every expert.
+- gemma_int4_q8_moe_run runs the tile over a flat task list of (expert, row
+  block, token block). A binary search maps a task to its expert.
+
+The fused path gives the same token ids as the per-expert path. The check
+script shows that it matches the per-expert int8 path bit for bit. It also
+shows that np.add.at was the first cost of the fusion: 70 ms for each layer
+against 3.9 ms for one add for each expert. A row block of eight rows (I4Q_MR)
+is better than four.
+
+    stage        float      int8 tile   int8 fused
+    moe         3435.2 ms   2498.0 ms   1840.2 ms
+    attn        1638.0 ms   1354.7 ms   1464.4 ms
+    dense_mlp    451.3 ms    288.0 ms    358.7 ms
+    norm         127.0 ms    127.9 ms    185.7 ms
+    total       5685.0 ms   4301.0 ms   3900.0 ms
+    tokens/s      45.03       59.52       65.64
+
 ## What is left
 
-- The MoE stage gains only 1.38 times, not the 2.1 times of the kernel. The
-  model calls one expert at a time from Python. A group of 16 tokens gives a
-  small parallel region, so 18 threads give only about 2.3 times. A fused MoE
-  call that covers every expert in one parallel region is the next step. The
-  decode path already has that shape (gemma_int4_moe_gemv).
-- The attention stage gains 1.21 times. The stage includes the score matrix and
+- The MoE stage is 1.87 times the float path. The tile still computes a full
+  token block for an expert with fewer tokens, so a group of eleven tokens
+  costs the work of sixteen. A token block of eight would waste less, at the
+  price of a narrower vector.
+- The attention stage gains 1.12 times. The stage includes the score matrix and
   the softmax, which stay float32.
 - Phase 3, the one-token GEMV. The tile needs a group of tokens. A decode step
   is memory bound, so the gain is small.
