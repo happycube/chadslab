@@ -409,9 +409,9 @@ def linear_int4_numpy(x, packed, scales):
 
 # Use the int4 kernel with int8 activations. The kernel quantizes the
 # activations to int8 with one scale for each group of 32 columns. The dot then
-# uses the integer multiply maddubs. Set NP_GEMMA_INT4_Q8=1 to select it. The
-# default is 0 until the end-to-end test passes.
-_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "0") == "1"
+# uses the integer multiply maddubs. Set NP_GEMMA_INT4_Q8=0 to compare with
+# the float path. The 26B model gives the same token ids on the Paris test.
+_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "1") == "1"
 # The smallest token count for the int8 tile. A smaller count wastes the token
 # lanes and pays for the quantization of the activations.
 _INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))

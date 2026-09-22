@@ -10,8 +10,10 @@
  *   4. An int4 kernel for weights with float32 activations. A four-row dot
  *      serves a decode step. A multi-level GEMM decodes a row block to a
  *      float32 panel and serves a prompt.
- *   5. An integer int8 kernel that quantizes the activations too. It is off by
- *      default.
+ *   5. An int4 kernel that quantizes the activations to int8. The pointwise
+ *      loop then uses integer multiply and add. The lanes of the accumulator
+ *      hold the tokens, so the kernel sums over k with no horizontal sum. The
+ *      tile serves a prompt. Set NP_GEMMA_INT4_Q8=1 to select it.
  *   6. A float32 kernel for a comparison.
  *   7. A Q6_K kernel for the tied output head. It decodes a 210-byte block in
  *      the registers. It reads the weights in place. Thus the load step does

@@ -70,12 +70,13 @@ def check_tile(rng, rows, cols, tokens):
     w = rng.standard_normal((rows, cols)).astype(np.float32)
     packed, scales = ops.quantize_int4(w, group=32)
     x = rng.standard_normal((tokens, cols)).astype(np.float32) * 1.5
-    qxt, sx, sumx = cops.quantize_q8_t(x)
+    stride = -(-tokens // 16) * 16
+    qxt, sx, sumx = cops.quantize_q8_t(x, stride)
     out = cops.int4_q8_tile(qxt, sx, sumx, packed, scales, 32, tokens)
     # The reference uses the same quantized activations. Thus only the kernel
-    # arithmetic is under test.
-    qd = qxt.transpose(1, 0, 2).reshape(tokens, cols)
-    qd = (qd * np.repeat(sx.T, 32, axis=1)).astype(np.float32)
+    # arithmetic is under test. The token stride is padded to a full block.
+    qd = qxt[:, :tokens, :].transpose(1, 0, 2).reshape(tokens, cols)
+    qd = (qd * np.repeat(sx[:, :tokens].T, 32, axis=1)).astype(np.float32)
     ref = qd @ ops.dequantize_int4(packed, scales).T
     err = np.max(np.abs(out - ref)) / (np.max(np.abs(ref)) + 1e-30)
     float_out = ops.linear_int4_numpy(x, packed, scales)

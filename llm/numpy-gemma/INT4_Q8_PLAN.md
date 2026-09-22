@@ -124,3 +124,39 @@ Use the pattern of scripts/check_q6k.py.
   decode part of the profile.
 - The short-prompt prefill is not measured. The user benchmark gives 27.11
   tokens/s. Find the command and the prompt length of that number.
+
+## Results
+
+Phase 0 and phase 1 are done. The kernel commit is 433eecf.
+
+- The quantizer matches NumPy bit for bit. The tile matches a q8 reference to
+  3e-7 and the float path to 0.6 per cent.
+- The 26B model gives the same token ids with the int8 path on and off:
+  [818, 5279, 529, 7001, 563, 5213, 50429, 84750] = "The capital of France is
+  **Paris**."
+- The jackal microbenchmark on one thread gives about 2.1 times on the expert
+  shapes and 2.0 to 2.5 times on the attention and dense shapes.
+- The 256-token prefill on jackal went from 45.03 to 59.52 tokens per second:
+
+      stage        int8 off    int8 on    gain
+      moe           3435.2 ms  2498.0 ms  1.38
+      attn          1638.0 ms  1354.7 ms  1.21
+      dense_mlp      451.3 ms   288.0 ms  1.57
+      norm           127.0 ms   127.9 ms  1.00
+
+  The decode median did not become worse. A decode step uses the float path,
+  because the tile needs a group of tokens.
+
+## What is left
+
+- The MoE stage gains only 1.38 times, not the 2.1 times of the kernel. The
+  model calls one expert at a time from Python. A group of 16 tokens gives a
+  small parallel region, so 18 threads give only about 2.3 times. A fused MoE
+  call that covers every expert in one parallel region is the next step. The
+  decode path already has that shape (gemma_int4_moe_gemv).
+- The attention stage gains 1.21 times. The stage includes the score matrix and
+  the softmax, which stay float32.
+- Phase 3, the one-token GEMV. The tile needs a group of tokens. A decode step
+  is memory bound, so the gain is small.
+- Phase 4, the VNNI instruction, needs a third library and a run time test.
+
