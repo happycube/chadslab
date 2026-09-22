@@ -33,7 +33,7 @@ _LIB_DIR = _HERE / "_libs"
 # The code builds two libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The code loads the AVX-512 library
 # when the CPU gives AVX-512. Otherwise, the code loads the AVX2 library.
-_FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC"]
+_FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC", "-lm"]
 _FLAGS = _FLAGS_COMMON + ["-mavx2", "-mfma"]
 _FLAGS_AVX512 = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl", "-mfma"]
 
@@ -149,6 +149,10 @@ try:
         _lib.gemma_int4_gemm_tile_run.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
+        _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
+        _lib.gemma_rms_norm.restype = None
+        _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
+        _lib.gemma_gelu.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -406,3 +410,22 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def rms_norm(x, w, eps):
+    """Normalize the last axis of x. Multiply by the weight w. w may be None."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    rows, cols = x.shape
+    out = np.empty_like(x)
+    wp = None if w is None else w.ctypes.data
+    _lib.gemma_rms_norm(x.ctypes.data, wp, out.ctypes.data,
+                        ctypes.c_int(rows), ctypes.c_int(cols), ctypes.c_float(eps))
+    return out
+
+
+def gelu(x):
+    """Apply the tanh approximation of GELU to every value of x."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    out = np.empty_like(x)
+    _lib.gemma_gelu(x.ctypes.data, out.ctypes.data, ctypes.c_int(x.size))
+    return out

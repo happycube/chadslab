@@ -41,6 +41,11 @@ def rms_norm(x, weight=None, eps=1e-6):
     Note: the weight is the full scale. Do not add 1 to the weight.
     """
     x32 = np.asarray(x, dtype=np.float32)
+    if _cops is not None and _cops.available() and x32.ndim >= 1:
+        shape = x32.shape
+        x2 = np.ascontiguousarray(x32).reshape(-1, shape[-1])
+        w2 = None if weight is None else np.ascontiguousarray(weight, dtype=np.float32)
+        return _cops.rms_norm(x2, w2, eps).reshape(shape)
     # Calculate the mean of the squares. Add eps for stability.
     mean_sq = np.mean(x32 * x32, axis=-1, keepdims=True) + eps
     y = x32 * np.power(mean_sq, -0.5)
@@ -383,6 +388,8 @@ def gelu_tanh(x):
     This function agrees with torch.nn.functional.gelu(approximate="tanh").
     """
     x = np.asarray(x, dtype=np.float32)
+    if _cops is not None and _cops.available():
+        return _cops.gelu(x)
     return 0.5 * x * (1.0 + np.tanh(GELU_C * (x + 0.044715 * x * x * x)))
 
 

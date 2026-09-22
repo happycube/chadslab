@@ -16,6 +16,8 @@
  *   7. A Q6_K kernel for the tied output head. It decodes a 210-byte block in
  *      the registers. It reads the weights in place. Thus the load step does
  *      no dequantize of the head.
+ *   8. An RMSNorm kernel and a GELU kernel. The model calls these functions
+ *      for each layer. A NumPy call on a small array costs more than the work.
  *
  * Each kernel has an AVX-512 version and an AVX2 version. The code selects the
  * AVX-512 version at run time. If the CPU does not give AVX-512, the code uses
@@ -24,6 +26,7 @@
  * Build this file with:
  *   cc -O3 -mavx2 -mfma -fopenmp -shared -fPIC -o libgemma.so bf16_linear.c
  */
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -2587,6 +2590,49 @@ void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
 }
 
 #endif  /* GEMMA_X86 */
+
+/* ---------- elementwise kernels ----------
+ * The model calls RMSNorm and GELU for each layer. The arrays are small at a
+ * decode step. A NumPy call then costs more than the work. These kernels keep
+ * the work in C. The parallel region starts only for a large array. Thus a
+ * decode step does not pay for a thread team.
+ */
+
+/* Normalize the last axis of x. Multiply by the weight when it is present. */
+void gemma_rms_norm(const float *x, const float *w, float *out,
+                    int rows, int cols, float eps)
+{
+    #pragma omp parallel for if(rows >= 8) schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        const float *xi = x + (size_t)i * (size_t)cols;
+        float ss = 0.0f;
+        for (int k = 0; k < cols; ++k) {
+            ss += xi[k] * xi[k];
+        }
+        float s = 1.0f / sqrtf(ss / (float)cols + eps);
+        float *oi = out + (size_t)i * (size_t)cols;
+        if (w != NULL) {
+            for (int k = 0; k < cols; ++k) {
+                oi[k] = xi[k] * s * w[k];
+            }
+        } else {
+            for (int k = 0; k < cols; ++k) {
+                oi[k] = xi[k] * s;
+            }
+        }
+    }
+}
+
+/* Apply the tanh approximation of GELU to n values. */
+void gemma_gelu(const float *x, float *out, int n)
+{
+    const float c = 0.7978845608028654f;
+    #pragma omp parallel for if(n >= 65536) schedule(static)
+    for (int i = 0; i < n; ++i) {
+        float v = x[i];
+        out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
+    }
+}
 
 /* ---------- float32 kernel for a comparison ---------- */
 
