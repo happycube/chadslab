@@ -1901,6 +1901,59 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
     }
 }
 
+/* ---------- int4 mixture of experts ----------
+ * A mixture-of-experts layer selects a small set of experts for each token.
+ * A one-row call for each expert then starts one OpenMP region for each
+ * expert. The thread team is small when the expert has few rows, and the
+ * main thread does the region work many times.
+ *
+ * This kernel takes the list of selected experts. The parallel loop covers
+ * the full work of all the experts at once. Thus the thread team is large,
+ * and the caller starts one region for the whole layer.
+ *
+ * W holds one matrix for each expert in the Q4_0 block layout. scales holds
+ * one float32 scale for each group of 32 columns. ids gives the matrix index
+ * for each job. Job j computes
+ *     out[j * rows + r] = sum_k W[ids[j]][r][k] * x[j * xstride + k].
+ * An xstride of 0 gives the same x to every job. That is a decode step.
+ */
+void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
+                         const float *x, const int *ids, int jobs,
+                         float *out, int rows, int cols, int xstride)
+{
+    int groups = cols / 32;
+    size_t stride = (size_t)groups * 18;
+    size_t expert_bytes = (size_t)rows * stride;
+    size_t expert_scales = (size_t)rows * (size_t)groups;
+    int blocks = (rows + 3) / 4;
+    long total = (long)jobs * (long)blocks;
+    #pragma omp parallel for schedule(static)
+    for (long t = 0; t < total; ++t) {
+        int j = (int)(t / blocks);
+        int i = (int)(t % blocks) * 4;
+        int e = ids[j];
+        const uint8_t *wj = w + (size_t)e * expert_bytes;
+        const float *sj = scales + (size_t)e * expert_scales;
+        const float *xj = x + (size_t)j * (size_t)xstride;
+        float *oj = out + (size_t)j * (size_t)rows;
+        int left = rows - i;
+        if (left >= 4) {
+            float r[4];
+            dot4_i4_f32(wj + (size_t)i * stride, (int)stride,
+                        sj + (size_t)i * (size_t)groups, xj, cols, r);
+            oj[i] = r[0];
+            oj[i + 1] = r[1];
+            oj[i + 2] = r[2];
+            oj[i + 3] = r[3];
+        } else {
+            for (int q = i; q < rows; ++q) {
+                oj[q] = dot_i4_f32(wj + (size_t)q * stride,
+                                   sj + (size_t)q * (size_t)groups, xj, cols);
+            }
+        }
+    }
+}
+
 /* ---------- int4 GEMM for a long prompt ----------
  * The one-row dot decodes the packed weights again for each token. This GEMM
  * decodes a row block to a float32 A panel one time and then uses the panel

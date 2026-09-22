@@ -193,6 +193,27 @@ def linear_q6k(x, w_bytes, cols):
     return linear_q6k_numpy(x, w_bytes, cols)
 
 
+def int4_moe_ready():
+    """Return True when the fused expert kernel is ready."""
+    return _cops is not None and _cops.available()
+
+
+def int4_moe_gemv(w, scales, x, ids, rows, cols, xstride):
+    """Multiply each selected expert matrix by its input row.
+
+    Use the fused kernel when the C library is ready. Otherwise, run one call
+    for each expert.
+    """
+    if _cops is not None and _cops.available():
+        return _cops.int4_moe_gemv(w, scales, x, ids, rows, cols, xstride)
+    ids = np.asarray(ids, dtype=np.int64)
+    out = np.empty((ids.size, rows), dtype=np.float32)
+    for j in range(ids.size):
+        row = x if xstride == 0 else x[j * xstride:j * xstride + cols]
+        out[j] = linear_int4(row, w[ids[j]], scales[ids[j]])
+    return out
+
+
 # The number of columns in one int4 scale group.
 INT4_GROUP = 32
 

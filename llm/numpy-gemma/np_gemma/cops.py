@@ -149,6 +149,9 @@ try:
         _lib.gemma_int4_gemm_tile_run.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
+        _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                             _int, _void_p, _int, _int, _int]
+        _lib.gemma_int4_moe_gemv.restype = None
         _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
@@ -410,6 +413,25 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def int4_moe_gemv(w, scales, x, ids, rows, cols, xstride):
+    """Multiply each selected expert matrix by its input row.
+
+    w has the shape (experts, rows, groups, 18). scales has the shape
+    (experts, rows, groups). ids gives the selected experts. x has one row for
+    each job, with a stride of xstride. A stride of 0 gives the same x to each
+    job. Return (jobs, rows).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    ids = np.ascontiguousarray(ids, dtype=np.int32)
+    jobs = int(ids.size)
+    out = np.empty((jobs, rows), dtype=np.float32)
+    _lib.gemma_int4_moe_gemv(w.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                             ids.ctypes.data, ctypes.c_int(jobs), out.ctypes.data,
+                             ctypes.c_int(rows), ctypes.c_int(cols),
+                             ctypes.c_int(xstride))
+    return out
 
 
 def rms_norm(x, w, eps):

@@ -425,6 +425,8 @@ class Model:
         The code groups the tokens by expert. Thus one expert runs one matrix
         for all of its tokens.
         """
+        if self._dtype == "int4" and h.shape[0] == 1 and ops.int4_moe_ready():
+            return self._moe_one_token(h, w, val, idx)
         inner = self.cfg.moe_intermediate_size
         out = np.zeros_like(h)
         gu = w["experts.gate_up_proj"]
@@ -446,6 +448,27 @@ class Model:
             act = ops.gelu_tanh(gate) * up
             de = self.linear(act, dn_e)
             out[tok] += de * val[tok, slot, None]
+        return out
+
+    def _moe_one_token(self, h, w, val, idx):
+        """Run the selected experts for one token with the fused kernel.
+
+        One call serves all of the selected experts. The kernel starts one
+        thread team for the whole layer. The result matches the grouped code,
+        because the experts run in the same sorted order.
+        """
+        inner = self.cfg.moe_intermediate_size
+        gu_q, gu_s = w["experts.gate_up_proj"]
+        dn_q, dn_s = w["experts.down_proj"]
+        ids = np.unique(idx).astype(np.int32)
+        cols = h.shape[1]
+        act = ops.int4_moe_gemv(gu_q, gu_s, h, ids, gu_q.shape[1], cols, 0)
+        act = ops.gelu_tanh(act[:, :inner]) * act[:, inner:]
+        de = ops.int4_moe_gemv(dn_q, dn_s, act, ids, dn_q.shape[1], inner, inner)
+        out = np.zeros_like(h)
+        for j in range(ids.size):
+            slot = np.nonzero(idx[0] == ids[j])[0]
+            out[0] += de[j] * val[0, slot[0]]
         return out
 
     def _rope(self, plan, positions):
