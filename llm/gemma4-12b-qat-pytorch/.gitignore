@@ -3,5 +3,6 @@
 .cache/
 models/
 outputs/
+traces/
 __pycache__/
 *.pyc

@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=1)
     ap.add_argument("--thinking", action="store_true")
     ap.add_argument("--cache-weights", action="store_true")
-    ap.add_argument("--dtype", choices=("bf16", "f32"), default="f32",
+    ap.add_argument("--dtype", choices=("int4", "int8", "bf16", "f32"), default="f32",
                     help="f32 is fast and uses about 70 GB. bf16 uses about 24 GB and is slower.")
     ap.add_argument("--dry-run", action="store_true", help="only tokenize; do not load weights")
     args = ap.parse_args()

@@ -1,0 +1,6 @@
+*.swp
+*.swo
+.fuse_hidden*
+.tmp/
+__pycache__/
+*.pyc

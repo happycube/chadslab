@@ -26,7 +26,7 @@ def main():
         m = Model(st, cfg)
         batch = m.forward(ids, max_layers=args.layers)
         m.keep_weights = True
-        cache = KVCache(cfg.num_hidden_layers)
+        cache = KVCache(cfg, max_len=len(ids) + 1)
         outs = []
         for step, tok in enumerate(ids):
             x = m.forward([tok], max_layers=args.layers, cache=cache, start_pos=step)

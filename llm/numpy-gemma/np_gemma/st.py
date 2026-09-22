@@ -45,6 +45,12 @@ class SafeTensors:
         self._base = 8 + n
         # Map the file. A map is faster than a read. A map also uses less memory.
         self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        # Ask for large pages. A large page holds more data in the translation
+        # lookaside buffer. The call does nothing when the system says no.
+        try:
+            self._mm.madvise(mmap.MADV_HUGEPAGE)
+        except (AttributeError, OSError):
+            pass
 
     def __enter__(self):
         return self
@@ -64,6 +70,17 @@ class SafeTensors:
         except BufferError:
             pass
         self._fh.close()
+
+    def release_pages(self):
+        """Tell the operating system to drop the mapped pages from memory.
+
+        Use this method after the code copies all the data. Use it after an
+        int8 load. Do not use it when NumPy views still point into the map.
+        """
+        try:
+            self._mm.madvise(mmap.MADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
 
     def names(self):
         """Return all tensor names."""
