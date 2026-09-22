@@ -398,11 +398,13 @@ class Model:
         gu = w["experts.gate_up_proj"]
         dn = w["experts.down_proj"]
         packed = self._dtype in ("int8", "int4")
-        for e in range(self.cfg.num_experts):
-            hit = idx == e
-            if not hit.any():
+        # Visit the selected experts only. A decode step selects eight experts.
+        # The scan over all 128 experts costs a large part of the layer time.
+        for e in np.unique(idx):
+            e = int(e)
+            tok, slot = np.nonzero(idx == e)
+            if tok.size == 0:
                 continue
-            tok, slot = np.nonzero(hit)
             xe = h[tok]
             gu_e = (gu[0][e], gu[1][e]) if packed else gu[e]
             dn_e = (dn[0][e], dn[1][e]) if packed else dn[e]
