@@ -151,21 +151,23 @@ def _dequant(raw, t, count):
     if t == Q6_K:
         # 256 values in one block. ql holds the low 4 bits, qh the top 2 bits,
         # sc one 8-bit scale for each group of 16, and d the block scale.
+        # Use int16 for the work. The scale of a group of 16 is a repeat, not a
+        # gather. Thus the temporary arrays stay small.
         nb = raw.shape[0]
         ql = raw["ql"].reshape(nb, 2, 64)
         qh = raw["qh"].reshape(nb, 2, 32)
-        sc = raw["sc"].astype(np.int32).reshape(nb, 2, 8)
-        d = raw["d"].astype(np.float32).reshape(nb, 1, 1)
-        idx = np.array([0] * 16 + [1] * 16)
-        q1 = ((ql[:, :, 0:32] & 0x0F) | (((qh >> 0) & 3) << 4)).astype(np.int32) - 32
-        q2 = ((ql[:, :, 32:64] & 0x0F) | (((qh >> 2) & 3) << 4)).astype(np.int32) - 32
-        q3 = ((ql[:, :, 0:32] >> 4) | (((qh >> 4) & 3) << 4)).astype(np.int32) - 32
-        q4 = ((ql[:, :, 32:64] >> 4) | (((qh >> 6) & 3) << 4)).astype(np.int32) - 32
-        y1 = d * sc[:, :, idx + 0] * q1
-        y2 = d * sc[:, :, idx + 2] * q2
-        y3 = d * sc[:, :, idx + 4] * q3
-        y4 = d * sc[:, :, idx + 6] * q4
+        sc = raw["sc"].astype(np.int16).reshape(nb, 2, 8)
+        d = raw["d"].astype(np.float32)
+        q1 = ((ql[:, :, 0:32] & 0x0F) | (((qh >> 0) & 3) << 4)).astype(np.int16) - 32
+        q2 = ((ql[:, :, 32:64] & 0x0F) | (((qh >> 2) & 3) << 4)).astype(np.int16) - 32
+        q3 = ((ql[:, :, 0:32] >> 4) | (((qh >> 4) & 3) << 4)).astype(np.int16) - 32
+        q4 = ((ql[:, :, 32:64] >> 4) | (((qh >> 6) & 3) << 4)).astype(np.int16) - 32
+        y1 = q1 * np.repeat(sc[:, :, 0:2], 16, axis=2)
+        y2 = q2 * np.repeat(sc[:, :, 2:4], 16, axis=2)
+        y3 = q3 * np.repeat(sc[:, :, 4:6], 16, axis=2)
+        y4 = q4 * np.repeat(sc[:, :, 6:8], 16, axis=2)
         out = np.concatenate([y1, y2, y3, y4], axis=2)
+        out = out.reshape(nb, 256).astype(np.float32) * d[:, None]
         return out.reshape(-1)[:count]
     raise ValueError("dequant for type %s is not implemented" % _TYPE_NAME.get(t, t))
 
@@ -405,4 +407,54 @@ class GGUF:
                     "partial_rotary_factor": 0.25,
                 },
             },
+        }
+
+    # ---- the tokenizer ----------------------------------------------------
+
+    def meta_strings(self, key):
+        """Return one metadata string array. Read the data from the file.
+
+        The reader keeps a large string array on the disk. It stores the file
+        offset in the metadata. This method reads the array.
+        """
+        item = self.meta[key]
+        if not isinstance(item, dict) or "__array__" not in item:
+            return list(item)
+        n = item["__array__"]
+        pos = item["offset"]
+        mm = self._mm
+        out = []
+        for _ in range(n):
+            ln = struct.unpack_from("<Q", mm, pos)[0]
+            pos += 8
+            out.append(mm[pos:pos + ln].decode("utf-8", "replace"))
+            pos += ln
+        return out
+
+    def tokenizer_json(self):
+        """Return the tokenizer data in the form of a tokenizer.json dict.
+
+        The GGUF token type gives the kind of each token. Type 3 is a control
+        token and type 4 is a user token. These are the added tokens of the
+        Hugging Face file. Type 6 is a byte token, so the byte fallback is on.
+        """
+        m = self.meta
+        tokens = self.meta_strings("tokenizer.ggml.tokens")
+        merges = self.meta_strings("tokenizer.ggml.merges")
+        types = np.asarray(m["tokenizer.ggml.token_type"])
+        vocab = {t: i for i, t in enumerate(tokens)}
+        added = []
+        for i, t in enumerate(tokens):
+            if i < types.size and int(types[i]) in (3, 4):
+                added.append({"content": t, "id": i, "special": True})
+        unk_id = int(m.get("tokenizer.ggml.unknown_token_id", 0))
+        return {
+            "model": {
+                "type": "BPE",
+                "vocab": vocab,
+                "merges": merges,
+                "byte_fallback": bool((types == 6).any()),
+                "unk_token": tokens[unk_id],
+            },
+            "added_tokens": added,
         }

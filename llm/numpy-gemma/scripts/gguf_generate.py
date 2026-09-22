@@ -27,15 +27,16 @@ from np_gemma.tokenizer import Tokenizer
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--tokenizer", required=True)
+    ap.add_argument("--tokenizer", default=None,
+                    help="A tokenizer.json file. The GGUF data is the default.")
     ap.add_argument("--dtype", default="int4")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new-tokens", type=int, default=16)
     ap.add_argument("--raw", action="store_true", help="Do not use the chat template.")
     args = ap.parse_args()
 
-    tok = Tokenizer(args.tokenizer)
     g = GGUF(args.gguf)
+    tok = Tokenizer(args.tokenizer) if args.tokenizer else Tokenizer.from_gguf(g)
     cfg = Config({"text_config": g.text_config()})
     t0 = time.perf_counter()
     model = Model(g, cfg).load_all(dtype=args.dtype)

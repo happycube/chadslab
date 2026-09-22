@@ -30,6 +30,20 @@ class Tokenizer:
 
     def __init__(self, tokenizer_json):
         data = json.loads(Path(tokenizer_json).read_text())
+        self._setup(data)
+
+    @classmethod
+    def from_gguf(cls, gguf):
+        """Make a tokenizer from the data of a GGUF file.
+
+        Use this method when the model comes from a GGUF file. Then the code
+        needs no separate tokenizer.json file.
+        """
+        obj = cls.__new__(cls)
+        obj._setup(gguf.tokenizer_json())
+        return obj
+
+    def _setup(self, data):
         m = data["model"]
         if m.get("type") != "BPE":
             raise ValueError("expected a BPE model, got " + str(m.get("type")))

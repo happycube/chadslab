@@ -217,6 +217,11 @@ class Model:
                         packed = self.st.get(src + "_packed", dtype=None)
                         scale = ops.bf16_to_f32(self.st.get_bf16(src + "_scale"))
                         parts = ops.convert_w4a16(packed, scale)
+                    elif dtype == "int4" and hasattr(self.st, "int4_packed"):
+                        # The source already gives the int4 data in the runtime
+                        # layout. Do not convert the data to float32 and
+                        # quantize it again.
+                        parts = self.st.int4_packed(src)
                     else:
                         parts = quant(self.st.get(src))
                     if self._cache_write is not None:
