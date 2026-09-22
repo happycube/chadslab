@@ -198,6 +198,16 @@ def linear_q6k(x, w_bytes, cols):
 ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
 
 
+def int4_multi4_ready():
+    """Return True when the fused multi-matrix kernel is ready."""
+    return _cops is not None and _cops.available()
+
+
+def int4_multi4(mats, x, cols):
+    """Run up to four int4 matrices on the same one-row x."""
+    return _cops.int4_multi4(mats, x, cols)
+
+
 def attn_ready():
     """Return True when the fused attention kernel is ready.
 

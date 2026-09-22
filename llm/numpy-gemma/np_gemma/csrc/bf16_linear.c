@@ -1901,6 +1901,64 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
     }
 }
 
+/* ---------- four int4 matrices on one x row ----------
+ * The query, the key, and the value projection of one attention layer share
+ * the x row. Three calls then start three OpenMP regions for the same x. This
+ * kernel runs up to four matrices in one region. A null weight pointer skips
+ * a matrix. The MLP gate and up projection can use the same kernel.
+ */
+void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
+                       const uint8_t *w1, const float *s1, float *o1, int rows1,
+                       const uint8_t *w2, const float *s2, float *o2, int rows2,
+                       const uint8_t *w3, const float *s3, float *o3, int rows3,
+                       const float *x, int cols)
+{
+    int groups = cols / 32;
+    size_t stride = (size_t)groups * 18;
+    int b0 = w0 ? (rows0 + 3) / 4 : 0;
+    int b1 = w1 ? (rows1 + 3) / 4 : 0;
+    int b2 = w2 ? (rows2 + 3) / 4 : 0;
+    int b3 = w3 ? (rows3 + 3) / 4 : 0;
+    long total = (long)b0 + (long)b1 + (long)b2 + (long)b3;
+    #pragma omp parallel for schedule(static)
+    for (long t = 0; t < total; ++t) {
+        const uint8_t *w = w0;
+        const float *s = s0;
+        float *o = o0;
+        int rows = rows0;
+        long u = t;
+        if (u >= b0) {
+            u -= b0;
+            if (u < b1) {
+                w = w1; s = s1; o = o1; rows = rows1;
+            } else {
+                u -= b1;
+                if (u < b2) {
+                    w = w2; s = s2; o = o2; rows = rows2;
+                } else {
+                    u -= b2;
+                    w = w3; s = s3; o = o3; rows = rows3;
+                }
+            }
+        }
+        int i = (int)u * 4;
+        if (i + 4 <= rows) {
+            float r[4];
+            dot4_i4_f32(w + (size_t)i * stride, (int)stride,
+                        s + (size_t)i * (size_t)groups, x, cols, r);
+            o[i] = r[0];
+            o[i + 1] = r[1];
+            o[i + 2] = r[2];
+            o[i + 3] = r[3];
+        } else {
+            for (int q = i; q < rows; ++q) {
+                o[q] = dot_i4_f32(w + (size_t)q * stride,
+                                  s + (size_t)q * (size_t)groups, x, cols);
+            }
+        }
+    }
+}
+
 /* ---------- int4 mixture of experts ----------
  * A mixture-of-experts layer selects a small set of experts for each token.
  * A one-row call for each expert then starts one OpenMP region for each

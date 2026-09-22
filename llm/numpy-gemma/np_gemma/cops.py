@@ -156,6 +156,8 @@ try:
                                            _void_p, _void_p, _void_p, _void_p,
                                            _int, _int, _int, _int]
         _lib.gemma_attn_decode.restype = None
+        _lib.gemma_int4_multi4.argtypes = ([_void_p, _void_p, _void_p, _int] * 4) + [_void_p, _int]
+        _lib.gemma_int4_multi4.restype = None
         _lib.gemma_rms_norm.argtypes = [_void_p, _void_p, _void_p, _int, _int, ctypes.c_float]
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
@@ -417,6 +419,29 @@ def linear_int4_tile(x, xt, packed, scales, group):
 def linear_f32(x, w):
     """Multiply x by W. W is float32 data. Use the C kernel."""
     return _call(_lib.gemma_f32_linear, w, x)
+
+
+def int4_multi4(mats, x, cols):
+    """Run up to four int4 matrices on the same one-row x.
+
+    mats is a list of up to four (packed, scales) pairs. A None entry skips a
+    matrix. Return a list of float32 outputs, or None for a skipped matrix.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    args = []
+    outs = []
+    for i in range(4):
+        if i < len(mats) and mats[i] is not None:
+            w, s = mats[i]
+            o = np.empty(w.shape[0], dtype=np.float32)
+            args += [w.ctypes.data, s.ctypes.data, o.ctypes.data, ctypes.c_int(w.shape[0])]
+            outs.append(o)
+        else:
+            args += [None, None, None, ctypes.c_int(0)]
+            outs.append(None)
+    args += [x.ctypes.data, ctypes.c_int(cols)]
+    _lib.gemma_int4_multi4(*args)
+    return outs
 
 
 def attn_decode(qq, qs, kq, ks, vq, vs, scores, out,

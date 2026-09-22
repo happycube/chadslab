@@ -653,15 +653,24 @@ class Model:
         hd = plan.head_dim
         t = x.shape[0]
 
-        q = self.linear(x, w["self_attn.q_proj"])
-        emit(hook, p + "self_attn.q_proj", q)
-        q = q.reshape(t, plan.num_q_heads, hd)
+        if t == 1 and self._dtype == "int4" and ops.int4_multi4_ready():
+            # One call serves the query, the key, and the value projection.
+            vp = None if plan.k_eq_v else w["self_attn.v_proj"]
+            qf, kf, vf, _ = ops.int4_multi4(
+                [w["self_attn.q_proj"], w["self_attn.k_proj"], vp], x, self.cfg.hidden_size)
+        else:
+            qf = self.linear(x, w["self_attn.q_proj"])
+            kf = self.linear(x, w["self_attn.k_proj"])
+            vf = None if plan.k_eq_v else self.linear(x, w["self_attn.v_proj"])
+
+        q = qf.reshape(t, plan.num_q_heads, hd)
+        emit(hook, p + "self_attn.q_proj", qf)
         q = ops.rms_norm(q, w["self_attn.q_norm"], eps)
         emit(hook, p + "self_attn.q_norm", q)
 
-        k_raw = self.linear(x, w["self_attn.k_proj"])
-        emit(hook, p + "self_attn.k_proj", k_raw)
+        k_raw = kf
         k = k_raw.reshape(t, plan.num_kv_heads, hd)
+        emit(hook, p + "self_attn.k_proj", k_raw)
         k = ops.rms_norm(k, w["self_attn.k_norm"], eps)
         emit(hook, p + "self_attn.k_norm", k)
 
@@ -669,9 +678,8 @@ class Model:
             # The global layers have no v_proj. Use the raw key data. Apply RMSNorm.
             v = ops.rms_norm(k_raw.reshape(t, plan.num_kv_heads, hd), None, eps)
         else:
-            v = self.linear(x, w["self_attn.v_proj"])
-            emit(hook, p + "self_attn.v_proj", v)
-            v = ops.rms_norm(v.reshape(t, plan.num_kv_heads, hd), None, eps)
+            emit(hook, p + "self_attn.v_proj", vf)
+            v = ops.rms_norm(vf.reshape(t, plan.num_kv_heads, hd), None, eps)
 
         q = rope_mod.apply(q, cos, sin)
         k = rope_mod.apply(k, cos, sin)
