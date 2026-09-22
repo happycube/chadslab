@@ -13,6 +13,7 @@ This module also supplies the chat template.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 # The sentence-piece space character.
@@ -69,9 +70,15 @@ class Tokenizer:
                 self.special_ids.add(a["id"])
         # Sort the special tokens by length. Test the longest token first.
         self._added_sorted = sorted(self.added, key=len, reverse=True)
-        self.bos_id = self.added.get("<bos>", self.vocab.get("<bos>"))
-        self.eos_id = self.added.get("<eos>", self.vocab.get("<eos>"))
-        self.pad_id = self.added.get("<pad>", self.vocab.get("<pad>"))
+        self.bos_id = data.get("bos_id", self.added.get("<bos>", self.vocab.get("<bos>")))
+        self.eos_id = data.get("eos_id", self.added.get("<eos>", self.vocab.get("<eos>")))
+        self.pad_id = data.get("pad_id", self.added.get("<pad>", self.vocab.get("<pad>")))
+        # The token ids that end a generation. The GGUF file gives the end of a
+        # turn as the end token. Use NP_GEMMA_STOP to add more ids.
+        self.stop_ids = set(int(x) for x in data.get("stop_ids", ()))
+        self.stop_ids |= set(int(x) for x in os.environ.get("NP_GEMMA_STOP", "").split(",") if x.strip())
+        if self.eos_id is not None:
+            self.stop_ids.add(int(self.eos_id))
 
     # ---- encoding ----------------------------------------------------------
     def _normalize(self, text):

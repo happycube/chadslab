@@ -483,4 +483,14 @@ class GGUF:
                 "unk_token": tokens[unk_id],
             },
             "added_tokens": added,
+            # The ids that the GGUF metadata declares. The end token of the
+            # metadata is the end of a turn, not the <eos> token.
+            "bos_id": int(m.get("tokenizer.ggml.bos_token_id", 0)),
+            "eos_id": int(m.get("tokenizer.ggml.eos_token_id", 0)),
+            "pad_id": int(m.get("tokenizer.ggml.padding_token_id", 0)),
+            # The end of a turn ends a chat answer. The metadata declares the
+            # <eos> token, so add the end-of-turn tokens as well.
+            "stop_ids": [int(m.get("tokenizer.ggml.eos_token_id", 0))] + [
+                i for i, s in enumerate(tokens) if s in ("<turn|>", "<end_of_turn>")
+            ],
         }

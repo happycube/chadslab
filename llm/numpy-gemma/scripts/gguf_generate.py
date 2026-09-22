@@ -32,7 +32,9 @@ def main():
     ap.add_argument("--dtype", default="int4")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new-tokens", type=int, default=16)
-    ap.add_argument("--raw", action="store_true", help="Do not use the chat template.")
+    ap.add_argument("--raw", "--no-chat-template", action="store_true",
+                    help="Do not use the chat template.")
+    ap.add_argument("--system", default=None, help="A system message for the chat template.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
@@ -45,8 +47,11 @@ def main():
     if args.raw:
         ids = tok.encode(args.prompt)
     else:
-        text = tok.apply_chat_template([{"role": "user", "content": args.prompt}],
-                                       add_generation_prompt=True, thinking=False)
+        messages = []
+        if args.system:
+            messages.append({"role": "system", "content": args.system})
+        messages.append({"role": "user", "content": args.prompt})
+        text = tok.apply_chat_template(messages, add_generation_prompt=True, thinking=False)
         ids = tok.encode(text)
     cache = KVCache(cfg, max_len=len(ids) + args.max_new_tokens + 4)
     t0 = time.perf_counter()
@@ -56,10 +61,11 @@ def main():
     out = list(ids)
     gens = []
     t0 = time.perf_counter()
-    for k in range(args.max_new_tokens):
+    # Stop at an end token, or at the token limit.
+    while len(gens) < args.max_new_tokens and nxt not in tok.stop_ids:
         gens.append(nxt)
         out.append(nxt)
-        if k + 1 == args.max_new_tokens:
+        if len(gens) == args.max_new_tokens:
             break
         x = model.forward([nxt], cache=cache, start_pos=len(out) - 1)
         nxt = int(np.argmax(model.logits(x)[0]))
