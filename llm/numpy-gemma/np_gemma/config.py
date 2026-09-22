@@ -68,6 +68,11 @@ class Config:
         self.max_position_embeddings = tc["max_position_embeddings"]
         self.sliding_window = tc["sliding_window"]
         self.final_logit_softcapping = tc.get("final_logit_softcapping")
+        # The mixture-of-experts block. The dense model has no such block.
+        self.num_experts = tc.get("num_experts")
+        self.top_k_experts = tc.get("top_k_experts")
+        self.moe_intermediate_size = tc.get("moe_intermediate_size")
+        self.enable_moe_block = bool(self.num_experts)
         # Scale the input embeddings by sqrt(hidden_size).
         self.embed_scale = self.hidden_size ** 0.5
         self.rope_parameters = tc["rope_parameters"]

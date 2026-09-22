@@ -43,6 +43,12 @@ _PROJ_KEYS = (
     "mlp.up_proj",
     "mlp.down_proj",
 )
+# The extra normalization tensors of the mixture-of-experts block.
+_MOE_NORM_KEYS = (
+    "post_feedforward_layernorm_1",
+    "post_feedforward_layernorm_2",
+    "pre_feedforward_layernorm_2",
+)
 
 
 def emit(hook, key, value):
@@ -170,6 +176,9 @@ class Model:
         # The w4a16 checkpoint keeps the packed 4-bit weights and the scales
         # from the quantization-aware training.
         self._w4a16 = (PREFIX + "layers.0.mlp.gate_proj.weight_packed") in st.names()
+        # A GGUF source gives the quantized data directly. Do not build the
+        # on-disk weight cache for it.
+        self._use_cache = bool(getattr(st, "use_cache", True))
         self.keep_weights = False
         # The prompt pass uses the int8 GEMM. The GEMM is fastest for a block
         # of about 256 tokens. A longer prompt is cut into blocks of this size.
@@ -190,6 +199,9 @@ class Model:
         plan = self.cfg.plan[i]
         p = PREFIX + "layers." + str(i) + "."
         w = {key: self.st.get(p + key + ".weight") for key in _NORM_KEYS}
+        if self.cfg.enable_moe_block:
+            for key in _MOE_NORM_KEYS:
+                w[key] = self.st.get(p + key + ".weight")
         if dtype in ("int8", "int4"):
             # Read the quantized weights from the cache. Quantize the weights
             # and write the cache when the cache is not ready.
@@ -224,7 +236,48 @@ class Model:
                 w[key] = proj_get(p + key + ".weight")
             w["self_attn.v_proj"] = None if plan.k_eq_v else proj_get(p + "self_attn.v_proj.weight")
         w["layer_scalar"] = float(self.st.get(p + "layer_scalar")[0])
+        if self.cfg.enable_moe_block:
+            # The router tensors stay in float32. They are small.
+            w["router.proj"] = self.st.get(p + "router.proj.weight")
+            w["router.scale"] = self.st.get(p + "router.scale")
+            w["router.per_expert_scale"] = self.st.get(p + "router.per_expert_scale")
+            for key in ("experts.gate_up_proj", "experts.down_proj"):
+                w[key] = self._load_expert(p + key, dtype)
         return w
+
+    def _load_expert(self, src, dtype):
+        """Load one 3-D expert tensor.
+
+        The int4 mode uses the packed data of the source when the source gives
+        it. Then the code does not quantize again. The other modes convert the
+        data.
+        """
+        n = self.cfg.num_experts
+        if dtype == "int4" and hasattr(self.st, "int4_row_slice"):
+            if self._cache is not None:
+                return (self._cache.read(src + ".q4"), self._cache.read(src + ".scale"))
+            parts = self.st.int4_row_slice(src, 0, n)
+            if self._cache_write is not None:
+                self._cache_write.write(src + ".q4", parts[0])
+                self._cache_write.write(src + ".scale", parts[1])
+            return parts
+        if dtype in ("int8", "int4"):
+            suffix = ".q" if dtype == "int8" else ".q4"
+            if self._cache is not None:
+                return (self._cache.read(src + suffix), self._cache.read(src + ".scale"))
+            arr = self.st.get(src)
+            flat = arr.reshape(-1, arr.shape[-1])
+            quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
+            q, s = quant(flat)
+            parts = (q.reshape(arr.shape[:-1] + (q.shape[-1],)),
+                     s.reshape(arr.shape[:-1] + (s.shape[-1],)))
+            if self._cache_write is not None:
+                self._cache_write.write(src + suffix, parts[0])
+                self._cache_write.write(src + ".scale", parts[1])
+            return parts
+        if dtype == "bf16":
+            return self.st.get_bf16(src)
+        return self.st.get(src)
 
     def load_all(self, dtype="f32"):
         """Load all layers and the embedding table. Keep the data in memory.
@@ -237,7 +290,7 @@ class Model:
         dtype = dtype.lower()
         if dtype not in ("f32", "bf16", "int8", "int4"):
             raise ValueError("dtype must be f32, bf16, int8, or int4")
-        if dtype in ("int8", "int4"):
+        if dtype in ("int8", "int4") and self._use_cache:
             cache = WeightCache(self.st.path, dtype)
             if cache.ready():
                 self._cache = cache
@@ -254,8 +307,9 @@ class Model:
         if dtype == "bf16":
             self._embed_bf16 = self.st.get_bf16(PREFIX + "embed_tokens.weight")
         elif dtype in ("int8", "int4"):
-            if dtype == "int4" and self._w4a16:
-                # The w4a16 checkpoint does not quantize the embedding table.
+            if dtype == "int4" and (self._w4a16 or getattr(self.st, "keep_embedding_bf16", False)):
+                # The source keeps the embedding at a higher precision. Do not
+                # quantize the tied output head to 4 bits.
                 self._embed_bf16 = self.st.get_bf16(PREFIX + "embed_tokens.weight")
             else:
                 quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
@@ -315,6 +369,50 @@ class Model:
         if self._dtype == "bf16":
             return ops.linear_bf16(x, w)
         return ops.linear(x, w)
+
+    # ---- mixture of experts ------------------------------------------------
+    def _router(self, x, w):
+        """Return the expert weights and indices for each token.
+
+        The router reads the residual. The router RMSNorm has no weight. The
+        softmax uses float32.
+        """
+        eps = self.cfg.rms_norm_eps
+        r = ops.rms_norm(x, None, eps)
+        r = r * w["router.scale"] * (self.cfg.hidden_size ** -0.5)
+        logits = ops.linear(r, w["router.proj"])
+        probs = ops.softmax(logits.astype(np.float32), axis=-1)
+        val, idx = ops.topk_k(probs, self.cfg.top_k_experts)
+        val = val / val.sum(axis=-1, keepdims=True)
+        val = val * w["router.per_expert_scale"][idx]
+        return val, idx
+
+    def _moe(self, h, w, val, idx):
+        """Run the selected experts. Return the sum with the router weights.
+
+        The code groups the tokens by expert. Thus one expert runs one matrix
+        for all of its tokens.
+        """
+        inner = self.cfg.moe_intermediate_size
+        out = np.zeros_like(h)
+        gu = w["experts.gate_up_proj"]
+        dn = w["experts.down_proj"]
+        packed = self._dtype in ("int8", "int4")
+        for e in range(self.cfg.num_experts):
+            hit = idx == e
+            if not hit.any():
+                continue
+            tok, slot = np.nonzero(hit)
+            xe = h[tok]
+            gu_e = (gu[0][e], gu[1][e]) if packed else gu[e]
+            dn_e = (dn[0][e], dn[1][e]) if packed else dn[e]
+            act = self.linear(xe, gu_e)
+            gate = act[:, :inner]
+            up = act[:, inner:]
+            act = ops.gelu_tanh(gate) * up
+            de = self.linear(act, dn_e)
+            out[tok] += de * val[tok, slot, None]
+        return out
 
     def _rope(self, plan, positions):
         """Return the cosine and sine tables for one layer at the given positions."""
@@ -384,6 +482,22 @@ class Model:
         emit(hook, p + "mlp.up_proj", u)
         m = self.linear(ops.gelu_tanh(g) * u, w["mlp.down_proj"])
         emit(hook, p + "mlp.down_proj", m)
+        if self.cfg.enable_moe_block:
+            # The mixture-of-experts block is additive and parallel to the
+            # shared MLP. The router and the experts read the residual, not the
+            # MLP output.
+            h1 = ops.rms_norm(m, w["post_feedforward_layernorm_1"], eps)
+            emit(hook, p + "post_feedforward_layernorm_1", h1)
+            val, idx = self._router(residual, w)
+            emit(hook, p + "router.top_idx", idx.astype(np.float32))
+            emit(hook, p + "router.probs", val)
+            h2 = ops.rms_norm(residual, w["pre_feedforward_layernorm_2"], eps)
+            emit(hook, p + "pre_feedforward_layernorm_2", h2)
+            h2 = self._moe(h2, w, val, idx)
+            emit(hook, p + "experts.out", h2)
+            h2 = ops.rms_norm(h2, w["post_feedforward_layernorm_2"], eps)
+            emit(hook, p + "post_feedforward_layernorm_2", h2)
+            m = h1 + h2
         m = ops.rms_norm(m, w["post_feedforward_layernorm"], eps)
         emit(hook, p + "post_feedforward_layernorm", m)
         x = residual + m

@@ -186,6 +186,13 @@ class GGUF:
     mapped to the names of this runtime.
     """
 
+    # A GGUF file already holds the quantized weights. Do not build the
+    # on-disk weight cache for it.
+    use_cache = False
+    # The embedding table of the QAT files is Q6_K. Keep the tied output head
+    # at that precision. A 4-bit output head changes the first token.
+    keep_embedding_bf16 = True
+
     def __init__(self, path):
         self.path = path
         self._fh = open(path, "rb")

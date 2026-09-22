@@ -36,6 +36,8 @@ The runtime does five tasks:
         ├── chat.py             Generate text from a prompt.
         ├── session.py          Load one time. Then answer many prompts.
         ├── gen_ids.py          Write greedy token ids for a HF comparison.
+        ├── gguf_generate.py    Run a GGUF model and generate text.
+        ├── hf_gguf_reference.py  Load GGUF weights into the HF model. Compare.
         ├── bench_numba.py      Compare the NumPy path and the Numba path.
         ├── bench_kernels.py    Compare the NumPy, Numba, and C paths.
         ├── profile_token.py    Time the parts of one decode step.

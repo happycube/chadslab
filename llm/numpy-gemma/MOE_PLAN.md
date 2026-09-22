@@ -175,6 +175,22 @@ weight cache.
 A test of the reader gave an exact result. The Q4_0 dequant, the Q6_K dequant,
 and the int4 XOR path all agree with a scalar reference.
 
+## Status
+
+All phases are done. The model answers "The capital of France is **Paris**."
+The code reads the Q4_0 data of the GGUF directly. It does not build the
+on-disk weight cache for the GGUF. The local copy of the file is at
+~/.cache/np_gemma/models/gemma-4-26B-qat-q4_0. The load from the local disk is
+64 s. The load from the network mount is 206 s.
+
+The embedding table must stay at Q6_K precision. A 4-bit output head changes
+the first token and the text becomes " is is is". The GGUF reader sets
+keep_embedding_bf16.
+
+The model is slow. The decode is about 0.3 tokens for each second on a loaded
+machine. The Python loop over 128 experts controls the time. The next work is
+the expert grouping of Phase 6.
+
 ### Phase 1: get the file and confirm the layout
 
 1. Download gemma-4-26B_q4_0-it.gguf (14.44 GB) from the GGUF repository.

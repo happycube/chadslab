@@ -297,6 +297,21 @@ def linear_int8(x, q, scales, packed=None):
 
 
 
+def topk_k(x, k):
+    """Return the k largest values of the last axis and their indices.
+
+    The values and the indices are in decreasing order. Use this function for
+    the router of the mixture-of-experts block.
+    """
+    x = np.asarray(x)
+    part = np.argpartition(-x, k - 1, axis=-1)[..., :k]
+    val = np.take_along_axis(x, part, axis=-1)
+    order = np.argsort(-val, axis=-1)
+    idx = np.take_along_axis(part, order, axis=-1)
+    val = np.take_along_axis(val, order, axis=-1)
+    return val, idx
+
+
 def gelu_tanh(x):
     """Apply the tanh approximation of GELU.
 
