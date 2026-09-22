@@ -63,10 +63,14 @@ SNAP is the unquantized checkpoint. SNAP4 is the 4-bit checkpoint from the
 quantization-aware training. Use the full path. The command "find" can give the
 wrong model, because the cache holds two models.
 
-Set the thread values. These values give the best speed:
+Set the thread values before the first command:
 
     export OPENBLAS_NUM_THREADS=1
     export OMP_NUM_THREADS=6
+
+The default for OMP_NUM_THREADS is one thread for each physical core. The code
+also obeys the CPUs that the process may use. Set the variable only to override
+the default, for example OMP_NUM_THREADS=18 on an 18-core machine.
 
 The attention uses small matrix products. One BLAS thread is faster than many,
 because the many threads fight the OpenMP threads of the int8 kernel. A test at
@@ -110,8 +114,8 @@ bf16, int8, and int4.
 
     PYTHONPATH=. $PY scripts/session.py --snapshot "$SNAP" --dtype bf16 --prompts "Hello"
 
-The variable OMP_NUM_THREADS gives the thread count. The default is six. Six is
-the best value for the model. The variable OMP_WAIT_POLICY=ACTIVE keeps the
+The variable OMP_NUM_THREADS gives the thread count. The default is one thread
+for each physical core. The variable OMP_WAIT_POLICY=ACTIVE keeps the
 threads awake between the kernel calls. This value gives a better median time
 on a loaded machine.
 
@@ -141,7 +145,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
 
     variable               default                 task
     OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel.
-    OMP_NUM_THREADS        6                       The thread count of the int8 kernel. Six is the best value.
+    OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
