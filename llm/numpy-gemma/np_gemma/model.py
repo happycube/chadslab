@@ -78,6 +78,8 @@ class KVCache:
         self.vs = [None] * n
         self.base = [0] * n      # absolute position of buffer row 0
         self.end = [0] * n       # absolute position after the last stored row
+        self._q8_on = [False] * n
+        self.attn_min = ops.ATTN_MIN
 
     def _shape(self, layer, cap):
         plan = self.cfg.plan[layer]
@@ -144,10 +146,11 @@ class KVCache:
                 if rows > 0:
                     self.k[layer][:rows] = self.k[layer][off:off + rows]
                     self.v[layer][:rows] = self.v[layer][off:off + rows]
-                    self.kq[layer][:rows] = self.kq[layer][off:off + rows]
-                    self.ks[layer][:rows] = self.ks[layer][off:off + rows]
-                    self.vq[layer][:rows] = self.vq[layer][off:off + rows]
-                    self.vs[layer][:rows] = self.vs[layer][off:off + rows]
+                    if self._q8_on[layer]:
+                        self.kq[layer][:rows] = self.kq[layer][off:off + rows]
+                        self.ks[layer][:rows] = self.ks[layer][off:off + rows]
+                        self.vq[layer][:rows] = self.vq[layer][off:off + rows]
+                        self.vs[layer][:rows] = self.vs[layer][off:off + rows]
                 self.base[layer] = keep
             need = end - self.base[layer]
             if need > self.k[layer].shape[0]:
@@ -164,8 +167,15 @@ class KVCache:
             self.k[layer][start_pos:end] = k
             self.v[layer][start_pos:end] = v
         self.end[layer] = end
-        # Keep an int8 copy for the fused attention of a decode step.
-        self._store_q8(layer, start_pos - self.base[layer], k, v)
+        # Keep an int8 copy for the fused attention of a decode step. Build it
+        # only when the cache is long enough that the fused path pays for the
+        # work of the quantization.
+        if end - self.base[layer] >= self.attn_min:
+            if not self._q8_on[layer]:
+                self._quantize_all(layer)
+                self._q8_on[layer] = True
+            else:
+                self._store_q8(layer, start_pos - self.base[layer], k, v)
 
     def _store_q8(self, layer, start, k, v):
         """Store the int8 copy of a block of keys and values."""
@@ -184,6 +194,16 @@ class KVCache:
         """Return the keys, the values, and the position of the first row."""
         base = self.base[layer]
         return self.k[layer][:end - base], self.v[layer][:end - base], base
+
+    def _quantize_all(self, layer):
+        """Quantize every stored row of one layer from the float32 copy."""
+        n = self.end[layer] - self.base[layer]
+        if n > 0:
+            self._store_q8(layer, 0, self.k[layer][:n], self.v[layer][:n])
+
+    def q8_ready(self, layer):
+        """Return True when the int8 copy of one layer is ready."""
+        return self._q8_on[layer]
 
     def read_q8(self, layer, end):
         """Return the int8 keys, the int8 values, and the position of row 0."""
@@ -659,7 +679,7 @@ class Model:
         if cache is not None:
             start = positions[0]
             cache.write(i, start, k, v)
-            if t == 1 and ops.attn_ready():
+            if t == 1 and ops.attn_ready() and cache.q8_ready(i):
                 kq, ks, vq, vs, _b = cache.read_q8(i, start + t)
                 n = kq.shape[0]
                 o = ops.attn_decode(q[0], kq, ks, vq, vs,

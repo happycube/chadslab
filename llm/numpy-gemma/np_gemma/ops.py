@@ -193,6 +193,11 @@ def linear_q6k(x, w_bytes, cols):
     return linear_q6k_numpy(x, w_bytes, cols)
 
 
+# The key and value cache keeps an int8 copy only when it holds at least this
+# many values. Below it the float32 path is faster.
+ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
+
+
 def attn_ready():
     """Return True when the fused attention kernel is ready.
 
