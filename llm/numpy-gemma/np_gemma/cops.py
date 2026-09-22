@@ -151,6 +151,13 @@ try:
         _lib.gemma_int4_gemm.restype = None
         _lib.gemma_int4_gemm_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int4_gemm_tile_run.restype = None
+        _lib.gemma_quantize_q8_groups.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int]
+        _lib.gemma_quantize_q8_groups.restype = None
+        _lib.gemma_quantize_q8_t.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_quantize_q8_t.restype = None
+        _lib.gemma_int4_q8_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                _void_p, _void_p, _int, _int, _int, _int]
+        _lib.gemma_int4_q8_tile_run.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
@@ -427,6 +434,67 @@ def linear_int4_tile(x, xt, packed, scales, group):
                                   xt.ctypes.data, out.ctypes.data,
                                   ctypes.c_int(rows), ctypes.c_int(x.shape[1]),
                                   ctypes.c_int(x.shape[0]))
+    return out
+
+
+def quantize_q8_groups(x):
+    """Quantize the last axis of x to int8 with one scale for each group of 32.
+
+    Return qx (tokens, cols) int8, sx (tokens, groups) float32, and sumx
+    (tokens, groups) int32, the integer sum of each group.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    tokens, cols = x.shape
+    groups = cols // 32
+    qx = np.empty((tokens, cols), dtype=np.int8)
+    sx = np.empty((tokens, groups), dtype=np.float32)
+    sumx = np.empty((tokens, groups), dtype=np.int32)
+    _lib.gemma_quantize_q8_groups(x.ctypes.data, qx.ctypes.data, sx.ctypes.data,
+                                  sumx.ctypes.data, ctypes.c_int(tokens), ctypes.c_int(cols))
+    return qx, sx, sumx
+
+
+def quantize_q8_t(x, stride=None):
+    """Quantize the last axis of x to int8 in the transposed tile layout.
+
+    The layout for one group is (k / 4, token, 4). stride gives the token stride
+    of qxt, sx, and sumx. It defaults to the token count. The values from tokens
+    to stride are zero.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    tokens, cols = x.shape
+    groups = cols // 32
+    if stride is None:
+        stride = tokens
+    qxt = np.zeros(groups * 8 * stride * 4, dtype=np.int8)
+    sx = np.zeros(groups * stride, dtype=np.float32)
+    sumx = np.zeros(groups * stride, dtype=np.int32)
+    _lib.gemma_quantize_q8_t(x.ctypes.data, qxt.ctypes.data, sx.ctypes.data,
+                             sumx.ctypes.data, ctypes.c_int(tokens),
+                             ctypes.c_int(cols), ctypes.c_int(stride))
+    return qxt.reshape(groups * 8, stride, 4), sx.reshape(groups, stride), \
+        sumx.reshape(groups, stride)
+
+
+def int4_q8_tile(qxt, sx, sumx, packed, scales, group, tokens):
+    """Multiply x by W for one group of tokens. W is packed 4-bit data.
+
+    qxt, sx, and sumx come from quantize_q8_t. The kernel quantizes the
+    activations to int8 and uses integer multiply and add.
+    """
+    qxt = np.ascontiguousarray(qxt, dtype=np.int8)
+    sx = np.ascontiguousarray(sx, dtype=np.float32)
+    sumx = np.ascontiguousarray(sumx, dtype=np.int32)
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    rows = packed.shape[0]
+    cols = packed.shape[1] * 32
+    stride = qxt.shape[1]
+    out = np.empty((tokens, rows), dtype=np.float32)
+    _lib.gemma_int4_q8_tile_run(packed.ctypes.data, scales.ctypes.data,
+                                qxt.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
+                                out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
+                                ctypes.c_int(tokens), ctypes.c_int(stride))
     return out
 
 

@@ -407,6 +407,38 @@ def linear_int4_numpy(x, packed, scales):
     return x @ dequantize_int4(packed, scales).T
 
 
+# Use the int4 kernel with int8 activations. The kernel quantizes the
+# activations to int8 with one scale for each group of 32 columns. The dot then
+# uses the integer multiply maddubs. Set NP_GEMMA_INT4_Q8=1 to select it. The
+# default is 0 until the end-to-end test passes.
+_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "0") == "1"
+# The smallest token count for the int8 tile. A smaller count wastes the token
+# lanes and pays for the quantization of the activations.
+_INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))
+# The token block of the int8 tile. It must match I4Q_TB in the C kernel.
+_INT4_Q8_TB = 16
+
+
+def int4_q8_ready():
+    """Return True when the int4 kernel with int8 activations is ready."""
+    if not _INT4_Q8:
+        return False
+    return _cops is not None and _cops.available() and _cops.AVX512
+
+
+def linear_int4_q8(x, packed, scales):
+    """Multiply x by W with int8 activations. W is packed 4-bit data.
+
+    Quantize x to int8 with one scale for each group of 32 columns. The C kernel
+    then uses the integer multiply maddubs on the nibbles of W. The token count
+    is padded to a full token block.
+    """
+    tokens = x.shape[0]
+    stride = (tokens + _INT4_Q8_TB - 1) // _INT4_Q8_TB * _INT4_Q8_TB
+    qxt, sx, sumx = _cops.quantize_q8_t(x, stride)
+    return _cops.int4_q8_tile(qxt, sx, sumx, packed, scales, INT4_GROUP, tokens)
+
+
 # Use the int4 prompt GEMM for this many tokens or more. The GEMM decodes a
 # row block to float32 one time and reuses it for every token block. The one
 # row dot decodes the weights again for each token. Below one full token block
@@ -426,6 +458,8 @@ def linear_int4(x, packed, scales):
         # The C kernel uses the block-32 layout. Use NumPy for another group.
         if group == INT4_GROUP:
             tokens = x.shape[0]
+            if tokens >= _INT4_Q8_TOKENS and int4_q8_ready():
+                return linear_int4_q8(x, packed, scales)
             if tokens >= _INT4_GEMM_TOKENS:
                 xt = np.ascontiguousarray(x.T)
                 return _cops.linear_int4_gemm(x, xt, packed, scales, group)

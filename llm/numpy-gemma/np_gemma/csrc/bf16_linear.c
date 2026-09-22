@@ -3019,3 +3019,257 @@ void gemma_f32_linear(const float *w, const float *x, float *out,
         }
     }
 }
+
+/* ---------- int4 weights with int8 activations ----------
+ * The int4 dot above converts each weight value to float32. An int8 activation
+ * lets the dot use integer multiply and add. The instruction maddubs does
+ * sixteen multiply and add pairs at once.
+ *
+ * A group holds 32 values. The Q4_0 block holds 16 bytes. Byte j holds value j
+ * in the low nibble and value j+16 in the high nibble. The value of a nibble is
+ * the nibble minus 8. The activation x becomes int8 with one float32 scale and
+ * one integer sum for each group of 32 values:
+ *
+ *     sx   = max(abs(group)) / 127
+ *     qx   = round(x / sx)
+ *     sumx = sum(qx)
+ *
+ * Then, for one group:
+ *     sum_i (nib_i - 8) * qx_i = dot - 8 * sumx
+ *     result = (dot - 8 * sumx) * wscale * sx
+ *
+ * The tile reads the activations in a transposed layout. For one group the
+ * layout is (k / 4, token, 4). Thus a 64-byte vector holds four k values for
+ * each of sixteen tokens. One maddubs gives sixteen int16 pair sums. One madd
+ * then gives sixteen int32 lane sums, one lane for each token. The lanes are
+ * the tokens, so the pointwise kernel sums over k with no horizontal sum.
+ */
+
+/* Quantize one group of 32 float values to int8. q gets 32 bytes. Return the
+ * scale and put the integer sum of the group in *sum. The vector path divides
+ * by the scale, so the result matches a float32 divide and rint. */
+static inline float gemma_quant_group32(const float *x, int8_t *q, int32_t *sum)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 v0 = _mm512_loadu_ps(x);
+    __m512 v1 = _mm512_loadu_ps(x + 16);
+    __m512 n0 = _mm512_sub_ps(_mm512_setzero_ps(), v0);
+    __m512 n1 = _mm512_sub_ps(_mm512_setzero_ps(), v1);
+    float amax = _mm512_reduce_max_ps(_mm512_max_ps(
+        _mm512_max_ps(v0, n0), _mm512_max_ps(v1, n1)));
+    float sc = amax > 0.0f ? amax / 127.0f : 1e-12f;
+    __m512 sv = _mm512_set1_ps(sc);
+    const __m512i lo = _mm512_set1_epi32(-127);
+    const __m512i hi = _mm512_set1_epi32(127);
+    __m512i q0 = _mm512_max_epi32(_mm512_min_epi32(
+        _mm512_cvtps_epi32(_mm512_div_ps(v0, sv)), hi), lo);
+    __m512i q1 = _mm512_max_epi32(_mm512_min_epi32(
+        _mm512_cvtps_epi32(_mm512_div_ps(v1, sv)), hi), lo);
+    *sum = _mm512_reduce_add_epi32(_mm512_add_epi32(q0, q1));
+    _mm_storeu_si128((__m128i *)(q + 0), _mm512_cvtepi32_epi8(q0));
+    _mm_storeu_si128((__m128i *)(q + 16), _mm512_cvtepi32_epi8(q1));
+    return sc;
+#else
+    float amax = 0.0f;
+    for (int k = 0; k < 32; ++k) {
+        float a = fabsf(x[k]);
+        if (a > amax) {
+            amax = a;
+        }
+    }
+    float sc = amax > 0.0f ? amax / 127.0f : 1e-12f;
+    int32_t s = 0;
+    for (int k = 0; k < 32; ++k) {
+        long v = lrintf(x[k] / sc);
+        if (v > 127) {
+            v = 127;
+        }
+        if (v < -127) {
+            v = -127;
+        }
+        q[k] = (int8_t)v;
+        s += (int32_t)v;
+    }
+    *sum = s;
+    return sc;
+#endif
+}
+
+/* Quantize the last axis of x with one scale for each group of 32 values.
+ * qx gets one int8 for each value, with the shape (tokens, cols). sx gets one
+ * float32 for each group. sumx gets the integer sum of each group. */
+void gemma_quantize_q8_groups(const float *x, int8_t *qx, float *sx,
+                              int32_t *sumx, int rows, int cols)
+{
+    const int groups = cols / 32;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < rows; ++t) {
+        const float *xt = x + (size_t)t * (size_t)cols;
+        int8_t *qt = qx + (size_t)t * (size_t)cols;
+        float *st = sx + (size_t)t * (size_t)groups;
+        int32_t *mt = sumx + (size_t)t * (size_t)groups;
+        for (int g = 0; g < groups; ++g) {
+            st[g] = gemma_quant_group32(xt + (size_t)g * 32,
+                                        qt + (size_t)g * 32, mt + g);
+        }
+    }
+}
+
+/* Quantize the last axis of x to int8 and write the transposed layout. The
+ * layout for one group is (k / 4, token, 4). stride gives the token stride of
+ * qxt, sx, and sumx. The rows from tokens to stride must be zero. */
+void gemma_quantize_q8_t(const float *x, int8_t *qxt, float *sx, int32_t *sumx,
+                         int tokens, int cols, int stride)
+{
+    const int groups = cols / 32;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < tokens; ++t) {
+        const float *xt = x + (size_t)t * (size_t)cols;
+        for (int g = 0; g < groups; ++g) {
+            int8_t q[32];
+            int32_t s;
+            float sc = gemma_quant_group32(xt + (size_t)g * 32, q, &s);
+            sx[(size_t)g * stride + t] = sc;
+            sumx[(size_t)g * stride + t] = s;
+            for (int q4 = 0; q4 < 8; ++q4) {
+                int8_t *dst = qxt + (((size_t)g * 8 + q4) * (size_t)stride + t) * 4;
+                dst[0] = q[q4 * 4 + 0];
+                dst[1] = q[q4 * 4 + 1];
+                dst[2] = q[q4 * 4 + 2];
+                dst[3] = q[q4 * 4 + 3];
+            }
+        }
+    }
+}
+
+
+/* The token block and the row block of the int8 tile. AVX-512 holds sixteen
+ * tokens in one register. AVX2 holds eight. */
+#if GEMMA_X86 && defined(__AVX512F__)
+#define I4Q_TB 16
+#define I4Q_MR 4
+#else
+#define I4Q_TB 8
+#define I4Q_MR 4
+#endif
+
+#if GEMMA_X86 && defined(__AVX512F__)
+/* Process one row block and one token block of the int8 tile. */
+static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
+                                      const int8_t *qxt, const float *sx,
+                                      const int32_t *sumx, float *out,
+                                      int rows, int cols, int tokens, int stride,
+                                      int i0, int t0)
+{
+    const int groups = cols / 32;
+    const int wstride = groups * 18;
+    int nrow = rows - i0;
+    if (nrow > I4Q_MR) {
+        nrow = I4Q_MR;
+    }
+    int ntok = tokens - t0;
+    if (ntok > I4Q_TB) {
+        ntok = I4Q_TB;
+    }
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512 eight = _mm512_set1_ps(8.0f);
+    __m512 outf[I4Q_MR];
+    for (int r = 0; r < I4Q_MR; ++r) {
+        outf[r] = _mm512_setzero_ps();
+    }
+    for (int g = 0; g < groups; ++g) {
+        uint8_t exp[I4Q_MR][32];
+        for (int r = 0; r < nrow; ++r) {
+            const uint8_t *b = w + (size_t)(i0 + r) * (size_t)wstride
+                               + (size_t)g * 18 + 2;
+            __m128i raw = _mm_loadu_si128((const __m128i *)b);
+            __m128i lo = _mm_and_si128(raw, m4);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+            /* Bytes 0 to 15 hold columns 0 to 15 and bytes 16 to 31 hold
+             * columns 16 to 31. This matches the order of the q8 group. */
+            _mm256_storeu_si256((__m256i *)exp[r], _mm256_set_m128i(hi, lo));
+        }
+        const int32_t *sg = sumx + (size_t)g * (size_t)stride + t0;
+        const float *xg = sx + (size_t)g * (size_t)stride + t0;
+        __m512 sumf = _mm512_cvtepi32_ps(_mm512_loadu_si512((const void *)sg));
+        __m512 sxv = _mm512_loadu_ps(xg);
+        for (int r = 0; r < nrow; ++r) {
+            __m512i acc = _mm512_setzero_si512();
+            for (int q4 = 0; q4 < 8; ++q4) {
+                __m512i wv = _mm512_set1_epi32(*(const int32_t *)(exp[r] + q4 * 4));
+                __m512i qv = _mm512_loadu_si512((const void *)(
+                    qxt + (((size_t)g * 8 + q4) * (size_t)stride + t0) * 4));
+                __m512i p = _mm512_maddubs_epi16(wv, qv);
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p, ones));
+            }
+            __m512 f = _mm512_sub_ps(_mm512_cvtepi32_ps(acc),
+                                     _mm512_mul_ps(sumf, eight));
+            float wsc = scales[(size_t)(i0 + r) * (size_t)groups + g];
+            outf[r] = _mm512_fmadd_ps(f, _mm512_mul_ps(_mm512_set1_ps(wsc), sxv),
+                                      outf[r]);
+        }
+    }
+    for (int r = 0; r < nrow; ++r) {
+        float tmp[I4Q_TB];
+        _mm512_storeu_ps(tmp, outf[r]);
+        for (int t = 0; t < ntok; ++t) {
+            out[(size_t)(t0 + t) * (size_t)rows + (size_t)i0 + r] = tmp[t];
+        }
+    }
+}
+#else
+/* Scalar version of the int8 tile. Use it for a comparison and for a machine
+ * without AVX-512. */
+static inline void gemma_int4_q8_tile(const uint8_t *w, const float *scales,
+                                      const int8_t *qxt, const float *sx,
+                                      const int32_t *sumx, float *out,
+                                      int rows, int cols, int tokens, int stride,
+                                      int i0, int t0)
+{
+    const int groups = cols / 32;
+    const int wstride = groups * 18;
+    for (int r = 0; r < I4Q_MR && i0 + r < rows; ++r) {
+        for (int t = 0; t < I4Q_TB && t0 + t < tokens; ++t) {
+            float acc = 0.0f;
+            for (int g = 0; g < groups; ++g) {
+                const uint8_t *b = w + (size_t)(i0 + r) * (size_t)wstride
+                                   + (size_t)g * 18 + 2;
+                const int8_t *qt = qxt + (((size_t)g * 8) * (size_t)stride + (t0 + t)) * 4;
+                int32_t dot = 0;
+                for (int k = 0; k < 32; ++k) {
+                    const int8_t *qd = qxt + (((size_t)g * 8 + k / 4) * (size_t)stride
+                                              + (t0 + t)) * 4 + (k % 4);
+                    int nib = (k < 16) ? (b[k] & 0x0F) : ((b[k - 16] >> 4) & 0x0F);
+                    dot += nib * (int32_t)*qd;
+                }
+                (void)qt;
+                dot -= 8 * sumx[(size_t)g * (size_t)stride + t0 + t];
+                acc += (float)dot * scales[(size_t)(i0 + r) * (size_t)groups + g]
+                       * sx[(size_t)g * (size_t)stride + t0 + t];
+            }
+            out[(size_t)(t0 + t) * (size_t)rows + (size_t)i0 + r] = acc;
+        }
+    }
+}
+#endif
+
+/* Run the int8 tile over every row block and token block. tokens is the true
+ * token count and stride is the token stride of qxt, sx, and sumx. */
+void gemma_int4_q8_tile_run(const uint8_t *w, const float *scales,
+                            const int8_t *qxt, const float *sx,
+                            const int32_t *sumx, float *out,
+                            int rows, int cols, int tokens, int stride)
+{
+    const int nrb = (rows + I4Q_MR - 1) / I4Q_MR;
+    const int ntb = (stride + I4Q_TB - 1) / I4Q_TB;
+    #pragma omp parallel for schedule(static) collapse(2)
+    for (int rb = 0; rb < nrb; ++rb) {
+        for (int tb = 0; tb < ntb; ++tb) {
+            gemma_int4_q8_tile(w, scales, qxt, sx, sumx, out,
+                               rows, cols, tokens, stride,
+                               rb * I4Q_MR, tb * I4Q_TB);
+        }
+    }
+}
+
