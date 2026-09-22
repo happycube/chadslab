@@ -224,6 +224,13 @@ def linear_int4_numpy(x, packed, scales):
     return x @ dequantize_int4(packed, scales).T
 
 
+# Use the int4 prompt GEMM for this many tokens or more. The GEMM decodes a
+# row block to float32 one time and reuses it for every token block. The one
+# row dot decodes the weights again for each token. Below one full token block
+# the GEMM does no work, so use the one-row dot.
+_INT4_GEMM_TOKENS = 64
+
+
 def linear_int4(x, packed, scales):
     """Multiply x by W. W is packed 4-bit data.
 
@@ -235,6 +242,9 @@ def linear_int4(x, packed, scales):
         group = int4_group(packed, scales)
         # The C kernel uses the block-32 layout. Use NumPy for another group.
         if group == INT4_GROUP:
+            if x.shape[0] >= _INT4_GEMM_TOKENS:
+                xt = np.ascontiguousarray(x.T)
+                return _cops.linear_int4_gemm(x, xt, packed, scales, group)
             return _cops.linear_int4(x, packed, scales, group)
     return linear_int4_numpy(x, packed, scales)
 

@@ -42,6 +42,7 @@ The runtime does five tasks:
         ├── bench_decode.py     Time each decode step. Show the warm-up.
         ├── bench_ram_cache.py  Compare the memory map and the local memory.
         ├── bench_int8_stream.py  Measure the int8 kernel for each stream size.
+        ├── bench_prefill.py    Measure the int8 and int4 prompt GEMM.
         ├── bench_threads.py    Measure the kernel speed against the thread count.
         ├── peak.c              Measure the peak AVX-512 speed.
         └── membw.c             Measure the memory bandwidth.
@@ -186,22 +187,41 @@ Three kernels are available:
    x one time for four rows.
    The int8 kernel reads one row for each token in a decode step. For a prompt
    the code uses a tiled GEMM. The code uses the GEMM at 32 tokens or more.
-   The prompt GEMM keeps the result of four rows and four tokens in a vector.
-   The code converts 16 weights with one instruction and uses each converted
-   vector for four tokens. The final sum over the columns is horizontal.
-   mlp.down_proj is 3.2 times faster at 256 tokens. The full model is about
-   1.6 times faster. The AVX2 library keeps the older tile, because the new
-   tile needs AVX-512.
-   The prompt GEMM then uses three levels of cache. A micro kernel keeps 16
-   rows and 16 tokens in the AVX-512 registers. An A panel and a B panel fit
-   in the L2 cache. A block over the columns uses the L3 cache. Thus the code
-   reads each weight one time. The multi-level GEMM is 1.26 times faster at
-   128 tokens and 1.32 times faster at 256 and 512 tokens than the K-vectorized
-   tile. The code uses it at 128 tokens or more. A shorter prompt keeps the
-   K-vectorized tile. Use cops.set_gemm_ml(False) for a test.
+   Both targets give the same two prompt tiles.
+   * The K-vectorized tile keeps the result of four rows and four tokens in a
+     vector. AVX2 uses four rows and two tokens. One instruction converts 16
+     weights on AVX-512 and 8 weights on AVX2. Each converted vector serves
+     several tokens. The final sum over the columns is horizontal.
+   * The multi-level GEMM reads each weight one time. A micro kernel keeps
+     ML_MR rows and ML_NR tokens in the registers. The values are 16 and 16 on
+     AVX-512 and 8 and 8 on AVX2. An int8 A panel and a float32 B panel stay in
+     the cache. A block over the columns then reduces the weight traffic.
+   The multi-level GEMM is 1.26 times faster at 128 tokens and 1.32 times
+   faster at 256 and 512 tokens than the K-vectorized tile on AVX-512. The code
+   uses it at 128 tokens or more on AVX-512 and at 64 tokens or more on AVX2. A
+   shorter prompt keeps the K-vectorized tile. Use cops.set_gemm_ml(False) for
+   a test and cops.set_gemm_kv(False) for the older token-vectorized tile.
+   The AVX2 block sizes are ML_KC 64, ML_MC 64, and ML_NC 64. A KC of 64 makes
+   the B panel 16 KB, so the B panel stays in the 32 KB L1 cache. A larger KC
+   was about 10 percent slower. The AVX-512 block sizes are 256, 128, and 128.
    A long prompt is cut into blocks of 256 tokens. The GEMM is then always in
    its fast range. A test of the large matrices at 1024 tokens gave 1.4 times
    to 2.4 times more speed. Set the block size with NP_GEMMA_PREFILL_CHUNK.
+
+   Speed for one prompt matrix, best of three runs, GFLOP/s at 256 tokens:
+
+       shape                 AVX2    AVX-512
+       int8 15360x3840        289       428
+       int8 3840x3840         335       490
+       int4 15360x3840        308       425
+       int4 3840x15360        309       399
+       int4 3840x3840         337       432
+
+   The AVX-512 value moves by about 10 percent with the machine load. The AVX2
+   values are 68 to 78 percent of the AVX-512 values. Before the AVX2 work the
+   int8 value was 120 to 138 GFLOP/s and the int4 path had no GEMM. The AVX2
+   path is tuned for a 32 KB L1 cache and six threads. The Intel Core i5-8500
+   (Coffee Lake, 6 cores, 2 channels of DDR4) is a target for that path.
 
    Result for one int8 set of 2.36 GB, best of three runs:
 
@@ -330,12 +350,14 @@ the x stream. The full model showed no clear gain. The code stays for the small
 gain. Use cops.set_rows4(False) to select the one-row loop.
 
 The token-vectorized int8 GEMM was tested with a tile shape of 16 rows and 32
-tokens. The result was 343 GFLOP/s at 32 tokens. A tile of 8 rows and 32 tokens
-gave 181 GFLOP/s. That tile is still in the code for the AVX2 library.
+tokens. The result was 343 GFLOP/s at 32 tokens on AVX-512. A tile of 8 rows
+and 32 tokens gave 181 GFLOP/s. That tile is still the fallback when the
+K-vectorized tile and the multi-level GEMM are off.
 
-A K-vectorized tile then replaced it on AVX-512. The new tile keeps the result
-of four rows and four tokens in a vector. One instruction converts 16 weights,
-and each converted vector serves four tokens. A test gave this result:
+A K-vectorized tile then replaced it on both targets. The new tile keeps the
+result of four rows and four tokens in a vector. One instruction converts 16
+weights (8 on AVX2), and each converted vector serves several tokens. A test
+gave this result:
 
     shape                 tile 16x32    K-vectorized    gain
     gate 15360x3840       174 GB/s      167 GB/s        0.96x
@@ -343,8 +365,8 @@ and each converted vector serves four tokens. A test gave this result:
     o    3840x8192         47 GB/s      131 GB/s        2.80x
 
 The full model was 1.60 times faster for a prompt of 256 tokens. The error is
-also smaller, because the tile sums 16 values in a vector. Use cops.set_gemm_kv
-to select the older tile for a test.
+also smaller, because the tile sums 16 values (8 on AVX2) in a vector. Use
+cops.set_gemm_kv to select the older tile for a test.
 
 The script peak.c measures the limits of the machine. The result was:
 
@@ -435,6 +457,11 @@ loaded machine. The value did not change the best time.
 Test the kernels with this command:
 
     PYTHONPATH=. $PY scripts/bench_kernels.py
+
+Test the int8 and int4 prompt GEMM with this command. Set NP_GEMMA_ARCH=avx2 to
+measure the AVX2 library.
+
+    PYTHONPATH=. $PY scripts/bench_prefill.py
 
 Measured result for one 15360x3840 matrix and one token:
 
@@ -622,15 +649,19 @@ give about 35 GB/s for a plain read. Thus some bandwidth remains.
 1. The bandwidth is at the machine limit. The kernel gives 42 GB/s in a
    single pass. A plain read gives 41 GB/s to 43 GB/s with six threads. A
    loaded machine gave a lower value. Do not expect more speed from this path.
-2. Tune the multi-level GEMM. It reached 441 to 457 GFLOP/s at 256 tokens
-   against the measured FMA value of 602 to 676 GFLOP/s. The panel pack and the
-   broadcast of each x value control the rest of the time. Try a larger MC, a
-   second level of blocking over the columns, and a pack of the B panel for
-   each row block. The decode path uses a different kernel, so the prompt work
-   did not slow the decode.
-3. Make the integer int8 kernel accurate. Use a scale for a group of columns
+2. The multi-level GEMM now runs on AVX2 as well as AVX-512. AVX2 reached 289
+   to 335 GFLOP/s for int8 at 256 tokens. AVX-512 reached 453 to 475 GFLOP/s.
+   The measured pure FMA value is 602 to 676 GFLOP/s with six threads. The AVX2
+   peak is about half of the AVX-512 peak, so the AVX2 kernel is near its share
+   of the limit. A wider micro tile or a packed B panel may give a small gain.
+3. The int4 path now has a prompt GEMM on both targets. AVX2 reached 308 to 337
+   GFLOP/s at 256 tokens. AVX-512 reached 446 to 483 GFLOP/s. The GEMM decodes
+   one row block to a float32 A panel and reuses the panel for every token
+   block. The int4 decode kernel also uses a byte-lane sign decode. That change
+   gave 2.6 times more speed on a wide matrix.
+4. Make the integer int8 kernel accurate. Use a scale for a group of columns
    for the activations as well as the weights.
-4. Add bf16 rounding after each operation. Then the float32 mode follows the
+5. Add bf16 rounding after each operation. Then the float32 mode follows the
    reference more closely.
 5. Port the model to C.
 

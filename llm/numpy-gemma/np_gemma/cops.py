@@ -140,6 +140,8 @@ try:
         _lib.gemma_int4_set_rows4.restype = None
         _lib.gemma_int4_linear.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int, _int]
         _lib.gemma_int4_linear.restype = None
+        _lib.gemma_int4_gemm.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_int4_gemm.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -341,6 +343,23 @@ def linear_int4(x, packed, scales, group):
     _lib.gemma_int4_linear(packed.ctypes.data, scales.ctypes.data, x.ctypes.data, out.ctypes.data,
                            ctypes.c_int(rows), ctypes.c_int(cols),
                            ctypes.c_int(x.shape[0]), ctypes.c_int(group))
+    return out
+
+
+def linear_int4_gemm(x, xt, packed, scales, group):
+    """Multiply x by W for a prompt. W is packed 4-bit data.
+
+    The kernel decodes a row block to float32 one time and reuses it for every
+    token block. xt is x transposed, that is (cols, tokens).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    xt = np.ascontiguousarray(xt, dtype=np.float32)
+    rows = packed.shape[0]
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.gemma_int4_gemm(packed.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                         xt.ctypes.data, out.ctypes.data,
+                         ctypes.c_int(rows), ctypes.c_int(x.shape[1]),
+                         ctypes.c_int(x.shape[0]))
     return out
 
 

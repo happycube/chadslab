@@ -114,15 +114,41 @@ Error 4 gave a value that changed from run to run.
     48 greedy token ids against the ref   equal
     AVX2 library build                    correct
 
+## The AVX2 port
+
+The multi-level GEMM was guarded by __AVX512F__ only. The AVX2 library then
+fell back to the token-vectorized tile. This work gave AVX2 its own multi-level
+GEMM and K-vectorized tile.
+
+* The micro kernel vectorizes over 8 rows, not 16. ML_MR and ML_NR are 8.
+* The AVX2 block sizes are ML_KC 64, ML_MC 64, and ML_NC 64. A KC of 64 makes
+  the float32 B panel 16 KB, so the B panel stays in the 32 KB L1 cache. A
+  larger KC was about 10 percent slower.
+* The AVX2 K-vectorized tile uses a tile of 4 rows and 2 tokens. The 8
+  accumulators, 4 weight vectors, and 2 x vectors fit in the 16 registers.
+
+The result at 256 tokens was:
+
+    shape                 before    after
+    int8 15360x3840        120       289 GFLOP/s
+    int8 3840x3840         124       335 GFLOP/s
+    int4 15360x3840         69       308 GFLOP/s
+    int4 3840x3840          69       337 GFLOP/s
+
+The int4 mode also got a prompt GEMM. That kernel decodes one row block to a
+float32 A panel and reuses the panel for every token block. The int4 decode
+kernel now does the sign decode in the byte lanes. That change gave 2.6 times
+more speed on a wide matrix.
+
 ## What is left
 
-The GEMM reached 441 to 457 GFLOP/s against the measured FMA value of 602 to
-676 GFLOP/s. The panel pack and the broadcast of each x value control the rest
-of the time. The next changes are a larger MC, a second block over the columns,
-and a pack of the B panel for each row block.
+The AVX-512 multi-level GEMM reached 428 to 490 GFLOP/s against the measured
+FMA value of 602 to 676 GFLOP/s. The AVX2 value is 289 to 337 GFLOP/s. The
+panel pack and the broadcast of each x value control the rest of the time. The
+next changes are a wider micro tile and a packed B panel.
 
 ## What the plan did not change
 
-* The decode path. It uses the 4-row int8 GEMV kernel.
+* The decode path. It uses the 4-row int8 GEMV kernel and the 4-row int4 dot.
 * The weight cache.
 * The attention and the norms.

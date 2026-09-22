@@ -1,13 +1,18 @@
 /* Multiply x by W for the Gemma 4 NumPy runtime.
  *
- * This file gives four kernels:
+ * This file gives these kernels:
  *   1. A bfloat16 GEMV kernel. It reads four output rows in one loop. Thus the
  *      loop loads x one time for four rows.
  *   2. A bfloat16 GEMM kernel for a prompt with many tokens.
- *   3. An integer int8 kernel. It multiplies int8 weights by int8 activations.
- *      The kernel uses integer SIMD instructions. It does not convert the
- *      values to float32.
- *   4. A float32 kernel for a comparison.
+ *   3. An int8 kernel for weights with float32 activations. A one-row dot
+ *      serves a decode step. A K-vectorized tile and a multi-level GEMM serve
+ *      a prompt.
+ *   4. An int4 kernel for weights with float32 activations. A four-row dot
+ *      serves a decode step. A multi-level GEMM decodes a row block to a
+ *      float32 panel and serves a prompt.
+ *   5. An integer int8 kernel that quantizes the activations too. It is off by
+ *      default.
+ *   6. A float32 kernel for a comparison.
  *
  * Each kernel has an AVX-512 version and an AVX2 version. The code selects the
  * AVX-512 version at run time. If the CPU does not give AVX-512, the code uses
@@ -643,8 +648,15 @@ static inline void gemma_int8_gemm_tile(const int8_t *w, const float *scales,
  * sum over the columns is horizontal.
  */
 
+#if GEMMA_X86 && defined(__AVX512F__)
 #define GEMMA_KV_MR 4
 #define GEMMA_KV_TB 4
+#else
+/* AVX2 has 8 float lanes and 16 registers. A tile of 4 rows and 2 tokens
+ * keeps 8 accumulators, 4 weight vectors, and 2 x vectors in the registers. */
+#define GEMMA_KV_MR 4
+#define GEMMA_KV_TB 2
+#endif
 
 #if GEMMA_X86 && defined(__AVX512F__)
 static inline void gemma_int8_gemm_tile_kv(const int8_t *w, const float *scales,
@@ -678,6 +690,48 @@ static inline void gemma_int8_gemm_tile_kv(const int8_t *w, const float *scales,
         for (int r = 0; r < GEMMA_KV_MR; ++r) {
             out[(size_t)(t0 + t) * rows + i0 + r] =
                 _mm512_reduce_add_ps(acc[r][t]) * scales[i0 + r];
+        }
+    }
+}
+#elif GEMMA_X86
+static inline void gemma_int8_gemm_tile_kv(const int8_t *w, const float *scales,
+                                           const float *x, float *out,
+                                           int rows, int cols, int tokens,
+                                           int i0, int t0)
+{
+    __m256 acc[GEMMA_KV_MR][GEMMA_KV_TB];
+    for (int r = 0; r < GEMMA_KV_MR; ++r) {
+        for (int t = 0; t < GEMMA_KV_TB; ++t) {
+            acc[r][t] = _mm256_setzero_ps();
+        }
+    }
+    int k = 0;
+    for (; k + 8 <= cols; k += 8) {
+        /* Convert 8 weights with two instructions. Each weight vector serves
+         * both tokens, so the convert cost falls by GEMMA_KV_TB. */
+        __m256 wv[GEMMA_KV_MR];
+        __m256 xv[GEMMA_KV_TB];
+        for (int r = 0; r < GEMMA_KV_MR; ++r) {
+            wv[r] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                _mm_loadl_epi64((const __m128i *)(w + (size_t)(i0 + r) * cols + k))));
+        }
+        for (int t = 0; t < GEMMA_KV_TB; ++t) {
+            xv[t] = _mm256_loadu_ps(x + (size_t)(t0 + t) * cols + k);
+        }
+        for (int r = 0; r < GEMMA_KV_MR; ++r) {
+            for (int t = 0; t < GEMMA_KV_TB; ++t) {
+                acc[r][t] = _mm256_fmadd_ps(wv[r], xv[t], acc[r][t]);
+            }
+        }
+    }
+    for (int t = 0; t < GEMMA_KV_TB; ++t) {
+        for (int r = 0; r < GEMMA_KV_MR; ++r) {
+            float s = hsum_ps_avx2(acc[r][t]);
+            /* The columns that do not fill a vector use the scalar loop. */
+            for (int kk = k; kk < cols; ++kk) {
+                s += x[(size_t)(t0 + t) * cols + kk] * (float)w[(size_t)(i0 + r) * cols + kk];
+            }
+            out[(size_t)(t0 + t) * rows + i0 + r] = s * scales[i0 + r];
         }
     }
 }
@@ -1097,19 +1151,32 @@ void gemma_int8_gemm_blk(const int8_t *w, const int8_t *pw, const float *scales,
  * necessary.
  */
 
+#if GEMMA_X86 && defined(__AVX512F__)
 #define ML_KC 256
 #define ML_MC 128
 #define ML_NC 128
 #define ML_MR 16
 #define ML_NR 16
+#else
+/* AVX2 has 8 float lanes and a 32 KB L1. A KC of 64 makes the B panel 16 KB,
+ * so the B panel stays in the L1 cache. That is faster than a larger KC. */
+#define ML_KC 64
+#define ML_MC 64
+#define ML_NC 64
+#define ML_MR 8
+#define ML_NR 8
+#endif
 
-#if GEMMA_X86 && defined(__AVX512F__)
-/* One micro tile: ML_MR rows and ML_NR tokens. */
+#if GEMMA_X86
+/* One micro tile: ML_MR rows and ML_NR tokens. Each lane is one output row.
+ * Thus the sum over the columns stays in the lanes and needs no horizontal
+ * add. */
 static inline void gemma_ml_micro(const int8_t *a, int lda, int mi,
                                   const float *b, int ldb, int nj, int kc,
                                   const float *scales, float *out, int rows,
                                   int m0, int n0, int add)
 {
+#if defined(__AVX512F__)
     __m512 acc[ML_NR];
     for (int n = 0; n < ML_NR; ++n) {
         acc[n] = _mm512_setzero_ps();
@@ -1133,13 +1200,38 @@ static inline void gemma_ml_micro(const int8_t *a, int lda, int mi,
         }
         _mm512_storeu_ps(op, v);
     }
+#else
+    __m256 acc[ML_NR];
+    for (int n = 0; n < ML_NR; ++n) {
+        acc[n] = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < kc; ++k) {
+        /* Convert 8 weights with two instructions and use the result for
+         * ML_NR tokens. */
+        __m256 av = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+            _mm_loadl_epi64((const __m128i *)(a + (size_t)k * lda + mi))));
+        const float *brow = b + (size_t)k * ldb + nj;
+        for (int n = 0; n < ML_NR; ++n) {
+            acc[n] = _mm256_fmadd_ps(av, _mm256_set1_ps(brow[n]), acc[n]);
+        }
+    }
+    __m256 sv = _mm256_loadu_ps(scales + m0 + mi);
+    for (int n = 0; n < ML_NR; ++n) {
+        float *op = out + (size_t)(n0 + nj + n) * (size_t)rows + (m0 + mi);
+        __m256 v = _mm256_mul_ps(acc[n], sv);
+        if (add) {
+            v = _mm256_add_ps(_mm256_loadu_ps(op), v);
+        }
+        _mm256_storeu_ps(op, v);
+    }
+#endif
 }
 #endif
 
 void gemma_int8_gemm_ml(const int8_t *w, const float *scales, const float *x,
                         const float *xt, float *out, int rows, int cols, int tokens)
 {
-#if GEMMA_X86 && defined(__AVX512F__)
+#if GEMMA_X86
     int mb = rows / ML_MC;
     int nb = tokens / ML_NC;
     int kb = (cols + ML_KC - 1) / ML_KC;
@@ -1205,10 +1297,10 @@ void gemma_int8_gemm_ml(const int8_t *w, const float *scales, const float *x,
 }
 
 static int gemma_gemm_tokens_outer = GEMMA_GEMM_TOKENS_OUTER;
-#if GEMMA_X86 && defined(__AVX512F__)
-/* The K-vectorized tile is the default on AVX-512. It converts 16 weights with
- * one instruction. It is 3.2 times faster for mlp.down_proj at 256 tokens.
- * The AVX2 library keeps the token-vectorized tile. */
+#if GEMMA_X86
+/* The K-vectorized tile is the default on both x86 targets. It converts 16
+ * weights with one instruction (8 on AVX2) and uses each converted vector for
+ * several tokens. */
 static int gemma_gemm_kv = 1;
 #else
 static int gemma_gemm_kv = 0;
@@ -1228,11 +1320,10 @@ void gemma_int8_gemm_set_panel(int on)
     gemma_gemm_panel = on ? 1 : 0;
 }
 
-#if GEMMA_X86 && defined(__AVX512F__)
-/* The multi-level GEMM is the default on AVX-512. It reads each weight one
- * time. It is 1.3 to 1.4 times faster than the K-vectorized tile at 256
- * tokens. A shorter prompt keeps the K-vectorized tile, because the multi
- * level GEMM needs a full token block. */
+#if GEMMA_X86
+/* The multi-level GEMM is the default on both x86 targets. It reads each
+ * weight one time. A shorter prompt keeps the K-vectorized tile, because the
+ * multi-level GEMM needs a full token block. */
 static int gemma_gemm_ml = 1;
 #else
 static int gemma_gemm_ml = 0;
@@ -1378,6 +1469,15 @@ void gemma_int8_gemm(const int8_t *w, const float *scales, const float *x,
  * is too slow. The kernel then becomes compute bound.
  */
 
+/* Turn packed nibbles into signed bytes. A value is a 4-bit two's complement
+ * number, so (nibble ^ 8) - 8 sign-extends it. Do this in the byte lanes before
+ * the widening. The operation is then 2 instructions for 16 values, not 2
+ * instructions for each widened vector. */
+static inline __m128i i4_sign_bytes(__m128i nib, __m128i b8)
+{
+    return _mm_sub_epi8(_mm_xor_si128(nib, b8), b8);
+}
+
 #if GEMMA_X86 && defined(__AVX512F__)
 /* Return the dot product of one packed 4-bit row and one float32 row.
  * scales holds one value for each group of 32 columns.
@@ -1387,16 +1487,14 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
 {
     __m512 acc = _mm512_setzero_ps();
     const __m128i mask = _mm_set1_epi8(0x0F);
-    const __m512i bias = _mm512_set1_epi32(8);
+    const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
         __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
-        __m512i loq = _mm512_xor_si512(
-            _mm512_cvtepi8_epi32(_mm_and_si128(b, mask)), bias);
-        __m512i hiq = _mm512_xor_si512(
-            _mm512_cvtepi8_epi32(_mm_and_si128(_mm_srli_epi16(b, 4), mask)), bias);
-        __m512 lo = _mm512_cvtepi32_ps(_mm512_sub_epi32(loq, bias));
-        __m512 hi = _mm512_cvtepi32_ps(_mm512_sub_epi32(hiq, bias));
+        __m512 lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+            i4_sign_bytes(_mm_and_si128(b, mask), b8)));
+        __m512 hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+            i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8)));
         __m512 p = _mm512_fmadd_ps(
             _mm512_loadu_ps(x + (size_t)g * 32), lo,
             _mm512_mul_ps(_mm512_loadu_ps(x + (size_t)g * 32 + 16), hi));
@@ -1412,20 +1510,16 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
 {
     __m256 acc = _mm256_setzero_ps();
     const __m128i mask = _mm_set1_epi8(0x0F);
-    const __m256i bias = _mm256_set1_epi32(8);
+    const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
         __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
-        __m128i lo = _mm_and_si128(b, mask);
-        __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
-        __m256 l0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-            _mm256_xor_si256(_mm256_cvtepi8_epi32(lo), bias), bias));
-        __m256 l1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-            _mm256_xor_si256(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)), bias), bias));
-        __m256 h0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-            _mm256_xor_si256(_mm256_cvtepi8_epi32(hi), bias), bias));
-        __m256 h1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-            _mm256_xor_si256(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)), bias), bias));
+        __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
+        __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
+        __m256 l0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+        __m256 l1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+        __m256 h0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+        __m256 h1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
         __m256 p0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + (size_t)g * 32), l0,
                                     _mm256_mul_ps(_mm256_loadu_ps(x + (size_t)g * 32 + 8), l1));
         __m256 p1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + (size_t)g * 32 + 16), h0,
@@ -1459,14 +1553,13 @@ static inline float dot_i4_f32(const uint8_t *w, const float *scales,
 
 #if GEMMA_X86 && defined(__AVX512F__)
 /* Put the 32 values of 16 packed bytes in two float32 vectors. */
-static inline void i4_pair(__m128i b, __m128i mask, __m512i bias,
+static inline void i4_pair(__m128i b, __m128i mask, __m128i b8,
                            __m512 *lo, __m512 *hi)
 {
-    *lo = _mm512_cvtepi32_ps(_mm512_sub_epi32(
-        _mm512_xor_si512(_mm512_cvtepi8_epi32(_mm_and_si128(b, mask)), bias), bias));
-    *hi = _mm512_cvtepi32_ps(_mm512_sub_epi32(
-        _mm512_xor_si512(_mm512_cvtepi8_epi32(
-            _mm_and_si128(_mm_srli_epi16(b, 4), mask)), bias), bias));
+    *lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+        i4_sign_bytes(_mm_and_si128(b, mask), b8)));
+    *hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+        i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8)));
 }
 
 static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales,
@@ -1477,7 +1570,7 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
     __m512 a2 = _mm512_setzero_ps();
     __m512 a3 = _mm512_setzero_ps();
     const __m128i mask = _mm_set1_epi8(0x0F);
-    const __m512i bias = _mm512_set1_epi32(8);
+    const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
         __m512 xlo = _mm512_loadu_ps(x + (size_t)g * 32);
@@ -1488,10 +1581,10 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
         __m128i b2 = _mm_loadu_si128((const __m128i *)(p + (size_t)2 * stride));
         __m128i b3 = _mm_loadu_si128((const __m128i *)(p + (size_t)3 * stride));
         __m512 l0, h0, l1, h1, l2, h2, l3, h3;
-        i4_pair(b0, mask, bias, &l0, &h0);
-        i4_pair(b1, mask, bias, &l1, &h1);
-        i4_pair(b2, mask, bias, &l2, &h2);
-        i4_pair(b3, mask, bias, &l3, &h3);
+        i4_pair(b0, mask, b8, &l0, &h0);
+        i4_pair(b1, mask, b8, &l1, &h1);
+        i4_pair(b2, mask, b8, &l2, &h2);
+        i4_pair(b3, mask, b8, &l3, &h3);
         a0 = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l0, _mm512_mul_ps(xhi, h0)),
                              _mm512_set1_ps(scales[g]), a0);
         a1 = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l1, _mm512_mul_ps(xhi, h1)),
@@ -1508,26 +1601,22 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
 }
 #elif GEMMA_X86
 /* Put the 32 values of 16 packed bytes in four float32 vectors. */
-static inline void i4_pair256(__m128i b, __m128i mask, __m256i bias,
+static inline void i4_pair256(__m128i b, __m128i mask, __m128i b8,
                               __m256 *lo0, __m256 *lo1, __m256 *hi0, __m256 *hi1)
 {
-    __m128i lo = _mm_and_si128(b, mask);
-    __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
-    *lo0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-        _mm256_xor_si256(_mm256_cvtepi8_epi32(lo), bias), bias));
-    *lo1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-        _mm256_xor_si256(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)), bias), bias));
-    *hi0 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-        _mm256_xor_si256(_mm256_cvtepi8_epi32(hi), bias), bias));
-    *hi1 = _mm256_cvtepi32_ps(_mm256_sub_epi32(
-        _mm256_xor_si256(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)), bias), bias));
+    __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
+    __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
+    *lo0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+    *lo1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+    *hi0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+    *hi1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
 }
 
 static inline __m256 i4_row256(const uint8_t *p, __m256 x0, __m256 x1,
-                               __m256 x2, __m256 x3, __m128i mask, __m256i bias)
+                               __m256 x2, __m256 x3, __m128i mask, __m128i b8)
 {
     __m256 l0, l1, h0, h1;
-    i4_pair256(_mm_loadu_si128((const __m128i *)p), mask, bias, &l0, &l1, &h0, &h1);
+    i4_pair256(_mm_loadu_si128((const __m128i *)p), mask, b8, &l0, &l1, &h0, &h1);
     return _mm256_add_ps(_mm256_fmadd_ps(x0, l0, _mm256_mul_ps(x1, l1)),
                          _mm256_fmadd_ps(x2, h0, _mm256_mul_ps(x3, h1)));
 }
@@ -1540,7 +1629,7 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
     __m256 a2 = _mm256_setzero_ps();
     __m256 a3 = _mm256_setzero_ps();
     const __m128i mask = _mm_set1_epi8(0x0F);
-    const __m256i bias = _mm256_set1_epi32(8);
+    const __m128i b8 = _mm_set1_epi8(8);
     int groups = n / 32;
     for (int g = 0; g < groups; ++g) {
         __m256 x0 = _mm256_loadu_ps(x + (size_t)g * 32);
@@ -1548,13 +1637,13 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
         __m256 x2 = _mm256_loadu_ps(x + (size_t)g * 32 + 16);
         __m256 x3 = _mm256_loadu_ps(x + (size_t)g * 32 + 24);
         const uint8_t *p = w + (size_t)g * 16;
-        a0 = _mm256_fmadd_ps(i4_row256(p, x0, x1, x2, x3, mask, bias),
+        a0 = _mm256_fmadd_ps(i4_row256(p, x0, x1, x2, x3, mask, b8),
                              _mm256_set1_ps(scales[g]), a0);
-        a1 = _mm256_fmadd_ps(i4_row256(p + stride, x0, x1, x2, x3, mask, bias),
+        a1 = _mm256_fmadd_ps(i4_row256(p + stride, x0, x1, x2, x3, mask, b8),
                              _mm256_set1_ps(scales[(size_t)groups + g]), a1);
-        a2 = _mm256_fmadd_ps(i4_row256(p + (size_t)2 * stride, x0, x1, x2, x3, mask, bias),
+        a2 = _mm256_fmadd_ps(i4_row256(p + (size_t)2 * stride, x0, x1, x2, x3, mask, b8),
                              _mm256_set1_ps(scales[(size_t)2 * groups + g]), a2);
-        a3 = _mm256_fmadd_ps(i4_row256(p + (size_t)3 * stride, x0, x1, x2, x3, mask, bias),
+        a3 = _mm256_fmadd_ps(i4_row256(p + (size_t)3 * stride, x0, x1, x2, x3, mask, b8),
                              _mm256_set1_ps(scales[(size_t)3 * groups + g]), a3);
     }
     r[0] = hsum256_ps(a0);
@@ -1622,6 +1711,195 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
                 dot_i4_f32(wi, si, x + (size_t)t * (size_t)cols, cols);
         }
     }
+}
+
+/* ---------- int4 GEMM for a long prompt ----------
+ * The one-row dot decodes the packed weights again for each token. This GEMM
+ * decodes a row block to a float32 A panel one time and then uses the panel
+ * for every token block. The decode cost then falls by the number of token
+ * blocks. The A panel holds the group scale, so the micro kernel is a plain
+ * float32 multiply and add.
+ */
+
+#if GEMMA_X86 && defined(__AVX512F__)
+#define I4_MC 64
+#define I4_KC 128
+#define I4_NC 64
+#define I4_MR 16
+#define I4_NR 16
+#else
+/* AVX2 has 8 float lanes. The A panel and the B panel are float32, so keep
+ * them small enough for the L1 cache. */
+#define I4_MC 64
+#define I4_KC 64
+#define I4_NC 32
+#define I4_MR 8
+#define I4_NR 8
+#endif
+
+/* Decode ng groups (32 columns each) of one packed 4-bit row to float32. The
+ * function applies the group scale. The A panel is column-major: the values of
+ * one column are contiguous with a stride of lda. The micro kernel then reads
+ * the rows of one column as one vector. */
+static inline void i4_decode_row(const uint8_t *w, const float *scales,
+                                 int ng, int lda, float *dst)
+{
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i b8 = _mm_set1_epi8(8);
+    for (int g = 0; g < ng; ++g) {
+        __m128i b = _mm_loadu_si128((const __m128i *)(w + (size_t)g * 16));
+        float sc = scales[g];
+        __m128i lo = i4_sign_bytes(_mm_and_si128(b, mask), b8);
+        __m128i hi = i4_sign_bytes(_mm_and_si128(_mm_srli_epi16(b, 4), mask), b8);
+        float buf[32];
+#if defined(__AVX512F__)
+        _mm512_storeu_ps(buf + 0, _mm512_mul_ps(
+            _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)), _mm512_set1_ps(sc)));
+        _mm512_storeu_ps(buf + 16, _mm512_mul_ps(
+            _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)), _mm512_set1_ps(sc)));
+#else
+        _mm256_storeu_ps(buf + 0, _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), _mm256_set1_ps(sc)));
+        _mm256_storeu_ps(buf + 8, _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))),
+            _mm256_set1_ps(sc)));
+        _mm256_storeu_ps(buf + 16, _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), _mm256_set1_ps(sc)));
+        _mm256_storeu_ps(buf + 24, _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))),
+            _mm256_set1_ps(sc)));
+#endif
+        float *col = dst + (size_t)g * 32 * lda;
+        for (int j = 0; j < 32; ++j) {
+            col[(size_t)j * lda] = buf[j];
+        }
+    }
+}
+
+#if GEMMA_X86
+/* One micro tile for an already decoded float32 A panel. */
+static inline void gemma_ml_micro_f32(const float *a, int lda, int mi,
+                                      const float *b, int ldb, int nj, int kc,
+                                      float *out, int rows, int m0, int n0, int add)
+{
+#if defined(__AVX512F__)
+    __m512 acc[I4_NR];
+    for (int n = 0; n < I4_NR; ++n) {
+        acc[n] = _mm512_setzero_ps();
+    }
+    for (int k = 0; k < kc; ++k) {
+        __m512 av = _mm512_loadu_ps(a + (size_t)k * lda + mi);
+        const float *brow = b + (size_t)k * ldb + nj;
+        for (int n = 0; n < I4_NR; ++n) {
+            acc[n] = _mm512_fmadd_ps(av, _mm512_set1_ps(brow[n]), acc[n]);
+        }
+    }
+    for (int n = 0; n < I4_NR; ++n) {
+        float *op = out + (size_t)(n0 + nj + n) * (size_t)rows + (m0 + mi);
+        __m512 v = acc[n];
+        if (add) {
+            v = _mm512_add_ps(_mm512_loadu_ps(op), v);
+        }
+        _mm512_storeu_ps(op, v);
+    }
+#else
+    __m256 acc[I4_NR];
+    for (int n = 0; n < I4_NR; ++n) {
+        acc[n] = _mm256_setzero_ps();
+    }
+    for (int k = 0; k < kc; ++k) {
+        __m256 av = _mm256_loadu_ps(a + (size_t)k * lda + mi);
+        const float *brow = b + (size_t)k * ldb + nj;
+        for (int n = 0; n < I4_NR; ++n) {
+            acc[n] = _mm256_fmadd_ps(av, _mm256_set1_ps(brow[n]), acc[n]);
+        }
+    }
+    for (int n = 0; n < I4_NR; ++n) {
+        float *op = out + (size_t)(n0 + nj + n) * (size_t)rows + (m0 + mi);
+        __m256 v = acc[n];
+        if (add) {
+            v = _mm256_add_ps(_mm256_loadu_ps(op), v);
+        }
+        _mm256_storeu_ps(op, v);
+    }
+#endif
+}
+#endif
+
+void gemma_int4_gemm(const uint8_t *w, const float *scales, const float *x,
+                     const float *xt, float *out, int rows, int cols, int tokens)
+{
+#if GEMMA_X86
+    int mb = rows / I4_MC;
+    int nb = tokens / I4_NC;
+    int kb = (cols + I4_KC - 1) / I4_KC;
+    #pragma omp parallel
+    {
+        float *abuf = (float *)malloc((size_t)I4_MC * I4_KC * sizeof(float));
+        float *bbuf = (float *)malloc((size_t)I4_KC * I4_NC * sizeof(float));
+        if (abuf != NULL && bbuf != NULL) {
+            #pragma omp for schedule(static)
+            for (int bi = 0; bi < mb; ++bi) {
+                int m0 = bi * I4_MC;
+                for (int ki = 0; ki < kb; ++ki) {
+                    int k0 = ki * I4_KC;
+                    int kc = cols - k0 < I4_KC ? cols - k0 : I4_KC;
+                    int kfast = kc & ~31;
+                    int g0 = k0 / 32;
+                    /* Decode the A panel one time for all the token blocks. */
+                    for (int mm = 0; mm < I4_MC; ++mm) {
+                        const uint8_t *wi = w + (size_t)(m0 + mm) * (size_t)(cols / 2);
+                        const float *si = scales + (size_t)(m0 + mm) * (size_t)(cols / 32);
+                        i4_decode_row(wi + (size_t)g0 * 16, si + g0, kfast / 32,
+                                      I4_MC, abuf + mm);
+                    }
+                    /* The columns that do not fill a group of 32 use scalar code. */
+                    for (int kk = kfast; kk < kc; ++kk) {
+                        int g = (k0 + kk) / 32;
+                        int p = (k0 + kk) % 32;
+                        for (int mm = 0; mm < I4_MC; ++mm) {
+                            const uint8_t *wi = w + (size_t)(m0 + mm) * (size_t)(cols / 2);
+                            const float *si = scales + (size_t)(m0 + mm) * (size_t)(cols / 32);
+                            int byte = wi[(size_t)g * 16 + (p & 15)];
+                            int nib = (p < 16) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+                            abuf[(size_t)kk * I4_MC + mm] = (float)((nib ^ 8) - 8) * si[g];
+                        }
+                    }
+                    for (int ni = 0; ni < nb; ++ni) {
+                        int n0 = ni * I4_NC;
+                        for (int kk = 0; kk < kc; ++kk) {
+                            memcpy(bbuf + (size_t)kk * I4_NC,
+                                   xt + (size_t)(k0 + kk) * (size_t)tokens + n0,
+                                   I4_NC * sizeof(float));
+                        }
+                        for (int mi = 0; mi < I4_MC; mi += I4_MR) {
+                            for (int njj = 0; njj < I4_NC; njj += I4_NR) {
+                                gemma_ml_micro_f32(abuf, I4_MC, mi, bbuf, I4_NC, njj,
+                                                   kc, out, rows, m0, n0, ki > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        free(abuf);
+        free(bbuf);
+    }
+    /* The rows and the tokens that do not fill a block use the one-row dot. */
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        const uint8_t *wi = w + (size_t)i * (size_t)(cols / 2);
+        const float *si = scales + (size_t)i * (size_t)(cols / 32);
+        int t0 = (i < mb * I4_MC) ? nb * I4_NC : 0;
+        for (int t = t0; t < tokens; ++t) {
+            out[(size_t)t * (size_t)rows + i] =
+                dot_i4_f32(wi, si, x + (size_t)t * (size_t)cols, cols);
+        }
+    }
+#else
+    (void)w; (void)scales; (void)x; (void)xt; (void)out;
+    (void)rows; (void)cols; (void)tokens;
+#endif
 }
 
 /* ---------- bfloat16 GEMM for a long prompt ---------- */
