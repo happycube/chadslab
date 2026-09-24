@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a language model answers — a guided walk</title>
+<style>
+  :root { --ink:#1f2937; --dim:#6b7280; --line:#e5e7eb; --bg:#fbfaf8; --card:#fff;
+          --a:#4f46e5; --b:#0891b2; --c:#c2410c; --good:#15803d; --warn:#b45309; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.65 Georgia, "Iowan Old Style", "Times New Roman", serif; }
+  .wrap { max-width:820px; margin:0 auto; padding:48px 24px 90px; }
+  h1 { font:700 34px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:-.02em; margin:0 0 10px; }
+  h2 { font:700 23px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:-.01em; margin:0 0 6px; }
+  h3 { font:700 16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; margin:22px 0 6px; }
+  p { margin:10px 0; }
+  .lede { font-size:18px; color:#374151; }
+  .dim { color:var(--dim); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:26px 28px; margin:22px 0; }
+  .step { display:flex; align-items:baseline; gap:14px; margin:0 0 10px; }
+  .step .n { font:700 13px/1 system-ui,sans-serif; color:#fff; background:var(--a);
+             width:26px; height:26px; border-radius:50%; display:inline-flex;
+             align-items:center; justify-content:center; flex:0 0 auto; }
+  .step .n.b { background:var(--b); } .step .n.c { background:var(--c); }
+  .step h2 { margin:0; }
+  .ana { border-left:3px solid var(--line); padding:4px 0 4px 14px; margin:12px 0;
+         color:#4b5563; font-style:italic; }
+  .ana b { font-style:normal; color:var(--ink); }
+  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:12px; margin:16px 0 4px; }
+  .fact { background:#f9fafb; border:1px solid var(--line); border-radius:9px; padding:10px 12px; }
+  .fact .v { font:700 20px/1.2 system-ui,sans-serif; letter-spacing:-.02em; }
+  .fact .k { font-size:12.5px; color:var(--dim); font-family:system-ui,sans-serif; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+          font:600 13px/1 system-ui,sans-serif; margin:18px 0; }
+  .flow span { background:#eef2ff; color:#3730a3; border-radius:8px; padding:9px 12px; }
+  .flow i { color:#9ca3af; font-style:normal; }
+  .flow span.hot { background:#ecfeff; color:#155e75; }
+  .diagram { display:flex; gap:34px; flex-wrap:wrap; align-items:flex-start; margin:18px 0 6px; }
+  .grid { display:grid; gap:2px; width:150px; }
+  .grid i { width:100%; aspect-ratio:1; background:#e8eaee; border-radius:2px; display:block; }
+  .grid i.on { background:var(--b); }
+  .grid.moe { width:236px; gap:3px; grid-template-columns:repeat(16,1fr); }
+  .grid.moe i { background:#e8eaee; border-radius:3px; }
+  .grid.moe i.pick { background:var(--c); }
+  .cap { font:13px/1.5 system-ui,sans-serif; color:var(--dim); max-width:230px; }
+  .cap b { color:var(--ink); }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font:14px/1.5 system-ui,sans-serif; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th { font-size:11.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  td.n,th.n { text-align:right; font-family:ui-monospace,monospace; }
+  .quote { background:#f3f4f6; border-radius:9px; padding:14px 18px; margin:14px 0;
+           font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; overflow-x:auto; }
+  .quote b { background:#fde68a; border-radius:3px; padding:1px 4px; }
+  .three { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px; margin:16px 0; }
+  .three > div { border:1px solid var(--line); border-radius:10px; padding:14px 16px; background:#fff; }
+  .three h4 { margin:0 0 6px; font:700 14px/1.3 system-ui,sans-serif; }
+  .three p { margin:6px 0; font-size:14.5px; }
+  .gloss dt { font:700 14.5px/1.4 system-ui,sans-serif; margin-top:12px; }
+  .gloss dd { margin:2px 0 0; font-size:15px; color:#4b5563; }
+  .foot { border-top:1px solid var(--line); margin-top:40px; padding-top:16px;
+          font:13.5px/1.6 system-ui,sans-serif; color:var(--dim); }
+  .tag { font:700 11px/1 system-ui,sans-serif; letter-spacing:.06em; text-transform:uppercase;
+         color:var(--dim); }
+</style></head><body><div class="wrap">
+
+<h1>How a language model answers</h1>
+<p class="lede">A walk through one answer, for someone who has never looked inside a model.
+The example throughout is <b>Gemma&nbsp;4&nbsp;26B</b> — the model this repository runs — and the
+question is the simplest one there is: <i>“The capital of France is…?”</i></p>
+
+<div class="card">
+<p><b>The one-sentence version.</b> A language model does exactly one thing: given some text,
+it gives a score to every possible next piece of text. Then it picks one, sticks it on the end,
+and does the whole thing again. Everything else — the knowledge, the grammar, the reasoning —
+lives inside how those scores are computed.</p>
+<p>The example sentence is processed as numbers from the first step to the last. It is worth
+holding on to that: there are no words inside the model, only lists of numbers that stand for
+words.</p>
+<div class="flow">
+  <span>text</span><i>→</i><span>pieces</span><i>→</i><span>meaning vectors</span><i>→</i>
+  <span class="hot">30 rounds of refinement</span><i>→</i><span>a score per candidate</span>
+  <i>→</i><span>pick one</span><i>→</i><span>append &amp; repeat</span>
+</div>
+</div>
+
+<!-- 1 -->
+<div class="card">
+<div class="step"><span class="n">1</span><h2>Cutting the text into pieces</h2></div>
+<p>The model cannot read letters. Its entire alphabet is a fixed catalogue of
+<b>262,144 pieces</b>, called <b>tokens</b>. Before anything else, the text is chopped into
+those pieces and each piece is swapped for its number in the catalogue.</p>
+<div class="quote">"The capital of France is" → The ·&nbsp;capital ·&nbsp;of ·&nbsp;France ·&nbsp;is
+→ [818, 5279, 529, 7001, 563]</div>
+<p>Common words get a piece to themselves. Unusual words are not in the catalogue at all, so
+they are built out of smaller pieces — the model might see “unexpected” as
+<i>un&nbsp;+&nbsp;expect&nbsp;+&nbsp;ed</i>. This is why a model can handle any text at all while
+still having a fixed vocabulary.</p>
+<p class="ana"><b>The analogy.</b> Think of LEGO. There is a fixed box of bricks. Ordinary
+words are a single brick; unfamiliar words are assembled from several standard ones. Text in
+any language, or computer code, gets built the same way.</p>
+<p class="dim">Nothing is lost here. This step is just bookkeeping — but it is worth knowing that
+a “word” for the model is often not a word for you, which is why token counts differ from
+word counts.</p>
+</div>
+
+<!-- 2 -->
+<div class="card">
+<div class="step"><span class="n">2</span><h2>Turning pieces into meaning</h2></div>
+<p>Each number in the catalogue is attached to a <b>list of 2,816 values</b> — a coordinate.
+That list is the token’s position in a vast space of meanings.</p>
+<p>The trick is that the coordinates are arranged so that related things land near each other.
+“France” and “Italy” end up as neighbours; “Paris” ends up near “capital”. The model’s whole
+sense of what a word means is <i>where it sits</i>.</p>
+<p class="ana"><b>The analogy.</b> A map with 262,144 pins on it. Distance on the map is
+relatedness, and direction is a kind of relationship — one direction might separate countries
+from capitals, another might separate singular from plural.</p>
+<p class="dim">These coordinates are not written by anyone. They are learned from text, and
+no human can read a single one of the 2,816 values. From here on, the sentence is just a
+trail of coordinates through this space.</p>
+</div>
+
+<!-- 3 -->
+<div class="card">
+<div class="step"><span class="n">3</span><h2>Thirty rounds of refinement</h2></div>
+<p>The trail of coordinates now passes through <b>30 identical blocks</b>. Each block does the
+same two jobs, in order, and then adds a small correction to what it was given.</p>
+<p class="ana"><b>The analogy.</b> Sheets of tracing paper. Every sheet draws a bit more detail
+without erasing anything underneath. By the thirtieth sheet, the picture is complete.</p>
+
+<h3>Job A — Attention: deciding what to look at</h3>
+<p>To predict what comes next, the model has to work out which earlier words matter. Attention
+does this with a matching game played by every token at once:</p>
+<ul>
+  <li>Each token asks a question — <i>“what am I looking for?”</i> This is the <b>query</b>.</li>
+  <li>Each token also advertises what it contains — <i>“here is what I am about”</i>. That is the <b>key</b>.</li>
+  <li>Where a question matches an advertisement, the asking token copies the answering token’s
+  content — the <b>value</b>.</li>
+</ul>
+<p>By the time the model reaches the end of “The capital of France is”, the last token has
+collected “capital” and “France” into itself, and it has become something like <i>“a specific
+kind of city, in a specific country”</i>. That is the state from which “Paris” is the obvious
+continuation.</p>
+<p><b>It can only look backwards.</b> A token may attend to earlier tokens, never later ones —
+otherwise predicting the next word would be cheating.</p>
+<p><b>It looks in 16 ways at once.</b> The model runs 16 separate matching games in parallel,
+called <b>heads</b>. One head may end up tracking grammar, another the topic, another simple
+position. Their results are combined.</p>
+<p><b>The window — the important part.</b> In 25 of the 30 rounds, a token may only look back
+<b>1,024 positions</b>. The other 5 rounds may look back at the entire conversation.</p>
+<div class="diagram">
+  <div>
+    <div class="cap" style="margin-bottom:8px"><b>All 30 rounds, if they all looked everywhere</b><br>
+    Rows are tokens asking; columns are tokens being looked at. The cost grows with the
+    <i>square</i> of the length — doubling the conversation quadruples the work.</div>
+    <div class="grid g" style="grid-template-columns:repeat(12,1fr)"><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div>
+  </div>
+  <div>
+    <div class="cap" style="margin-bottom:8px"><b>What the 25 sliding rounds actually do</b><br>
+    A diagonal band: each token sees a short stretch behind itself. The cost grows in a
+    straight line instead — ten times the conversation, ten times the work.</div>
+    <div class="grid g" style="grid-template-columns:repeat(12,1fr)"><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div>
+  </div>
+</div>
+<p class="ana"><b>The analogy.</b> Short-term versus long-term memory. Most rounds work with
+what was just said, the way you follow a conversation. Five rounds step back and consider the
+whole discussion. Restricting 25 of the 30 rounds is what makes long conversations affordable
+at all.</p>
+
+<h3>Job B — The experts: applying knowledge</h3>
+<p>Looking around is not the same as knowing. After attention, the token needs facts and
+patterns, and that is a second network — normally the largest part of a model.</p>
+<p>This model splits that work into <b>128 specialist sub-networks</b> per round and consults
+only <b>8 of them</b> for any given token.</p>
+<div class="diagram">
+  <div class="grid moe"><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="pick"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i></div>
+  <div class="cap"><b>One round’s 128 experts.</b> Eight are chosen for each token (orange).
+  The other 120 never run for that token — but they all still have to be stored.</div>
+</div>
+<p class="ana"><b>The analogy.</b> A very large hospital. A patient is routed to eight
+specialists rather than being seen by all 128. Most of the doctors are idle most of the time,
+which is exactly the point: the hospital can be enormous because nobody visits everyone.</p>
+<p><b>The router.</b> The choice of which 8 is made by a small, simple calculation: score all
+128, take the top 8. It is a hard choice, not a blend. Keep that in mind — it becomes important
+at the very end.</p>
+<div class="facts">
+  <div class="fact"><div class="v">26 billion</div><div class="k">numbers stored</div></div>
+  <div class="fact"><div class="v">≈ 4 billion</div><div class="k">actually used per token</div></div>
+  <div class="fact"><div class="v">8 of 128</div><div class="k">experts consulted</div></div>
+</div>
+<p class="dim">This is the model’s central economy: a 26-billion-piece model that only has to
+read about 4 billion pieces to produce one token.</p>
+</div>
+
+<!-- 4 -->
+<div class="card">
+<div class="step"><span class="n">4</span><h2>The vote</h2></div>
+<p>After 30 rounds, the last token carries a single vector that summarises everything the model
+has worked out. To turn that into a prediction, it is compared against <b>every one of the
+262,144 tokens</b> in the catalogue, and each gets a score.</p>
+<p class="ana"><b>The analogy.</b> An election with 262,144 candidates. Nobody campaigns; each
+candidate simply gets a score based on how well it fits the current state. The winner is the
+model’s prediction for the next piece of text.</p>
+<p class="dim">Scores are then squeezed into a limited range so that no single candidate can
+dominate absurdly — a detail that matters when the model is very confident.</p>
+</div>
+
+<!-- 5 -->
+<div class="card">
+<div class="step"><span class="n">5</span><h2>Choosing one — sampling</h2></div>
+<p>The scores are not the answer; one has to be picked. How you pick is a genuine choice with
+visible consequences.</p>
+<table>
+  <tr><th>setting</th><th>what it does</th><th>effect</th></tr>
+  <tr><td><b>Always the top</b><br><span class="dim">(“greedy”)</span></td>
+      <td>Take the highest score, every time.</td>
+      <td>Consistent and predictable, but a single bad step is never recovered from.</td></tr>
+  <tr><td><b>Temperature</b></td>
+      <td>How willing to consider the 2nd, 3rd, 10th choice. Zero means never.</td>
+      <td>Higher is more varied and more creative — and more likely to wander.</td></tr>
+  <tr><td><b>Top-k / top-p</b></td>
+      <td>Restrict the pool first: the best <i>k</i>, or the smallest set covering <i>p</i> of the
+      probability.</td>
+      <td>Prevents the very long tail of nonsense candidates from ever being chosen.</td></tr>
+</table>
+<p>This model ships at temperature 0.3 with top-k 64 — a compromise. “Always the top” was
+rejected as the default, for a reason that only becomes clear in the last section.</p>
+</div>
+
+<!-- 6 -->
+<div class="card">
+<div class="step"><span class="n">6</span><h2>The loop, and the notebook</h2></div>
+<p>The chosen piece is stuck on the end of the text, and the whole machine runs again to pick
+the next one. A three-sentence answer is hundreds of these rounds.</p>
+<p>Here is the catch. Attention needs the <b>keys</b> and <b>values</b> of every earlier token.
+Those do not change from one step to the next, so recomputing them each time would be
+enormous waste. Instead they are saved in the <b>KV cache</b> and reused.</p>
+<p class="ana"><b>The analogy.</b> Taking notes in the margin of a book. When you turn the page
+you consult your notes instead of re-reading from the beginning. It makes reading the whole
+book together much faster — but it means the notebook grows with every page.</p>
+<p>That notebook is the model’s memory cost, and it grows with the conversation. The 25 sliding
+rounds only need about 1,024 tokens of notes. The 5 global rounds need the entire conversation,
+so they are the ones that grow without limit.</p>
+<table>
+  <tr><th>conversation length</th><th class="n">notes kept</th><th class="n">short-term rounds</th></tr>
+  <tr><td>2,000 tokens</td><td class="n">0.9 GB</td><td class="n">2,048</td></tr>
+  <tr><td>8,000 tokens</td><td class="n">1.3 GB</td><td class="n">1,791</td></tr>
+  <tr><td>16,000 tokens</td><td class="n">1.6 GB</td><td class="n">2,303</td></tr>
+  <tr><td>16,000, before the window was respected</td><td class="n">≈ 7.4 GB</td><td class="n">16,000</td></tr>
+</table>
+<p class="dim">The short-term rounds hover around 1,024–2,300 tokens of notes no matter how long
+the conversation gets. That is the window doing its job.</p>
+</div>
+
+<!-- 7 -->
+<div class="card">
+<div class="step"><span class="n">7</span><h2>Reading is fast; writing is slow</h2></div>
+<p>There are two very different phases, and they are worth separating.</p>
+<div class="three">
+  <div><h4>Reading the question — “prefill”</h4>
+    <p>All the prompt tokens are processed <b>at once, in parallel</b>. A long document is
+    absorbed in one burst.</p>
+    <p class="dim">≈ 60 tokens per second here.</p></div>
+  <div><h4>Writing the answer — “decode”</h4>
+    <p>One token at a time, and each single token requires reading a large part of the model
+    again. It cannot be parallelised, because each word depends on the one before.</p>
+    <p class="dim">≈ 160 ms per token, about 6 per second.</p></div>
+</div>
+<p class="ana"><b>The analogy.</b> Reading a page is quick — your eyes take it in at once.
+Writing that page out by hand, one letter at a time, is slow.</p>
+<p>This is why a long prompt comes with a noticeable pause before the answer starts, and why
+the answer then arrives steadily rather than instantly.</p>
+
+<h3>Where the experts fit in</h3>
+<p>Step 3 hides an interaction with these two phases. Every token picks 8 of the 128 experts. While
+<b>reading</b>, thousands of tokens pass the experts at once; while <b>writing</b>, exactly one
+does. That single difference changes what an expert is worth.</p>
+<p>A prompt of 4,096 tokens makes 4,096 × 8 = 32,768 picks, which spread across the 128 experts at
+roughly <b>256 tokens each</b>. An expert is a large block of numbers, and those numbers have to be
+fetched from memory before they can be used. Fetching a block once and using it 256 times is
+efficient. Writing is the opposite: one token makes 8 picks, so each of those experts is fetched
+and used exactly <b>once</b> — and every word repeats this in all 30 rounds, which is 240 expert
+fetches to produce one word.</p>
+<div class="three">
+  <div><h4>Reading a 4,096-token prompt</h4>
+    <p>4,096 tokens × 8 picks = 32,768 picks, spread over 128 experts.</p>
+    <p style="font-size:19px"><b>≈ 256 uses per expert fetch</b></p>
+    <p class="dim">Plenty of arithmetic to do for each block of numbers brought in.</p></div>
+  <div><h4>Writing one token</h4>
+    <p>1 token × 8 picks = 8 picks.</p>
+    <p style="font-size:19px"><b>1 use per expert fetch</b></p>
+    <p class="dim">Almost pure fetching. This is why writing is limited by memory rather than by
+    calculation.</p></div>
+</div>
+<p class="ana"><b>The analogy.</b> While reading, the hospital receives a whole clinic’s worth of
+patients, so each specialist stays busy. While writing, it opens for one patient, calls in eight
+specialists, and each of them does a single thing before going back to waiting.</p>
+<div class="facts">
+  <div class="fact"><div class="v">≈ 3 MB</div><div class="k">one expert at four bits</div></div>
+  <div class="fact"><div class="v">≈ 24 MB</div><div class="k">the 8 experts one token needs</div></div>
+  <div class="fact"><div class="v">≈ 25 MB</div><div class="k">the machine’s fast memory</div></div>
+</div>
+<p>Those last two numbers are the whole story of writing. Fetching the experts for a <i>single</i>
+token already fills the fast memory, so there is no room left to hold them while another token
+arrives. Every word is fetched nearly from scratch.</p>
+<p><b>Why reading an even bigger block stops helping.</b> It is tempting to expect that reading
+4,096 tokens at a time, or 8,192, would keep improving things. It does not. The reuse only pays
+while the numbers being worked on fit in that same small fast memory. Measured on this model:
+reading in blocks of 256 tokens versus 2,048 tokens — sixteen versus 128 tokens per expert, an
+eight-fold increase in reuse — changed the total prompt time by about <b>4%</b>. The benefit
+saturates long before the block sizes people reach for.</p>
+<p>So the two phases stress the machine differently — reading gives each fetched number many uses,
+writing gives it one — and it is also why every expert has to be stored even though most sit idle
+at any moment: which eight are needed depends entirely on the words.</p>
+</div>
+
+<!-- 8 -->
+<div class="card">
+<div class="step"><span class="n b">8</span><h2>Wrapping it as a conversation</h2></div>
+<p>The model itself knows nothing about “messages”, “users”, or “assistants”. It sees one
+stream of text. Everything else is decoration added around your words before they reach it:</p>
+<table>
+  <tr><th>idea</th><th>what actually happens</th></tr>
+  <tr><td>Roles (system / user / assistant)</td><td>Small pieces of marker text are inserted around each message.</td></tr>
+  <tr><td>“Thinking”</td><td>A special marker opens a private channel; the model reasons there first, then closes it and answers.</td></tr>
+  <tr><td>Using a tool</td><td>The model writes a structured request (<i>“read this file”</i>) as text. Your program runs it and pastes the result back in as text. The model never touches anything itself.</td></tr>
+  <tr><td>Remembering the chat</td><td>It does not. Every turn resends the entire conversation — which is why the notebook from step 6 matters so much.</td></tr>
+</table>
+<p class="dim">One consequence: the model cannot “look something up” mid-answer unless a tool
+result was already pasted into its input. It only ever continues text.</p>
+</div>
+
+<!-- closing -->
+<div class="card">
+<div class="step"><span class="n c">✳</span><h2>What it costs — and where it breaks</h2></div>
+<p>Once you have the eight steps, the three kinds of cost fall out naturally.</p>
+<div class="three">
+  <div><h4>Memory</h4>
+    <p>26 billion numbers must be stored. Written out in full precision that is about
+    <b>104 GB</b>; stored four bits at a time it is about <b>14 GB</b> — which is how it fits on
+    an ordinary machine at all.</p>
+    <p class="dim">The price: every number is slightly wrong.</p></div>
+  <div><h4>Speed</h4>
+    <p>Every single token requires reading a large part of those numbers. The machine is
+    therefore limited by how fast it can pull data from memory — not by how fast it can
+    calculate.</p>
+    <p class="dim">The only real lever is reading <i>less</i>: consult 8 experts, not 128; look
+    back 1,024 tokens, not the whole conversation.</p></div>
+  <div><h4>Quality</h4>
+    <p>The approximations are tiny and usually harmless. But step 3 has an <b>argmax</b> in it:
+    the router picks 8 experts by a hard “which is larger” comparison.</p>
+    <p class="dim">Nudge its input by a rounding error and it may pick a different expert. A
+    small numeric difference then becomes a different sentence.</p></div>
+</div>
+<p>That last point is the deep trade-off of this whole exercise. It is why compressing the
+model’s memory — the step that makes it fit and run at all — is also the step that most easily
+damages its answers, and why the only trustworthy test of a speed-up is not “is the maths
+close?” but <b>“did it still produce the same words?”</b></p>
+<p>One shortcut broke that test outright: storing the conversation notebook (step 6) at low
+precision was fast and saved memory, but the rounding was enough to send the router down a
+different path, and the model fell into repeating itself. It is kept as an option and left
+switched off.</p>
+</div>
+
+<div class="card">
+<h3 style="margin-top:0">Words you will meet</h3>
+<dl class="gloss">
+  <dt>Token</dt><dd>A piece of text — a whole word, part of a word, or a punctuation mark. The
+  model’s unit of everything.</dd>
+  <dt>Embedding</dt><dd>The list of numbers that stands for a token; its coordinate in
+  meaning-space.</dd>
+  <dt>Parameter</dt><dd>One stored number. “26B parameters” means 26 billion of them.</dd>
+  <dt>Attention</dt><dd>The matching game that lets each token gather in what earlier tokens
+  contain.</dd>
+  <dt>Head</dt><dd>One parallel run of that matching game. This model runs 16 at once.</dd>
+  <dt>Expert / MoE</dt><dd>One of 128 specialist sub-networks per round; only 8 are consulted
+  per token.</dd>
+  <dt>Router</dt><dd>The small calculation that picks which experts to consult. A hard choice.</dd>
+  <dt>Causal</dt><dd>Looking backwards only.</dd>
+  <dt>Context window</dt><dd>The stretch of text a token may attend to. Here, 1,024 in most
+  rounds and unlimited in five.</dd>
+  <dt>Prefill / decode</dt><dd>Reading the prompt in parallel / writing the answer one token at
+  a time.</dd>
+  <dt>Cache</dt><dd>A small, very fast store beside the processor. Numbers used repeatedly are
+  kept there; everything else must be fetched from slower main memory.</dd>
+  <dt>KV cache</dt><dd>The notebook: saved attention keys and values, so past text is not
+  recomputed.</dd>
+</dl>
+</div>
+
+<p class="foot">This is the conceptual walk-through. The engineering record — what was actually
+measured, what was tried and abandoned, and the performance/memory/quality numbers for each
+optimisation — is in <code>pipeline.html</code> beside this file. The model described is the
+Q4_0 Gemma&nbsp;4 26B-A4B checkpoint used by the server: 30 layers, 25 sliding and 5 global,
+2,816-wide, 16 heads, 128 experts with 8 active, a 262,144-piece vocabulary, and a 1,024-token
+window.</p>
+
+</div></body></html>

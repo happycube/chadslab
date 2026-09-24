@@ -1,0 +1,49 @@
+prefill 5 tokens 0.252 s
+step  0 0.092 s
+step  1 0.096 s
+step  2 0.094 s
+step  3 0.097 s
+step  4 0.092 s
+step  5 0.096 s
+step  6 0.092 s
+step  7 0.096 s
+step  8 0.093 s
+decode median 0.096 s  best 0.092 s  10.42 tok/s
+stage report (sum 82.8 ms)
+  moe           43.6 ms    53%
+  attn          22.1 ms    27%
+  dense_mlp      8.8 ms    11%
+  norm           8.1 ms    10%
+  other          0.2 ms     0%
+output head 10.8 ms
+         28045 function calls in 0.131 seconds
+
+   Ordered by: internal time
+   List reduced from 113 to 22 due to restriction <22>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      685    0.053    0.000    0.057    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/cops.py:344(linear_int4)
+        1    0.011    0.011    0.011    0.011 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/cops.py:356(linear_q6k)
+       30    0.010    0.000    0.053    0.002 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/model.py:422(_moe)
+      331    0.007    0.000    0.016    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:36(rms_norm)
+      270    0.006    0.000    0.006    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:380(gelu_tanh)
+      331    0.004    0.000    0.008    0.000 /home/cpage/proj/chadslab/llm/gemma4-12b-qat-pytorch/.venv/lib/python3.12/site-packages/numpy/_core/_methods.py:115(_mean)
+       30    0.004    0.000    0.004    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:52(linear)
+      481    0.003    0.000    0.003    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+      685    0.002    0.000    0.063    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:293(linear_int4)
+     2743    0.002    0.000    0.002    0.000 /home/cpage/proj/chadslab/llm/gemma4-12b-qat-pytorch/.venv/lib/python3.12/site-packages/numpy/_core/_internal.py:262(__init__)
+       30    0.001    0.000    0.030    0.001 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/model.py:544(_attention)
+       30    0.001    0.000    0.116    0.004 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/model.py:501(_decoder_layer)
+      686    0.001    0.000    0.003    0.000 <frozen os>:709(__getitem__)
+        1    0.001    0.001    0.001    0.001 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:401(softcap)
+      331    0.001    0.000    0.002    0.000 /home/cpage/proj/chadslab/llm/gemma4-12b-qat-pytorch/.venv/lib/python3.12/site-packages/numpy/_core/_methods.py:73(_count_reduce_items)
+       60    0.001    0.000    0.004    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/rope.py:52(apply)
+      331    0.001    0.000    0.009    0.000 /home/cpage/proj/chadslab/llm/gemma4-12b-qat-pytorch/.venv/lib/python3.12/site-packages/numpy/_core/fromnumeric.py:3737(mean)
+       60    0.001    0.000    0.003    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/ops.py:389(softmax)
+      686    0.001    0.000    0.001    0.000 {built-in method numpy.empty}
+       60    0.001    0.000    0.001    0.000 /home/cpage/proj/chadslab/llm/numpy-gemma/np_gemma/rope.py:46(rotate_half)
+       90    0.001    0.000    0.002    0.000 /home/cpage/proj/chadslab/llm/gemma4-12b-qat-pytorch/.venv/lib/python3.12/site-packages/numpy/lib/_shape_base_impl.py:33(_make_along_axis_idx)
+      686    0.001    0.000    0.003    0.000 <frozen _collections_abc>:804(get)
+
+
+

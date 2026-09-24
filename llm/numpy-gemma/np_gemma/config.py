@@ -28,6 +28,7 @@ class LayerPlan:
     head_dim: int
     num_q_heads: int
     num_kv_heads: int
+    window: int = 0
 
     @property
     def q_dim(self):
@@ -47,7 +48,7 @@ class LayerPlan:
     @property
     def sliding_window(self):
         """Return the window size for a sliding layer. Return None for a global layer."""
-        return 1024 if self.is_sliding else None
+        return self.window or None
 
 
 class Config:
@@ -82,9 +83,13 @@ class Config:
 
     def _plan(self, idx, layer_type):
         """Make the plan for one layer. Use the layer type."""
+        # The window comes from the GGUF metadata. A global layer has none.
+        window = self.sliding_window if layer_type == "sliding_attention" else 0
         if layer_type == "sliding_attention":
-            return LayerPlan(idx, True, self.head_dim, self.num_attention_heads, self.num_key_value_heads)
-        return LayerPlan(idx, False, self.global_head_dim, self.num_attention_heads, self.num_global_key_value_heads)
+            return LayerPlan(idx, True, self.head_dim, self.num_attention_heads,
+                             self.num_key_value_heads, window)
+        return LayerPlan(idx, False, self.global_head_dim, self.num_attention_heads,
+                         self.num_global_key_value_heads, window)
 
     @classmethod
     def load(cls, path):

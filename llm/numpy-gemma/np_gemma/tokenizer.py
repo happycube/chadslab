@@ -200,31 +200,23 @@ class Tokenizer:
         return out.decode("utf-8", errors="replace")
 
     # ---- chat --------------------------------------------------------------
-    def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False):
+    def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False,
+                            tools=None, preserve_thinking=False,
+                            empty_thought_block=True):
         """Build the chat prompt from the message list.
 
-        Add one turn for each message. Change the role "assistant" to "model".
-        Add a system turn. If thinking is true, open the system turn with the
-        think token. If thinking is false, close an empty thought channel.
+        Use the canonical Gemma 4 template of np_gemma/chat_template.jinja. Give
+        tools to declare them in the system turn. thinking opens the thought
+        channel. The message list follows the OpenAI shape: a tool call has the
+        field tool_calls and a result uses the role tool.
+
+        Set empty_thought_block to False for the E2B and E4B models. See
+        render_chat.
         """
-        parts = ["<bos>"]
-        system = [m for m in messages if m.get("role") == "system"]
-        if thinking:
-            parts.append("<|turn>system\n<|think|>\n")
-            for m in system:
-                parts.append(str(m.get("content", "")))
-            parts.append("<turn|>\n")
-        else:
-            for m in system:
-                parts.append("<|turn>system\n" + str(m.get("content", "")) + "<turn|>\n")
-        for m in messages:
-            role = m.get("role")
-            if role == "system":
-                continue
-            role = "model" if role == "assistant" else role
-            parts.append("<|turn>" + role + "\n" + str(m.get("content", "")) + "<turn|>\n")
-        if add_generation_prompt:
-            parts.append("<|turn>model\n")
-            if not thinking:
-                parts.append("<|channel>thought\n<channel|>")
-        return "".join(parts)
+        from .chat import render_chat
+
+        return render_chat(messages, tools=tools,
+                           add_generation_prompt=add_generation_prompt,
+                           enable_thinking=thinking,
+                           preserve_thinking=preserve_thinking,
+                           empty_thought_block=empty_thought_block)

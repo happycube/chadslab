@@ -34,17 +34,23 @@ def _default_threads():
     return allowed
 
 
-# The attention uses small matrix products. The BLAS library must use one
-# thread for them. Many BLAS threads fight the OpenMP threads of the int4
-# kernel and make a long decode slow. Set the values before NumPy loads.
-# OMP_NUM_THREADS follows the physical core count. Set it yourself to override
-# the value, for example OMP_NUM_THREADS=6 on a small machine.
-_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+# A long prompt spends a large part of its time in the attention matrix
+# products. One BLAS thread is too few for them. Many threads fight the OpenMP
+# threads of the int4 kernel. A small count is the compromise: it gives the
+# prompt about 7 per cent and leaves the decode unchanged. Set the values
+# before NumPy loads. OMP_NUM_THREADS follows the physical core count. Set it
+# yourself to override the value, for example OMP_NUM_THREADS=6 on a small
+# machine.
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", str(min(8, _default_threads())))
 _os.environ.setdefault("OMP_NUM_THREADS", str(_default_threads()))
 
 from .config import Config
 from .st import SafeTensors
+from .ct import CompressedTensors
+from .e4b import E4B, E4BConfig, E4BCache
 from .model import Model, KVCache, Session
+from .sampling import Sampler
 from .tokenizer import Tokenizer
 
-__all__ = ["Config", "SafeTensors", "Model", "KVCache", "Session", "Tokenizer"]
+__all__ = ["Config", "SafeTensors", "CompressedTensors", "E4B", "E4BConfig",
+           "E4BCache", "Model", "KVCache", "Session", "Sampler", "Tokenizer"]

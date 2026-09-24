@@ -5,6 +5,20 @@ It uses NumPy only. It does not use PyTorch. It does not use transformers.
 The project is the Phase 1 baseline of the learning plan in
 ../Gemma LLM Runtime Learning Plan.md.
 
+It also runs google/gemma-4-E4B-it-qat-mobile-ct, the 4.5B effective dense
+model. That model comes from a compressed-tensors SafeTensors file or from the
+Q4_0 GGUF file of the same model. It adds Per-Layer Embeddings. Transformers
+appears only in the check scripts, where it builds the reference.
+
+A C kernel reads the packed 4-bit and 2-bit weights in place. Thus the file
+layout is the runtime layout, and the model builds no float32 copy of a
+weight. See the section "Gemma 4 E4B".
+
+This file follows ASD-STE100, Simplified Technical English. A sentence in a
+description has 25 words or less. A sentence in an instruction has 20 words or
+less. `scripts/check_ste100.py` checks these rules and the approved verb forms.
+The commands, the tables, and the quoted model output keep their own words.
+
 The runtime does five tasks:
 1. Read the SafeTensors weights. Convert bfloat16 data to float32 or int8 data.
 2. Run the 48 decoder layers.
@@ -15,9 +29,14 @@ The runtime does five tasks:
 ## Files
 
     numpy-gemma/
+    ├── WEIGHT_STRUCTURE.md  Four negative results on the linear-algebraic structure of the weights.
+    ├── how-llms-work.html  Walk through the eight phases of inference, for a newcomer.
+    ├── pipeline.html      The pipeline, with the performance, memory, and quality tradeoffs.
     ├── np_gemma/
     │   ├── st.py          Read SafeTensors files. Use mmap. Convert bf16 to f32.
     │   ├── config.py      Read the configuration. Make a plan for each layer.
+    │   ├── ct.py          Read a compressed-tensors file. Decode a packed weight.
+    │   ├── e4b.py         Run the Gemma 4 E4B model. The per-layer embeddings.
     │   ├── ops.py         Give rms_norm, linear, gelu_tanh, softmax, softcap.
     │   ├── rope.py        Make the default RoPE and the proportional RoPE.
     │   ├── model.py       Give KVCache and Model. Run the forward pass.
@@ -26,8 +45,13 @@ The runtime does five tasks:
     │   ├── numba_ops.py   Give the Numba JIT kernels. Optional.
     │   ├── cops.py        Build and load the C kernels with ctypes. Optional.
     │   ├── weight_cache.py  Store the converted weights on the disk.
+    │   ├── sampling.py    Give the token sampler. Temperature, top_k, top_p.
+    │   ├── chat.py        Render the Gemma 4 chat template. Read the output.
+    │   ├── chat_template.jinja  The canonical Google Gemma 4 chat template.
+    │   ├── server.py      Give the OpenAI compatible HTTP server.
     │   └── csrc/
-    │       └── bf16_linear.c  Give the fused bfloat16 and int8 C kernels.
+    │       └── bf16_linear.c  Give the fused bfloat16, int8, and int4 C kernels,
+    │                          and the packed 4-bit and 2-bit kernel for E4B.
     └── scripts/
         ├── check_trace.py      Compare each intermediate with a HF trace.
         ├── check_cache.py      Compare the KV cache with a batch prefill.
@@ -47,6 +71,32 @@ The runtime does five tasks:
         ├── bench_int8_stream.py  Measure the int8 kernel for each stream size.
         ├── bench_prefill.py    Measure the int8 and int4 prompt GEMM.
         ├── bench_threads.py    Measure the kernel speed against the thread count.
+        ├── serve.py            Run the OpenAI compatible server.
+        ├── check_server.py     Check the server with a fake model.
+        ├── check_server_live.py  Check the server with a real model.
+        ├── check_chat_template.py  Compare chat.py with the Jinja template.
+        ├── check_int4_q8.py    Check the int4 kernel with int8 activations.
+        ├── bench_int4_q8.py    Compare the float and the int8 int4 kernels.
+        ├── measure_prefill_glue.py  Split a prefill into the C kernels and the glue.
+        ├── check_slide.py      Check the sliding window key slice.
+        ├── check_flash_c.py    Check the C flash attention against the NumPy reference.
+        ├── check_kv_window.py  Check the sliding window key cache bound.
+        ├── bench_flash_kernel.py  Compare the flash attention versions with the batched matmul.
+        ├── bench_flash_model.py   Compare flash attention with the plain path on a model.
+        ├── e4b_inspect.py      Show the tensor layout of the E4B checkpoint.
+        ├── e4b_trace.py        Compare the E4B model with a HF reference, layer by layer.
+        ├── e4b_generate.py     Generate E4B text. Check the ids against HF.
+        ├── check_ct.py         Check the compressed-tensors reader against the library.
+        ├── check_ct_kernel.py  Check the packed 4-bit and 2-bit C kernel, every column.
+        ├── check_ste100.py     Check this file against ASD-STE100, Simplified Technical English.
+        ├── bench_ct_kernel.py  Compare the packed kernel with the float32 multiply.
+        ├── profile_e4b.py      Split one decode step. Find why a token is slow.
+        ├── profile_e4b_gguf.py Split a decode step of a GGUF file. Show each group.
+        ├── profile_e4b_prefill.py Split a prompt pass. Show the glue and the attention.
+        ├── bench_gguf_models.py  Measure pp512 and tg128 in the form of llama-bench.
+        ├── bench_e4b_mmap.py   Compare resident, streamed, and packed weights.
+        ├── check_e4b_gguf.py   Check the GGUF E4B model against a HF reference.
+        ├── check_gelu.py       Check the GELU kernel against a float64 reference.
         ├── peak.c              Measure the peak AVX-512 speed.
         └── membw.c             Measure the memory bandwidth.
 
@@ -69,7 +119,7 @@ Set the thread values before the first command:
     export OMP_NUM_THREADS=6
 
 The default for OMP_NUM_THREADS is one thread for each physical core. The code
-also obeys the CPUs that the process may use. Set the variable only to override
+also obeys the CPUs that the process can use. Set the variable only to override
 the default, for example OMP_NUM_THREADS=18 on an 18-core machine.
 
 The attention uses small matrix products. One BLAS thread is faster than many,
@@ -99,10 +149,11 @@ keyboard. Type :reset to clear the history. Type :q to stop.
     PYTHONPATH=. $PY scripts/session.py --snapshot "$SNAP" --dtype int8
 
 A chat keeps the key and value cache between the turns. The class Session
-finds the common prefix of the new turn and the cache. It runs the forward pass
-only for the new tokens. Thus a chat does not read the history again. The class
-started at 24 of 48 tokens for the second turn of a two turn test. Set the
-cache size with --max-len. Use --no-history for independent prompts.
+finds the common prefix of the new turn and the cache. It runs the forward
+pass only for the new tokens. Thus a chat does not read the history again.
+
+The class started at 24 of 48 tokens for the second turn of a two turn test.
+Set the cache size with --max-len. Use --no-history for independent prompts.
 
 Run the 4-bit mode with the w4a16 checkpoint. This mode gives 48 of 48 tokens
 equal to the reference.
@@ -144,16 +195,26 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
 ### Environment variables
 
     variable               default                 task
-    OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel.
+    OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel. Set it to 1 for the E4B int4 mode as well: that mode is about eight times slower with a BLAS pool.
     OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
-    NP_GEMMA_ATTN          1                       1 uses the int8 cache and the fused attention. 0 uses the float32 cache and NumPy.
+    NP_GEMMA_ATTN          1                       1 uses the fused attention. 0 uses the batched matmul and the NumPy path for a comparison.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
     NP_GEMMA_ARCH          auto                    avx2 or avx512 forces one C library.
     NP_GEMMA_KERNEL        auto                    c, numba, or numpy forces one kernel path.
     NP_GEMMA_INT8_INT      0                       1 uses the integer int8 kernel. That kernel is less accurate.
     NP_GEMMA_PREFILL_CHUNK 256                     The prompt pass uses blocks of this many tokens.
+    NP_GEMMA_SLIDE         1                       1 drops the keys that no query in the block can see. 0 keeps every key.
+    NP_GEMMA_FLASH         0                       1 runs the C flash attention kernel. ref runs the NumPy reference. 0 uses the batched matmul.
+    NP_GEMMA_ATTN_IMPL     auto                    c, avx2, or avx512 forces one version of the flash kernel.
+    NP_GEMMA_FLASH         0 for the 12B,         1 sends a prompt of more than one token to the C flash kernel. "slide" uses it for a sliding layer only.
+                           1 for E4B
+    NP_GEMMA_INT4_Q8       1                       1 uses the int8 tile for the int4 kernel. That tile is faster from two tokens up.
+    NP_GEMMA_INT4_Q8_TOKENS 2                       The smallest token count for the int8 tile. A lower value is slower for one token.
+    NP_GEMMA_INT4_MULTI4   1                       1 runs the query, key, and value in one call, and the gate with the up projection. 0 gives one call for each matrix.
+    NP_GEMMA_E4B_BF16      1                       1 keeps a bfloat16 copy of a large weight that the quantization did not touch. 0 uses the float32 BLAS path.
+    NP_GEMMA_E4B_BF16_MIN  1048576                 The smallest value count for the bfloat16 copy. A smaller matrix keeps the float32 path.
 
 ## Weight modes
 
@@ -182,20 +243,23 @@ and one scale for each row. Both modes convert the values during each multiply.
 Three kernels are available:
 
 1. The C kernel. A small C file gives the multiply. The code compiles the file
-   one time with cc. Then it loads the library with ctypes. ctypes is part of
-   Python, so no new package is necessary. The C code uses AVX2, FMA, and
-   OpenMP. The kernel reads the values and converts them during the multiply.
-   It does not write a float32 block.
-   The code builds two libraries from the same source. The first library uses
-   an AVX2 baseline. The second library uses an AVX-512 baseline. The code reads
-   the CPU features at run time. A CPU with AVX-512 loads the AVX-512 library. A
-   CPU without AVX-512 loads the AVX2 library. Every target machine gives AVX2.
-   Set NP_GEMMA_ARCH=avx2 or NP_GEMMA_ARCH=avx512 to force a library.
-   The bfloat16 kernel reads four output rows in one loop. Thus the loop loads
-   x one time for four rows.
-   The int8 kernel reads one row for each token in a decode step. For a prompt
-   the code uses a tiled GEMM. The code uses the GEMM at 32 tokens or more.
-   Both targets give the same two prompt tiles.
+one time with cc and then loads the library with ctypes. The ctypes module is part of
+Python, so no new package is necessary. The C code uses AVX2, FMA, and OpenMP.
+The kernel reads the values, converts them during the multiply, and writes no
+float32 block.
+
+The code builds two libraries from the same source. The first library uses an
+AVX2 baseline. The second library uses an AVX-512 baseline. The code reads the
+CPU features at run time. A CPU with AVX-512 loads the AVX-512 library.
+
+A CPU without AVX-512 loads the AVX2 library. Every target machine gives AVX2.
+Set NP_GEMMA_ARCH=avx2 or NP_GEMMA_ARCH=avx512 to force a library. The
+bfloat16 kernel reads four output rows in one loop. Thus the loop loads x one
+time for four rows.
+
+The int8 kernel reads one row for each token in a decode step. For a prompt
+the code uses a tiled GEMM. The code uses the GEMM at 32 tokens or more. Both
+targets give the same two prompt tiles.
    * The K-vectorized tile keeps the result of four rows and four tokens in a
      vector. AVX2 uses four rows and two tokens. One instruction converts 16
      weights on AVX-512 and 8 weights on AVX2. Each converted vector serves
@@ -204,17 +268,20 @@ Three kernels are available:
      ML_MR rows and ML_NR tokens in the registers. The values are 16 and 16 on
      AVX-512 and 8 and 8 on AVX2. An int8 A panel and a float32 B panel stay in
      the cache. A block over the columns then reduces the weight traffic.
-   The multi-level GEMM is 1.26 times faster at 128 tokens and 1.32 times
-   faster at 256 and 512 tokens than the K-vectorized tile on AVX-512. The code
-   uses it at 128 tokens or more on AVX-512 and at 64 tokens or more on AVX2. A
-   shorter prompt keeps the K-vectorized tile. Use cops.set_gemm_ml(False) for
-   a test and cops.set_gemm_kv(False) for the older token-vectorized tile.
-   The AVX2 block sizes are ML_KC 64, ML_MC 64, and ML_NC 64. A KC of 64 makes
-   the B panel 16 KB, so the B panel stays in the 32 KB L1 cache. A larger KC
-   was about 10 percent slower. The AVX-512 block sizes are 256, 128, and 128.
-   A long prompt is cut into blocks of 256 tokens. The GEMM is then always in
-   its fast range. A test of the large matrices at 1024 tokens gave 1.4 times
-   to 2.4 times more speed. Set the block size with NP_GEMMA_PREFILL_CHUNK.
+
+The multi-level GEMM is 1.26 times faster at 128 tokens. It is 1.32 times
+faster at 256 and 512 tokens than the K-vectorized tile on AVX-512. The code
+uses it at 128 tokens or more on AVX-512 and at 64 tokens or more on AVX2. A
+shorter prompt keeps the K-vectorized tile. Use cops.set_gemm_ml(False) for a
+test and cops.set_gemm_kv(False) for the older token-vectorized tile.
+
+The AVX2 block sizes are ML_KC 64, ML_MC 64, and ML_NC 64. A KC of 64 makes
+the B panel 16 KB, so the B panel stays in the 32 KB L1 cache.
+
+A larger KC was about 10 percent slower. The AVX-512 block sizes are 256, 128,
+and 128. A long prompt is cut into blocks of 256 tokens. The GEMM is then
+always in its fast range. A test of the large matrices at 1024 tokens gave 1.4
+times to 2.4 times more speed. Set the block size with NP_GEMMA_PREFILL_CHUNK.
 
    Speed for one prompt matrix, best of three runs, GFLOP/s at 256 tokens:
 
@@ -255,10 +322,11 @@ small error. The test below shows no difference in the generated token ids.
 
 The C file also gives an integer int8 kernel. The integer kernel quantizes the
 activations to int8 as well as the weights. Then it uses integer multiply and
-add. The integer kernel is faster for one matrix. The activation quantization
-causes a larger error. A test gave 29 of 48 tokens equal to the reference. The
-integer kernel is not the default. Set the environment variable
-NP_GEMMA_INT8_INT=1 to select it.
+add. The integer kernel is faster for one matrix.
+
+The activation quantization causes a larger error. A test gave 29 of 48 tokens
+equal to the reference. The integer kernel is not the default. Set the
+environment variable NP_GEMMA_INT8_INT=1 to select it.
 
 ## 4-bit weights
 
@@ -314,9 +382,11 @@ memory is more than the 5.6 GB of the packed weights. The measured memory is
 The packed order in the file is different from the order in the C kernel. The
 function ops.convert_w4a16 changes the order. In the file, byte i of the int32
 holds column 2i in the low nibble and column 2i + 1 in the high nibble. The
-value is nibble - 8. The function writes 32 bytes for each block of 32 values.
-Byte j holds value j in the low nibble and value j + 16 in the high nibble.
-The function also converts the scales to float32.
+value is nibble - 8.
+
+The function writes 32 bytes for each block of 32 values. Byte j holds value j
+in the low nibble and value j + 16 in the high nibble. The function also
+converts the scales to float32.
 
 Use this command to run the w4a16 checkpoint in the int4 mode:
 
@@ -333,8 +403,8 @@ The int8 loop was tested with three changes:
     eight scalar accumulators                 slower
 
 The compiler loop with "#pragma omp simd" was faster than all three. The
-hardware prefetcher already reads a sequential stream. A manual loop stops the
-compiler from vectorizing the code.
+hardware prefetcher already reads a sequential stream. A manual loop prevents
+the vectorization of the code.
 
 The one change that did help was the AVX-512 baseline library. It changed the
 int8 loop from 19.7 GB/s to 27.8 GB/s.
@@ -398,13 +468,14 @@ The float weight panel removes the int8 convert. But it reads one row block at
 a time. The x data is then read again for each row block. The result was 0.41
 times the speed for mlp.down_proj at 256 tokens. The default is off.
 
-The token-vectorized tile reads the weights only 8 times at 256 tokens. But its
-weight convert costs more. A packed weight layout was built to give both. The
-pack puts the 16 weights of one column next to each other. One instruction
-then converts all 16 values. But the pack belongs to one row block, and the x
-data is read again for each row block. The result was 0.40 times the speed for
-mlp.down_proj at 256 tokens. The default is off. Use cops.set_gemm_packed for
-a test.
+The token-vectorized tile reads the weights only 8 times at 256 tokens. But
+its weight convert costs more. A packed weight layout was built to give both.
+The pack puts the 16 weights of one column next to each other. One instruction
+then converts all 16 values.
+
+But the pack belongs to one row block, and the x data is read again for each
+row block. The result was 0.40 times the speed for mlp.down_proj at 256
+tokens. The default is off. Use cops.set_gemm_packed for a test.
 
 A packed copy of all the weights with square blocks of 16 rows and 16 columns
 was tested last. One block is 256 bytes and fills four cache lines. The result
@@ -445,9 +516,11 @@ the cache win. The default is off. Use cops.set_gemm_kc for a test.
 
 The int8 mode is memory bound in the full model. The script profile_int8.py
 gives the bytes and the bandwidth of each matrix. One matrix gives 40 GB/s to
-46 GB/s. A single pass over all the matrices gives 42 GB/s. A plain read of one
-large array gives 41 GB/s to 43 GB/s with six threads. Thus the kernel works at
-the memory speed of the machine. There is no bandwidth gap to close.
+46 GB/s. A single pass over all the matrices gives 42 GB/s.
+
+A plain read of one large array gives 41 GB/s to 43 GB/s with six threads.
+Thus the kernel works at the memory speed of the machine. No bandwidth gap is
+left to close.
 
 The machine had a heavy load from other users during some tests. The same code
 then gave 17 GB/s to 24 GB/s. Measure again when the load is small. The command
@@ -491,6 +564,143 @@ group mode. Use quantize_int8(w, group) with a smaller group for a smaller
 error. A small group makes the multiply slower. A group of 32 columns makes a
 long chain of additions. For this reason, the per-row scale is the default.
 
+## Flash attention
+
+The plain attention path builds the whole score matrix for one chunk. The
+shape is (kv heads, tokens, heads per group, keys). At a long context that
+matrix is large. At 8192 keys one global layer holds about 134 MB of scores,
+and the softmax reads and writes it a second time. The path also computes the
+scores that the causal mask hides.
+
+The flash kernel keeps the scores of one row block and one key block at a
+time. It reads only the keys that the block can see, so a sliding layer reads
+the window and not the whole context. It holds the key transposed. Thus the
+score of a row over a block of keys is a vector over the keys, and it needs no
+horizontal sum. The value stays in the natural layout. The online softmax
+keeps a running maximum, a running sum, and the running weighted sum.
+
+The kernel has three versions:
+
+    version   key width   note
+    c         scalar      The reference. Slow. Use it to check the other two.
+    avx2      8 keys      The fallback for a CPU without AVX-512.
+    avx512    16 keys     The default when the build gives AVX-512.
+
+Set the version with NP_GEMMA_ATTN_IMPL=c, avx2, or avx512. Leave it unset to
+take the best version that the build gives. Set NP_GEMMA_FLASH=1 to use the
+kernel. Set NP_GEMMA_FLASH=ref for the NumPy reference. Leave it at 0 for the
+batched matmul path.
+
+Check the kernel against the NumPy reference:
+
+    PYTHONPATH=. python scripts/check_flash_c.py
+
+Measure the kernel alone. The batched matmul path uses OpenBLAS, and the model
+gives OpenBLAS eight threads, so the table uses eight BLAS threads:
+
+    shape                        batched   avx512
+    256x1024 global  hd=512         29 ms     37 ms
+    256x1024 sliding hd=256         14 ms     12 ms
+    256x8192 global  hd=512        160 ms    279 ms
+    256x8192 sliding hd=256         18 ms     20 ms
+
+The sliding layers win, because the window caps the work. The global layers
+lose, because OpenBLAS tiles the score matrix better than a register tile of
+eight rows. On the full model the two effects nearly cancel. A 2048 token
+prompt took 30.8 s with the batched path and 27.2 s with the kernel. A 4096
+token prompt took 60.1 s and 58.3 s.
+
+The greedy tokens were equal. The kernel allocates no score matrix, so it fits
+a very long context better.
+
+## Key and value cache
+
+The cache holds one key tensor and one value tensor for each layer, and it grows
+with the sequence. A sliding layer never reads past its window, so its buffer
+does not need to grow:
+
+    layer type   rows kept                          at 16384 tokens
+    sliding      2 * window + one prompt block      2303
+    global       the whole sequence                 16384
+
+A query at position p sees back to p - window + 1. The first query of a new
+block therefore sees back to start_pos - window + 1, and the code drops every
+row older than that. The drop is safe, because the window mask hides those rows
+for every query of the block. The code used to compact only for a decode step,
+so a prompt pass grew a sliding buffer to the full sequence.
+
+Measured cache size. The server runs the float32 cache by default:
+
+    tokens    float32   with the int8 copy   sliding rows
+    2048       0.92 GB   1.18 GB              2048
+    4096       1.11 GB   1.42 GB              1535
+    8192       1.28 GB   1.64 GB              1791
+    16384      1.62 GB   2.07 GB              2303
+
+The total now grows only with the five global layers. Before the change a
+sliding layer held one row per token. At 16384 tokens the 25 sliding layers
+alone held 25 * 16384 * 16 KB, or about 6.7 GB. The whole cache was about 7.4
+GB, against 1.62 GB now.
+
+The cache also held an int8 copy of every key and value for the fused
+attention. The float32 path never reads that copy. The code now builds it only
+when NP_GEMMA_ATTN is 1. Then the default float mode does not spend the memory
+or the quantization time. That copy is the difference between the two columns.
+
+Check the bound and the output:
+
+    PYTHONPATH=. python scripts/check_kv_window.py 2048 4096 8192 16384
+
+## Prefill experiments
+
+Four ways to make the prompt pass cheaper were tried. Three change how the
+machine works; the fourth removes work. The measurements use a 4096 token prompt
+unless the text says otherwise.
+
+**Layer-major schedule.** The code normally runs every layer for one block,
+then the next block. A layer-major pass runs one layer for the whole prompt,
+then the next layer. Thus the model loads a layer one time, and every expert
+sees the whole prompt.
+
+At the same block of 256 tokens it was 58.6 s against 61.0 s, a gain of 4
+percent. A block of the whole prompt was 65.7 s, which is 12 percent slower,
+because the working set no longer fits the cache. Use
+Model.prefill_layer_major.
+
+**Weight prefetch.** The int8 tile asks the prefetcher for the next group of
+weights and activations. It is slower: 0.87 to 1.00 of the speed without it. The
+prefetch instructions cost more than the stall they hide. Use
+cops.set_int4_prefetch(1).
+
+**Wider token block.** The wide tile reads 32 tokens for one weight decode
+instead of 16. The result is the same to the last bit and it is 0.57 to 0.80
+of the speed of the 16 token block. The row block falls from 8 to 4 to make
+room in the registers. Then each activation load and each weight broadcast
+serves half the rows. Use ops.linear_int4_q8_wide.
+
+A test of the VNNI instruction says the tile spends more time on the
+instructions that do not multiply than on the multiply itself. That result
+suggested the wider block. The wider block then lost, so the instruction count
+is not the whole story: the register pressure and the smaller row block cost
+more.
+
+**Prefix reuse.** A conversation sends the whole history again on each turn. The
+session cache keeps the keys and values of the shared prefix, so a later turn
+reads only the new tokens. Measured on a 3776 token conversation:
+
+    turn   prompt   prefill
+    1      3776     59.19 s
+    2      3796      1.17 s
+    3      3816      1.20 s
+    4      3836      1.08 s
+
+Four turns cost 62.7 s against about 237 s for four cold prompt passes, so the
+reuse saves 74 percent. That is larger than every kernel change in this file put
+together, and it is the reason the server keeps a session.
+
+Measure the four with scripts/bench_prefill_schedule.py, scripts/bench_tile.py,
+and scripts/bench_prefix.py.
+
 ## Weight cache
 
 The int8 conversion reads the full model and quantizes six billion parameters.
@@ -511,9 +721,11 @@ network mount. Set the variable NP_GEMMA_CACHE to use a different directory.
 Set the variable NP_GEMMA_CACHE_RAM=1 to copy the cache into one block of
 anonymous memory. The block starts at a 2 MiB boundary. The system then gives
 2 MiB pages. One large page covers 512 small pages. Thus the read needs fewer
-TLB entries. The copy gave 1.09 times to 1.24 times more speed in a test. The
-copy uses the same memory as the file page cache. The count is larger for a
-short time during the load. The default is the memory map.
+TLB entries.
+
+The copy gave 1.09 times to 1.24 times more speed in a test. The copy uses the
+same memory as the file page cache. The count is larger for a short time
+during the load. The default is the memory map.
 
 Measure the two caches with this command:
 
@@ -550,6 +762,610 @@ The file gen_ids.py writes greedy token ids. Compare the ids with the HF file
 
     PYTHONPATH=. $PY scripts/gen_ids.py --snapshot "$SNAP" --dtype bf16         --prompts "Count from 1 to 10." --max-new-tokens 24 --out ids.json
 
+## Gemma 4 E4B
+
+`google/gemma-4-E4B-it-qat-mobile-ct` is the 4.5B "effective" dense model. It
+is a different runtime from the 12B, so it has its own module and its own
+scripts. The new idea in this model is Per-Layer Embeddings (PLE). Every
+decoder layer gets its own small embedding for each token. The layer adds it
+to the residual stream as a second signal.
+
+Two published files of this model work with this runtime:
+
+    file                                 form          size
+    gemma-4-E4B-it-qat-mobile-ct         SafeTensors   3.73 GB
+    gemma-4-E4B-it-qat-q4_0-gguf         GGUF Q4_0     5.15 GB
+
+The first file is the compressed-tensors "pack-quantized" form. It is not the
+w4a16 form. One file holds four kinds of weight:
+
+    weight                     bits  strategy
+    the token embedding
+      and the output head        2   one scale for each row
+    the per-layer table          2   one scale for each group of 256
+    the decoder projections      4   one scale for each row
+    the per-layer gates          8   one scale for each row
+
+`np_gemma/ct.py` reads that form straight from the memory map. It infers the
+bit width from the packed shape and the logical shape, so it does not need the
+quantization section of the configuration file. `scripts/check_ct.py` shows
+that the decode matches the `compressed_tensors` library exactly, for all four
+kinds, and that `row()` agrees with the whole-matrix decode.
+
+### The architecture
+
+    layers                      42
+    global attention layers     5, 11, 17, 23, 29, 35, 41
+    sliding window              512
+    head size                   256 in a sliding layer, 512 in a global layer
+    query heads                 8
+    key and value heads         2
+    key and value sharing       the last 18 layers reuse layers 22 and 23
+    attention scale             1.0; the query norm already gives unit RMS
+    query and key norm          yes, with a scale
+    value norm                  yes, without a scale
+    per-layer width             256
+    vocabulary                  262144
+    logit soft cap              30
+    tied output head            no
+
+Three details differ from the 12B model:
+
+1.  The head size changes with the layer. The reference calls this
+    `per_layer_config`. A sliding layer uses 256 and a global layer uses 512.
+2.  The last 18 layers have no `k_proj`, no `v_proj`, and no `k_norm`. They
+    reuse the key and the value that layer 22 (sliding) or layer 23 (global)
+    stored. The file still holds a `k_proj` and a `v_proj` for those layers.
+    They are unused and this runtime does not read them.
+3.  `attention_k_eq_v` is false, so the key and the value stay separate in
+    every layer. The 12B model reuses the key as the value in a global layer.
+
+Two constants are rounded to bfloat16 before use, because the reference casts
+them to the weight dtype. The embedding scale `sqrt(2560)` becomes 50.5. The
+per-layer input scale `2**-0.5` becomes 0.70703125. Without that rounding the
+output drifts.
+
+The model also differs in its chat template. When thinking is off, the 12B
+starts the answer with an empty `<|channel>thought\n<channel|>` block. The E2B
+and E4B models do not. `render_chat` and `apply_chat_template` take the
+argument `empty_thought_block` for this; pass False for E4B.
+
+### Run it
+
+Copy the checkpoint to the local disk first. The HuggingFace cache of this
+project lives on an sshfs mount. The int4 mode reads the weights on every
+token, so the storage under the file sets the speed. Copy the files, not the
+symlinks:
+
+    mkdir -p ~/.cache/e4b-mobile-ct
+    cp -L <the snapshot>/* ~/.cache/e4b-mobile-ct/
+
+Set the paths:
+
+    cd numpy-gemma
+    PY=../gemma4-12b-qat-pytorch/.venv/bin/python
+    SNAP4B=~/.cache/e4b-mobile-ct
+
+Show the tensor layout of the file. This step reads the header only:
+
+    PYTHONPATH=. $PY scripts/e4b_inspect.py "$SNAP4B/model.safetensors" --layer 0 --layer 24 --prefixes
+
+Generate text in the int4 mode. This mode reads every packed weight on each
+token. Thus set the BLAS thread count to one. With more than one thread the
+BLAS pool fights the OpenMP regions of the kernel, and the run is about eight
+times slower. The script warns when the setting is wrong.
+
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=6 OMP_WAIT_POLICY=ACTIVE \
+        PYTHONPATH=. $PY scripts/e4b_generate.py --snapshot "$SNAP4B" \
+        --mode int4 --prompt "The capital of France is" --max-new-tokens 8
+
+The Python interface is small:
+
+    from np_gemma.ct import CompressedTensors
+    from np_gemma.e4b import E4B, E4BConfig, E4BCache
+
+    ct = CompressedTensors(snapshot + "/model.safetensors")
+    cfg = E4BConfig.load(snapshot + "/config.json")
+    model = E4B(ct, cfg, mode="int4")
+    cache = E4BCache(cfg)
+    hidden = model.forward(prompt_ids, cache=cache, start_pos=0)
+    print(model.generate(prompt_ids, max_new_tokens=8))
+
+The mode chooses how the weights are kept:
+
+    mode      what the memory holds                     one token reads
+    f32       every weight as float32, about 15 GB      18.6 GB
+    stream    one layer                                 2.2 GB of packed words, decoded every time
+    int4      the packed 4-bit and 2-bit words, 2.2 GB   2.2 GB of packed words, decoded by the kernel
+
+The mode "int4" is the one to use. The lines below give the numbers.
+
+The same runtime reads the Q4_0 GGUF file of this model. Put the file on the
+local disk and set the path:
+
+    GGUF4B=~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf
+
+The GGUF file holds Q4_0 weights, Q6_K embedding tables, and one F16 matrix.
+The block layout of Q4_0 is the layout that the int4 kernel of the 12B model
+already takes. Thus the mode "int4" needs no new kernel. The class `E4B` takes
+either source and selects the kernel from it. The check compares the GGUF run
+with a HuggingFace reference:
+
+    PYTHONPATH=. $PY scripts/check_e4b_gguf.py --gguf "$GGUF4B" \
+        --config-snapshot "$SNAP4B"
+
+The config snapshot gives the dimensions and the tokenizer. The weights come
+from the GGUF file.
+
+### The int4 kernel
+
+The checkpoint packs a weight row into int32 words. Element k of a row starts
+at bit k * bits from the start of the row. The value carries a bias of 2 **
+(bits - 1). One float32 scale covers the whole row, because these matrices use
+the "channel" strategy:
+
+    out[t][r] = scale[r] * sum over k of x[t][k] * q[r][k]
+
+`gemma_ct_linear` in `np_gemma/csrc/bf16_linear.c` reads those words where the
+file put them. It unpacks them in the registers, converts to float32, and uses
+a fused multiply and add. It never writes a float32 copy of a weight, and it
+never builds a second copy of the file. So the layout of the file is the
+layout of the runtime, which is what makes the memory map enough.
+
+The kernel has an AVX-512 version, an AVX2 version, and a plain C version, in
+the same shape as the other kernels in that file. A 4-bit row takes two words
+for each 16 values. A 2-bit row takes one word. Both fill a 512-bit register
+with one fused multiply and add.
+
+`scripts/check_ct_kernel.py` checks the kernel against the decoded weights. It
+gives the kernel the one-hot vector e_k. The kernel then returns one column of
+the matrix. The script does that for every column of a group of rows. Thus the
+check tests every bit position of the row. The 4-bit and the 2-bit forms both
+agree exactly.
+
+A block of random tokens agrees to 1e-6 relative. The difference is the
+float32 rounding. The kernel applies the scale after the sum, and the NumPy
+path applies it to each group.
+
+Two notes:
+
+*   The kernel takes a channel scale, one value for each row. The per-layer
+    embedding table uses a group scale of 256, and the two per-layer
+    projections use 8 bits, so those three keep the decoded path. They are
+    small: the 8-bit pairs are 55 M parameters against 4.56 G for the packed
+    matrices.
+*   `OPENBLAS_NUM_THREADS=1` matters. The model makes about 300 kernel calls
+    for each layer pass, and each one opens an OpenMP region. A BLAS pool with
+    six threads fights those regions: the measured decode is 2.5 s a token
+    against 0.33 s. This is the same effect the section "Start here" notes for
+    the int8 kernel of the 12B model.
+
+### The Q4_0 GGUF source
+
+`np_gemma/gguf.py` reads the GGUF file with NumPy only. It maps the names of
+the Gemma 4 blocks onto the names of this runtime. The per-layer embeddings
+need these mappings:
+
+    GGUF name                       runtime name
+    blk.N.inp_gate.weight           layers.N.per_layer_input_gate.weight
+    blk.N.proj.weight               layers.N.per_layer_projection.weight
+    blk.N.post_norm.weight          layers.N.post_per_layer_input_norm.weight
+    per_layer_model_proj.weight     per_layer_model_projection.weight
+    per_layer_proj_norm.weight      per_layer_projection_norm.weight
+    per_layer_token_embd.weight     embed_tokens_per_layer.weight
+
+The GGUF file has no output head. The token embedding is the output head,
+because the two matrices hold the same values. The mobile-ct file proves that
+point: its `lm_head` weight and its `embed_tokens` weight are equal bit for
+bit. Thus the GGUF runtime reads the token embedding table for the head.
+
+Three tensors differ from the mobile-ct file:
+
+    tensor                        GGUF                   mobile-ct
+    the token embedding           Q6_K                   2 bit, row scale
+    the per-layer table           Q6_K                   2 bit, group scale of 256
+    the per-layer model map       F16                    4 bit, row scale
+
+The Q6_K tables are more accurate than the 2-bit tables, but they are larger.
+One token reads 2824.8 MB from the GGUF file against 2443.2 MB from the
+mobile-ct file. The output head alone is 550.5 MB against 167.8 MB. The GGUF
+file keeps the token embedding in Q6_K, which is the common choice for a Q4_0
+file. The head is the largest single cost of the decode.
+
+The int4 kernel takes the Q4_0 blocks in place. `GGUF.int4_packed` returns a
+view of the file map, so the mode "int4" copies no weight. `GGUF.tensor_bytes`
+gives the stored size of one tensor without a read of the data;
+`scripts/profile_e4b_gguf.py` uses it for the byte table of a decode step.
+
+### Check it against the reference
+
+The check script compares the E4B file against a HuggingFace reference in two
+steps. Thus the two models never hold memory at the same time:
+
+    PYTHONPATH=. $PY scripts/e4b_trace.py hf --snapshot "$SNAP4B" \
+        --prompt "The capital of France is" --out .cache/hf_e4b.npz
+    PYTHONPATH=. OMP_NUM_THREADS=6 $PY scripts/e4b_trace.py np --snapshot "$SNAP4B" \
+        --trace .cache/hf_e4b.npz
+
+The first step writes the hidden state after each of the 42 layers, the
+per-layer embeddings, and the logits. The second step prints the largest
+difference at each layer.
+
+One warning about the reference.
+`Gemma4ForConditionalGeneration.from_pretrained` does not work for this
+checkpoint in transformers 5.17. The compressed-tensors loader keeps
+`weight_packed` and `weight_scale` as parameters, and it removes `weight`.
+Then the shared `_init_weights` asks for `module.weight`, so the load stops.
+If the call is patched to continue, the load finishes but the model returns
+zeros. The dequantize step never runs for those modules.
+
+The check script therefore builds a plain `Gemma4TextModel`. That class has no
+quantized modules. The script fills it from `np_gemma.ct`. Thus the reference
+is the forward pass of HuggingFace itself. That is the purpose of the check.
+
+### Does the memory map make sense?
+
+`scripts/bench_e4b_mmap.py` answers the question. The answer depends on where
+the file lives, so the script reports the mount as well.
+
+Measured on this machine. The benchmark ran on the local copy in
+~/.cache/e4b-mobile-ct, with OPENBLAS_NUM_THREADS=1, OMP_NUM_THREADS=6, and
+OMP_WAIT_POLICY=ACTIVE.
+
+    file                                          3.734 GB
+      the two embedding tables                    0.872 GB   read by row
+      the matrices and norms                      2.224 GB   read in full per token
+    the same weights as float32                  32.536 GB
+
+    local ext4, /dev/nvme0n1p2
+      first read of the text model                 0.50 s     6.17 GB/s
+      second read                                  0.50 s     6.26 GB/s
+      the per-token weights, second read           0.35 s     6.28 GB/s
+      memory map, one touch for each 4 KiB page    0.17 s     4.5 M pages/s
+
+    sshfs, the HuggingFace cache inside the project
+      first read of the text model                29.5 s      0.10 GB/s
+      second read, same file handle                0.53 s     5.80 GB/s
+      the per-token weights, second read           0.38 s     5.90 GB/s
+
+    decode the per-token weights with NumPy        21.6 s    18.58 GB of float32
+
+    mode      prefill s/token   decode s/token   private memory
+    f32                 0.834             1.75    15.0 GB
+    stream              0.628            20.35     1.6 GB
+    int4                0.126             0.26     0.44 GB
+
+The decode figure is the steady state, from the second token on. The first
+decode step of the f32 mode also loads the output head. That matrix is 2.68 GB
+as float32 and 168 MB packed. Thus the mean of the first four steps is 2.80 s
+in that mode. The output head is the largest single matrix in the model.
+
+The conclusions:
+
+*   **Copy the file to the local disk.** The project cache is on an sshfs
+    mount to jackal.local. That mount reads at 0.10 GB/s, so a mode that reads
+    the weights on each token cannot work there. The local ext4 disk reads the
+    same file at 6.2 GB/s, sixty times faster, and it also holds the page
+    cache. The int4 mode went from 2.57 s a token on
+    sshfs to 0.26 s on the local copy. The storage causes most of that
+    difference.
+
+*   **The map is fine for a row.** A token reads 640 bytes of the token
+    embedding, 2688 bytes of the per-layer table, and 86 bytes of scales. The
+    map reads 3.4 KiB for a token. A model that reads the tables whole reads
+    2.2 GB. This is the strongest argument for the map, and it is the reason
+    the two tables stay in the file in every mode.
+
+*   **The map is not a way to avoid the projections.** The model reads every
+    decoder projection once for each token. The stream mode therefore decodes
+    18.58 GB of float32 again for each token. That is 21.6 s of NumPy work, and
+    the mode measures 20.35 s a token. A memory map does not remove that work.
+    It only moves where the source bytes live.
+
+*   **The float32 copy was the real problem.** The f32 mode holds 15.0 GB of
+    private memory and reads 18.58 GB for each token. The packed 4-bit and
+    2-bit matrices are 2.113 GB, and the int4 kernel reads them in place. That
+    is 8.8 times fewer bytes for each token. The decode takes 6.7 times less
+    time and the prefill 6.6 times less. The mode needs 34 times less private
+    memory.
+
+*   **The kernel is not the limit, and neither is the storage.** The int4
+    mode reads the per-token weights at 10.5 GB/s on nosey. The same kernel in
+    one tight loop reads at 27.3 GB/s, which is 73 per cent of the machine
+    rate. On jackal the same loop reads at 46.2 GB/s, which is 77 per cent of
+    the machine rate. See the next section for the rest of the time.
+
+### Why the decode is slower than the memory rate
+
+One token reads 2443.2 MB from the mobile-ct file and 2824.8 MB from the GGUF
+file. The floor for one token is the byte count divided by the read rate of
+the machine. Two machines give these numbers:
+
+    machine          cores   read rate   decode    floor   ratio
+    nosey, W-2133        6   37.6 GB/s   0.26 s   0.065 s   4.0
+    jackal, W-2295      18   59.8 GB/s   0.10 s   0.047 s   2.1
+
+`scripts/profile_e4b.py` measures the mobile-ct file.
+`scripts/profile_e4b_gguf.py` measures the GGUF file. Each script splits one
+decode step into the matrix kernels, the output head, and everything else.
+
+The GGUF file on jackal, 18 threads, ten steps:
+
+    step                0.0862 s   median
+      the kernels       0.0566 s   66 per cent
+      the output head   0.0121 s   14 per cent
+      everything else   0.0174 s   20 per cent
+
+The table gives the mean of the ten steps:
+
+    group                           calls      MB   seconds    GB/s
+    mlp gate, up, and down            126  1857.9    0.0411   45.20
+    output head (Q6_K)                  1   550.5    0.0111   49.57
+    attention q and o                  84   289.0    0.0091   31.76
+    per-layer projection and gate      84    31.0    0.0061    5.08
+    per-layer model projection           1    55.1    0.0009   61.90
+    attention k and v                  48    41.3    0.0014   29.49
+    TOTAL                             344  2824.8    0.0698   40.47
+
+The call column counts the matrices. The fused kernel runs two or three of
+them in one call, so the model makes 254 calls for one token.
+
+The floor for these bytes at 59.8 GB/s is 0.0472 s. The kernels are 1.5 times
+the floor. The same measurement for the mobile-ct file on nosey, six threads,
+gives 2443.2 MB in 0.2439 s. The rate is 10.02 GB/s, which is 3.8 times the
+floor. The bfloat16 copy of the per-layer model projection takes that call
+from 7.7 ms to 1.2 ms on the same machine.
+
+The machine varies by about 8 per cent between two runs of the same command.
+Treat a single step value as a guide and not as a measurement.
+
+Two changes took the step from 0.1055 s to 0.0965 s. The measurement
+interleaves the settings, and each value is the mean of two runs:
+
+    change                            step      kernel
+    the start                       0.1055 s   0.0677 s
+    a bfloat16 copy of the
+      per-layer model projection    0.1017 s   0.0622 s
+    one call for the query, the
+      key, and the value            0.1044 s   0.0665 s
+    both                            0.0965 s   0.0598 s
+
+The attention change of the section "The prompt pass" also helps the decode.
+It removes the `np.repeat` and the NumPy softmax from every layer. The effect
+is small at a short context, and large at a long one.
+
+#### Three ideas that the profile rules out
+
+**The pause between kernel calls is not the cost.** The model runs work
+between two kernel calls that the OpenMP pool does not join. A test walks 16
+matrices of 14.7 MB, which is more than the cache of the machine. A pause of
+0.05 ms before a call costs 1.01 times, and a pause of 1 ms costs 1.10 times.
+
+A second test puts a norm and an attention product between the calls. That
+costs 1.00 times. So a fused call for the whole layer saves almost nothing.
+
+**The storage is not the cost.** The packed words come from the file mapping.
+A copy of the same words in ordinary memory with large pages gives 14.32 GB/s
+against 14.01 GB/s for the mapping. That is 1.02 times.
+
+#### What the cost is
+
+**The inner loop is the cost.** One thread reads plain memory at 13.4 GB/s.
+One thread reads a packed 4-bit matrix at about 4.9 GB/s. So the unpack and
+the conversion cost about 2.7 times more than the read alone. The 16 matrices
+of the tight loop give 46.2 GB/s on jackal, which is 77 per cent of the machine
+rate. Each group of 16 values costs about ten instructions: load the word,
+take the two nibbles, convert to float32, and multiply and add.
+
+**A short run for each thread is also a cost.** The small matrices lose the
+most. On jackal the feed-forward matrices reach 42.6 GB/s inside the model,
+against 46.2 GB/s in the tight loop. The per-layer projection is 0.37 MB for
+each layer and reaches 3.5 GB/s. The kernel opens an OpenMP region for each
+call, and 0.37 MB does not pay for that region.
+
+**The tanh of the GELU was the largest cost outside the kernels.** The old
+`gemma_gelu` called the scalar `tanhf` function of the C library for each
+value, at about 20 ns for each value. The E4B model needs 440000 values for
+each token, so the function cost 17.2 ms of a 125 ms token. The new kernel
+uses an AVX-512 form of tanh with a degree-6 polynomial, and the cost falls
+to 1.5 ms. The decode went from 0.120 s to about 0.10 s. This change helps
+every model in this project.
+
+`scripts/check_gelu.py` measures the error against float64. The error is the
+same as the error of the scalar function.
+
+**The per-layer model projection was the largest single cost.** The matrix is
+F16 in the GGUF file and BF16 in the mobile-ct file, and 55 MB in both. The
+mode "int4" kept a float32 copy, and the multiplication used one BLAS thread
+because the kernel needs `OPENBLAS_NUM_THREADS=1`. The rate was 6.5 GB/s, at
+8.4 ms for each token. The model now keeps a bfloat16 copy and uses
+`cops.linear_bf16`. The rate is 58 to 62 GB/s, at 0.9 ms.
+
+The change gives 7.5 ms, which is the largest single gain of this decode. A
+small weight keeps the float32 path, because the start of the kernel costs
+more than the read.
+
+**One kernel call can run several matrices.** The query, the key, and the
+value projection share the input row of the attention block. The gate and the
+up projection share the input row of the feed-forward block. One call with
+`gemma_int4_multi4` runs each group, so the model opens 254 OpenMP regions for
+a token in place of 344. That change gives 1.1 ms alone and 3.3 ms together
+with the bfloat16 change.
+
+**VNNI gives 10 to 14 per cent on the prefill.** The int8 tile of the 12B
+model uses `vpdpbusd` when the CPU gives AVX-512 VNNI. A CPU without VNNI uses
+an emulation with `maddubs`. The measured E4B prefill on jackal, 18 threads:
+
+    tokens   VNNI      no VNNI   ratio
+         14   0.331 s   0.377 s   1.14
+         64   1.480 s   1.647 s   1.11
+        256  10.696 s  11.811 s   1.10
+
+The int8 tile also beats the float tile, by 1.2 to 1.4 times at 18 threads.
+For one token the int8 tile is slower, because the token lanes stay empty.
+
+### The prompt pass
+
+A prompt pass reads the same 2825 MB of weights one time, but it uses each
+weight for every token. Thus the prompt pass is compute bound. The useful
+measure is the number of arithmetic operations for each second.
+
+`scripts/profile_e4b_prefill.py` splits one prompt pass. The measurement is on
+jackal with 18 threads, after a warm-up:
+
+    tokens     before      after    GFLOP/s
+        14    0.336 s    0.266 s       516
+        64    1.376 s    0.767 s       818
+       256   10.493 s    2.920 s       859
+       512   35.217 s    6.646 s       755
+      1024        --    14.489 s       692
+
+The column "before" is the state at the start of this measurement. The matrix
+kernels were 23 per cent of a 256-token pass, and the glue was 73 per cent.
+The two attention products alone were 6.64 s of 9.92 s.
+
+#### The attention product did not reach the BLAS library
+
+`np.einsum("thd,shd->hts", q, kk)` ran at 4.8 GFLOP/s. The index order does
+not let NumPy use a matrix multiply, so the call used the slow NumPy loop. The
+same product with `np.matmul` runs at 86 GFLOP/s, which is 18 times faster.
+The 12B model already used `np.matmul` for this reason.
+
+The code now uses the batched matrix multiply of the 12B model. That form also
+removes the `np.repeat` of the key and the value. It replaces the NumPy mask
+and the NumPy softmax with one C call to `ops.softmax_mask`. A prompt of 256
+tokens then took 3.86 s in place of 10.51 s.
+
+#### The C flash kernel for the prompt
+
+`NP_GEMMA_FLASH=1` sends a prompt of more than one token to the C flash kernel.
+That kernel walks only the keys that the mask leaves visible, and it uses the
+OpenMP pool in place of one BLAS thread. E4B measures the kernel ahead at
+every prompt length. The default for E4B is 1, and the 12B model keeps its own
+default of 0.
+
+    tokens   matmul    flash   ratio
+        14   0.274 s  0.283 s   0.97
+        64   0.763 s  0.755 s   1.01
+       256   3.235 s  2.860 s   1.13
+       512   7.590 s  6.646 s   1.14
+      1024  18.014 s 14.489 s   1.24
+
+Each value is the mean of two runs, and the two settings run in turn. The
+tokens agree at every length. The logits of the two paths have cosine 0.9996
+at 256 tokens and 0.9967 at 1024.
+
+The C kernel also agrees with the HuggingFace reference a little better than
+the matmul path does. The cosine at layer 41 is 0.9996 for the kernel and
+0.9994 for the matmul.
+
+#### What is left
+
+After the changes, a prompt of 256 tokens takes 2.89 s:
+
+    part                seconds   share
+    matrix kernels       2.32 s   80 per cent
+    the glue             0.20 s    7 per cent
+    the rest             0.37 s   13 per cent
+
+The int8 tile is the cost now, at about 900 GFLOP/s. A sweep of the settings
+shows that the current ones are already the best. The token block of 16 wins
+at 14 tokens, and the float path is 1.8 times slower at 256 tokens.
+
+The remaining items are small. The rope table of a prompt is now made two
+times in place of 42, and that change also helps the decode. The per-layer
+model projection costs 0.11 s for 14 GFLOP.
+
+A sliding layer cannot drop keys inside one prompt block, because the first
+query of the block sees key zero. The code keeps that trim for a decode step
+at a long context. The attention of one such step with 512 keys falls from
+0.151 s to 0.013 s.
+
+### Compare with llama.cpp
+
+llama.cpp is the reference implementation for a quantized GGUF model. The
+comparison uses the same three GGUF files, the same machine, and 18 threads.
+The build is `llama.cpp/build-vnni` with AVX-512 VNNI. The command is:
+
+    llama-bench -m FILE -p 512 -n 128 -r 2
+
+`scripts/bench_gguf_models.py` gives the same two numbers for this runtime:
+
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=18 OMP_WAIT_POLICY=ACTIVE \
+        PYTHONPATH=. $PY scripts/bench_gguf_models.py --gguf FILE \
+        --prompt 512 --gen 128 --reps 2
+
+The two runtimes run in turn, for three rounds. The table gives the mean:
+
+    model              runtime        pp512     tg128
+    gemma-4-12B Q4_0   llama.cpp      44.1 t/s   7.52 t/s
+    gemma-4-12B Q4_0   numpy-gemma    31.2 t/s   5.34 t/s
+    gemma-4-26B Q4_0   llama.cpp      83.1 t/s  18.02 t/s
+    gemma-4-26B Q4_0   numpy-gemma    69.7 t/s  11.68 t/s
+    gemma-4-E4B Q4_0   llama.cpp     107.8 t/s  16.10 t/s
+    gemma-4-E4B Q4_0   numpy-gemma    80.9 t/s  11.20 t/s
+
+    model              pp512   tg128
+    gemma-4-12B        1.41x   1.41x
+    gemma-4-26B        1.19x   1.54x
+    gemma-4-E4B        1.33x   1.44x
+
+Three points follow from the table:
+
+1.  The prompt pass of the 26B model is at parity. The mixture-of-experts
+    prefill of this runtime is competitive with llama.cpp.
+2.  The 12B model has the smallest margin. It is a dense model, so each token
+    reads 6.48 GiB. The rate of llama.cpp is 52 GB/s against a machine rate of
+    59.8 GB/s. This runtime reaches 37 GB/s. Both sit near the limit.
+3.  The decode of the E4B model was the largest gap. The section below closes
+    most of it.
+
+#### The E4B decode at a long context
+
+llama-bench measures the generation after a prompt of 512 tokens, so the
+context is 513 tokens. The context changes the result:
+
+    context     before     after
+      20 tok   0.0862 s   0.0824 s
+     512 tok   0.1308 s   0.0871 s
+
+The profile showed that the work outside the matrix kernels grew by 31 ms at
+the long context. Two measured parts of that growth were the attention
+products (16 ms) and the key and value cache (6 ms).
+
+**The attention product did not use the cache layout.** The batched matmul
+needs a transpose of the key for each layer. At a context of 512 tokens that
+copy costs more than the arithmetic. `gemma_attn_decode_f32` is a new C
+kernel. It runs the scores, the softmax, and the output for one query token in
+one call. It reads the cache in place.
+
+The gain for one layer:
+
+    layer type             head_dim   matmul    fused
+    sliding                     256   274 us   151 us
+    global                      512   673 us   405 us
+
+**The cache copied its whole history.** `E4BCache.append` ran a `concatenate`
+for each layer, which copied 63 MB for each token at a context of 512. The
+cache now makes its buffers one time and writes each new key into its place.
+The two buffers of a layer also keep a stride, so the kernel reads the part in
+use without a copy. A copy of the key and the value for each layer costs
+98 MB for a token at the same context.
+
+**The two orders cost 2.4 times.** A cache of (keys, kv_heads, head_dim) makes
+the hardware prefetch jump over the other head for each key. The cache now
+keeps (kv_heads, keys, head_dim), so the keys of one head follow each other. A
+measurement of the dot product alone gives 69 us for the first order and 29 us
+for the second.
+
+The generation at the context of the benchmark went from 8.52 to 11.20 tokens
+for each second. `NP_GEMMA_ATTN=0` selects the older matmul path for a
+comparison.
+
+The machine also carries a `scripts/serve.py` process for the 26B model from
+an earlier session. It uses about 160 per cent of one core, and two rounds of
+the same measurement differ by 5 to 10 per cent.
+
 ## Test results
 
     Test                                      Result
@@ -569,6 +1385,35 @@ The file gen_ids.py writes greedy token ids. Compare the ids with the HF file
     24 greedy tokens, 2 prompts, int8 + C     48/48 ids equal to HF
     24 greedy tokens, 2 prompts, int4 + C     48/48 ids equal to HF
      (int4 from the w4a16 checkpoint)
+
+    Gemma 4 E4B, the mobile-ct checkpoint
+    Compressed-tensors decode, 4 weight kinds   exact, 7/7 tensors
+    row() and rows() against dequant()          exact, 7/7 tensors
+    Hidden states, all 42 layers                max relative 0.037, no jump
+    Input embedding                             one bfloat16 step
+    Greedy tokens vs the reference              8/8 ids equal
+    Cached decode vs the whole sequence         8/8 ids equal
+    int4 mode, prefill and decode               8/8 ids equal to the reference
+    Packed kernel, every column, 4-bit and 2-bit  exact, 3 matrices
+    Packed kernel, block of 4 tokens            relative 1e-6
+    Tokenizer and chat template vs HF           ids equal
+    First output                               "The capital of France is **Paris**."
+
+    Gemma 4 E4B, the Q4_0 GGUF file
+    Name mapping, config, and tied head         all tensors found
+    Layer 0, position 0                         cosine 0.999968
+    Layer 20                                    cosine 0.999845
+    Layer 41                                    cosine 0.999607
+    Logits                                      cosine 0.999941
+    First greedy token                          reference 818 = ours 818
+    Greedy tokens vs the reference              8/8 ids equal
+    Cached decode vs the whole sequence         8/8 ids equal
+    int8 tile with VNNI, 12 token counts        relative 3.6e-07 or better
+    GELU kernel against float64                 max difference 4.3e-07
+
+The GELU check gives the same error for the AVX-512 build and the AVX2 build.
+98.2 per cent of the values agree bit for bit between the two builds, and the
+largest difference is 2.4e-07.
 
 The f32 mode computes all values as float32. The real model computes most
 values as bfloat16. Thus small differences occur. The cosine value stays above
@@ -638,6 +1483,97 @@ These steps changed the decode time from 1.46 s per token to 1.07 s per token.
 The effective bandwidth changed from 12.4 GB/s to 17.0 GB/s. The machine can
 give about 35 GB/s for a plain read. Thus some bandwidth remains.
 
+## Server
+
+The server gives the OpenAI paths. It uses only the Python standard library.
+
+    PYTHONPATH=. python scripts/serve.py --gguf models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf \
+        --dtype int4 --port 8080 --temperature 0.0
+
+The paths are:
+
+    GET  /v1/models               List the model.
+    GET  /v1/models/{id}          One model.
+    POST /v1/chat/completions     A chat turn. Set stream true for the events.
+    POST /v1/completions          A raw text prompt.
+    GET  /health                  The status.
+
+The server also takes the bare paths with no /v1, because some clients use
+them. The chat path takes the fields that the OpenAI clients send. The fields
+are model, messages, max_tokens, temperature, top_k, top_p, min_p, stop,
+stream, seed, presence_penalty, frequency_penalty, and repetition_penalty. A
+stream uses the server-sent-event format and ends with the data [DONE] line.
+Set stream_options.include_usage to get the token counts in the last event.
+
+The model is not thread safe and shares one key and value cache. Thus the
+server answers one request at a time. The other requests wait.
+
+A client points at http://127.0.0.1:8080/v1 . The model id is the file name of
+the GGUF. Use --thinking to open the thought channel.
+
+The server gives tool calls. Send the OpenAI tools field. The model then answers
+with the field tool_calls and the finish reason tool_calls. Send the result back
+as a message with the role tool and the field tool_call_id. The prompt uses the
+canonical Gemma 4 template in np_gemma/chat_template.jinja. The file gives the
+exact text without a Jinja engine.
+
+The server also splits the thought channel from the answer. With thinking on,
+the reasoning arrives in the field reasoning_content, both in the message and in
+the stream delta. The answer arrives in the field content.
+
+Check the chat template against the Jinja file. The test needs jinja2, which the
+Hugging Face package gives.
+
+    python scripts/check_chat_template.py
+
+Check the server without a model. The script uses a fake backend.
+
+    python scripts/check_server.py
+
+Check it with a model. The script loads the model and asks for the capital of
+France.
+
+    PYTHONPATH=. python scripts/check_server_live.py --gguf PATH --dtype int4
+
+### DeepSeek Harness
+
+Register the server as a provider in the harness settings file. The
+llm-pi-ai.providers dict holds one entry for each route:
+
+    llm-pi-ai:
+      providers:
+        npgemma:
+          displayName: Gemma 4 26B (local)
+          api: openai-completions
+          baseURL: http://jackal.local:8123/v1
+          models:
+            - id: gemma-4-26B_q4_0-it
+              name: Gemma 4 26B Q4_0
+              contextWindow: 8192
+              maxTokens: 4096
+
+Start the server on the machine that holds the weights. Bind every address so
+that the harness can reach it over the network:
+
+    PYTHONPATH=. OMP_NUM_THREADS=18 python scripts/serve.py --gguf PATH --dtype int4 --host 0.0.0.0 --port 8123 --temperature 0.0
+
+Then choose the provider and the model in the harness. No credential is
+needed, because the daemon reads no key. The context window is a choice. The
+model allows 262144, and the key and value cache is float32, so a smaller
+value keeps the cache small.
+
+The harness needs tool calls, a finish reason, and streamed usage. The server
+gives all three. Check the wire path through the harness client library:
+
+    node scripts/check_pi_ai.mjs http://jackal.local:8123/v1
+
+### Sampling
+
+np_gemma/sampling.py gives the Sampler class. A temperature of zero selects the
+most probable token. The other settings are top_k, top_p, min_p, and the three
+penalties. The seed makes a sampled run repeatable. The class keeps the count of
+each token in the history for the penalties.
+
 ## Limits
 
 * The f32 mode needs about 70 GB of memory. Use the int8 mode when memory is
@@ -665,7 +1601,7 @@ give about 35 GB/s for a plain read. Thus some bandwidth remains.
    to 335 GFLOP/s for int8 at 256 tokens. AVX-512 reached 453 to 475 GFLOP/s.
    The measured pure FMA value is 602 to 676 GFLOP/s with six threads. The AVX2
    peak is about half of the AVX-512 peak, so the AVX2 kernel is near its share
-   of the limit. A wider micro tile or a packed B panel may give a small gain.
+   of the limit. A wider micro tile or a packed B panel can give a small gain.
 3. The int4 path now has a prompt GEMM on both targets. AVX2 reached 308 to 337
    GFLOP/s at 256 tokens. AVX-512 reached 446 to 483 GFLOP/s. The GEMM decodes
    one row block to a float32 A panel and reuses the panel for every token
@@ -675,10 +1611,23 @@ give about 35 GB/s for a plain read. Thus some bandwidth remains.
    for the activations as well as the weights.
 5. Add bf16 rounding after each operation. Then the float32 mode follows the
    reference more closely.
-5. Port the model to C.
+6. Port the model to C.
+7. Use the vector tanh in `gemma_gelu_mul`. The mixture-of-experts path of the
+   26B model still calls the scalar `tanhf` for each value.
+8. Cut the number of calls for the small matrices of E4B. The 84 per-layer
+   matrices cannot join one call, because each one waits for the layer before
+   it. Each call costs about 16 microseconds of fixed time at 18 threads.
+9. Make the int8 tile faster for the prompt. It is 80 per cent of a prompt
+   pass at about 900 GFLOP/s. A copy of a weight as int8 can remove the
+   unpack of each 4-bit block, at the cost of a larger weight.
 
 ## Sample run
 
+The block below shows the command and the start of the answer. The model
+output is quoted as it came from the model, so its words are not the words
+of this document.
+
+```text
 $ PYTHONPATH=. $PY scripts/session.py --snapshot "$SNAP" --dtype int8 --max-new-tokens 512     --prompts "How does grouped query attention work?"
 [load] 48 layers + embedding table resident (int8) in 5.4s | RSS 0.3 GB
 [gen ] 512 new tokens in 731.8s (0.70 tok/s) | RSS 12.0 GB
@@ -712,4 +1661,5 @@ GQA is the "middle ground." Instead of every head having its own K/V (MHA) or ev
 
 #### How it works visually:
 Imagine you have **8 Query heads**. You can group them into **2 groups** (4 heads per group
+```
 

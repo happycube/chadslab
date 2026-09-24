@@ -30,12 +30,14 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
 _LIB_DIR = _HERE / "_libs"
-# The code builds two libraries. The first library uses an AVX2 baseline. The
-# second library uses an AVX-512 baseline. The code loads the AVX-512 library
-# when the CPU gives AVX-512. Otherwise, the code loads the AVX2 library.
+# The code builds three libraries. The first library uses an AVX2 baseline. The
+# second library uses an AVX-512 baseline. The third adds the VNNI
+# instruction. The code loads the fastest library that the CPU gives.
 _FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC", "-lm"]
 _FLAGS = _FLAGS_COMMON + ["-mavx2", "-mfma"]
 _FLAGS_AVX512 = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl", "-mfma"]
+_FLAGS_VNNI = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl",
+                               "-mavx512vnni", "-mfma"]
 
 _MAX_GEMM_TOKENS = 1024
 
@@ -64,6 +66,21 @@ def have_avx512():
         with open("/proc/cpuinfo") as fh:
             text = fh.read()
         return "avx512f" in text and "avx512bw" in text
+    except OSError:
+        return False
+
+
+def have_vnni():
+    """Return True when the CPU gives AVX-512 VNNI."""
+    try:
+        import numpy.core._multiarray_umath as _m
+
+        return bool(_m.__cpu_features__.get("AVX512VNNI"))
+    except Exception:
+        pass
+    try:
+        with open("/proc/cpuinfo") as fh:
+            return "avx512_vnni" in fh.read()
     except OSError:
         return False
 
@@ -100,7 +117,14 @@ def _build(flags=None):
 
 # NP_GEMMA_ARCH=avx2 or avx512 forces one library. The default detects the CPU.
 _ENV_ARCH = os.environ.get("NP_GEMMA_ARCH", "").lower()
-AVX512 = True if _ENV_ARCH == "avx512" else (False if _ENV_ARCH == "avx2" else have_avx512())
+if _ENV_ARCH == "vnni":
+    VNNI = True
+elif _ENV_ARCH in ("avx512", "avx2"):
+    VNNI = False
+else:
+    VNNI = have_vnni()
+AVX512 = True if _ENV_ARCH in ("avx512", "vnni") else (
+    False if _ENV_ARCH == "avx2" else have_avx512())
 # The smallest token group for the int4 tile. A smaller group uses the four-row
 # dot. The AVX-512 tile masks a partial token block, so a small group is fine.
 # The smallest token group that uses the int4 tile. The one-row dot decodes
@@ -110,7 +134,7 @@ AVX512 = True if _ENV_ARCH == "avx512" else (False if _ENV_ARCH == "avx2" else h
 INT4_TILE_TOKENS = int(os.environ.get("NP_GEMMA_INT4_TILE_TOKENS", "2"))
 _lib = None
 try:
-    _path = _build(_FLAGS_AVX512 if AVX512 else _FLAGS)
+    _path = _build(_FLAGS_VNNI if VNNI else (_FLAGS_AVX512 if AVX512 else _FLAGS))
     if _path is not None:
         _lib = ctypes.CDLL(str(_path))
         _lib.gemma_bf16_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
@@ -158,18 +182,39 @@ try:
         _lib.gemma_int4_q8_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                                 _void_p, _void_p, _int, _int, _int, _int]
         _lib.gemma_int4_q8_tile_run.restype = None
+        _lib.gemma_int4_q8_tile_run32.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                  _void_p, _void_p, _int, _int, _int, _int]
+        _lib.gemma_int4_q8_tile_run32.restype = None
         _lib.gemma_quantize_q8_t_moe.argtypes = [_void_p, _void_p, _void_p, _void_p,
-                                                 _int, _int, _void_p, _void_p, _int]
+                                                 _void_p, _int, _int, _void_p, _void_p,
+                                                 _int]
         _lib.gemma_quantize_q8_t_moe.restype = None
+        _lib.gemma_gelu_mul.argtypes = [_void_p, _void_p, _int, _int]
+        _lib.gemma_gelu_mul.restype = None
+        _lib.gemma_moe_scatter.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                           _int, _int]
+        _lib.gemma_moe_scatter.restype = None
+        _lib.gemma_softmax_mask.argtypes = [_void_p, _int, _int, _void_p, _int,
+                                           _int, _int, _int]
+        _lib.gemma_softmax_mask.restype = None
         _lib.gemma_int4_q8_moe_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                                _void_p, _void_p, _int, _int, _int,
                                                _void_p, _void_p, _void_p, _int]
         _lib.gemma_int4_q8_moe_run.restype = None
+        _lib.gemma_int4_q8_set_tb8.argtypes = [_int]
+        _lib.gemma_int4_q8_set_tb8.restype = None
+        _lib.gemma_int4_q8_set_prefetch.argtypes = [_int]
+        _lib.gemma_int4_q8_set_prefetch.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                              _int, _void_p, _int, _int, _int]
         _lib.gemma_int4_moe_gemv.restype = None
+        _lib.gemma_attn_decode_f32.argtypes = [_void_p, _void_p, _void_p,
+                                               _void_p, _void_p, _int, _int,
+                                               _int, _int, ctypes.c_long,
+                                               ctypes.c_long, _int, _int, _int]
+        _lib.gemma_attn_decode_f32.restype = None
         _lib.gemma_attn_decode.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                            _void_p, _void_p, _void_p, _void_p,
                                            _int, _int, _int, _int]
@@ -196,6 +241,11 @@ try:
         _lib.gemma_int8_pf.restype = None
         _lib.gemma_f32_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_f32_linear.restype = None
+        _lib.gemma_ct_linear.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                         _int, _int, _int, _int]
+        _lib.gemma_ct_linear.restype = None
+        _lib.gemma_ct_set_rows4.argtypes = [_int]
+        _lib.gemma_ct_set_rows4.restype = None
 except Exception:
     _lib = None
 
@@ -205,6 +255,18 @@ HAVE_C = _lib is not None
 def available():
     """Return True when the C kernels are ready."""
     return HAVE_C
+
+
+def set_int4_prefetch(on):
+    """Select the prefetch of the next weight group in the int8 tile. A test."""
+    if _lib is not None:
+        _lib.gemma_int4_q8_set_prefetch(1 if on else 0)
+
+
+def set_int4_q8_tb8(on):
+    """Select the narrow (eight token) block of the int8 tile."""
+    if _lib is not None:
+        _lib.gemma_int4_q8_set_tb8(1 if on else 0)
 
 
 def set_gemm_ml(on):
@@ -382,6 +444,49 @@ def linear_int8_pf(x, q_i8, scales):
     return out
 
 
+def set_ct_rows4(on):
+    """Select the four-row loop (1) or the one-row loop (0) of ct_linear."""
+    _lib.gemma_ct_set_rows4(1 if on else 0)
+
+
+def ct_linear(x, packed, scale, bits, cols=None):
+    """Multiply x by W. W is a weight of a compressed-tensors file, packed.
+
+    This is the layout the E4B mobile-ct checkpoint uses, and it is not the
+    layout of linear_int4. packed holds the int32 words of the row, and scale
+    holds one float32 value for each row (the "channel" strategy). The kernel
+    reads the words in place, so the caller keeps the weights packed and no
+    float32 copy is ever built.
+
+    bits is 4 or 2. cols is the value count of one row; when it is None the
+    value count follows from the packed shape.
+
+    x is (tokens, cols) and the result is (tokens, rows).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    packed = np.asarray(packed)
+    if packed.dtype != np.int32:
+        packed = packed.view(np.int32)
+    if not packed.flags.c_contiguous:
+        packed = np.ascontiguousarray(packed)
+    rows, words = packed.shape
+    covered = words * 32 // bits
+    if cols is None:
+        cols = covered
+    elif cols != covered:
+        raise ValueError("the packed row holds %d values, not %d" % (covered, cols))
+    if cols % 16:
+        raise ValueError("cols must be a multiple of 16, got %d" % cols)
+    scale = np.ascontiguousarray(scale, dtype=np.float32).reshape(-1)
+    if scale.shape[0] != rows:
+        raise ValueError("scale has %d values for %d rows" % (scale.shape[0], rows))
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.gemma_ct_linear(packed.ctypes.data, scale.ctypes.data, x.ctypes.data,
+                         out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
+                         ctypes.c_int(x.shape[0]), ctypes.c_int(bits))
+    return out
+
+
 def linear_int4(x, packed, scales, group):
     """Multiply x by W. W is packed 4-bit data. scales gives one scale for each group."""
     x = np.ascontiguousarray(x, dtype=np.float32)
@@ -505,26 +610,120 @@ def int4_q8_tile(qxt, sx, sumx, packed, scales, group, tokens):
     return out
 
 
-def quantize_q8_t_moe(x, cols, stride, off, ntok):
+def int4_q8_tile32(qxt, sx, sumx, packed, scales, group, tokens):
+    """The wide tile: 32 tokens for one weight decode. A test uses it."""
+    qxt = np.ascontiguousarray(qxt, dtype=np.int8)
+    sx = np.ascontiguousarray(sx, dtype=np.float32)
+    sumx = np.ascontiguousarray(sumx, dtype=np.int32)
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    rows = packed.shape[0]
+    cols = packed.shape[1] * 32
+    stride = qxt.shape[1]
+    out = np.empty((tokens, rows), dtype=np.float32)
+    _lib.gemma_int4_q8_tile_run32(packed.ctypes.data, scales.ctypes.data,
+                                  qxt.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
+                                  out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
+                                  ctypes.c_int(tokens), ctypes.c_int(stride))
+    return out
+
+
+def quantize_q8_t_moe(x, cols, stride, off, ntok, src=None):
     """Quantize every expert's rows to the transposed int8 layout.
 
-    x holds the rows of the experts, one after the other. off gives the token
-    offset of each expert and ntok its token count. stride is the token stride
-    of qxt, sx, and sumx. Leave a slack of one token block.
+    off gives the token offset of each expert and ntok its token count. stride
+    is the token stride of qxt, sx, and sumx. Leave a slack of one token block.
+    src maps a destination row to a row of x, so the caller needs no gather. A
+    null src gives the identity.
+
+    The padding rows hold no value. A tile reads them but stores only the real
+    rows, so the buffers start as empty.
     """
     x = np.ascontiguousarray(x, dtype=np.float32)
     groups = cols // 32
-    qxt = np.zeros(groups * 8 * stride * 4, dtype=np.int8)
-    sx = np.zeros(groups * stride, dtype=np.float32)
-    sumx = np.zeros(groups * stride, dtype=np.int32)
+    qxt = np.empty(groups * 8 * stride * 4, dtype=np.int8)
+    sx = np.empty(groups * stride, dtype=np.float32)
+    sumx = np.empty(groups * stride, dtype=np.int32)
     off = np.ascontiguousarray(off, dtype=np.int32)
     ntok = np.ascontiguousarray(ntok, dtype=np.int32)
-    _lib.gemma_quantize_q8_t_moe(x.ctypes.data, qxt.ctypes.data, sx.ctypes.data,
-                                 sumx.ctypes.data, ctypes.c_int(cols),
-                                 ctypes.c_int(stride), off.ctypes.data,
-                                 ntok.ctypes.data, ctypes.c_int(off.size))
+    sp = None if src is None else np.ascontiguousarray(src, dtype=np.int32)
+    _lib.gemma_quantize_q8_t_moe(x.ctypes.data, None if sp is None else sp.ctypes.data,
+                                 qxt.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
+                                 ctypes.c_int(cols), ctypes.c_int(stride),
+                                 off.ctypes.data, ntok.ctypes.data,
+                                 ctypes.c_int(off.size))
     return (qxt.reshape(groups * 8, stride, 4), sx.reshape(groups, stride),
             sumx.reshape(groups, stride))
+
+
+def gelu_mul(x, inner):
+    """Apply the GELU to the gate half of x and multiply by the up half."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    out = np.empty((x.shape[0], inner), dtype=np.float32)
+    _lib.gemma_gelu_mul(x.ctypes.data, out.ctypes.data, ctypes.c_int(x.shape[0]),
+                        ctypes.c_int(inner))
+    return out
+
+
+def softmax_mask(x, positions, n_rep, base, window):
+    """Apply the causal mask, the window mask, and the softmax in place.
+
+    x is (kv_heads, tokens, heads_per_group, keys) and must be contiguous.
+    """
+    _lib.gemma_softmax_mask(x.ctypes.data,
+                            ctypes.c_int(x.shape[0] * x.shape[1] * x.shape[2]),
+                            ctypes.c_int(x.shape[3]), positions.ctypes.data,
+                            ctypes.c_int(x.shape[1]), ctypes.c_int(n_rep),
+                            ctypes.c_int(base), ctypes.c_int(window))
+
+
+if _lib is not None:
+    _lib.gemma_attn_prefill.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                        _int, _int, _void_p, _int, _int,
+                                        _int, _int, _int]
+    _lib.gemma_attn_prefill.restype = None
+    _lib.gemma_attn_prefill_set_impl.argtypes = [_int]
+    _lib.gemma_attn_prefill_set_impl.restype = None
+
+
+def attn_prefill_impl(which):
+    """Select the flash attention version.
+
+    0 takes the best that the build gives, 1 the straight C version, 2 the AVX2
+    version, and 3 the AVX-512 version. A test uses this.
+    """
+    if _lib is not None:
+        _lib.gemma_attn_prefill_set_impl(ctypes.c_int(int(which)))
+
+
+def attn_prefill(q, k, v, positions, base, window):
+    """Run flash attention for a prompt.
+
+    q is (tokens, q_heads, head_dim). k and v are (keys, kv_heads, head_dim).
+    positions gives the position of each query. base is the position of key
+    zero. A window of zero turns the sliding window off. Return the
+    (tokens, q_heads, head_dim) result.
+    """
+    q = np.ascontiguousarray(q, dtype=np.float32)
+    k = np.ascontiguousarray(k, dtype=np.float32)
+    v = np.ascontiguousarray(v, dtype=np.float32)
+    positions = np.ascontiguousarray(positions, dtype=np.int32)
+    t, q_heads, hd = q.shape
+    n, kv_heads, _ = k.shape
+    out = np.empty((t, q_heads, hd), dtype=np.float32)
+    _lib.gemma_attn_prefill(q.ctypes.data, k.ctypes.data, v.ctypes.data,
+                            positions.ctypes.data, ctypes.c_int(int(base)),
+                            ctypes.c_int(int(window)), out.ctypes.data,
+                            ctypes.c_int(t), ctypes.c_int(n),
+                            ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
+                            ctypes.c_int(hd))
+    return out
+
+
+def moe_scatter(out, de, rows, w, hidden, n):
+    """Add de[j] * w[j] to the row rows[j] of out. out is (tokens, hidden)."""
+    _lib.gemma_moe_scatter(out.ctypes.data, de.ctypes.data, rows.ctypes.data,
+                           w.ctypes.data, ctypes.c_int(n), ctypes.c_int(hidden))
 
 
 def int4_q8_moe(w, scales, qxt, sx, sumx, rows, cols, stride, off, ntok, eid):
@@ -610,6 +809,24 @@ def attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
                            vq.ctypes.data, vs.ctypes.data, scores.ctypes.data, out.ctypes.data,
                            ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
                            ctypes.c_int(head_dim), ctypes.c_int(n))
+
+
+def attn_decode_f32(q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
+                    k_head_stride, v_head_stride, pos, base, window):
+    """Run the fused float32 attention for one query token.
+
+    q is (q_heads, head_dim). k and v are (kv_heads, n, head_dim) parts of a
+    larger buffer. The strides give the distance between two heads, in values.
+    scores is a scratch array of (q_heads, n). All arrays must be float32.
+    """
+    _lib.gemma_attn_decode_f32(q.ctypes.data, k.ctypes.data, v.ctypes.data,
+                               scores.ctypes.data, out.ctypes.data,
+                               ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
+                               ctypes.c_int(head_dim), ctypes.c_int(n),
+                               ctypes.c_long(k_head_stride),
+                               ctypes.c_long(v_head_stride),
+                               ctypes.c_int(pos), ctypes.c_int(base),
+                               ctypes.c_int(window))
 
 
 def int4_moe_gemv(w, scales, x, ids, rows, cols, xstride):

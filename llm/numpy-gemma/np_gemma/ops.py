@@ -74,6 +74,22 @@ def bf16_to_f32(u16):
     return out.view(np.float32)
 
 
+def to_bf16(x):
+    """Round float32 data to bfloat16. Return the raw uint16 values.
+
+    Round to the nearest even value before the shift. Work in a chunk, so the
+    float32 data of the chunk stays in the cache.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    flat = x.reshape(-1).view(np.uint32)
+    out = np.empty(flat.shape, dtype=np.uint16)
+    step = 1 << 20
+    for i in range(0, flat.size, step):
+        u = flat[i:i + step]
+        out[i:i + step] = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    return out.reshape(x.shape)
+
+
 # The number of output rows in one dequant block. A small block keeps the
 # float32 data in cache. A large block lowers the Python work. Change the value
 # with the environment variable NP_GEMMA_BF16_CHUNK.
@@ -238,7 +254,13 @@ def router(x, scale, proj, per_expert, top_k, eps, hscale):
 
 
 def int4_multi4_ready():
-    """Return True when the fused multi-matrix kernel is ready."""
+    """Return True when the fused multi-matrix kernel is ready.
+
+    Set NP_GEMMA_INT4_MULTI4=0 to compare the fused kernel with one call for
+    each matrix.
+    """
+    if os.environ.get("NP_GEMMA_INT4_MULTI4", "1") != "1":
+        return False
     return _cops is not None and _cops.available()
 
 
@@ -266,6 +288,10 @@ def quantize_q8(x):
     """
     x = np.asarray(x, dtype=np.float32)
     shape = x.shape
+    if _cops is not None and _cops.available() and x.size and shape[-1] % 32 == 0:
+        cols = shape[-1]
+        qx, sx, _sumx = _cops.quantize_q8_groups(x.reshape(-1, cols))
+        return qx.reshape(shape), sx.reshape(shape[:-1])
     flat = x.reshape(-1, 32)
     amax = np.max(np.abs(flat), axis=1)
     scale = np.where(amax > 0.0, amax / 127.0, 1e-12).astype(np.float32)
@@ -289,6 +315,30 @@ def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
     _cops.attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
                       q_heads, kv_heads, head_dim, n)
     return out
+
+
+def attn_decode_f32(q, k, v, pos, base=0, window=0):
+    """Run the fused float32 attention for one query token.
+
+    q is (1, q_heads, head_dim) after RoPE, or (q_heads, head_dim). k and v
+    are (kv_heads, keys, head_dim), the layout of the cache. They may be a
+    part of a larger buffer: the kernel uses the stride between two heads, so
+    it copies nothing. pos is the position of the query and base is the
+    position of key zero. A window of zero turns the sliding window off.
+    Return the output, with the shape of q.
+    """
+    k = np.asarray(k, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    q2 = np.ascontiguousarray(q, dtype=np.float32).reshape(-1)
+    head_dim = k.shape[2]
+    q_heads = q2.size // head_dim
+    n = k.shape[1]
+    scores = np.empty((q_heads, n), dtype=np.float32)
+    out = np.empty((q_heads, head_dim), dtype=np.float32)
+    _cops.attn_decode_f32(q2, k, v, scores, out, q_heads, k.shape[0],
+                          head_dim, n, k.strides[0] // 4, v.strides[0] // 4,
+                          int(pos), int(base), int(window))
+    return out.reshape(q.shape)
 
 
 def int4_moe_ready():
@@ -415,8 +465,12 @@ _INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "1") == "1"
 # The smallest token count for the int8 tile. A smaller count wastes the token
 # lanes and pays for the quantization of the activations.
 _INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))
-# The token block of the int8 tile. It must match I4Q_TB in the C kernel.
-_INT4_Q8_TB = 16
+# The token block of the int8 tile. The value 8 selects the narrow 256-bit
+# kernel, which wastes fewer lanes for an expert with fewer than sixteen tokens.
+# The value must match I4Q_TB or I4Q2_TB in the C kernel.
+_INT4_Q8_TB = int(os.environ.get("NP_GEMMA_INT4_Q8_TB", "16"))
+if _INT4_Q8_TB == 8 and _cops is not None and _cops.available():
+    _cops.set_int4_q8_tb8(1)
 
 
 def int4_q8_ready():
@@ -439,6 +493,19 @@ def linear_int4_q8(x, packed, scales):
     return _cops.int4_q8_tile(qxt, sx, sumx, packed, scales, INT4_GROUP, tokens)
 
 
+def linear_int4_q8_wide(x, packed, scales):
+    """Multiply x by W with the wide int8 tile.
+
+    The wide tile reads 32 tokens for one weight decode instead of 16. That
+    halves the weight decode and the weight broadcast for each token. A test
+    uses it.
+    """
+    tokens = x.shape[0]
+    stride = (tokens + 31) // 32 * 32
+    qxt, sx, sumx = _cops.quantize_q8_t(x, stride)
+    return _cops.int4_q8_tile32(qxt, sx, sumx, packed, scales, INT4_GROUP, tokens)
+
+
 def int4_q8_moe_ready():
     """Return True when the fused int8 mixture-of-experts kernel is ready."""
     return int4_q8_ready()
@@ -453,8 +520,8 @@ def moe_int4_q8(h, gu, dn, val, idx, inner):
     expert. Return the sum of the expert outputs, weighted by the router.
 
     The experts run in one parallel region for the gate and up projection and
-    one for the down projection. The order matches the grouped code, so the
-    result matches the code that calls one expert at a time.
+    one for the down projection. The gather, the GELU, and the scatter stay in
+    C, so the loop over the experts holds no work on the NumPy side.
     """
     gu_p, gu_s = gu
     dn_p, dn_s = dn
@@ -462,9 +529,9 @@ def moe_int4_q8(h, gu, dn, val, idx, inner):
     top_k = idx.shape[1]
     flat_e = np.asarray(idx, dtype=np.int64).reshape(-1)
     flat_t = np.repeat(np.arange(tokens), top_k)
-    flat_s = np.tile(np.arange(top_k), tokens)
     order = np.argsort(flat_e, kind="stable")
-    t_all = flat_t[order]
+    # src maps a row of the expert scratch to a row of h.
+    src = flat_t[order].astype(np.int32)
     eid, _first, counts = np.unique(flat_e[order], return_index=True,
                                     return_counts=True)
     ntok = counts.astype(np.int32)
@@ -474,25 +541,16 @@ def moe_int4_q8(h, gu, dn, val, idx, inner):
     n = tokens * top_k
     # A tile may read one token block past the end of an expert. Leave a slack.
     stride = n + 16
-    x = np.ascontiguousarray(h[t_all])
-    qxt, sx, sumx = _cops.quantize_q8_t_moe(x, hidden, stride, off, ntok)
+    qxt, sx, sumx = _cops.quantize_q8_t_moe(h, hidden, stride, off, ntok, src)
     act = _cops.int4_q8_moe(gu_p, gu_s, qxt, sx, sumx, gu_p.shape[1], hidden,
                             stride, off, ntok, eid)[:n]
-    act = gelu_tanh(act[:, :inner]) * act[:, inner:]
-    qxt2, sx2, sumx2 = _cops.quantize_q8_t_moe(act, inner, stride, off, ntok)
+    act2 = _cops.gelu_mul(act, inner)
+    qxt2, sx2, sumx2 = _cops.quantize_q8_t_moe(act2, inner, stride, off, ntok)
     de = _cops.int4_q8_moe(dn_p, dn_s, qxt2, sx2, sumx2, dn_p.shape[1], inner,
                            stride, off, ntok, eid)[:n]
-    w = np.asarray(val, dtype=np.float32).reshape(-1)[order]
-    # A token appears in top_k experts, so the scatter has duplicate rows.
-    # np.add.at costs about 70 ms for each layer. An expert has no duplicate
-    # token, so add the work of one expert at a time.
+    w = np.ascontiguousarray(np.asarray(val, dtype=np.float32).reshape(-1)[order])
     out = np.zeros_like(h)
-    pos = 0
-    for j in range(eid.size):
-        m = int(ntok[j])
-        rows = t_all[pos:pos + m]
-        out[rows] += de[pos:pos + m] * w[pos:pos + m, None]
-        pos += m
+    _cops.moe_scatter(out, de, src, w, hidden, n)
     return out
 
 
@@ -601,6 +659,49 @@ def gelu_tanh(x):
     if _cops is not None and _cops.available():
         return _cops.gelu(x)
     return 0.5 * x * (1.0 + np.tanh(GELU_C * (x + 0.044715 * x * x * x)))
+
+
+def softmax_mask(scores, positions, n_rep, base, window):
+    """Apply the causal mask, the sliding window mask, and the softmax.
+
+    scores is (kv_heads, tokens, heads_per_group, keys). positions gives the
+    position of each query token. The kernel works in place and gives the
+    probabilities of the last axis.
+    """
+    scores = np.ascontiguousarray(scores, dtype=np.float32)
+    positions = np.ascontiguousarray(positions, dtype=np.int32)
+    if _cops is not None and _cops.available() and scores.ndim == 4:
+        _cops.softmax_mask(scores, positions, n_rep, base, window)
+        return scores
+    kpos = base + np.arange(scores.shape[-1])
+    mask = kpos[None, :] <= positions[:, None]
+    if window:
+        mask &= (positions[:, None] - kpos[None, :]) < window
+    scores = np.where(mask[None, :, None, :], scores, np.float32(-1e30))
+    return softmax(scores, axis=-1)
+
+
+def flash_ready():
+    """Return True when the C flash attention kernel is ready."""
+    return _cops is not None and _cops.available()
+
+
+def flash_prefill(q, k, v, positions, base, window):
+    """Run the C flash attention kernel for a prompt."""
+    return _cops.attn_prefill(q, k, v, positions, base, window)
+
+
+def _select_flash_impl():
+    """Apply NP_GEMMA_ATTN_IMPL. A test and a benchmark use this."""
+    if _cops is None or not _cops.available():
+        return
+    name = os.environ.get("NP_GEMMA_ATTN_IMPL", "").lower()
+    which = {"": 0, "auto": 0, "c": 1, "scalar": 1, "avx2": 2, "avx512": 3}.get(name)
+    if which is not None:
+        _cops.attn_prefill_impl(which)
+
+
+_select_flash_impl()
 
 
 def softmax(x, axis=-1):

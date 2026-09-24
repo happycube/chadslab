@@ -165,19 +165,25 @@ against 3.9 ms for one add for each expert. A row block of eight rows (I4Q_MR)
 is better than four.
 
     stage        float      int8 tile   int8 fused
-    moe         3435.2 ms   2498.0 ms   1840.2 ms
-    attn        1638.0 ms   1354.7 ms   1464.4 ms
-    dense_mlp    451.3 ms    288.0 ms    358.7 ms
-    norm         127.0 ms    127.9 ms    185.7 ms
-    total       5685.0 ms   4301.0 ms   3900.0 ms
-    tokens/s      45.03       59.52       65.64
+    moe         3435.2 ms   2498.0 ms   1795.0 ms
+    attn        1638.0 ms   1354.7 ms   1458.0 ms
+    dense_mlp    451.3 ms    288.0 ms    345.0 ms
+    norm         127.0 ms    127.9 ms    186.0 ms
+    total       5685.0 ms   4301.0 ms   3838.0 ms
+    tokens/s      45.03       59.52       66.70
+
+The fused column is the mean of three runs. Two of them give 3.79 and 3.89 s.
+The kernel commit of the fused path is b08b3ae.
 
 ## What is left
 
-- The MoE stage is 1.87 times the float path. The tile still computes a full
-  token block for an expert with fewer tokens, so a group of eleven tokens
-  costs the work of sixteen. A token block of eight would waste less, at the
-  price of a narrower vector.
+- The MoE stage is 1.93 times the float path. The tile computes a full token
+  block for an expert with fewer tokens, so a group of eleven tokens costs the
+  work of sixteen. A narrow token block of eight was measured. It uses a
+  256-bit kernel, so it wastes fewer lanes. The lower vector width costs more
+  than the saved lanes: the MoE rises from 1811 to 2037 ms and the whole
+  prefill from 3.89 to 4.54 s. Keep the wide block. Set NP_GEMMA_INT4_Q8_TB=8
+  to repeat the test.
 - The attention stage gains 1.12 times. The stage includes the score matrix and
   the softmax, which stay float32.
 - Phase 3, the one-token GEMV. The tile needs a group of tokens. A decode step

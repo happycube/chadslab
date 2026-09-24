@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemma 4 26B-A4B in NumPy — pipeline, performance, memory, quality</title>
+<style>
+  :root {
+    --ink: #111827; --dim: #6b7280; --line: #e5e7eb; --bg: #f8fafc; --card: #ffffff;
+    --perf: #2563eb; --mem: #d97706; --qual: #059669; --bad: #dc2626; --muted: #9ca3af;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h3 { font-size: 15px; margin: 22px 0 8px; text-transform: uppercase;
+       letter-spacing: .07em; color: var(--dim); }
+  p { margin: 8px 0; }
+  .sub { color: var(--dim); font-size: 15px; max-width: 780px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 26px 0 8px; }
+  .chip { background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+          padding: 5px 12px; font-size: 12.5px; color: var(--dim); }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 22px 24px; margin: 18px 0; border-left: 4px solid var(--line); }
+  .card.perf { border-left-color: var(--perf); }
+  .card.mem  { border-left-color: var(--mem); }
+  .card.qual { border-left-color: var(--qual); }
+  .card.bad  { border-left-color: var(--bad); }
+  .tag { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+         text-transform: uppercase; padding: 3px 8px; border-radius: 5px; margin-right: 8px;
+         vertical-align: 2px; }
+  .t-perf { background: #dbeafe; color: #1d4ed8; }
+  .t-mem  { background: #fef3c7; color: #b45309; }
+  .t-qual { background: #d1fae5; color: #047857; }
+  .t-bad  { background: #fee2e2; color: #b91c1c; }
+  .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .num { color: var(--muted); font-weight: 700; font-size: 14px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 26px; margin: 16px 0 4px; }
+  .fact .v { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+  .fact .v.p { color: var(--perf); } .fact .v.m { color: var(--mem); }
+  .fact .v.q { color: var(--qual); } .fact .v.b { color: var(--bad); }
+  .fact .k { font-size: 12px; color: var(--dim); }
+  .bars { margin: 14px 0 4px; }
+  .brow { display: grid; grid-template-columns: 190px 1fr 78px; align-items: center;
+          gap: 10px; margin: 5px 0; font-size: 13px; }
+  .brow .lbl { color: var(--dim); text-align: right; }
+  .brow .val { font-family: ui-monospace, monospace; font-size: 12.5px; color: var(--ink); }
+  .track { background: #eef2f7; border-radius: 4px; height: 16px; overflow: hidden; }
+  .fill { height: 100%; border-radius: 4px; background: var(--perf); }
+  .fill.m { background: var(--mem); } .fill.q { background: var(--qual); }
+  .fill.b { background: var(--bad); } .fill.g { background: #cbd5e1; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+  td.n, th.n { text-align: right; font-family: ui-monospace, monospace; }
+  tr.win td { background: #f0fdf4; }
+  tr.lose td { background: #fff7ed; }
+  .note { font-size: 13px; color: var(--dim); margin-top: 10px; }
+  .note b { color: var(--ink); }
+  .trade { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+  .trade > div { background: #f9fafb; border: 1px solid var(--line); border-radius: 8px;
+                 padding: 9px 11px; font-size: 12.5px; }
+  .trade b { display: block; font-size: 11px; text-transform: uppercase;
+             letter-spacing: .06em; color: var(--dim); margin-bottom: 3px; }
+  .up { color: var(--qual); font-weight: 700; } .down { color: var(--bad); font-weight: 700; }
+  .flat { color: var(--dim); font-weight: 700; }
+  .kicker { font-size: 12px; color: var(--dim); border-top: 1px solid var(--line);
+            margin-top: 34px; padding-top: 14px; }
+  .pill { font-size: 11.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line);
+          color: var(--dim); }
+  ul { margin: 8px 0; padding-left: 20px; } li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Gemma 4 26B-A4B in NumPy</h1>
+  <p class="sub">A from-scratch runtime whose only dependency is NumPy, built to be
+  verified against Hugging Face and then made fast enough to serve a coding agent.
+  Every number below is measured on the same machine unless it says otherwise.
+  The story is a chain of tradeoffs: each stage buys speed or memory and pays for it
+  in numerical quality — and the quality bill is usually paid by the MoE router.</p>
+
+  <div class="strip">
+    <span class="chip"><b>1</b> HF reference</span>
+    <span class="chip"><b>2</b> NumPy runtime</span>
+    <span class="chip"><b>3</b> Quantized weights</span>
+    <span class="chip"><b>4</b> C kernels</span>
+    <span class="chip"><b>5</b> Fusions</span>
+    <span class="chip"><b>6</b> Attention</span>
+    <span class="chip"><b>7</b> KV cache</span>
+    <span class="chip"><b>8</b> Serving</span>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">The model, and the two things that shape every decision</h3>
+    <div class="facts">
+      <div class="fact"><div class="v">26B</div><div class="k">parameters, 4B active</div></div>
+      <div class="fact"><div class="v">30</div><div class="k">layers</div></div>
+      <div class="fact"><div class="v">25 / 5</div><div class="k">sliding / global</div></div>
+      <div class="fact"><div class="v">128</div><div class="k">experts, top 8</div></div>
+      <div class="fact"><div class="v">1024</div><div class="k">sliding window</div></div>
+      <div class="fact"><div class="v">262144</div><div class="k">vocab</div></div>
+    </div>
+    <p><b>Sliding heads.</b> 25 of the 30 layers attend only to the last 1024 keys and use
+    a 256-wide head with 8 KV heads; the 5 global layers use a 512-wide head with 2 KV
+    heads and attend to everything. The GGUF says so explicitly, in
+    <code>gemma4.attention.sliding_window_pattern</code>. This one fact is what makes long
+    context affordable — and it is the reason the attention work below splits cleanly into
+    "wins" and "loses".</p>
+    <p><b>The router.</b> Each layer routes to 8 of 128 experts with an <code>argmax</code>.
+    Any change to summation order perturbs the hidden state by a few ULPs, the router picks a
+    different expert, and the difference is amplified to a few percent. That is why almost no
+    optimisation here is bit-exact, and why the test that matters is the greedy token, not the
+    logit vector.</p>
+  </div>
+
+  <!-- 1 -->
+  <div class="card qual">
+    <div class="head"><span class="num">01</span><h2>Hugging Face reference</h2>
+      <span class="tag t-qual">quality</span></div>
+    <p>The oracle. Everything downstream is validated by token-for-token equality against it.</p>
+    <div class="facts">
+      <div class="fact"><div class="v">70.1<span style="font-size:14px"> GB</span></div><div class="k">float32 weights</div></div>
+      <div class="fact"><div class="v">23.6<span style="font-size:14px"> GB</span></div><div class="k">bfloat16</div></div>
+      <div class="fact"><div class="v">2.1<span style="font-size:14px"> s/tok</span></div><div class="k">decode, float32</div></div>
+    </div>
+    <div class="trade">
+      <div><b>Performance</b><span class="down">baseline</span></div>
+      <div><b>Memory</b><span class="down">does not fit casually</span></div>
+      <div><b>Quality</b><span class="up">ground truth</span></div>
+    </div>
+    <p class="note">A greedy 8-token run fixed the canonical sanity check:
+    <code>[818, 5279, 529, 7001, 563, 5213, 50429, 84750]</code> =
+    "The capital of France is <b>Paris</b>." That sequence is the regression test for every
+    later stage.</p>
+  </div>
+
+  <!-- 2 -->
+  <div class="card qual">
+    <div class="head"><span class="num">02</span><h2>NumPy runtime</h2>
+      <span class="tag t-qual">quality</span></div>
+    <p>A readable, dependency-free forward pass: GQA, RoPE with the sliding/global split,
+    RMSNorm, the MoE block, the Q6_K output head. Slow, but the point is that it is the same
+    code path that later gets a C implementation behind it — so a kernel can always be checked
+    against the pure-NumPy semantics it replaced.</p>
+    <div class="trade">
+      <div><b>Performance</b><span class="down">not the goal</span></div>
+      <div><b>Memory</b><span class="flat">float32</span></div>
+      <div><b>Quality</b><span class="up">exact vs HF</span></div>
+    </div>
+    <p class="note">The chat template added later is checked against the published Jinja:
+    <b>12 / 12</b> conversations render byte-identical token ids.</p>
+  </div>
+
+  <!-- 3 -->
+  <div class="card mem">
+    <div class="head"><span class="num">03</span><h2>Quantized weights — int8, then int4</h2>
+      <span class="tag t-mem">memory</span><span class="tag t-perf">performance</span></div>
+    <p>Q4_0 blocks (a fp16 scale plus 16 nibbles, value <code>nibble − 8</code>) behind an
+    int8-activation tile. Memory is the driver: the model has to live in RAM and be re-read
+    every token.</p>
+    <h3>Weight memory</h3>
+    <div class="bars">
+      <div class="brow"><div class="lbl">float32</div><div class="track"><div class="fill m" style="width:100%"></div></div><div class="val">70.1 GB</div></div>
+      <div class="brow"><div class="lbl">bfloat16</div><div class="track"><div class="fill m" style="width:33.7%"></div></div><div class="val">23.6 GB</div></div>
+      <div class="brow"><div class="lbl">int8</div><div class="track"><div class="fill m" style="width:17.3%"></div></div><div class="val">12.1 GB</div></div>
+      <div class="brow"><div class="lbl">int4</div><div class="track"><div class="fill m" style="width:12.8%"></div></div><div class="val">9.0 GB</div></div>
+    </div>
+    <table>
+      <tr><th>mode</th><th class="n">memory</th><th class="n">decode</th><th>note</th></tr>
+      <tr><td>f32 + BLAS</td><td class="n">70.1 GB</td><td class="n">2.1 s/tok</td><td>reference</td></tr>
+      <tr><td>bf16 + C</td><td class="n">23.6 GB</td><td class="n">1.07 s/tok</td><td></td></tr>
+      <tr><td>int8 + C</td><td class="n">12.1 GB</td><td class="n">0.35 s/tok</td><td>a lossy activation kernel exists too</td></tr>
+      <tr class="win"><td>int4 + C (w4a16)</td><td class="n">9.0 GB</td><td class="n">fastest</td><td>the default</td></tr>
+    </table>
+    <div class="trade">
+      <div><b>Performance</b><span class="up">6× decode vs f32</span></div>
+      <div><b>Memory</b><span class="up">7.8× less than f32</span></div>
+      <div><b>Quality</b><span class="down">lossy activations from quant</span></div>
+    </div>
+    <p class="note">The int4 kernel keeps a float32 activation path and an int8
+    (integer-multiply) path; the two are cross-checked by
+    <code>check_int4_q8.py</code>. The integer path is faster but strictly less accurate, so it
+    is opt-in.</p>
+  </div>
+
+  <!-- 4 -->
+  <div class="card perf">
+    <div class="head"><span class="num">04</span><h2>C kernels — AVX2 → AVX-512 → VNNI</h2>
+      <span class="tag t-perf">performance</span></div>
+    <p>Prefill throughput, 256 tokens, 18 threads, int4. Each step below is a separate kernel
+    change; the llama.cpp rows are the same machine running the reference CPU implementation.</p>
+    <div class="bars">
+      <div class="brow"><div class="lbl">float32 baseline</div><div class="track"><div class="fill" style="width:41.3%"></div></div><div class="val">45.0 tok/s</div></div>
+      <div class="brow"><div class="lbl">int8 activation tile</div><div class="track"><div class="fill" style="width:54.6%"></div></div><div class="val">59.5 tok/s</div></div>
+      <div class="brow"><div class="lbl">fused MoE</div><div class="track"><div class="fill" style="width:60.2%"></div></div><div class="val">65.6 tok/s</div></div>
+      <div class="brow"><div class="lbl">VNNI + hoisting</div><div class="track"><div class="fill" style="width:63.1%"></div></div><div class="val">68.8 tok/s</div></div>
+      <div class="brow"><div class="lbl">MoE glue fusion</div><div class="track"><div class="fill" style="width:76.5%"></div></div><div class="val">83.4 tok/s</div></div>
+      <div class="brow"><div class="lbl">C softmax + q8 quant</div><div class="track"><div class="fill" style="width:80.1%"></div></div><div class="val">87.4 tok/s</div></div>
+      <div class="brow"><div class="lbl">OPENBLAS_NUM_THREADS=8</div><div class="track"><div class="fill" style="width:86.8%"></div></div><div class="val">94.7 tok/s</div></div>
+      <div class="brow"><div class="lbl">llama.cpp (AVX-512)</div><div class="track"><div class="fill g" style="width:86.6%"></div></div><div class="val">94.5 tok/s</div></div>
+      <div class="brow"><div class="lbl">llama.cpp (VNNI)</div><div class="track"><div class="fill g" style="width:100%"></div></div><div class="val">109.1 tok/s</div></div>
+    </div>
+    <p class="note">Cumulative <b>2.1×</b> over the float32 baseline, landing within 13% of
+    llama.cpp's VNNI build. The single largest win was not a kernel at all:
+    <b>OPENBLAS_NUM_THREADS=8</b>. Many BLAS threads fighting the int4 kernel over the same
+    cores costs more than it buys. The VNNI row is machine-gated — <code>nosey</code>
+    (Skylake) has AVX-512 but no VNNI, so it never sees that instruction.</p>
+    <div class="trade">
+      <div><b>Performance</b><span class="up">2.1×</span></div>
+      <div><b>Memory</b><span class="flat">unchanged</span></div>
+      <div><b>Quality</b><span class="flat">same int4 maths</span></div>
+    </div>
+  </div>
+
+  <!-- 5 -->
+  <div class="card bad">
+    <div class="head"><span class="num">05</span><h2>Fusions — the ones that worked, and the ones that did not</h2>
+      <span class="tag t-bad">negative results</span></div>
+    <p>Fusing the MoE block into one OpenMP region over a flat task list was the biggest
+    structural win. But two plausible fusions were measured and rejected, and they are worth
+    recording because both looked obviously right on paper.</p>
+    <table>
+      <tr><th>change</th><th class="n">result</th><th>why</th></tr>
+      <tr class="win"><td>flat MoE task list, then MoE glue fused</td><td class="n">83.4 tok/s</td><td>one parallel region instead of per-expert</td></tr>
+      <tr class="lose"><td>fused MoE with <code>np.add.at</code> scatter</td><td class="n">4.33 s</td><td>70 ms/layer vs 3.9 ms for the expert loop</td></tr>
+      <tr class="lose"><td>int8 tile with a token block of 8</td><td class="n">slower</td><td>too little per-expert work to amortise</td></tr>
+      <tr class="lose"><td>NumPy flash attention</td><td class="n">0.20×</td><td>Python tile loop cannot beat one big BLAS matmul</td></tr>
+    </table>
+    <p class="note">The NumPy flash version is not wasted: it is the correctness oracle for the
+    C kernel, and it validated the online-softmax and window-skipping logic to 3&times;10<sup>−7</sup>
+    before a line of C was written.</p>
+  </div>
+
+  <!-- 6 -->
+  <div class="card perf">
+    <div class="head"><span class="num">06</span><h2>Attention — where long context is won and lost</h2>
+      <span class="tag t-perf">performance</span><span class="tag t-qual">quality</span></div>
+    <p>Three changes, in increasing order of ambition: drop the keys the window hides before
+    building scores; write that as a C flash kernel; and use the kernel only where it wins.</p>
+
+    <h3>a. Key slice in the plain path</h3>
+    <p>The GGUF says which layers slide. The plain path used to score all <code>n</code> keys
+    and mask afterwards; it now slices <code>[lo, hi]</code> so masked keys are never scored.
+    Exact in the real numbers — a dropped key is masked for every query in the block — but not
+    bit-exact, because the second matmul now sums over fewer terms.</p>
+    <table>
+      <tr><th>n</th><th class="n">no slice</th><th class="n">slice</th><th class="n">speedup</th></tr>
+      <tr><td>2048</td><td class="n">30.9 s</td><td class="n">28.9 s</td><td class="n">1.07×</td></tr>
+      <tr><td>4096</td><td class="n">63.3 s</td><td class="n">59.6 s</td><td class="n">1.06×</td></tr>
+      <tr><td>8192</td><td class="n">166.5 s</td><td class="n">133.8 s</td><td class="n">1.24×</td></tr>
+    </table>
+    <p class="note">Quality: greedy tokens <b>8/8 identical</b> at every size, though layer-0
+    attention already differs by 5.6&times;10<sup>−5</sup> relative and the router flips an
+    expert at layer 1. The drift is rounding, not masking — the slice is exact in exact
+    arithmetic.</p>
+
+    <h3>b. C flash kernel</h3>
+    <p>Transposed key, per-block online softmax, block-level causal + window skipping, and a
+    vectorised polynomial <code>exp</code>. Three implementations exist: AVX-512 (16 keys per
+    vector), AVX2 (8), and a straight-C reference. Attention op alone, BLAS given its
+    model-configured 8 threads:</p>
+    <table>
+      <tr><th>shape (256 queries)</th><th class="n">batched</th><th class="n">AVX-512</th><th class="n">ratio</th><th class="n">AVX2</th><th class="n">straight C</th></tr>
+      <tr class="win"><td>1024 · sliding hd256</td><td class="n">14.0 ms</td><td class="n">12.4 ms</td><td class="n">1.13×</td><td class="n">23.1 ms</td><td class="n">278 ms</td></tr>
+      <tr class="win"><td>4096 · sliding hd256</td><td class="n">17.9 ms</td><td class="n">14.8 ms</td><td class="n">1.21×</td><td class="n">26.3 ms</td><td class="n">328 ms</td></tr>
+      <tr class="lose"><td>1024 · global hd512</td><td class="n">28.6 ms</td><td class="n">36.9 ms</td><td class="n">0.77×</td><td class="n">42.3 ms</td><td class="n">2034 ms</td></tr>
+      <tr class="lose"><td>8192 · global hd512</td><td class="n">160.1 ms</td><td class="n">279.1 ms</td><td class="n">0.57×</td><td class="n">466.0 ms</td><td class="n">—</td></tr>
+    </table>
+    <p class="note">The sliding rows are flat in <code>n</code> — the window caps the work, so
+    1024 and 4096 keys cost the same. The global rows grow with <code>n</code> and lose to
+    OpenBLAS, because the transposed-key panel does not fit L1 and is re-read once per micro-tile;
+    raising the row tile to fix that starves the load ports. Correctness: all three versions
+    match the NumPy reference to 9&times;10<sup>−8</sup> on well-scaled input and
+    1.9&times;10<sup>−5</sup> at model magnitudes.</p>
+
+    <h3>c. Use each tool where it wins</h3>
+    <p><code>NP_GEMMA_FLASH=slide</code> sends the 25 sliding layers to the kernel and the 5
+    global layers to the batched matmul.</p>
+    <table>
+      <tr><th>n</th><th class="n">plain</th><th class="n">flash everywhere</th><th class="n">slide</th></tr>
+      <tr class="win"><td>2048</td><td class="n">31.7 s</td><td class="n">27.1 s (1.17×)</td><td class="n">26.8 s (1.18×)</td></tr>
+      <tr class="win"><td>4096</td><td class="n">59.4 s</td><td class="n">58.3 s (1.02×)</td><td class="n">56.3 s (1.05×)</td></tr>
+    </table>
+    <div class="trade">
+      <div><b>Performance</b><span class="up">1.05–1.24×</span></div>
+      <div><b>Memory</b><span class="up">no score matrix</span></div>
+      <div><b>Quality</b><span class="down">router flips; greedy holds</span></div>
+    </div>
+  </div>
+
+  <!-- 7 -->
+  <div class="card mem">
+    <div class="head"><span class="num">07</span><h2>KV cache — memory, and a quality cliff</h2>
+      <span class="tag t-mem">memory</span><span class="tag t-qual">quality</span></div>
+    <p>A sliding layer never reads past its window, so its buffer never needed to grow. It did:
+    the code compacted only on decode steps, so a prompt pass grew all 25 sliding buffers to the
+    full sequence. Compacting during prefill too — keeping <code>window</code> plus the block —
+    bounds them at <code>2×window + chunk = 2304</code> rows regardless of context.</p>
+    <table>
+      <tr><th>tokens</th><th class="n">float32 cache</th><th class="n">with int8 copy</th><th class="n">sliding rows</th></tr>
+      <tr><td>2048</td><td class="n">0.92 GB</td><td class="n">1.18 GB</td><td class="n">2048</td></tr>
+      <tr><td>4096</td><td class="n">1.11 GB</td><td class="n">1.42 GB</td><td class="n">1535</td></tr>
+      <tr><td>8192</td><td class="n">1.28 GB</td><td class="n">1.64 GB</td><td class="n">1791</td></tr>
+      <tr><td>16384</td><td class="n">1.62 GB</td><td class="n">2.07 GB</td><td class="n">2303</td></tr>
+      <tr class="lose"><td>16384 · before</td><td class="n">≈7.4 GB</td><td class="n">more</td><td class="n">16384</td></tr>
+    </table>
+    <p>Second win: the int8 copy of every key and value was being built even in float mode,
+    where nothing reads it. Gating it on the fused attention removes the difference between the
+    two columns. Together, DSH's ~25k-token prompt goes from roughly 11 GB of cache to 1.9 GB.</p>
+
+    <h3>The quality cliff: int8 KV is not free</h3>
+    <p>Hidden-state error from quantising each part of the cache independently — the score side
+    (K and the query) dominates, which is the opposite of the naive guess:</p>
+    <div class="bars">
+      <div class="brow"><div class="lbl">value only</div><div class="track"><div class="fill b" style="width:10.4%"></div></div><div class="val">0.58%</div></div>
+      <div class="brow"><div class="lbl">query only</div><div class="track"><div class="fill b" style="width:19.1%"></div></div><div class="val">1.07%</div></div>
+      <div class="brow"><div class="lbl">key only</div><div class="track"><div class="fill b" style="width:24.8%"></div></div><div class="val">1.39%</div></div>
+      <div class="brow"><div class="lbl">all three</div><div class="track"><div class="fill b" style="width:26.6%"></div></div><div class="val">1.49%</div></div>
+      <div class="brow"><div class="lbl">worst layer</div><div class="track"><div class="fill b" style="width:100%"></div></div><div class="val">5.6%</div></div>
+    </div>
+    <p class="note">1.5% sounds harmless and is not. An error of that size is enough to move
+    the router, and greedy decoding with an int8 cache fell into repeat loops
+    (<code>repeat_len 48</code>) while the identical run on a float cache produced clean text.
+    The diagnosis was confirmed by elimination — greedy+q8 loops, greedy+float does not,
+    temperature 0.7+q8 loops — and the fix was to make <b>float KV the default</b>. The int8
+    cache decodes faster (102 ms/token vs 164 ms) and is kept as an option, not the default.</p>
+    <div class="trade">
+      <div><b>Performance</b><span class="up">int8 cache is 1.6× decode</span></div>
+      <div><b>Memory</b><span class="up">4.6× less, then 6× at 25k</span></div>
+      <div><b>Quality</b><span class="down">int8 KV loops the model</span></div>
+    </div>
+  </div>
+
+  <!-- 8 -->
+  <div class="card qual">
+    <div class="head"><span class="num">08</span><h2>Serving an agent</h2>
+      <span class="tag t-qual">quality</span><span class="tag t-perf">performance</span></div>
+    <p>An OpenAI-compatible server (stdlib only) with an agent's chat template, tool calls,
+    reasoning channels, and a session cache that reuses the KV prefix across turns.</p>
+    <table>
+      <tr><th>problem</th><th>symptom</th><th>fix</th></tr>
+      <tr><td>agent times out mid-prompt</td><td>idle stream, minutes of prefill</td><td>SSE keepalives every 15 s + client timeout raised</td></tr>
+      <tr><td>session not reused</td><td><code>reuse=4 new=24907</code></td><td>LRU over 4 sessions, min shared prefix 16</td></tr>
+      <tr><td>generation stops after one token</td><td><code>finish_reason: length</code></td><td>context budget vs prompt size; 8k → 16k</td></tr>
+      <tr><td>reasoning shows only "thought"</td><td>streaming prefix rewritten mid-flight</td><td>hold back deltas until the channel header closes</td></tr>
+      <tr><td>loops after a tool call</td><td>model re-emits the call</td><td>stop at <code>&lt;|tool_response&gt;</code></td></tr>
+    </table>
+    <h3>Sampling</h3>
+    <table>
+      <tr><th>setting</th><th class="n">repeat loops / 6</th><th class="n">valid tool calls</th></tr>
+      <tr><td>greedy</td><td class="n">0</td><td class="n">5 / 5</td></tr>
+      <tr class="win"><td>temperature 0.3</td><td class="n">0</td><td class="n">5 / 5</td></tr>
+      <tr><td>temperature 1.0</td><td class="n">0</td><td class="n">4 / 5</td></tr>
+    </table>
+    <p class="note">The shipped default follows the model metadata (top_p 0.95, top_k 64) with
+    temperature 0.3. Greedy was not chosen as the default: it is the most sensitive to the
+    router flips that every optimisation above introduces.</p>
+  </div>
+
+  <!-- summary -->
+  <div class="card">
+    <h3 style="margin-top:0">The tradeoff in one table</h3>
+    <table>
+      <tr><th>technique</th><th>performance</th><th>memory</th><th>quality</th></tr>
+      <tr><td>int4 weights</td><td>faster decode</td><td>7.8× less</td><td>lossy, validated</td></tr>
+      <tr><td>C kernels + VNNI</td><td>2.1× prefill</td><td>—</td><td>same maths</td></tr>
+      <tr><td>MoE fusion</td><td>+33% prefill</td><td>—</td><td>same maths</td></tr>
+      <tr><td>key slice</td><td>1.06–1.24×</td><td>—</td><td>exact, router flips</td></tr>
+      <tr><td>C flash kernel</td><td>wins sliding, loses global</td><td>no score matrix</td><td>1e-5, greedy holds</td></tr>
+      <tr><td>cache window bound</td><td>—</td><td>4.6–6×</td><td>exact</td></tr>
+      <tr><td>int8 KV cache</td><td>1.6× decode</td><td>further</td><td><b class="down">loops the model</b></td></tr>
+    </table>
+    <p class="note">The pattern across all eight stages: <b>performance and memory are
+    separable and controllable; quality is where the surprises live</b>, and they almost always
+    arrive through the discrete MoE router rather than through the smooth parts of the network.
+    That is why every optimisation here is gated behind a token-level equality check, and why the
+    int8 KV cache — the one change that broke generation outright — is the only one left off by
+    default.</p>
+  </div>
+
+  <div class="kicker">
+    <p><b>Conditions.</b> Measure host <code>jackal</code>: Xeon W-2295, 18 cores, AVX-512 with
+    VNNI. Build host <code>nosey</code>: Xeon W-2133, AVX-512 without VNNI. Prefill figures are
+    256-token blocks at 18 OpenMP threads; flash comparisons give BLAS its model-configured 8
+    threads. Cache figures are float32 keys and values for the 26B-A4B Q4_0 checkpoint.
+    Every claim above comes from a script in <code>numpy-gemma/scripts/</code>; the negative
+    results are kept in the repository rather than deleted.</p>
+    <p style="margin-top:10px">Generated from the working tree. No commits since
+    <code>b08b3ae</code>.</p>
+  </div>
+
+</div>
+</body>
+</html>

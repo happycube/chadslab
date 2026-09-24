@@ -21,6 +21,8 @@ import struct
 
 import numpy as np
 
+from .ops import to_bf16
+
 # The GGML data types.
 F32, F16, Q4_0, Q4_1 = 0, 1, 2, 3
 Q5_0, Q5_1, Q8_0, Q8_1 = 6, 7, 8, 9
@@ -84,6 +86,10 @@ _BLOCK_NAMES = {
     "post_ffw_norm_2.weight": "post_feedforward_layernorm_2.weight",
     "pre_ffw_norm_2.weight": "pre_feedforward_layernorm_2.weight",
     "layer_output_scale.weight": "layer_scalar",
+    # The per-layer embeddings of the E4B model.
+    "inp_gate.weight": "per_layer_input_gate.weight",
+    "proj.weight": "per_layer_projection.weight",
+    "post_norm.weight": "post_per_layer_input_norm.weight",
     "ffn_gate_inp.weight": "router.proj.weight",
     "ffn_gate_inp.scale": "router.scale",
     "ffn_gate_up_exps.weight": "experts.gate_up_proj",
@@ -94,6 +100,9 @@ _GLOBAL_NAMES = {
     "token_embd.weight": "embed_tokens.weight",
     "output_norm.weight": "norm.weight",
     "rope_freqs.weight": "rope_freqs.weight",
+    "per_layer_model_proj.weight": "per_layer_model_projection.weight",
+    "per_layer_proj_norm.weight": "per_layer_projection_norm.weight",
+    "per_layer_token_embd.weight": "embed_tokens_per_layer.weight",
 }
 
 
@@ -170,23 +179,6 @@ def _dequant(raw, t, count):
         out = out.reshape(nb, 256).astype(np.float32) * d[:, None]
         return out.reshape(-1)[:count]
     raise ValueError("dequant for type %s is not implemented" % _TYPE_NAME.get(t, t))
-
-
-def to_bf16(x):
-    """Round a float32 array to bfloat16. Return the raw uint16 values.
-
-    Work in chunks. A chunk of the float32 data stays in the cache. Thus the
-    function needs fewer passes over the full array.
-    """
-    x = np.ascontiguousarray(x, dtype=np.float32)
-    flat = x.reshape(-1).view(np.uint32)
-    out = np.empty(flat.shape, dtype=np.uint16)
-    step = 1 << 20
-    for i in range(0, flat.size, step):
-        u = flat[i:i + step]
-        # Round to the nearest even value before the shift.
-        out[i:i + step] = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
-    return out.reshape(x.shape)
 
 
 class GGUF:
@@ -300,6 +292,19 @@ class GGUF:
         """Return the GGUF type name of one tensor."""
         _d, t, _o = self.tensors[self._gguf(hf_name)]
         return _TYPE_NAME[t]
+
+    def tensor_bytes(self, hf_name):
+        """Return the byte count that one tensor takes in the file.
+
+        A quantized tensor holds whole blocks. The count uses the block table,
+        so the method reads no tensor data.
+        """
+        dims, t, _o = self.tensors[self._gguf(hf_name)]
+        count = 1
+        for d in dims:
+            count *= int(d)
+        values, block = _BLOCK[t]
+        return count // values * block
 
     def _blocks(self, hf_name, first, nblk):
         """Return the structured block array for a block range."""
@@ -441,10 +446,17 @@ class GGUF:
         """Return a Hugging Face text_config dict from the GGUF metadata."""
         m = self.meta
         head_kv = np.asarray(m["gemma4.attention.head_count_kv"])
+        if head_kv.ndim == 0:
+            # The E4B file gives one value for every layer.
+            head_kv = np.repeat(head_kv, int(m["gemma4.block_count"]))
         pattern = np.asarray(m["gemma4.attention.sliding_window_pattern"])
         layer_types = ["sliding_attention" if bool(p) else "full_attention" for p in pattern]
         sliding = [i for i, t in enumerate(layer_types) if t == "sliding_attention"]
-        return {
+        full = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        # The 12B and the 26B reuse the key as the value in a global layer, so
+        # those layers have no value projection. The E4B has one there.
+        has_v = any(("blk.%d.attn_v.weight" % i) in self.tensors for i in full)
+        cfg = {
             "hidden_size": int(m["gemma4.embedding_length"]),
             "intermediate_size": int(m["gemma4.feed_forward_length"]),
             "num_hidden_layers": int(m["gemma4.block_count"]),
@@ -452,15 +464,17 @@ class GGUF:
             "num_key_value_heads": int(head_kv[sliding[0]]) if sliding else int(head_kv[0]),
             "head_dim": int(m["gemma4.attention.key_length_swa"]),
             "global_head_dim": int(m["gemma4.attention.key_length"]),
-            "num_global_key_value_heads": int(head_kv[5]),
+            "num_global_key_value_heads": int(head_kv[full[0]]) if full else int(head_kv[0]),
             "rms_norm_eps": float(m["gemma4.attention.layer_norm_rms_epsilon"]),
             "vocab_size": 262144,
             "max_position_embeddings": int(m["gemma4.context_length"]),
             "sliding_window": int(m["gemma4.attention.sliding_window"]),
             "final_logit_softcapping": float(m["gemma4.final_logit_softcapping"]),
-            "num_experts": int(m["gemma4.expert_count"]),
-            "top_k_experts": int(m["gemma4.expert_used_count"]),
-            "moe_intermediate_size": int(m["gemma4.expert_feed_forward_length"]),
+            "attention_k_eq_v": not has_v,
+            "num_kv_shared_layers": int(m.get("gemma4.attention.shared_kv_layers", 0) or 0),
+            "hidden_size_per_layer_input": int(
+                m.get("gemma4.embedding_length_per_layer_input", 0) or 0),
+            "vocab_size_per_layer_input": 262144,
             "layer_types": layer_types,
             "rope_parameters": {
                 "sliding_attention": {"rope_theta": float(m["gemma4.rope.freq_base_swa"])},
@@ -470,6 +484,11 @@ class GGUF:
                 },
             },
         }
+        if "gemma4.expert_count" in m:
+            cfg["num_experts"] = int(m["gemma4.expert_count"])
+            cfg["top_k_experts"] = int(m["gemma4.expert_used_count"])
+            cfg["moe_intermediate_size"] = int(m["gemma4.expert_feed_forward_length"])
+        return cfg
 
     # ---- the tokenizer ----------------------------------------------------
 

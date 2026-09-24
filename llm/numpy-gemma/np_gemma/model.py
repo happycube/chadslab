@@ -80,6 +80,9 @@ class KVCache:
         self.end = [0] * n       # absolute position after the last stored row
         self._q8_on = [False] * n
         self.attn_min = ops.ATTN_MIN
+        # The int8 copy is only useful to the fused attention. The float path
+        # never reads it, so do not build it and do not spend the memory.
+        self.attn_on = ops.attn_ready()
 
     def _shape(self, layer, cap):
         plan = self.cfg.plan[layer]
@@ -102,7 +105,8 @@ class KVCache:
     def _alloc(self, layer, cap):
         self.k[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
         self.v[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
-        self._alloc_q(layer, cap)
+        if self.attn_on:
+            self._alloc_q(layer, cap)
 
     def _grow(self, layer, cap):
         old = 0 if self.k[layer] is None else self.k[layer].shape[0]
@@ -113,6 +117,8 @@ class KVCache:
             nv[:old] = self.v[layer][:old]
         self.k[layer] = nk
         self.v[layer] = nv
+        if not self.attn_on:
+            return
         ok = 0 if self.kq[layer] is None else self.kq[layer].shape[0]
         qk = np.empty(self._shape_q(layer, cap), dtype=np.int8)
         qks = np.empty(self._shape_s(layer, cap), dtype=np.float32)
@@ -136,11 +142,17 @@ class KVCache:
             w = self.window
             if self.k[layer] is None:
                 self._alloc(layer, 2 * w)
-            # A decode step compacts the buffer when it holds two windows.
-            # A prefill block does not compact, because early queries in the
-            # block need keys from the start of the block.
-            if t == 1 and end - self.base[layer] > 2 * w:
-                keep = end - w
+            # Drop the oldest rows when the buffer holds more than two
+            # windows. A query at position p sees back to p - window + 1, so
+            # the first query of the new block sees back to
+            # start_pos - window + 1. Every row before that is hidden for the
+            # whole block. The buffer then holds about the window and the
+            # block, and it does not grow with the context. A decode step and
+            # a prompt block both compact. The old code compacted only for a
+            # decode step, so a prompt block grew the buffer to the full
+            # sequence.
+            if start_pos - self.base[layer] > 2 * w:
+                keep = start_pos - w + 1
                 off = keep - self.base[layer]
                 rows = self.end[layer] - keep
                 if rows > 0:
@@ -170,7 +182,7 @@ class KVCache:
         # Keep an int8 copy for the fused attention of a decode step. Build it
         # only when the cache is long enough that the fused path pays for the
         # work of the quantization.
-        if end - self.base[layer] >= self.attn_min:
+        if self.attn_on and end - self.base[layer] >= self.attn_min:
             if not self._q8_on[layer]:
                 self._quantize_all(layer)
                 self._q8_on[layer] = True
@@ -655,8 +667,9 @@ class Model:
     def _attention(self, x, w, plan, cos, sin, positions, i, p, hook, cache):
         """Run the attention part of one layer.
 
-        For a sliding layer, mask keys that are older than the window. For a
-        global layer, use the raw key projection for the value.
+        For a sliding layer, keep only the keys inside the window and mask the
+        ones that the causal mask hides. For a global layer, use the raw key
+        projection for the value.
         """
         eps = self.cfg.rms_norm_eps
         hd = plan.head_dim
@@ -724,22 +737,53 @@ class Model:
         n_rep = plan.num_q_heads // plan.num_kv_heads
         nk = plan.num_kv_heads
         n = K.shape[0]
+        flash = os.environ.get("NP_GEMMA_FLASH", "0")
+        window = plan.sliding_window or 0
+        # "slide" combines the two paths: the kernel serves a sliding layer,
+        # where the window caps the work, and the batched matmul serves a
+        # global layer, where OpenBLAS tiles the score matrix better than a
+        # small register tile.
+        use_flash = flash != "0" and (flash != "slide" or window > 0)
+        if t > 1 and use_flash:
+            # The flash path. It keeps the scores of one block at a time and it
+            # walks only the keys that the mask leaves visible. Use the C
+            # kernel. The NumPy reference stays for a comparison and for a
+            # target with no C kernel.
+            from .flash import flash_attention
+            if flash == "ref" or not ops.flash_ready():
+                fo = flash_attention(q, K, V, positions, base, window)
+            else:
+                fo = ops.flash_prefill(q, K, V, positions, base, window)
+            out = self.linear(fo.reshape(t, plan.q_dim), w["self_attn.o_proj"])
+            emit(hook, p + "self_attn.o_proj", out)
+            return out
+        # Drop the keys that are invisible for every query in the block. The
+        # causal mask hides the keys after the last query. The window hides
+        # the keys before the first query less the window. A key that is
+        # hidden for every query would become zero in the softmax, so dropping
+        # it does not change the result. This is what keeps a long prompt
+        # affordable: 25 of the 30 layers slide with a window of 1024, so they
+        # read the window and not the whole context.
+        window = plan.sliding_window or 0
+        if window and os.environ.get("NP_GEMMA_SLIDE", "1") == "1":
+            kpos = base + np.arange(n)
+            lo = int(np.searchsorted(kpos, positions.min() - window + 1, side='left'))
+            hi = int(np.searchsorted(kpos, positions.max(), side='right'))
+            if lo or hi < n:
+                K = K[lo:hi]
+                V = V[lo:hi]
+                base = base + lo
+                n = hi - lo
         # Use a batched matrix multiply. The code makes one matrix for each
         # group of query heads. matmul is faster than einsum here, because
         # einsum looks for a contraction path at each call.
         qb = q.reshape(t, nk, n_rep, hd).transpose(1, 0, 2, 3).reshape(nk, t * n_rep, hd)
         kb = K.transpose(1, 2, 0)
         scores = np.matmul(qb, kb).reshape(nk, t, n_rep, n)
-        # A decode step needs no mask. The cache holds only earlier positions.
-        # A sliding layer needs the mask when the buffer holds more keys than
-        # the window. A prompt of many tokens always needs the causal mask.
-        if t > 1 or (plan.sliding_window and n > plan.sliding_window):
-            kpos = base + np.arange(n)
-            mask = kpos[None, :] <= positions[:, None]
-            if plan.sliding_window:
-                mask &= (positions[:, None] - kpos[None, :]) < plan.sliding_window
-            scores = np.where(mask[None, :, None, :], scores, np.float32(-1e30))
-        probs = ops.softmax(scores, axis=-1)
+        # The kernel applies the causal mask, the window mask, and the softmax
+        # over the last axis in one pass. The values that the mask hides become
+        # zero, so a decode step needs no special case.
+        probs = ops.softmax_mask(scores, positions, n_rep, base, window)
         vb = V.transpose(1, 0, 2)
         out = np.matmul(probs.reshape(nk, t * n_rep, n), vb)
         out = out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
@@ -789,6 +833,48 @@ class Model:
         for off in range(0, len(ids), chunk):
             x = self.forward(ids[off:off + chunk], cache=cache, start_pos=start + off,
                              hook=hook)
+        return x
+
+    def prefill_layer_major(self, ids, cache, start=0, hook=None, chunk=None):
+        """Run the prompt one layer at a time instead of one block at a time.
+
+        The hidden state of every token stays in memory. The code applies one
+        layer to the whole prompt, then the next layer. Thus a layer is loaded
+        one time and its weights are used for every token, and the mixture of
+        experts sees the whole prompt for each expert. The result matches
+        prefill, but the routing may choose a different expert, because the
+        token grouping changes the order of the sums.
+
+        A chunk of zero means the whole prompt in one step. That step needs the
+        tile attention, because the score matrix of a global layer would
+        otherwise hold tokens * keys values.
+        """
+        cfg = self.cfg
+        if chunk is None:
+            chunk = self.prefill_chunk
+        if chunk <= 0:
+            chunk = len(ids)
+        ids = np.asarray(ids)
+        n_tok = len(ids)
+        x = self.embed(ids)
+        if start == 0:
+            emit(hook, "embed_tokens", x)
+            emit(hook, "inputs_embeds", x)
+        pos = np.arange(start, start + n_tok)
+        for i in range(cfg.num_hidden_layers):
+            plan = cfg.plan[i]
+            w = self.load_layer(i)
+            for off in range(0, n_tok, chunk):
+                stop = off + chunk
+                if stop > n_tok:
+                    stop = n_tok
+                cos, sin = self._rope(plan, pos[off:stop])
+                x[off:stop] = self._decoder_layer(
+                    x[off:stop], w, plan, cos, sin, pos[off:stop], i, hook, cache)
+            self.free_layer(i)
+        norm_w = self._norm_w if self._norm_w is not None else self.st.get(PREFIX + "norm.weight")
+        x = ops.rms_norm(x, norm_w, cfg.rms_norm_eps)
+        emit(hook, PREFIX + "norm", x)
         return x
 
     def generate(self, input_ids, max_new_tokens=1, eos_ids=(), cache_weights=False,
@@ -891,3 +977,32 @@ class Session:
             nxt = int(np.argmax(self.model.logits(x)[0]))
             out.append(nxt)
         return out
+
+    def generate_stream(self, ids, max_new_tokens=1, eos_ids=(), sampler=None):
+        """Yield one token id at a time.
+
+        Run the new prompt tokens, then select one token for each step. The
+        sampler holds the sampling settings. The default sampler selects the
+        most probable token. The generator stops at an end token.
+        """
+        from .sampling import Sampler
+
+        ids = list(ids)
+        self.prefill(ids)
+        if self._x is None:
+            # The prompt is the same as the cache. Run the last token again.
+            self._x = self.model.forward(ids[-1:], cache=self.cache,
+                                         start_pos=len(ids) - 1)
+        if sampler is None:
+            sampler = Sampler(temperature=0.0)
+        sampler.reset(ids)
+        x = self._x
+        pos = len(ids)
+        for _ in range(max_new_tokens):
+            nxt = sampler(self.model.logits(x[-1:])[0])
+            yield nxt
+            if nxt in eos_ids:
+                return
+            x = self.model.forward([nxt], cache=self.cache, start_pos=pos)
+            self.ids.append(nxt)
+            pos += 1
