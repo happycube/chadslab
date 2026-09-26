@@ -61,10 +61,10 @@ static inline float sum8(float a, float b, float c, float d, float e, float f, f
 
 /* ---------- scalar fallback kernels ---------- */
 
-void gemma_bf16_scalar(const uint16_t *w, const float *x, float *out,
+static void gemma_bf16_scalar_body(const uint16_t *w, const float *x, float *out,
                        int rows, int cols, int tokens)
 {
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         const uint16_t *wi = w + (size_t)i * (size_t)cols;
         for (int t = 0; t < tokens; ++t) {
@@ -76,6 +76,14 @@ void gemma_bf16_scalar(const uint16_t *w, const float *x, float *out,
             out[(size_t)t * (size_t)rows + i] = acc;
         }
     }
+}
+
+
+void gemma_bf16_scalar(const uint16_t *w, const float *x, float *out,
+                       int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_bf16_scalar_body(w, x, out, rows, cols, tokens);
 }
 
 void gemma_int8_s8_scalar(const int8_t *w, const float *sw, const int8_t *qx, const float *sx,
@@ -127,11 +135,11 @@ static inline int32_t hsum_epi32_avx2(__m256i v)
 }
 
 __attribute__((target("avx2,fma")))
-void gemma_bf16_avx2(const uint16_t *w, const float *x, float *out,
+static void gemma_bf16_avx2_body(const uint16_t *w, const float *x, float *out,
                      int rows, int cols, int tokens)
 {
     int groups = rows / 4;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int g = 0; g < groups; ++g) {
         int i = g * 4;
         const uint16_t *w0 = w + (size_t)(i + 0) * (size_t)cols;
@@ -165,6 +173,7 @@ void gemma_bf16_avx2(const uint16_t *w, const float *x, float *out,
             out[(size_t)t * (size_t)rows + i + 3] = r3;
         }
     }
+    #pragma omp single
     for (int i = groups * 4; i < rows; ++i) {
         const uint16_t *wi = w + (size_t)i * (size_t)cols;
         for (int t = 0; t < tokens; ++t) {
@@ -176,6 +185,14 @@ void gemma_bf16_avx2(const uint16_t *w, const float *x, float *out,
             out[(size_t)t * (size_t)rows + i] = acc;
         }
     }
+}
+
+__attribute__((target("avx2,fma")))
+void gemma_bf16_avx2(const uint16_t *w, const float *x, float *out,
+                     int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_bf16_avx2_body(w, x, out, rows, cols, tokens);
 }
 
 __attribute__((target("avx2")))
@@ -209,11 +226,11 @@ void gemma_int8_s8_avx2(const int8_t *w, const float *sw, const int8_t *qx, cons
 /* ---------- AVX-512 ---------- */
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
-void gemma_bf16_avx512(const uint16_t *w, const float *x, float *out,
+static void gemma_bf16_avx512_body(const uint16_t *w, const float *x, float *out,
                        int rows, int cols, int tokens)
 {
     int groups = rows / 4;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int g = 0; g < groups; ++g) {
         int i = g * 4;
         const uint16_t *w0 = w + (size_t)(i + 0) * (size_t)cols;
@@ -247,6 +264,7 @@ void gemma_bf16_avx512(const uint16_t *w, const float *x, float *out,
             out[(size_t)t * (size_t)rows + i + 3] = r3;
         }
     }
+    #pragma omp single
     for (int i = groups * 4; i < rows; ++i) {
         const uint16_t *wi = w + (size_t)i * (size_t)cols;
         for (int t = 0; t < tokens; ++t) {
@@ -258,6 +276,14 @@ void gemma_bf16_avx512(const uint16_t *w, const float *x, float *out,
             out[(size_t)t * (size_t)rows + i] = acc;
         }
     }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void gemma_bf16_avx512(const uint16_t *w, const float *x, float *out,
+                       int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_bf16_avx512_body(w, x, out, rows, cols, tokens);
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
@@ -309,6 +335,17 @@ void gemma_bf16_linear(const uint16_t *w, const float *x, float *out,
     }
 }
 
+/* The body for a caller that is already in a region. */
+static void gemma_bf16_linear_body(const uint16_t *w, const float *x, float *out,
+                                   int rows, int cols, int tokens)
+{
+    if (gemma_have_avx512()) {
+        gemma_bf16_avx512_body(w, x, out, rows, cols, tokens);
+    } else {
+        gemma_bf16_avx2_body(w, x, out, rows, cols, tokens);
+    }
+}
+
 void gemma_int8_s8(const int8_t *w, const float *sw, const int8_t *qx, const float *sx,
                    float *out, int rows, int cols, int tokens)
 {
@@ -323,6 +360,13 @@ void gemma_bf16_linear(const uint16_t *w, const float *x, float *out,
                        int rows, int cols, int tokens)
 {
     gemma_bf16_scalar(w, x, out, rows, cols, tokens);
+}
+
+/* The body for a caller that is already in a region. */
+static void gemma_bf16_linear_body(const uint16_t *w, const float *x, float *out,
+                                   int rows, int cols, int tokens)
+{
+    gemma_bf16_scalar_body(w, x, out, rows, cols, tokens);
 }
 
 void gemma_int8_s8(const int8_t *w, const float *sw, const int8_t *qx, const float *sx,
@@ -6287,12 +6331,14 @@ enum { GP_T_NONE = 0, GP_T_INT = 1, GP_T_F32 = 2, GP_T_SLOT = 3 };
 enum {
     GP_S_MOV = 1, GP_S_ADD = 2, GP_S_SUB = 3, GP_S_MUL = 4, GP_S_MAX = 5,
     GP_S_MIN = 6,
-    GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19,
+    GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19, GP_GELU = 20,
+    GP_MUL = 21,
     GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
     GP_GELU_MUL_INT4 = 35, GP_INT4_LINEAR_MT = 36, GP_INT4_MULTI4_MT = 37,
-    GP_GELU_MUL_ROWS = 38,
+    GP_GELU_MUL_ROWS = 38, GP_BF16_LINEAR = 39,
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50, GP_ATTN_F32 = 51,
-    GP_ATTN_Q8_MT = 52, GP_ATTN_F32_MT = 53,
+    GP_ATTN_Q8_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
+    GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
 };
 
@@ -6548,6 +6594,33 @@ static void gp_step(const gp_rec *r, int64_t *e)
         memcpy(dst, src, n);
         break;
     }
+    case GP_GELU:
+        /* Operands: x, out, n. As ops.gelu_tanh. */
+        gemma_gelu_body(GP_P(const float, 0), GP_P(float, 1), GP_I(2));
+        break;
+    case GP_MUL: {
+        /* Operands: a, b, out, rows, cols, b_stride. out = a * b for each
+         * value. Row r of b starts at r * b_stride. Thus b can be a slice of a
+         * wider array, for example the per-layer input of the E4B model. */
+        const float *a = GP_P(const float, 0);
+        const float *b = GP_P(const float, 1);
+        float *out = GP_P(float, 2);
+        int rows = GP_I(3), cols = GP_I(4);
+        size_t bs = (size_t)gp_i(r, e, 5);
+        #pragma omp single
+        for (int i = 0; i < rows; ++i) {
+            for (int c = 0; c < cols; ++c) {
+                out[(size_t)i * (size_t)cols + c] =
+                    a[(size_t)i * (size_t)cols + c] * b[(size_t)i * bs + c];
+            }
+        }
+        break;
+    }
+    case GP_BF16_LINEAR:
+        /* Operands: x, w, out, rows, cols, tokens. A bfloat16 matrix. */
+        gemma_bf16_linear_body(GP_P(const uint16_t, 1), GP_P(const float, 0),
+                               GP_P(float, 2), GP_I(3), GP_I(4), GP_I(5));
+        break;
     /* ---- int4 matrices ---- */
     case GP_INT4_LINEAR:
         /* x, w, s, out, rows, cols */
@@ -6729,6 +6802,73 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                        out + j * qd, q_heads, kv_heads, head_dim, n,
                                        head_dim, head_dim, row, row,
                                        (int)(pos + j), (int)(base + lo), window);
+        }
+        break;
+    }
+    case GP_QKV_NORM:
+        /* Operands: q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps.
+         *
+         * A layer that reuses the key and the value of an earlier layer gives
+         * null for k and v. */
+        gemma_qkv_norm_body(GP_P(float, 0), GP_P(const float, 1), GP_I(2),
+                            GP_P(float, 3), GP_P(const float, 4), GP_I(5),
+                            GP_P(float, 6), GP_I(7), GP_I(8), gp_f(r, e, 9));
+        break;
+    case GP_ROPE:
+        /* Operands: q, q_rows, q_heads, k, k_rows, k_heads, cos, sin,
+         * head_dim. */
+        gemma_rope_body(GP_P(float, 0), GP_I(1), GP_I(2), GP_P(float, 3), GP_I(4),
+                        GP_I(5), GP_P(const float, 6), GP_P(const float, 7), GP_I(8));
+        break;
+    case GP_KV_WRITE_HEADS: {
+        /* Operands: k, v, kbuf, vbuf, head_stride, pos, tokens, kv_heads,
+         * head_dim. The E4B cache keeps (heads, positions, head_dim), so
+         * each head of each token goes to its own place. */
+        const float *k = GP_P(const float, 0);
+        const float *v = GP_P(const float, 1);
+        float *kb = GP_P(float, 2);
+        float *vb = GP_P(float, 3);
+        size_t hs = (size_t)gp_i(r, e, 4);
+        int64_t pos = gp_i(r, e, 5);
+        int tokens = GP_I(6), kv_heads = GP_I(7), head_dim = GP_I(8);
+        #pragma omp single
+        for (int j = 0; j < tokens; ++j) {
+            for (int h = 0; h < kv_heads; ++h) {
+                size_t src = ((size_t)j * (size_t)kv_heads + (size_t)h) * (size_t)head_dim;
+                size_t dst = (size_t)h * hs + (size_t)(pos + j) * (size_t)head_dim;
+                memcpy(kb + dst, k + src, (size_t)head_dim * sizeof(float));
+                memcpy(vb + dst, v + src, (size_t)head_dim * sizeof(float));
+            }
+        }
+        break;
+    }
+    case GP_ATTN_F32H: {
+        /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim,
+         * tokens, pos, head_stride, window, slide.
+         * The attention of one or more queries over the E4B cache. The code
+         * runs one query at a time, as E4B.attention does it. k and v point at
+         * position 0.
+         * With slide, a sliding layer reads only the rows of its window. */
+        const float *q = GP_P(const float, 0);
+        const float *k = GP_P(const float, 1);
+        const float *v = GP_P(const float, 2);
+        float *out = GP_P(float, 4);
+        int q_heads = GP_I(5), kv_heads = GP_I(6), head_dim = GP_I(7);
+        int tokens = GP_I(8), window = GP_I(11), slide = GP_I(12);
+        int64_t pos = gp_i(r, e, 9);
+        long hs = (long)gp_i(r, e, 10);
+        size_t qd = (size_t)q_heads * (size_t)head_dim;
+        for (int j = 0; j < tokens; ++j) {
+            int64_t p = pos + j;
+            int64_t lo = (slide && window > 0) ? p - window + 1 : 0;
+            if (lo < 0) {
+                lo = 0;
+            }
+            gemma_attn_decode_f32_body(q + j * qd, k + (size_t)lo * (size_t)head_dim,
+                                       v + (size_t)lo * (size_t)head_dim, GP_P(float, 3),
+                                       out + j * qd, q_heads, kv_heads, head_dim,
+                                       (int)(p + 1 - lo), hs, hs, head_dim, head_dim,
+                                       (int)p, (int)lo, window);
         }
         break;
     }

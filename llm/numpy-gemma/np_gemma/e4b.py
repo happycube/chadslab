@@ -60,6 +60,10 @@ from . import ops
 from . import rope as rope_mod
 
 PREFIX = "model.language_model."
+
+# Run a decode step as one program in C. Set NP_GEMMA_PROGRAM=0 for the Python
+# loop over the layers.
+_PROGRAM = os.environ.get("NP_GEMMA_PROGRAM", "1") != "0"
 # The output head is a top-level tensor. It is not inside the language model.
 # This checkpoint sets tie_word_embeddings to false, so the head is its own
 # quantized matrix and not the embedding table.
@@ -794,6 +798,14 @@ class E4B:
         """
         cfg = self.cfg
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
+        if (_PROGRAM and hook is None and isinstance(cache, E4BCache)
+                and (ids.size == 1 or ops.mt_ready(ids.size))):
+            # One decode step, or the group of an MTP verify step, as one
+            # program in C (np_gemma/program.py). The result has the bits of
+            # the Python loop below.
+            from . import program
+            if program.e4b_ready(self, cache):
+                return program.decode_step_e4b(self, cache, ids, int(start_pos))
         if cache is None:
             cache = E4BCache(cfg)
         emb = self.embed_rows(PREFIX + "embed_tokens", ids)

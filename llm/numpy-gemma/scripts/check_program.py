@@ -92,16 +92,59 @@ def bisect(prog, model, cache, i, x, pos, saved):
     return None
 
 
+def check_e4b(g, tok, args):
+    """Run steps of 1 to 8 tokens through E4B.forward, with the program off
+    and on. Compare the hidden states and the logits."""
+    import np_gemma.e4b as e4b_mod
+    from np_gemma.e4b import E4B, E4BCache, E4BConfig
+    cfg = E4BConfig({"text_config": g.text_config()})
+    model = E4B(g, cfg, mode="int4")
+    ids = tok.encode(open("README.md").read())
+    ok = True
+    sizes = [1, 3, 1, 2, 4, 1, 8, 1]
+    for n in args.contexts:
+        res = {}
+        for on in (False, True):
+            e4b_mod._PROGRAM = on
+            cache = E4BCache(cfg, max_len=n + 64)
+            model.forward(ids[:n], cache=cache)
+            xs, ts = [], {}
+            pos = n
+            for rep in range(2):
+                for t in sizes:
+                    t0 = time.perf_counter()
+                    x = model.forward(ids[pos:pos + t], cache=cache, start_pos=pos)
+                    lg = model.logits(x)
+                    ts.setdefault(t, []).append(time.perf_counter() - t0)
+                    xs.append((x, lg))
+                    pos += t
+            res[on] = (xs, ts)
+        same = all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+                   for a, b in zip(res[False][0], res[True][0]))
+        ok = ok and same
+        print("E4B context %d, steps of %s tokens (two rounds): %s" % (
+            n, sizes, "same" if same else "DIFFERENT"))
+        for t in sorted(res[True][1]):
+            print("  %d tokens, with logits: Python %.1f ms, program %.1f ms (last round)" % (
+                t, 1000 * res[False][1][t][-1], 1000 * res[True][1][t][-1]))
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", default=GGUF_PATH)
     ap.add_argument("--contexts", type=int, nargs="+", default=[200, 1100])
     ap.add_argument("--layers", type=int, nargs="+", default=None)
     ap.add_argument("--show", action="store_true", help="Print the form and the program.")
+    ap.add_argument("--e4b", action="store_true",
+                    help="The GGUF file is an E4B model. Check only the steps.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
     tok = Tokenizer.from_gguf(g)
+    if args.e4b:
+        return check_e4b(g, tok, args)
     cfg = Config({"text_config": g.text_config()})
     model = Model(g, cfg).load_all(dtype="int4")
     ids = tok.encode(open("README.md").read())

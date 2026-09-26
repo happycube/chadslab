@@ -65,11 +65,11 @@ T_NONE, T_INT, T_F32, T_SLOT = 0, 1, 2, 3
 # file. 1 to 15 are scalar operations. The comment of each case in gp_step
 # gives the order of the operands.
 S_MOV, S_ADD, S_SUB, S_MUL, S_MAX, S_MIN = 1, 2, 3, 4, 5, 6
-RMS_NORM, ADD, MUL_S, COPY = 16, 17, 18, 19
+RMS_NORM, ADD, MUL_S, COPY, GELU, MUL = 16, 17, 18, 19, 20, 21
 INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
-INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS = 36, 37, 38
+INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, BF16_LINEAR = 36, 37, 38, 39
 QKV_NORM_ROPE, KV_WRITE, ATTN_Q8, ATTN_F32 = 48, 49, 50, 51
-ATTN_Q8_MT, ATTN_F32_MT = 52, 53
+ATTN_Q8_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
 ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
 
 OP_NAMES = {v: k for k, v in dict(
@@ -80,7 +80,9 @@ OP_NAMES = {v: k for k, v in dict(
     ATTN_Q8=ATTN_Q8, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
     INT4_LINEAR_MT=INT4_LINEAR_MT, INT4_MULTI4_MT=INT4_MULTI4_MT,
     GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_Q8_MT=ATTN_Q8_MT, ATTN_F32_MT=ATTN_F32_MT,
-    ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT).items()}
+    ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
+    QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
+    ATTN_F32H=ATTN_F32H).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -423,6 +425,43 @@ def _py_step(op, a, e):
         out[:] = 0.0
         for k in range(top_k):
             out += contrib[m[:, k]]
+    elif op == GELU:
+        n = V(2)
+        _arr(V(1), n)[:] = cops.gelu(_arr(V(0), n))
+    elif op == MUL:
+        rows, cols, bs = V(3), V(4), V(5)
+        a_ = _arr(V(0), rows * cols).reshape(rows, cols)
+        b_ = np.lib.stride_tricks.as_strided(
+            _arr(V(1), (rows - 1) * bs + cols), (rows, cols), (4 * bs, 4))
+        _arr(V(2), rows * cols).reshape(rows, cols)[:] = a_ * b_
+    elif op == BF16_LINEAR:
+        L.gemma_bf16_linear(V(1), V(0), V(2), V(3), V(4), V(5))
+    elif op == QKV_NORM:
+        L.gemma_qkv_norm(V(0), V(1) or None, V(2), V(3) or None, V(4) or None, V(5),
+                         V(6) or None, V(7), V(8), F(9))
+    elif op == ROPE:
+        L.gemma_rope(V(0), V(1), V(2), V(3) or None, V(4), V(5), V(6), V(7), V(8))
+    elif op == KV_WRITE_HEADS:
+        hs, pos, t, kvh, hd = V(4), V(5), V(6), V(7), V(8)
+        k = _arr(V(0), t * kvh * hd).reshape(t, kvh, hd)
+        v = _arr(V(1), t * kvh * hd).reshape(t, kvh, hd)
+        for h in range(kvh):
+            base_ = h * hs + pos * hd
+            _arr(V(2) + 4 * base_, t * hd).reshape(t, hd)[:] = k[:, h]
+            _arr(V(3) + 4 * base_, t * hd).reshape(t, hd)[:] = v[:, h]
+    elif op == ATTN_F32H:
+        qh, kvh, hd, t, pos, hs, window, slide = (V(5), V(6), V(7), V(8), V(9), V(10),
+                                                  V(11), V(12))
+        q = _arr(V(0), t * qh * hd).reshape(t, qh, hd)
+        out = _arr(V(4), t * qh * hd).reshape(t, qh, hd)
+        span = (kvh - 1) * hs + (pos + t) * hd
+        K = np.lib.stride_tricks.as_strided(_arr(V(1), span), (kvh, pos + t, hd), (4 * hs, 4 * hd, 4))
+        Vv = np.lib.stride_tricks.as_strided(_arr(V(2), span), (kvh, pos + t, hd), (4 * hs, 4 * hd, 4))
+        for j in range(t):
+            p_ = pos + j
+            lo = max(0, p_ - window + 1) if (slide and window) else 0
+            out[j] = ops.attn_decode_f32(q[j:j + 1], K[:, lo:p_ + 1, :], Vv[:, lo:p_ + 1, :],
+                                         p_, lo, window)[0]
     else:
         raise ValueError("op %d" % op)
 
@@ -451,6 +490,8 @@ class Compiler:
         (slot name)            the slot of a parameter
         (w layer key)          a weight of a layer; (w None "norm") is the
                                final norm
+        (m module)             an E4B matrix: int4 blocks or bfloat16
+        (t key)                an E4B tensor, such as a norm weight
         (+ a b ...) (- ...) (* ...) (max ...) (min ...)
                                scalar operations on ints and slots
 
@@ -521,6 +562,13 @@ class Compiler:
             if layer is None:
                 return {"norm": self.model._norm_w}[key]
             return self.model._layers[layer][key]
+        if head == "m":
+            # An E4B matrix: the int4 blocks, or else the bfloat16 copy.
+            entry = self.model.q4(args[0])
+            return entry if entry is not None else self.model.W16(args[0])
+        if head == "t":
+            # An E4B tensor that the quantization did not touch.
+            return np.ascontiguousarray(self.model.T(args[0]), dtype=np.float32)
         if head in SCALAR:
             return self.scalar(head, [self.value(a) for a in args])
         fn = KERNELS[head]
@@ -586,9 +634,10 @@ def k_add(c, a, b, out=None):
 
 
 def k_mul(c, x, s, out=None):
-    """(mul x s): x times the float32 s. As x * layer_scalar in NumPy."""
+    """(mul x s): x times the float32 s. As x * layer_scalar in NumPy. s can
+    be an array of one value."""
     out = c.buffer(x.shape) if out is None else out
-    c.p.emit(MUL_S, x, float(s), out, x.size)
+    c.p.emit(MUL_S, x, float(np.asarray(s).reshape(-1)[0]), out, x.size)
     return out
 
 
@@ -812,6 +861,91 @@ def k_moe(c, h, val, idx, layer):
     return out
 
 
+def k_gelu(c, x, out=None):
+    """(gelu x): the tanh form of GELU of each value. As ops.gelu_tanh."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(GELU, x, out, x.size)
+    return out
+
+
+def k_mul_v(c, a, b, out=None):
+    """(mul_v a b): a * b for each value. As the NumPy product."""
+    out = c.buffer(a.shape) if out is None else out
+    c.p.emit(MUL, a, b, out, a.shape[0], a.size // a.shape[0], a.size // a.shape[0])
+    return out
+
+
+def k_mul_pli(c, a, pl, layer, out=None):
+    """(mul_pli a pl layer): a times the per-layer input of a layer. The
+    array pl is (tokens, layers * n). Thus the slice of one layer has a row
+    stride."""
+    n = a.shape[1]
+    out = c.buffer(a.shape) if out is None else out
+    c.p.emit(MUL, a, pl.ctypes.data + 4 * layer * n, out, a.shape[0], n, pl.shape[1])
+    return out
+
+
+def k_linear(c, mat, x, out=None):
+    """(linear m x): a matrix of the E4B model on the rows of x. An int4
+    matrix uses the int4 kernels. A bfloat16 matrix uses the bfloat16 GEMV,
+    as E4B.linear does for one token and for a group."""
+    if isinstance(mat, tuple):
+        return k_int4(c, mat, x, out)
+    out = c.buffer((x.shape[0], mat.shape[0])) if out is None else out
+    c.p.emit(BF16_LINEAR, x, mat, out, mat.shape[0], x.shape[1], x.shape[0])
+    return out
+
+
+def k_rms_norm_rows(c, x, cols, w, out=None):
+    """(rms_norm_rows x cols w): the norm of each part of cols values of x."""
+    view = x.reshape(-1, cols)
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(RMS_NORM, view, w, out, view.shape[0], cols, float(c.eps))
+    return out
+
+
+def k_qkv_norm(c, q, k, v, qn, kn, layer):
+    """(qkv_norm q k v qn kn layer): the norms of q, k, and v, in place. A
+    shared layer gives None for k and v. As ops.qkv_norm."""
+    hd = c.cfg.plan[layer].head_dim
+    c.p.emit(QKV_NORM, q, qn, q.size // hd, k, kn, 0 if k is None else k.size // hd,
+             v, 0 if v is None else v.size // hd, hd, float(c.eps))
+
+
+def k_rope(c, q, k, cos, sin, layer):
+    """(rope q k cos sin layer): the rope of the query and the key, in place.
+    As ops.rope_apply."""
+    plan = c.cfg.plan[layer]
+    hd = plan.head_dim
+    c.p.emit(ROPE, q, q.size // hd, plan.num_q_heads, k, 0 if k is None else k.size // hd,
+             plan.num_kv_heads, cos, sin, hd)
+
+
+def k_kv_write_heads(c, layer, k, v):
+    """(kv_write_heads layer k v): store the keys and the values of the tokens
+    in the E4B cache, which keeps (heads, positions, head_dim)."""
+    plan = c.cfg.plan[layer]
+    per = plan.num_kv_heads * plan.head_dim
+    s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
+    c.p.emit(KV_WRITE_HEADS, k, v, s("k"), s("v"), s("hs"), c.p.slot("pos"), k.size // per,
+             plan.num_kv_heads, plan.head_dim)
+
+
+def k_attn_e4b(c, layer, q):
+    """(attn_e4b layer q): the attention of the queries over the E4B cache. A
+    shared layer reads the buffers of its source layer. As E4B.attention."""
+    import os
+    plan = c.cfg.plan[layer]
+    hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
+    t = q.size // (qh * hd)
+    s = lambda name: c.p.slot("%s.%d" % (name, plan.source))  # noqa: E731
+    out = c.buffer((t, qh * hd))
+    slide = 1 if os.environ.get("NP_GEMMA_SLIDE", "1") == "1" else 0
+    c.p.emit(ATTN_F32H, q, s("k"), s("v"), c.p.slot("scores"), out, qh, kvh, hd, t,
+             c.p.slot("pos"), s("hs"), plan.window, slide)
+    return out
+
+
 KERNELS = {
     "rms_norm": k_rms_norm,
     "add": k_add,
@@ -830,6 +964,15 @@ KERNELS = {
     "attn_rows_q8": lambda c, layer, q: k_attn_rows(c, layer, q, "q8"),
     "attn_rows_f32": lambda c, layer, q: k_attn_rows(c, layer, q, "f32"),
     "router": k_router,
+    "gelu": k_gelu,
+    "mul_v": k_mul_v,
+    "mul_pli": k_mul_pli,
+    "linear": k_linear,
+    "rms_norm_rows": k_rms_norm_rows,
+    "qkv_norm": k_qkv_norm,
+    "rope": k_rope,
+    "kv_write_heads": k_kv_write_heads,
+    "attn_e4b": k_attn_e4b,
     "moe": k_moe,
 }
 
@@ -1038,3 +1181,146 @@ def bind_step(prog, model, cache, pos):
     kw["scores"] = sc
     prog.bind(**kw)
     prog.keep_bound = keep
+
+
+# ---- the E4B model ------------------------------------------------------------
+
+E4B_PREFIX = "model.language_model."
+
+
+def e4b_layer_form(model, i):
+    """Return one decoder layer of the E4B model as a nested expression.
+
+    The expression follows E4B.layer, E4B.attention, and E4B.mlp. A shared
+    layer computes only the query. It reads the key and the value of its
+    source layer.
+    """
+    plan = model.cfg.plan[i]
+    kind = "s" if plan.is_sliding else "f"
+    p = E4B_PREFIX + "layers.%d." % i
+
+    def T(k):
+        return ("t", p + k)
+
+    def M(k):
+        return ("m", p + k)
+
+    if plan.shared:
+        attn = (("let", "q", ("linear", M("self_attn.q_proj"), "h")),
+                ("qkv_norm", "q", None, None, T("self_attn.q_norm.weight"), None, i),
+                ("rope", "q", None, "cos." + kind, "sin." + kind, i))
+    else:
+        attn = (("let", ("q", "k", "v"), ("int4_multi4", "h", M("self_attn.q_proj"),
+                                         M("self_attn.k_proj"), M("self_attn.v_proj"))),
+                ("qkv_norm", "q", "k", "v", T("self_attn.q_norm.weight"),
+                 T("self_attn.k_norm.weight"), i),
+                ("rope", "q", "k", "cos." + kind, "sin." + kind, i),
+                ("kv_write_heads", i, "k", "v"))
+    return ("layer", i,
+            ("let", "h", ("rms_norm", "x", T("input_layernorm.weight"))),
+            *attn,
+            ("let", "a", ("attn_e4b", i, "q")),
+            ("let", "o", ("linear", M("self_attn.o_proj"), "a")),
+            ("set", "x", ("add", "x", ("rms_norm", "o", T("post_attention_layernorm.weight")))),
+            ("let", ("g", "u"), ("int4_multi4",
+                                 ("rms_norm", "x", T("pre_feedforward_layernorm.weight")),
+                                 M("mlp.gate_proj"), M("mlp.up_proj"))),
+            ("let", "d", ("linear", M("mlp.down_proj"), ("mul_v", ("gelu", "g"), "u"))),
+            ("set", "x", ("add", "x", ("rms_norm", "d", T("post_feedforward_layernorm.weight")))),
+            ("let", "pg", ("gelu", ("linear", M("per_layer_input_gate"), "x"))),
+            ("let", "pp", ("linear", M("per_layer_projection"), ("mul_pli", "pg", "pl", i))),
+            ("set", "x", ("add", "x", ("rms_norm", "pp",
+                                       T("post_per_layer_input_norm.weight")))),
+            ("set", "x", ("mul", "x", T("layer_scalar"))))
+
+
+def e4b_step_form(model):
+    """Return a whole step of the E4B model.
+
+    The step starts with the per-layer inputs, as E4B.per_layer_inputs does
+    it. That is the projection of x, its scale and norm, and the sum with the
+    token part "tok". Then come the layers and the final norm into xn.
+    """
+    cfg = model.cfg
+    n = cfg.hidden_size_per_layer_input
+    return ("seq",
+            ("let", "proj", ("linear", ("m", E4B_PREFIX + "per_layer_model_projection"), "x")),
+            ("set", "proj", ("mul", "proj", cfg.per_layer_model_projection_scale)),
+            ("let", "pn", ("rms_norm_rows", "proj", n,
+                           ("t", E4B_PREFIX + "per_layer_projection_norm.weight"))),
+            ("let", "pl", ("mul", ("add", "pn", "tok"), cfg.per_layer_input_scale)),
+            *[e4b_layer_form(model, i) for i in range(cfg.num_hidden_layers)],
+            ("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))))
+
+
+def compile_e4b_step(model, t=1):
+    """Compile a whole E4B step of t tokens. "x" and "tok" are the inputs;
+    "xn" is the hidden state after the final norm."""
+    cfg = model.cfg
+    c = Compiler(model)
+    c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
+    c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
+                            dtype=np.float32)
+    c.p.slot("pos")
+    c.compile(e4b_step_form(model))
+    c.p.tokens = t
+    return c.p.finish()
+
+
+def e4b_ready(model, cache):
+    """Return True when an E4B step can run as a program.
+
+    The program uses the fused float attention and the int4 blocks of a GGUF
+    file. The cache must hold the buffers of every layer that stores a key.
+    """
+    if not (ops.attn_ready() and model.mode == "int4" and model._q4 and cache.n > 0):
+        return False
+    return all(i in cache.kv for i, p in enumerate(model.cfg.plan) if not p.shared)
+
+
+def e4b_bind_step(prog, model, cache, pos):
+    """Prepare the E4B cache for the tokens of a step and bind the parameters."""
+    t = prog.tokens
+    cache._reserve(pos + t)
+    kw = {"pos": pos}
+    for i, plan in enumerate(model.cfg.plan):
+        if plan.shared:
+            continue
+        k, v = cache.kv[i]
+        kw.update({"k.%d" % i: k, "v.%d" % i: v, "hs.%d" % i: k.shape[1] * k.shape[2]})
+    cache.n = max(cache.n, pos + t)
+    keep = []
+    for kind, sliding in (("s", True), ("f", False)):
+        plan = next(p for p in model.cfg.plan if p.is_sliding == sliding)
+        cos, sin = model.rope_tables(plan, pos, t)
+        cos = np.ascontiguousarray(cos, dtype=np.float32)
+        sin = np.ascontiguousarray(sin, dtype=np.float32)
+        keep += [cos, sin]
+        kw["cos." + kind] = cos
+        kw["sin." + kind] = sin
+    need = max(p.num_q_heads * (pos + t) for p in model.cfg.plan)
+    sc = getattr(prog, "scores", None)
+    if sc is None or sc.size < need:
+        sc = np.zeros(max(need, 2 * (sc.size if sc is not None else 0)), dtype=np.float32)
+        prog.scores = sc
+    kw["scores"] = sc
+    prog.bind(**kw)
+    prog.keep_bound = keep
+
+
+def decode_step_e4b(model, cache, tokens, pos):
+    """Run an E4B step of one or more tokens with a program. Return the hidden
+    state after the final norm, shape (tokens, hidden)."""
+    cfg = model.cfg
+    ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+    progs = model.__dict__.setdefault("_programs", {})
+    prog = progs.get(ids.size)
+    if prog is None:
+        prog = progs[ids.size] = compile_e4b_step(model, ids.size)
+    e4b_bind_step(prog, model, cache, pos)
+    # The inputs, as E4B.forward and E4B.per_layer_inputs make them.
+    prog.names["x"][:] = model.embed_rows(E4B_PREFIX + "embed_tokens", ids) * cfg.embed_scale
+    tok = model.embed_rows(E4B_PREFIX + "embed_tokens_per_layer", ids)
+    prog.names["tok"][:] = (tok * cfg.per_layer_embed_scale).reshape(ids.size, -1)
+    prog.run()
+    return prog.names["xn"].copy()

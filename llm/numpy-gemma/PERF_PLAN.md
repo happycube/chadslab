@@ -332,6 +332,28 @@ path keeps its kernels and its bits.
 
   With the program, the MTP decode of the 26B gives 19.55 tokens/s with two
   drafts. The plain decode gives 14.79 in the same run (1.32 times).
+
+  Done for the E4B. The E4B model has its own builder, `e4b_step_form`. The
+  step computes the per-layer inputs, then the 42 layers, then the final
+  norm. The table lookup of the embeddings stays in Python.
+
+  A layer that
+  reuses the key and the value of an earlier layer reads the buffers of
+  that layer. The bfloat16 kernel now has a body and a wrapper too. New
+  operations: BF16_LINEAR, GELU, MUL, QKV_NORM, ROPE, KV_WRITE_HEADS, and
+  ATTN_F32H.
+
+  `scripts/check_program.py --e4b` gives the same bits as the Python path
+  for steps of 1 to 8 tokens, at a context of 40 and of 600. The E4B gains
+  more than the 26B, because it has more small matrices:
+
+      tokens   Python     program    (context 600)
+      1         88.7 ms    71.2 ms
+      4        167.7 ms   117.2 ms
+      8        278.6 ms   211.9 ms
+
+  The MTP decode of the E4B gives 21.37 tokens/s with two drafts. The plain
+  decode gives 14.99 in the same run, and it gave 12.54 before the program.
   Every prompt gives the same token ids with and without MTP.
 
 Expect 11 to 14 ms less for each step of the 26B, about 55 ms. That is 18
