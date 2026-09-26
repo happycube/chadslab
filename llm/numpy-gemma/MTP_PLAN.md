@@ -336,3 +336,30 @@ Use MTP from the command line:
 
 DRAFTER_DIR is the snapshot directory of the drafter. NP_GEMMA_MTP=0 turns
 the drafter off.
+
+### Phase 6: a limit on the draft
+
+With NP_GEMMA_MTP_PMIN=0.5, the drafter stops when its best token has a
+probability below 0.5. The 26B gives these values. The plain decode gave
+13.76 tokens/s in this run:
+
+    drafts   tokens/s   gain   accepted
+    n=3      17.25      1.25   72%
+    n=4      16.27      1.18   67%
+
+The limit raises the acceptance, but it gives no gain over two drafts
+without the limit. Prose still loses a little (0.94 times). The limit stays
+off, and two drafts stay the default.
+
+## What is left
+
+- Phase 5, the rule min(1, p/q) of speculative sampling. It accepts more
+  drafts with a temperature. It needs the drafter probabilities. The output
+  then follows the target distribution, but it does not give the exact
+  tokens of a plain run with the same seed.
+- The 26B verify batch. A group of four costs 1.9 decode steps, and 55 ms of
+  its 137 ms reads the experts of the four tokens. The output head (27 ms)
+  and the Python of the layer loop are the other large parts.
+- An MXFP4 drafter. In llama.cpp it is 6 per cent faster than q4_0. It needs
+  a new kernel here.
+- The unsloth Q4_K files. The GGUF reader needs the Q4_K type first.
