@@ -265,6 +265,48 @@ path keeps its kernels and its bits.
   head, a step is thus about 56 ms.
 - 2c: the whole decode step of the 26B in one program, with the output
   head. Python keeps the embedding, the sampler, and the cache management.
+
+  Done. Model.forward runs a step of one token as one program when
+  `program.ready` allows it. The program holds the 30 layers and the final
+  norm. The output head stays one call of Model.logits, because Session,
+  the MTP loop, and the server use forward and logits as two calls.
+
+  The program has two attention modes. The mode "q8" reads the int8 cache.
+  It needs the int8 copy of every layer, which is on after 128 tokens.
+  Before that, the Python loop runs the step.
+
+  The mode "f32" reads the
+  float cache (NP_GEMMA_ATTN=0, the default of the server). It uses a new C
+  kernel, `gemma_attn_decode_f32s`. The Python path now uses the same kernel
+  for one query, so the two paths and the MTP verify rows keep the same
+  bits. NP_GEMMA_F32_ATTN=numpy gives the old NumPy attention.
+
+  The builder also makes the dense layer of the 12B. The sum of the expert
+  outputs keeps a separate multiply and add. The cost is small, and the
+  program then keeps the bits of the Python path.
+
+  Tests:
+
+  - `scripts/check_program.py`: the same bits as the Python path in both
+    modes. The test covers single layers, all layers, and eight decode steps
+    through Model.forward. On the 12B, all 48 layers give the same bits.
+  - `scripts/check_mt.py`: an MTP group gives the same bits as single steps
+    in both modes.
+  - `scripts/check_kernels_ab.py`: with the int8 cache, the arrays at a
+    context of 300 and 1100 are the same as before. At a context of 40 the
+    step uses the float cache, so the new C kernel changes the result by at
+    most 4e-5.
+  - `scripts/check_hf_decode.py`: see "Accuracy against the reference".
+
+  The speed on jackal, in turn with llama-bench, two rounds:
+
+      runtime                     pp512           tg128
+      numpy-gemma, program        80.0, 87.2      15.92, 16.21
+      numpy-gemma, Python loop    80.9            12.64
+      llama.cpp                   86.9, 83.8      19.21, 18.92
+
+  The decode gains 1.27 times. The gap to llama.cpp falls from 1.41 to
+  about 1.19 times. The prompt pass is at the same speed as llama.cpp.
 - 2d: the group of 2 to 16 tokens, then the 12B and the E4B builders.
 
 Expect 11 to 14 ms less for each step of the 26B, about 55 ms. That is 18
@@ -327,6 +369,30 @@ Make the plan of this phase after the measurement.
   make 1 the default.
 - Fix the report of `.cache/kern_time.py`. It subtracts the time of all
   steps from the time of one step, so the Python row is negative.
+
+## Accuracy against the reference
+
+`scripts/check_hf_decode.py` compares the logits of 9 decode rows with
+Gemma4ForCausalLM of transformers in float32. The reference has the weights
+of the GGUF file, so a difference comes from the arithmetic. The prompt pass
+has 199 tokens.
+
+    prompt pass        cache             max |d|   mean |d|   top-1
+    int8 activations   int8              8.21      1.134       89%
+    int8 activations   float, C kernel   8.19      1.135       78%
+    float              int8              2.64      0.283      100%
+    float              float, C kernel   0.0003    0.00004    100%
+    float              float, NumPy      0.0003    0.00004    100%
+
+The new C kernel of the float cache is as close to the reference as the old
+NumPy attention. The two differ by at most 3e-5.
+
+The int8 activations of the prompt pass (NP_GEMMA_INT4_Q8=1, the default)
+give the largest error. One matrix product is off by about 0.6 per cent.
+The prompt pass writes the keys and the values of the cache, so each later
+decode step reads that error. The int8 cache gives a smaller error. Both
+defaults need a separate decision about speed and accuracy. This plan does
+not change them.
 
 ## Verification
 

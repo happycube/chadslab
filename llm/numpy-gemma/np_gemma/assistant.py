@@ -6,7 +6,7 @@ checks them in one batch. See MTP_PLAN.md.
 
 The assistant has four decoder layers. Its attention has a query and no key
 or value. A sliding layer reads the keys and the values of the last sliding
-layer of the target, and the global layer reads the last global layer. The
+layer of the target. The global layer reads the last global layer. The
 assistant writes nothing to the cache.
 
 One draft step:
@@ -45,9 +45,10 @@ _MATS = ("self_attn.q_proj", "self_attn.o_proj",
 def shared_layers(cfg):
     """Return the target layers that the assistant reads.
 
-    The result is (last sliding layer, last global layer). A target with
-    shared key and value layers (E2B and E4B) stops before the first shared
-    layer, because those layers reuse the cache of an earlier layer.
+    The result is (last sliding layer, last global layer). Some targets share
+    key and value layers (E2B and E4B). For them, the search stops
+    before the first shared layer. Those layers reuse the cache of an earlier
+    layer.
     """
     n = cfg.num_hidden_layers - (getattr(cfg, "num_kv_shared_layers", 0) or 0)
     types = cfg.layer_types[:n]
@@ -179,9 +180,10 @@ class Assistant:
     def step(self, emb, h, pos, cache, layers):
         """Run one draft step. Return the logits and the next h.
 
-        emb is the scaled target embedding of the token, shape (1, backbone).
-        h is the target hidden state, shape (1, backbone). layers is the pair
-        of shared_layers() for the target.
+        The argument emb is the scaled target embedding of the token, with
+        the shape (1, backbone). The argument h is the target hidden state,
+        with the same shape. The argument layers is the pair of
+        shared_layers() for the target.
         """
         eps = self.cfg.rms_norm_eps
         u = self.linear(np.concatenate([emb, h], axis=-1).astype(np.float32), self.pre)
@@ -256,11 +258,12 @@ def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
                max_new_tokens, stats=None):
     """Yield the new tokens of an MTP decode, one at a time.
 
-    ids holds the tokens in the cache, and the function extends it with the
-    rows that it keeps. nxt is the first new token, which the cache does not
-    hold yet, and h is the target hidden state of the row that predicted it.
-    pick(logits) selects a token from one row of target logits; it is the
-    sampler of the plain decode.
+    The list ids holds the tokens in the cache. The function adds the tokens
+    of the rows that it keeps.
+
+    The token nxt is the first new token. The cache does not hold it yet. The array h is the target hidden state of the row
+    that predicted nxt. The function pick(logits) selects a token from one
+    row of target logits. It is the sampler of the plain decode.
 
     The target picks its own token at each row of a verify batch, with the
     sampler of the plain decode. A draft is kept while it is the token that
@@ -321,9 +324,9 @@ def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=2,
                  eos_ids=(), stats=None, pick=greedy_pick):
     """Run the prompt, then generate tokens with MTP. Return the new tokens.
 
-    The result is the same as the plain decode with the same pick. stats,
-    when given, is a dict that receives the counts of steps, drafts, and
-    accepted drafts, and the time of the prompt pass and of the decode.
+    The result is the same as the plain decode with the same pick. The
+    optional dict stats receives the counts of steps, drafts, and accepted
+    drafts. It also receives the time of the prompt pass and of the decode.
     """
     ids = list(ids)
     t0 = time.perf_counter()

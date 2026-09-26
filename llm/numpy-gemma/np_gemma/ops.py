@@ -443,8 +443,8 @@ def int4_multi4_mt(mats, x, cols):
 def gelu_mul_rows(g, u):
     """Return gelu(g) * u one row at a time, as the decode step does.
 
-    The kernel treats a tail shorter than one vector in a different way, so a
-    call for each row keeps the tail of each row the same.
+    The kernel treats a tail shorter than one vector in a different way. A
+    call for each row thus keeps the tail of each row the same.
     """
     return np.stack([_cops.gelu_mul_pair(g[j], u[j]) for j in range(g.shape[0])])
 
@@ -518,6 +518,16 @@ def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
     _cops.attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
                       q_heads, kv_heads, head_dim, n)
     return out
+
+
+def attn_decode_f32s(q, k, v, pos, base, window):
+    """Run the attention of one query over rows of the float cache of Model.
+
+    k and v are (n, kv_heads, head_dim) and start at position base. Return
+    (q_heads, head_dim).
+    """
+    return _cops.attn_decode_f32s(q, np.ascontiguousarray(k), np.ascontiguousarray(v),
+                                  pos, base, window)
 
 
 def attn_decode_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):

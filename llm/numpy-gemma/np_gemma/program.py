@@ -19,10 +19,30 @@ variables. The program and its environment are one int64 array:
     record code[record count]
 
 A call binds the parameters, which writes their slots, and then runs C. Thus
-the state of a step is part of the program, and dump() shows its values.
+the state of a step is part of the program, and dump() shows its values. A
+cache buffer that moves when it grows needs only a new bind, not a new
+program.
+
+The scalar operations (+, -, *, max, min) compute the values that change for
+each step, such as the first key row of the sliding window. Each thread
+computes them into its own copy of the environment, so they need no barrier.
 
 run_py() runs the same records in Python. It calls the C entry points of
 today, one at a time, so a check can compare the two after each record.
+
+The entry points:
+
+    compile_step(model, attn)   the program of a whole decode step
+    ready(model, cache)         the attention mode for a cache, or None
+    decode_step(model, ...)     bind the step, run it, return the hidden state
+    compile_layers(model, ...)  the program of some layers, for a check
+
+The attention mode attn is "q8" or "f32". The mode "q8" reads the int8 copy
+of the cache (NP_GEMMA_ATTN=1, the default). The mode "f32" reads the float
+cache (NP_GEMMA_ATTN=0, the default of the server).
+Model.forward uses decode_step for one token when ready() allows it. The
+program gives the same bits as the Python loop of Model; see
+scripts/check_program.py.
 """
 from __future__ import annotations
 
@@ -32,15 +52,22 @@ import numpy as np
 
 from . import cops, ops
 
+# The size of a record and the first word of a program. They must agree with
+# GP_NARG and GP_MAGIC in np_gemma/csrc/bf16_linear.c.
 NARG = 24
 MAGIC = 0x4750524F47303031
 
+# The tag of an operand: an integer (also an address), the bits of a float32,
+# or the index of a slot of the environment.
 T_NONE, T_INT, T_F32, T_SLOT = 0, 1, 2, 3
 
+# The operation codes. They must agree with the enum of gemma_run in the C
+# file. 1 to 15 are scalar operations. The comment of each case in gp_step
+# gives the order of the operands.
 S_MOV, S_ADD, S_SUB, S_MUL, S_MAX, S_MIN = 1, 2, 3, 4, 5, 6
 RMS_NORM, ADD, MUL_S, COPY = 16, 17, 18, 19
 INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
-QKV_NORM_ROPE, KV_WRITE, ATTN_Q8 = 48, 49, 50
+QKV_NORM_ROPE, KV_WRITE, ATTN_Q8, ATTN_F32 = 48, 49, 50, 51
 ROUTER, MOE = 64, 65
 
 OP_NAMES = {v: k for k, v in dict(
@@ -48,8 +75,11 @@ OP_NAMES = {v: k for k, v in dict(
     RMS_NORM=RMS_NORM, ADD=ADD, MUL_S=MUL_S, COPY=COPY, INT4_LINEAR=INT4_LINEAR,
     INT4_MULTI4=INT4_MULTI4, RMS_NORM_MULTI4=RMS_NORM_MULTI4,
     GELU_MUL_INT4=GELU_MUL_INT4, QKV_NORM_ROPE=QKV_NORM_ROPE, KV_WRITE=KV_WRITE,
-    ATTN_Q8=ATTN_Q8, ROUTER=ROUTER, MOE=MOE).items()}
+    ATTN_Q8=ATTN_Q8, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE).items()}
 
+# One record: the operation, the flags (not used yet), the tag of each
+# operand, and the value of each operand. The C struct gp_rec has the same
+# layout; Program.finish checks the size.
 REC = np.dtype([("op", "<i4"), ("flags", "<i4"), ("tag", "u1", (NARG,)),
                 ("v", "<i8", (NARG,))])
 
@@ -66,10 +96,12 @@ class Slot:
 
 
 def _f32_bits(x):
+    """Return the bits of a float32 as an int, for a T_F32 operand."""
     return int(np.array([x], dtype=np.float32).view(np.uint32)[0])
 
 
 def _bits_f32(b):
+    """Return the float32 that the low 32 bits of b hold."""
     return float(np.array([b & 0xFFFFFFFF], dtype=np.uint32).view(np.float32)[0])
 
 
@@ -78,12 +110,14 @@ class Program:
 
     def __init__(self):
         self.slots = []            # Slot objects, in order
-        self.by_name = {}
+        self.by_name = {}          # the slot of each name
         self.init = []             # the first value of each slot
         self.recs = []             # (op, [(tag, value), ...])
-        self.keep = []             # the arrays that the literals point to
+        # A literal operand holds the address of an array. The program keeps
+        # the array, so the address stays good for the life of the program.
+        self.keep = []
         self.bound = {}            # the arrays that a bind points to
-        self.buf = None
+        self.buf = None            # the int64 array that C runs; see finish
         self.names = {}            # the buffers of the compiler, by name
 
     # ---- building ----------------------------------------------------------
@@ -98,9 +132,16 @@ class Program:
         return s
 
     def temp(self):
+        """Return a new slot for the result of a scalar operation."""
         return self.slot("t%d" % len(self.slots))
 
     def _enc(self, v):
+        """Return the (tag, value) of an operand.
+
+        A Slot gives its index. An array gives its address; the program keeps
+        the array. None gives a null address. An int is a literal, and a float
+        becomes the bits of a float32.
+        """
         if isinstance(v, Slot):
             return (T_SLOT, v.index)
         if v is None:
@@ -116,11 +157,17 @@ class Program:
         raise TypeError("operand %r" % (v,))
 
     def emit(self, op, *args):
+        """Add one record. The operands follow the order of gp_step in C."""
         assert len(args) <= NARG
         self.recs.append((op, [self._enc(a) for a in args]))
 
     def finish(self):
-        """Make the int64 array of the program."""
+        """Make the int64 array of the program.
+
+        The array holds the header, the environment, and the records. The
+        environment holds the first value of each slot. env and code are views
+        into the array, so bind writes the array that C reads.
+        """
         n_env = len(self.slots)
         code = np.zeros(len(self.recs), dtype=REC)
         for i, (op, args) in enumerate(self.recs):
@@ -142,7 +189,11 @@ class Program:
 
     # ---- running -----------------------------------------------------------
     def bind(self, **kw):
-        """Write parameters. A value is an int, a float, or an array."""
+        """Write parameters. A value is an int, a float, or an array.
+
+        An array gives its address. The program holds the array until the next
+        bind of the same name, so the address stays good for the run.
+        """
         for name, v in kw.items():
             s = self.by_name[name]
             if isinstance(v, np.ndarray):
@@ -189,19 +240,29 @@ class Program:
 # ---- the Python interpreter --------------------------------------------------
 
 def _val(args, e, k):
+    """Return operand k: its slot value in e, or its literal."""
     tag, v = args[k]
     return e[v] if tag == T_SLOT else v
 
 
 def _f(args, e, k):
+    """Return operand k as a float32."""
     return _bits_f32(_val(args, e, k))
 
 
 def _arr(addr, n, ctype=ctypes.c_float):
+    """Return a NumPy view of n values at an address. It copies nothing."""
     return np.ctypeslib.as_array((ctype * n).from_address(addr))
 
 
 def _py_step(op, a, e):
+    """Run one record in Python.
+
+    A kernel record calls the C entry point of the Python path. That entry
+    point opens its own region. A record that the Python path of Model does in
+    NumPy uses NumPy here. The result is the reference for a check of each
+    record.
+    """
     L = cops._lib
     V = lambda k: _val(a, e, k)  # noqa: E731
     F = lambda k: ctypes.c_float(_f(a, e, k))  # noqa: E731
@@ -252,6 +313,8 @@ def _py_step(op, a, e):
         v = _arr(V(1), n)
         _arr(V(2), n)[:] = k
         _arr(V(3), n)[:] = v
+        if not V(4):
+            return
         kq, ks = ops.quantize_q8(k.reshape(-1, 32))
         vq, vs = ops.quantize_q8(v.reshape(-1, 32))
         _arr(V(4), n, ctypes.c_int8)[:] = kq.reshape(-1)
@@ -265,6 +328,13 @@ def _py_step(op, a, e):
                             _arr(V(4), n * kvh * hd // 32), _arr(V(5), n * kvh * hd, ctypes.c_int8),
                             _arr(V(6), n * kvh * hd // 32), qh, kvh, hd, n)
         _arr(V(8), qh * hd)[:] = o.reshape(-1)
+    elif op == ATTN_F32:
+        qh, kvh, hd, n = V(5), V(6), V(7), V(8)
+        o = cops.attn_decode_f32s(_arr(V(0), qh * hd).reshape(qh, hd),
+                                  _arr(V(1), n * kvh * hd).reshape(n, kvh, hd),
+                                  _arr(V(2), n * kvh * hd).reshape(n, kvh, hd),
+                                  V(9), V(10), V(11))
+        _arr(V(4), qh * hd)[:] = o.reshape(-1)
     elif op == ROUTER:
         L.gemma_router(V(0), V(1), V(2), V(3), V(4), V(5), V(6), F(7), F(8), V(9), V(10))
     elif op == MOE:
@@ -292,7 +362,26 @@ def _py_step(op, a, e):
 # ---- the compiler --------------------------------------------------------------
 
 class Compiler:
-    """Turn the expressions of a model into the records of a Program."""
+    """Turn the expressions of a model into the records of a Program.
+
+    The special forms:
+
+        (seq f ...)            compile each form in order
+        (layer i f ...)        the same; i names the layer for a reader
+        (let name e)           compile e and give its value a name
+        (let (a b ...) e)      the same for an operation with several results
+        (set name e)           compile the kernel expression e into the
+                               buffer of name, in place
+        (slot name)            the slot of a parameter
+        (w layer key)          a weight of a layer; (w None "norm") is the
+                               final norm
+        (+ a b ...) (- ...) (* ...) (max ...) (min ...)
+                               scalar operations on ints and slots
+
+    Every other head is a kernel operation of KERNELS. A name is a value of a
+    let, or else a parameter slot of that name. A kernel operation makes a new
+    buffer for its result, except in a set.
+    """
 
     def __init__(self, model, prog=None):
         self.model = model
@@ -301,8 +390,13 @@ class Compiler:
         self.p = prog or Program()
         self.env = self.p.names
 
-    # A symbol is a name of the environment of the compiler, or a parameter.
     def value(self, x):
+        """Return the value of an operand of a form.
+
+        A name gives the value of a let, or else a parameter slot. A tuple is
+        a form to compile. Any other value (an int, a float, an array) stays
+        as it is.
+        """
         if isinstance(x, str):
             if x in self.env:
                 return self.env[x]
@@ -312,9 +406,11 @@ class Compiler:
         return x
 
     def buffer(self, shape, dtype=np.float32):
+        """Return a new buffer for a result. The program keeps it."""
         return np.zeros(shape, dtype=dtype)
 
     def compile(self, form):
+        """Compile a top-level form: a seq, a layer, or one expression."""
         head = form[0]
         if head in ("seq", "layer"):
             body = form[2:] if head == "layer" else form[1:]
@@ -324,6 +420,7 @@ class Compiler:
         return self.expr(form)
 
     def expr(self, form):
+        """Compile one expression and return its value."""
         head, args = form[0], form[1:]
         if head == "let":
             names, e = args
@@ -341,6 +438,8 @@ class Compiler:
             return self.p.slot(args[0])
         if head == "w":
             layer, key = args
+            if layer is None:
+                return {"norm": self.model._norm_w}[key]
             return self.model._layers[layer][key]
         if head in SCALAR:
             return self.scalar(head, [self.value(a) for a in args])
@@ -353,7 +452,11 @@ class Compiler:
         return fn(self, *[self.value(a) for a in form[1:]], out=out)
 
     def scalar(self, head, vals):
-        # Fold the constants in Python. A slot operand makes a record.
+        """Compile a scalar operation. Return an int or a slot.
+
+        Constants fold in Python. An operand that is a slot makes one record
+        for each pair of operands, from left to right.
+        """
         if all(isinstance(v, (int, np.integer)) for v in vals):
             r = vals[0]
             for v in vals[1:]:
@@ -378,33 +481,40 @@ SCALAR = {
 
 # ---- the kernel operations ------------------------------------------------------
 # Each function takes the compiler and the values of its operands. It emits the
-# records and returns the result.
+# records and returns the result. With out, it writes that buffer (a set).
+# Each operation calls the same kernel as the Python path of Model, so the
+# program keeps the bits of that path.
 
 def k_rms_norm(c, x, w, out=None):
+    """(rms_norm x w): the norm of each row of x. As ops.rms_norm."""
     out = c.buffer(x.shape) if out is None else out
     c.p.emit(RMS_NORM, x, w, out, x.shape[0], x.shape[1], float(c.eps))
     return out
 
 
 def k_add(c, a, b, out=None):
+    """(add a b): a + b. As the NumPy add of the Python path."""
     out = c.buffer(a.shape) if out is None else out
     c.p.emit(ADD, a, b, out, a.size)
     return out
 
 
 def k_mul(c, x, s, out=None):
+    """(mul x s): x times the float32 s. As x * layer_scalar in NumPy."""
     out = c.buffer(x.shape) if out is None else out
     c.p.emit(MUL_S, x, float(s), out, x.size)
     return out
 
 
 def k_copy(c, x, out=None):
+    """(copy x): a copy of x. The global layers use the key as the value."""
     out = c.buffer(x.shape, x.dtype) if out is None else out
     c.p.emit(COPY, x, out, x.nbytes)
     return out
 
 
 def _mats(mats):
+    """Return the operands of up to four int4 matrices and their outputs."""
     args, outs = [], []
     for m in range(4):
         if m < len(mats) and mats[m] is not None:
@@ -418,12 +528,16 @@ def _mats(mats):
 
 
 def k_int4_multi4(c, x, *mats):
+    """(int4_multi4 x m ...): up to four int4 matrices on the row x in one
+    kernel. As ops.int4_multi4. Return one (1, rows) buffer for each matrix."""
     args, outs = _mats(mats)
     c.p.emit(INT4_MULTI4, x, x.shape[1], *args)
     return tuple(outs)
 
 
 def k_rms_norm_multi4(c, x, wn, *mats):
+    """(rms_norm_multi4 x wn m ...): the norm of x, then up to four int4
+    matrices on the result. As ops.rms_norm_multi4."""
     args, outs = _mats(mats)
     scratch = c.buffer(x.shape[1])
     c.p.emit(RMS_NORM_MULTI4, x, np.ascontiguousarray(wn, dtype=np.float32), scratch,
@@ -432,6 +546,8 @@ def k_rms_norm_multi4(c, x, wn, *mats):
 
 
 def k_gelu_mul_int4(c, g, u, mat, out=None):
+    """(gelu_mul_int4 g u m): gelu(g) * u, then the int4 matrix m. As
+    ops.gelu_mul_int4."""
     w, s = mat
     rows, cols = w.shape[0], g.size
     out = c.buffer((1, rows)) if out is None else out
@@ -440,6 +556,8 @@ def k_gelu_mul_int4(c, g, u, mat, out=None):
 
 
 def k_int4(c, mat, x, out=None):
+    """(int4 m x): the int4 matrix m on the row x. As Model.linear for one
+    token."""
     w, s = mat
     out = c.buffer((1, w.shape[0])) if out is None else out
     c.p.emit(INT4_LINEAR, x, w, s, out, w.shape[0], x.shape[1])
@@ -447,6 +565,10 @@ def k_int4(c, mat, x, out=None):
 
 
 def k_qkv_norm_rope(c, q, k, v, qn, kn, cos, sin, layer):
+    """(qkv_norm_rope q k v qn kn cos sin layer): the norms of q, k, and v,
+    then the rope of q and k. The
+    operation changes q, k, and v in place. cos and sin are slots. bind_step
+    fills them with the rope table of the step."""
     plan = c.cfg.plan[layer]
     hd = plan.head_dim
     c.p.emit(QKV_NORM_ROPE, q, np.ascontiguousarray(qn, dtype=np.float32), q.size // hd,
@@ -455,21 +577,30 @@ def k_qkv_norm_rope(c, q, k, v, qn, kn, cos, sin, layer):
 
 
 def _addr(c, base, row, stride):
-    """Return base + row * stride, folded when both are constants."""
+    """Return base + row * stride, the address of a row, as a scalar value."""
     return c.scalar("+", [base, c.scalar("*", [row, stride])])
 
 
-def k_kv_write(c, layer, k, v, row):
+def k_kv_write(c, layer, k, v, row, q8=1):
+    """(kv_write layer k v row q8): store the key and the value at the
+    buffer row of the cache of a layer. With q8, also store the int8 copy, as
+    KVCache._store_q8 does. The addresses come from the slots of the layer
+    and the row, with scalar operations."""
     plan = c.cfg.plan[layer]
     n = plan.num_kv_heads * plan.head_dim
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
+    if q8:
+        q = [_addr(c, s("kq"), row, n), _addr(c, s("ks"), row, 4 * (n // 32)),
+             _addr(c, s("vq"), row, n), _addr(c, s("vs"), row, 4 * (n // 32))]
+    else:
+        q = [0, 0, 0, 0]
     c.p.emit(KV_WRITE, k, v,
-             _addr(c, s("k"), row, 4 * n), _addr(c, s("v"), row, 4 * n),
-             _addr(c, s("kq"), row, n), _addr(c, s("ks"), row, 4 * (n // 32)),
-             _addr(c, s("vq"), row, n), _addr(c, s("vs"), row, 4 * (n // 32)), n)
+             _addr(c, s("k"), row, 4 * n), _addr(c, s("v"), row, 4 * n), *q, n)
 
 
 def k_attn_q8(c, layer, q, lo, n):
+    """(attn_q8 layer q lo n): the fused attention of one query over n rows
+    of the int8 cache, from buffer row lo. As Model._attend_one."""
     plan = c.cfg.plan[layer]
     hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
     per = kvh * hd
@@ -482,7 +613,25 @@ def k_attn_q8(c, layer, q, lo, n):
     return out
 
 
+def k_attn_f32(c, layer, q, lo, n):
+    """(attn_f32 layer q lo n): the attention of one query over n rows of
+    the float cache, from buffer row lo. As Model._attend_one with the C
+    kernel (NP_GEMMA_F32_ATTN=c)."""
+    plan = c.cfg.plan[layer]
+    hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
+    per = kvh * hd
+    s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
+    out = c.buffer((1, qh * hd))
+    base = c.scalar("+", [s("base"), lo])
+    c.p.emit(ATTN_F32, q, _addr(c, s("k"), lo, 4 * per), _addr(c, s("v"), lo, 4 * per),
+             c.p.slot("scores"), out, qh, kvh, hd, n, c.p.slot("pos"), base,
+             plan.sliding_window or 0)
+    return out
+
+
 def k_router(c, x, layer):
+    """(router x layer): the router of the mixture of experts. Return the
+    weights and the indices of the top experts. As ops.router."""
     w = c.model._layers[layer]
     cfg = c.cfg
     top_k = cfg.top_k_experts
@@ -498,6 +647,8 @@ def k_router(c, x, layer):
 
 
 def k_moe(c, h, val, idx, layer):
+    """(moe h val idx layer): the selected experts on the row h, and the sum
+    of their outputs with the router weights. As Model._moe_one_token."""
     w = c.model._layers[layer]
     gu_q, gu_s = w["experts.gate_up_proj"]
     dn_q, dn_s = w["experts.down_proj"]
@@ -523,6 +674,7 @@ KERNELS = {
     "qkv_norm_rope": k_qkv_norm_rope,
     "kv_write": k_kv_write,
     "attn_q8": k_attn_q8,
+    "attn_f32": k_attn_f32,
     "router": k_router,
     "moe": k_moe,
 }
@@ -530,12 +682,14 @@ KERNELS = {
 
 # ---- the forms of the 26B model -------------------------------------------------
 
-def layer_form(model, i):
-    """Return one decoder layer of the 26B model as a nested expression.
+def layer_form(model, i, attn="q8"):
+    """Return one decoder layer as a nested expression.
 
     The expression follows Model._decoder_layer and Model._attention for one
-    token with the int8 cache. x is the hidden state; the layer changes it in
-    place.
+    token. The mode attn is "q8" for the int8 cache and "f32" for the float
+    cache. x is the hidden state. The layer changes it in place. A model with the
+    mixture-of-experts block (the 26B) adds the router and the experts; the
+    dense model (the 12B) does not.
     """
     cfg = model.cfg
     plan = cfg.plan[i]
@@ -556,28 +710,39 @@ def layer_form(model, i):
         lo = ("max", 0, ("-", "pos", plan.sliding_window - 1, base))
     else:
         lo = 0
+    q8 = 1 if attn == "q8" else 0
+    if cfg.enable_moe_block:
+        ffn = (("let", ("val", "idx"), ("router", "x", i)),
+               ("let", "e", ("moe", ("rms_norm", "x", w("pre_feedforward_layernorm_2")),
+                             "val", "idx", i)),
+               ("let", "f", ("add", ("rms_norm", "m", w("post_feedforward_layernorm_1")),
+                             ("rms_norm", "e", w("post_feedforward_layernorm_2")))))
+    else:
+        ffn = (("let", "f", "m"),)
     return ("layer", i,
             ("let", "h", ("rms_norm", "x", w("input_layernorm"))),
             *qkv,
             ("qkv_norm_rope", "q", "k", "v", w("self_attn.q_norm"), w("self_attn.k_norm"),
              "cos." + kind, "sin." + kind, i),
             ("let", "row", ("-", "pos", base)),
-            ("kv_write", i, "k", "v", "row"),
+            ("kv_write", i, "k", "v", "row", q8),
             ("let", "lo", lo),
             ("let", "n", ("-", ("+", "pos", 1), base, "lo")),
-            ("let", "a", ("attn_q8", i, "q", "lo", "n")),
+            ("let", "a", ("attn_" + attn, i, "q", "lo", "n")),
             ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
             ("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),
             ("let", ("g", "u"), ("rms_norm_multi4", "x", w("pre_feedforward_layernorm"),
                                  w("mlp.gate_proj"), w("mlp.up_proj"))),
             ("let", "m", ("gelu_mul_int4", "g", "u", w("mlp.down_proj"))),
-            ("let", ("val", "idx"), ("router", "x", i)),
-            ("let", "e", ("moe", ("rms_norm", "x", w("pre_feedforward_layernorm_2")),
-                          "val", "idx", i)),
-            ("let", "f", ("add", ("rms_norm", "m", w("post_feedforward_layernorm_1")),
-                          ("rms_norm", "e", w("post_feedforward_layernorm_2")))),
+            *ffn,
             ("set", "x", ("add", "x", ("rms_norm", "f", w("post_feedforward_layernorm")))),
             ("set", "x", ("mul", "x", w("layer_scalar"))))
+
+
+def step_form(model, attn="q8"):
+    """Return a whole decode step: every layer, then the final norm into xn."""
+    layers = [layer_form(model, i, attn) for i in range(model.cfg.num_hidden_layers)]
+    return ("seq", *layers, ("let", "xn", ("rms_norm", "x", ("w", None, "norm"))))
 
 
 def format_form(form, indent=0):
@@ -610,16 +775,57 @@ def format_form(form, indent=0):
     return "\n".join(parts) + ")"
 
 
-def compile_layers(model, layers):
+def compile_layers(model, layers, attn="q8"):
     """Compile decoder layers into one Program. The buffer "x" is the input
     and the output."""
     c = Compiler(model)
     c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
     for i in layers:
-        c.compile(layer_form(model, i))
+        c.compile(layer_form(model, i, attn))
     c.p.layers = list(layers)
+    c.p.attn = attn
     return c.p.finish()
+
+
+def compile_step(model, attn="q8"):
+    """Compile a whole decode step. "x" is the input embedding and "xn" the
+    hidden state after the final norm, the input of the output head."""
+    c = Compiler(model)
+    c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
+    c.p.slot("pos")
+    c.compile(step_form(model, attn))
+    c.p.layers = list(range(model.cfg.num_hidden_layers))
+    c.p.attn = attn
+    return c.p.finish()
+
+
+def ready(model, cache):
+    """Return the attention mode of a step program for this cache, or None.
+
+    The int8 mode needs the int8 copy of every layer. It is on after 128
+    tokens. Before that, the Python path runs the step, because the step
+    that turns the int8 copy on also quantizes the old rows.
+    """
+    if ops.attn_ready():
+        if all(cache.q8_ready(i) for i in range(model.cfg.num_hidden_layers)):
+            return "q8"
+        return None
+    return "f32"
+
+
+def decode_step(model, cache, token, pos):
+    """Run one decode step with a program. Return the hidden state after the
+    final norm, shape (1, hidden). The program is made on the first call."""
+    attn = ready(model, cache)
+    progs = model.__dict__.setdefault("_programs", {})
+    prog = progs.get(attn)
+    if prog is None:
+        prog = progs[attn] = compile_step(model, attn)
+    bind_step(prog, model, cache, pos)
+    prog.names["x"][:] = model.embed([token])
+    prog.run()
+    return prog.names["xn"].copy()
 
 
 def bind_step(prog, model, cache, pos):
@@ -631,14 +837,16 @@ def bind_step(prog, model, cache, pos):
     """
     kw = {"pos": pos}
     keep = []
+    q8 = getattr(prog, "attn", "q8") == "q8"
     for i in prog.layers:
-        assert cache.q8_ready(i), "the program needs the int8 cache"
+        assert not q8 or cache.q8_ready(i), "the program needs the int8 cache"
         cache.prepare(i, pos, 1)
         cache.end[i] = pos + 1
         kw.update({"base.%d" % i: cache.base[i], "k.%d" % i: cache.k[i],
-                   "v.%d" % i: cache.v[i], "kq.%d" % i: cache.kq[i],
-                   "ks.%d" % i: cache.ks[i], "vq.%d" % i: cache.vq[i],
-                   "vs.%d" % i: cache.vs[i]})
+                   "v.%d" % i: cache.v[i]})
+        if q8:
+            kw.update({"kq.%d" % i: cache.kq[i], "ks.%d" % i: cache.ks[i],
+                       "vq.%d" % i: cache.vq[i], "vs.%d" % i: cache.vs[i]})
     positions = np.array([pos])
     for kind, sliding in (("s", True), ("f", False)):
         plan = next((model.cfg.plan[i] for i in prog.layers

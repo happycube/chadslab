@@ -52,6 +52,17 @@ _MOE_NORM_KEYS = (
 )
 
 
+# The attention of one query over the float cache. "c" uses the C kernel,
+# which the program of a decode step also uses. "numpy" uses the batched
+# matrix product of the prompt path.
+_F32_ATTN_C = os.environ.get("NP_GEMMA_F32_ATTN", "c") != "numpy"
+
+# Run a decode step as one program in C. Set NP_GEMMA_PROGRAM=0 for the Python
+# loop over the layers. The program needs NP_GEMMA_F32_ATTN=c for the float
+# cache, so "numpy" also turns it off.
+_PROGRAM = os.environ.get("NP_GEMMA_PROGRAM", "1") != "0" and _F32_ATTN_C
+
+
 def emit(hook, key, value):
     """Send one intermediate tensor to the hook. Do nothing when hook is None."""
     if hook is not None:
@@ -676,6 +687,14 @@ class Model:
         quick test.
         """
         cfg = self.cfg
+        if (_PROGRAM and len(input_ids) == 1 and hook is None and max_layers is None
+                and isinstance(cache, KVCache) and self._dtype == "int4"
+                and self.keep_weights):
+            # One decode step as one program in C (np_gemma/program.py). The
+            # result has the bits of the Python loop below.
+            from . import program
+            if program.ready(self, cache) is not None:
+                return program.decode_step(self, cache, int(input_ids[0]), int(start_pos))
         x = self.embed(input_ids)
         if start_pos == 0:
             emit(hook, "embed_tokens", x)
@@ -897,9 +916,11 @@ class Model:
     def _attend_one(self, q, plan, i, pos, cache, q8_before):
         """Run the attention of one query at pos over the cache. Return (q_dim,).
 
-        Use the int8 cache when a decode step at pos uses it: the int8 copy is
-        on before the write, or the write turns it on at pos + 1 rows. A
-        sliding layer reads only the rows of the window. The cache can hold
+        Use the int8 cache when a decode step at pos uses it. That is true
+        when the int8 copy is on before the write. It is also true when the
+        write turns the copy on at pos + 1 rows. Otherwise use the float cache.
+
+        A sliding layer reads only the rows of the window. The cache can hold
         more rows than the window, because it drops old rows in large steps.
         """
         hd = plan.head_dim
@@ -913,6 +934,12 @@ class Model:
                                 kq.shape[0] - lo)
             return o.reshape(plan.q_dim)
         K, V, base = cache.read(i, pos + 1)
+        if _F32_ATTN_C:
+            # The C kernel of the float cache. The program of a decode step
+            # uses the same kernel, so the two give the same bits.
+            lo = max(0, pos - window + 1 - base) if window else 0
+            o = ops.attn_decode_f32s(q[0], K[lo:], V[lo:], pos, base + lo, window)
+            return o.reshape(plan.q_dim)
         return self._attend_rows(q, K, V, base, np.array([pos]), plan)[0]
 
     def _attend_rows(self, q, K, V, base, positions, plan):

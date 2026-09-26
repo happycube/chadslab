@@ -268,6 +268,8 @@ try:
         _lib.gemma_attn_decode_mt.argtypes = [_void_p] * 8 + [_int, _int, _int,
                                                                _void_p, _void_p, _int, _int]
         _lib.gemma_attn_decode_mt.restype = None
+        _lib.gemma_attn_decode_f32s.argtypes = [_void_p] * 5 + [_int] * 7
+        _lib.gemma_attn_decode_f32s.restype = None
         _lib.gemma_run.argtypes = [_void_p, _int]
         _lib.gemma_run.restype = _int
         _lib.gemma_gp_record_size.argtypes = []
@@ -1240,3 +1242,21 @@ def gp_run(buf, limit=-1):
 def gp_record_size():
     """Return the size of one program record in C."""
     return _lib.gemma_gp_record_size()
+
+
+def attn_decode_f32s(q, k, v, pos, base, window):
+    """The attention of one query over rows of the float cache of Model.
+
+    q is (q_heads, head_dim). k and v are (n, kv_heads, head_dim). They are a
+    contiguous part of the cache that starts at position base. Return
+    (q_heads, head_dim).
+    """
+    q = np.ascontiguousarray(q, dtype=np.float32)
+    n, kvh, hd = k.shape
+    qh = q.size // hd
+    scores = np.empty((qh, n), dtype=np.float32)
+    out = np.empty((qh, hd), dtype=np.float32)
+    _lib.gemma_attn_decode_f32s(q.ctypes.data, k.ctypes.data, v.ctypes.data,
+                                scores.ctypes.data, out.ctypes.data, qh, kvh, hd, n,
+                                int(pos), int(base), int(window))
+    return out

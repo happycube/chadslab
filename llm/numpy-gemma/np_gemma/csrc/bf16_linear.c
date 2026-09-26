@@ -2256,9 +2256,9 @@ void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *
 
 void gemma_gelu_mul(const float *x, float *out, int rows, int inner);
 
-/* The gate and up projection of the experts for a group of tokens, then the
- * GELU and the multiply. act holds 2 * inner values and out holds inner
- * values for each pair. */
+/* The gate and up projection of the experts for a group of tokens. Then the
+ * GELU and the multiply. act holds 2 * inner values for each pair, and out
+ * holds inner values for each pair. */
 void gemma_moe_gemv_gelu_mt(const uint8_t *w, const float *scales, const float *x,
                             const int *ids, const int *poff, const int *xi, int jobs,
                             float *act, float *out, int rows, int cols, int xstride,
@@ -2939,8 +2939,8 @@ static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
 
 /* The dot of one Q6_K row with up to Q6K_TMAX token rows. The kernel decodes
  * each group of 16 weights one time and uses it for every token. The steps
- * for one token are the steps of dot_q6k_row_avx512 in the same order, so the
- * result of each token is the same bit for bit. An MTP verify batch then
+ * for one token are the steps of dot_q6k_row_avx512, in the same order. Thus
+ * the result of each token is the same bit for bit. An MTP verify batch then
  * gives the same logits as a decode step. */
 #define Q6K_TMAX 8
 
@@ -3472,17 +3472,18 @@ static inline float dot_f32_f32(const float *a, const float *b, int n)
  * The parallel loop covers the query heads. A decode step of this model has 8
  * of them, so the number of busy threads is 8 and not 18.
  */
-void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
-                           float *scores, float *out,
-                           int q_heads, int kv_heads, int head_dim, int n,
-                           long k_head_stride, long v_head_stride,
-                           int pos, int base, int window)
+static void gemma_attn_decode_f32_body(const float *q, const float *k, const float *v,
+                                       float *scores, float *out,
+                                       int q_heads, int kv_heads, int head_dim, int n,
+                                       long k_head_stride, long v_head_stride,
+                                       long k_row, long v_row,
+                                       int pos, int base, int window)
 {
     if (n <= 0 || head_dim <= 0 || q_heads < kv_heads) {
         return;
     }
     const int n_rep = q_heads / kv_heads;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int h = 0; h < q_heads; ++h) {
         const int kv = h / n_rep;
         const float *qh = q + (size_t)h * (size_t)head_dim;
@@ -3496,7 +3497,7 @@ void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
                 sc[j] = -INFINITY;
                 continue;
             }
-            sc[j] = dot_f32_f32(kh + (size_t)j * (size_t)head_dim, qh, head_dim);
+            sc[j] = dot_f32_f32(kh + (size_t)j * (size_t)k_row, qh, head_dim);
         }
         float m = -INFINITY;
         for (int j = 0; j < n; ++j) {
@@ -3532,7 +3533,7 @@ void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
             if (p == 0.0f) {
                 continue;
             }
-            const float *vp = vh + (size_t)j * (size_t)head_dim;
+            const float *vp = vh + (size_t)j * (size_t)v_row;
             d = 0;
 #if GEMMA_X86 && defined(__AVX512F__)
             const __m512 pv = _mm512_set1_ps(p);
@@ -3552,6 +3553,34 @@ void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
             }
         }
     }
+}
+
+/* The E4B cache keeps the keys of one head together: a row stride of
+ * head_dim. */
+void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
+                           float *scores, float *out,
+                           int q_heads, int kv_heads, int head_dim, int n,
+                           long k_head_stride, long v_head_stride,
+                           int pos, int base, int window)
+{
+    #pragma omp parallel
+    gemma_attn_decode_f32_body(q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
+                               k_head_stride, v_head_stride, head_dim, head_dim,
+                               pos, base, window);
+}
+
+/* The cache of Model keeps one row for each position: (rows, kv_heads,
+ * head_dim). The head stride is head_dim and the row stride is
+ * kv_heads * head_dim. A decode step with the float cache uses this kernel. */
+void gemma_attn_decode_f32s(const float *q, const float *k, const float *v,
+                            float *scores, float *out,
+                            int q_heads, int kv_heads, int head_dim, int n,
+                            int pos, int base, int window)
+{
+    #pragma omp parallel
+    gemma_attn_decode_f32_body(q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
+                               head_dim, head_dim, (long)kv_heads * head_dim,
+                               (long)kv_heads * head_dim, pos, base, window);
 }
 
 /* The int8 attention for one query token. The attribute keeps the AVX2
@@ -3639,9 +3668,11 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
 
 /* The fused decode attention for a small group of query tokens in one
  * parallel region. Token t reads the key rows lo[t] to lo[t] + n[t] - 1 of the
- * int8 cache, which is what a decode step of that token reads. qq is
- * (tokens, q_heads, head_dim), qs is (tokens, q_heads, groups), scores holds
- * tokens * q_heads * nmax values, and out is (tokens, q_heads, head_dim). */
+ * int8 cache. A decode step of that token reads the same rows.
+ *
+ * The shapes: qq is (tokens, q_heads, head_dim). qs is (tokens, q_heads,
+ * groups). The array scores holds tokens * q_heads * nmax values. The array
+ * out is (tokens, q_heads, head_dim). */
 static void gemma_attn_decode_mt_body(const int8_t *qq, const float *qs,
                           const int8_t *kq, const float *ks,
                           const int8_t *vq, const float *vs,
@@ -6226,8 +6257,9 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
  *     record code[record count]
  *
  * A record has an operation code, flags, and GP_NARG operands. A tag gives
- * the kind of each operand: an integer literal (an address is an integer), a
- * float literal (the bits of a float32), or a slot of the environment.
+ * the kind of each operand. An operand is an integer literal, a float literal,
+ * or a slot of the environment. An address is an integer, and a float literal
+ * holds the bits of a float32.
  *
  * gemma_run opens one OpenMP region for the whole program. Each thread copies
  * the environment. A scalar operation writes the private copy of each thread,
@@ -6259,7 +6291,7 @@ enum {
     GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19,
     GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
     GP_GELU_MUL_INT4 = 35,
-    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50,
+    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50, GP_ATTN_F32 = 51,
     GP_ROUTER = 64, GP_MOE = 65,
 };
 
@@ -6295,9 +6327,9 @@ static void gp_add_scaled(float *out, const float *d, float v, int n)
     }
 }
 
-/* The experts of one token, as Model._moe_one_token does it: the selected
- * experts in the order of their index, then the sum of their outputs with the
- * router weights in that order. */
+/* The experts of one token, as Model._moe_one_token does it. The kernels run
+ * the selected experts in the order of their index. Then the code adds their
+ * outputs with the router weights, in the same order. */
 static void gp_moe_one(const gp_rec *r, const int64_t *e)
 {
     const float *h = GP_P(const float, 0);
@@ -6473,7 +6505,8 @@ static void gp_step(const gp_rec *r, int64_t *e)
             int32_t junk;
             memcpy(kd, k, (size_t)n * sizeof(float));
             memcpy(vd, v, (size_t)n * sizeof(float));
-            for (int g = 0; g < n / 32; ++g) {
+            /* A cache with no int8 copy gives null addresses. */
+            for (int g = 0; kqd != NULL && g < n / 32; ++g) {
                 ksd[g] = gemma_quant_group32(k + (size_t)g * 32, kqd + (size_t)g * 32, &junk);
                 vsd[g] = gemma_quant_group32(v + (size_t)g * 32, vqd + (size_t)g * 32, &junk);
             }
@@ -6481,8 +6514,9 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     }
     case GP_ATTN_Q8: {
-        /* q, qq, qs, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
-         * head_dim, n: the fused attention of one query over the int8 cache */
+        /* Operands: q, qq, qs, kq, ks, vq, vs, scores, out, q_heads,
+         * kv_heads, head_dim, n.
+         * The fused attention of one query over the int8 cache. */
         const float *q = GP_P(const float, 0);
         int8_t *qq = GP_P(int8_t, 1);
         float *qs = GP_P(float, 2);
@@ -6500,6 +6534,17 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                q_heads, GP_I(10), head_dim, GP_I(12));
         break;
     }
+    case GP_ATTN_F32:
+        /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
+         * pos, base, window.
+         * The attention of one query over the float cache. k and v point at
+         * the row of position base. */
+        gemma_attn_decode_f32_body(GP_P(const float, 0), GP_P(const float, 1),
+                                   GP_P(const float, 2), GP_P(float, 3), GP_P(float, 4),
+                                   GP_I(5), GP_I(6), GP_I(7), GP_I(8),
+                                   GP_I(7), GP_I(7), (long)GP_I(6) * GP_I(7),
+                                   (long)GP_I(6) * GP_I(7), GP_I(9), GP_I(10), GP_I(11));
+        break;
     /* ---- mixture of experts ---- */
     case GP_ROUTER:
         /* x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale,

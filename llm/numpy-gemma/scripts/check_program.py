@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Check the program of a decode step against the Python path, bit for bit.
 
-PERF_PLAN.md, phase 2b. For each layer of --layers, the script runs the
-Python layer (Model._decoder_layer) and the program of the same layer, from
-the same input and the same cache, and compares the hidden state and the new
-cache row. It runs the program in C and with the Python interpreter. When a
+PERF_PLAN.md, phase 2. For each layer of --layers, the script runs the
+Python layer (Model._decoder_layer) and the program of the same layer. The
+two start from the same input and the same cache. The script compares the
+hidden state and the new cache row. It runs the program in C and with the Python interpreter. When a
 result differs, it runs the records one prefix at a time and names the first
 record whose output differs.
 
 It then runs all the layers as one program and compares the result with the
-Python loop over the layers, and it prints the time of each.
+Python loop over the layers. It prints the time of each. Last, it runs eight
+decode steps through Model.forward with the program off and on.
+
+Run it with NP_GEMMA_ATTN=0 as well, for the float cache.
 
     OPENBLAS_NUM_THREADS=1 OMP_WAIT_POLICY=ACTIVE PYTHONPATH=. \\
         python scripts/check_program.py
@@ -21,7 +24,8 @@ import time
 
 import numpy as np
 
-from np_gemma import KVCache, Model
+import np_gemma.model as model_mod
+from np_gemma import KVCache, Model, ops
 from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 from np_gemma.program import bind_step, compile_layers, format_form, layer_form
@@ -32,24 +36,26 @@ PARTS = ("k", "v", "kq", "ks", "vq", "vs")
 
 
 def snap(cache, i):
-    s = {n: getattr(cache, n)[i].copy() for n in PARTS}
+    s = {n: None if getattr(cache, n)[i] is None else getattr(cache, n)[i].copy()
+         for n in PARTS}
     s.update(base=cache.base[i], end=cache.end[i], q8=cache._q8_on[i])
     return s
 
 
 def restore(cache, i, s):
     for n in PARTS:
-        getattr(cache, n)[i] = s[n].copy()
+        getattr(cache, n)[i] = None if s[n] is None else s[n].copy()
     cache.base[i], cache.end[i], cache._q8_on[i] = s["base"], s["end"], s["q8"]
 
 
 def rows(cache, i, pos):
     r = pos - cache.base[i]
-    return [getattr(cache, n)[i][r].copy() for n in PARTS]
+    return [None if getattr(cache, n)[i] is None else getattr(cache, n)[i][r].copy()
+            for n in PARTS]
 
 
 def same_rows(a, b):
-    return all(np.array_equal(x, y) for x, y in zip(a, b))
+    return all((x is None and y is None) or np.array_equal(x, y) for x, y in zip(a, b))
 
 
 def python_layer(model, cache, i, x, pos):
@@ -105,8 +111,10 @@ def main():
         print(format_form(layer_form(model, layers[0])))
         print(compile_layers(model, [layers[0]]).dump())
 
+    attn = "q8" if ops.attn_ready() else "f32"
+    print("attention mode:", attn)
     ok = True
-    progs = {i: compile_layers(model, [i]) for i in layers}
+    progs = {i: compile_layers(model, [i], attn) for i in layers}
     for n in args.contexts:
         cache = KVCache(cfg, max_len=n + 16)
         model.prefill(ids[:n], cache)
@@ -137,7 +145,7 @@ def main():
     n = args.contexts[-1]
     cache = KVCache(cfg, max_len=n + 64)
     model.prefill(ids[:n], cache)
-    allp = compile_layers(model, range(cfg.num_hidden_layers))
+    allp = compile_layers(model, range(cfg.num_hidden_layers), attn)
     x0 = model.embed([ids[n]])
     saved = {i: snap(cache, i) for i in range(cfg.num_hidden_layers)}
     t_py, t_c = [], []
@@ -164,6 +172,28 @@ def main():
     print("all %d layers, %d records: %s. Python loop %.1f ms, program %.1f ms (best of 5)"
           % (cfg.num_hidden_layers, len(allp.recs), "same" if same else "DIFFERENT",
              1000 * min(t_py), 1000 * min(t_c)))
+
+    # Decode steps through Model.forward, with the program off and on.
+    res = {}
+    for on in (False, True):
+        model_mod._PROGRAM = on
+        cache = KVCache(cfg, max_len=n + 64)
+        model.prefill(ids[:n], cache)
+        xs, ts = [], []
+        for k in range(8):
+            t0 = time.perf_counter()
+            x = model.forward([ids[n + k]], cache=cache, start_pos=n + k)
+            lg = model.logits(x)
+            ts.append(time.perf_counter() - t0)
+            xs.append((x, lg))
+        res[on] = (xs, ts)
+    same = all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+               for a, b in zip(res[False][0], res[True][0]))
+    ok = ok and same
+    print("8 decode steps through Model.forward: %s. Step with logits: Python %.1f ms, "
+          "program %.1f ms (median)" % ("same" if same else "DIFFERENT",
+                                       1000 * np.median(res[False][1]),
+                                       1000 * np.median(res[True][1])))
     print("PASS" if ok else "FAIL")
     g.close()
     return 0 if ok else 1

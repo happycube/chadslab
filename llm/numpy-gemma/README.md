@@ -259,6 +259,11 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_FUSED_STEP    1                       1 uses the fused entry points of the C library for a decode step. 0 gives one call for each kernel, which is slower by about 4 per cent.
     NP_GEMMA_E4B_BF16      1                       1 keeps a bfloat16 copy of a large weight that the quantization did not touch. 0 uses the float32 BLAS path.
     NP_GEMMA_E4B_BF16_MIN  1048576                 The smallest value count for the bfloat16 copy. A smaller matrix keeps the float32 path.
+    NP_GEMMA_PROGRAM       1                       1 runs a decode step of one token as one program in C (np_gemma/program.py). 0 uses the Python loop over the layers. The two give the same bits.
+    NP_GEMMA_F32_ATTN      c                       c uses the C kernel for the attention of one query over the float cache. numpy uses the batched matmul. The program needs c.
+    NP_GEMMA_MT            1                       1 uses the small-group kernels for 2 to 16 tokens, the MTP verify step. 0 uses the prompt kernels.
+    NP_GEMMA_MTP           1                       0 turns the MTP drafter off. See MTP_PLAN.md.
+    NP_GEMMA_MTP_PMIN      0                       The drafter stops when its best token has a lower probability than this value. 0 turns the test off.
 
 ## Weight modes
 

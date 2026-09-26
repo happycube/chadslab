@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Save or compare the output of a fixed decode workload, bit for bit.
 
-A change to the C kernels that must keep the bits (for example the split of
-a kernel into a body and a wrapper) runs this script two times. The first
-run, on the old code, saves the output. The second run, on the new code,
-compares it.
+Use this script for a change to the C kernels that must keep the bits. An
+example is the split of a kernel into a body and a wrapper. Run it two times.
+The first run, on the old code, saves the output. The second run, on the new
+code, compares it.
 
-The workload covers the paths of a decode step: a prompt pass, single decode
-steps, token groups of the MTP verify step, a context past the sliding
-window of 1024, and the output head.
+The workload covers the paths of a decode step. It has a prompt pass, single
+decode steps, and token groups of the MTP verify step. It uses a context
+past the sliding window of 1024, and it runs the output head.
 
     PYTHONPATH=. python scripts/check_kernels_ab.py --save base.npz
     PYTHONPATH=. python scripts/check_kernels_ab.py --compare base.npz
