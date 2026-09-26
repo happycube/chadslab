@@ -1216,3 +1216,13 @@ def attn_decode_mt(qq, qs, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
                               ctypes.c_int(head_dim), lo.ctypes.data, n.ctypes.data,
                               ctypes.c_int(nmax), ctypes.c_int(t))
     return out
+
+
+def linear_bf16_gemv(x, w_u16):
+    """Multiply the rows of x by W with the GEMV kernel. W is raw bfloat16 data.
+
+    The kernel runs each token with the steps of a one-token call, so each
+    token gets the same bits. A small token group uses it in place of the GEMM.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    return _call(_lib.gemma_bf16_linear, w_u16, x)

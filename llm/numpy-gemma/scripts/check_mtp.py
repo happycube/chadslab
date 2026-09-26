@@ -62,13 +62,21 @@ def main():
     ap.add_argument("--n-draft", type=int, nargs="+", default=[3])
     ap.add_argument("--max-new-tokens", type=int, default=200)
     ap.add_argument("--prompts", nargs="+", default=[p[0] for p in PROMPTS])
+    ap.add_argument("--e4b", action="store_true", help="The GGUF file is an E4B model.")
     args = ap.parse_args()
     path = args.assistant or sorted(glob.glob(os.path.join(HUB, REPO, "snapshots", "*")))[-1]
 
     g = GGUF(args.gguf)
     tok = Tokenizer.from_gguf(g)
-    cfg = Config({"text_config": g.text_config()})
-    model = Model(g, cfg).load_all(dtype="int4")
+    if args.e4b:
+        from np_gemma.e4b import E4B, E4BCache, E4BConfig
+        cfg = E4BConfig({"text_config": g.text_config()})
+        model = E4B(g, cfg, mode="int4")
+        new_cache = lambda n: E4BCache(cfg, max_len=n)  # noqa: E731
+    else:
+        cfg = Config({"text_config": g.text_config()})
+        model = Model(g, cfg).load_all(dtype="int4")
+        new_cache = lambda n: KVCache(cfg, max_len=n)  # noqa: E731
     drafter = Assistant(path, dtype=args.drafter_dtype)
     eos = set(tok.stop_ids)
 
@@ -81,11 +89,11 @@ def main():
         msg = tok.apply_chat_template([{"role": "user", "content": text}],
                                       add_generation_prompt=True, thinking=False)
         ids = tok.encode(msg)
-        cache = KVCache(cfg, max_len=len(ids) + args.max_new_tokens + 16)
+        cache = new_cache(len(ids) + args.max_new_tokens + 16)
         ref, _p, dt_plain = plain(model, ids, cache, args.max_new_tokens, eos)
         r_plain = (len(ref) - 1) / dt_plain
         for n in args.n_draft:
-            cache = KVCache(cfg, max_len=len(ids) + args.max_new_tokens + 16)
+            cache = new_cache(len(ids) + args.max_new_tokens + 16)
             st = {}
             out = mtp_generate(model, drafter, ids, cache, args.max_new_tokens, n, eos, st)
             r_mtp = (len(out) - 1) / st["decode_s"]

@@ -425,6 +425,11 @@ def router_mt(x, scale, proj, per_expert, top_k, eps, hscale):
                            top_k, eps, hscale)
 
 
+def linear_bf16_mt(x, w_u16):
+    """Multiply a small group of rows of x by W. W is raw bfloat16 data."""
+    return _cops.linear_bf16_gemv(x, w_u16)
+
+
 def linear_int4_mt(x, packed, scales):
     """Multiply a small group of rows of x by W. W is packed 4-bit data."""
     return _cops.linear_int4_mt(x, packed, scales)

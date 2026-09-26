@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--prompt", default="Write a Python function that returns the "
                     "n-th Fibonacci number, then explain it in two sentences.")
     ap.add_argument("--steps", type=int, default=3)
+    ap.add_argument("--e4b", action="store_true", help="The GGUF file is an E4B model.")
     args = ap.parse_args()
     path = args.assistant or snapshot(REPO)
 
@@ -52,26 +53,39 @@ def main():
 
     g = GGUF(args.gguf)
     tok = Tokenizer.from_gguf(g)
-    cfg = Config({"text_config": g.text_config()})
-    target = Model(g, cfg).load_all(dtype="int4")
+    if args.e4b:
+        from np_gemma.e4b import E4B, E4BCache, E4BConfig
+        cfg = E4BConfig({"text_config": g.text_config()})
+        target = E4B(g, cfg, mode="int4")
+    else:
+        cfg = Config({"text_config": g.text_config()})
+        target = Model(g, cfg).load_all(dtype="int4")
     text = tok.apply_chat_template([{"role": "user", "content": args.prompt}],
                                    add_generation_prompt=True, thinking=False)
     ids = tok.encode(text)
-    cache = KVCache(cfg, max_len=len(ids) + 8)
+    cache = E4BCache(cfg, max_len=len(ids) + 8) if args.e4b else KVCache(cfg, max_len=len(ids) + 8)
     x = target.prefill(ids, cache)
     h = x[-1:]
     token = int(np.argmax(target.logits(h)[0]))
     pos = len(ids)
     assert pos < cfg.sliding_window, "the check needs a context below the window"
 
-    layers = shared_layers(cfg)
     shared = {}
-    for name, layer in (("sliding_attention", layers[0]), ("full_attention", layers[1])):
-        K, V, base = cache.read(layer, pos)
-        assert base == 0
-        # (keys, heads, dim) -> (1, heads, keys, dim)
-        shared[name] = (torch.from_numpy(np.ascontiguousarray(K.transpose(1, 0, 2)))[None],
-                        torch.from_numpy(np.ascontiguousarray(V.transpose(1, 0, 2)))[None])
+    if args.e4b:
+        layers = None
+        for name in ("sliding_attention", "full_attention"):
+            K, V = cache.shared[name]
+            # (heads, keys, dim) -> (1, heads, keys, dim)
+            shared[name] = (torch.from_numpy(np.ascontiguousarray(K[:, :pos]))[None],
+                            torch.from_numpy(np.ascontiguousarray(V[:, :pos]))[None])
+    else:
+        layers = shared_layers(cfg)
+        for name, layer in (("sliding_attention", layers[0]), ("full_attention", layers[1])):
+            K, V, base = cache.read(layer, pos)
+            assert base == 0
+            # (keys, heads, dim) -> (1, heads, keys, dim)
+            shared[name] = (torch.from_numpy(np.ascontiguousarray(K.transpose(1, 0, 2)))[None],
+                            torch.from_numpy(np.ascontiguousarray(V.transpose(1, 0, 2)))[None])
 
     hf = Gemma4AssistantForCausalLM.from_pretrained(path, dtype=torch.float32,
                                                     attn_implementation="eager").eval()

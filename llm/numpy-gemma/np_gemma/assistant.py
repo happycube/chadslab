@@ -74,6 +74,9 @@ class Assistant:
         # Read the int8 copy of the target cache when it is ready. Set False
         # to read the float copy, as the check against transformers does.
         self.q8_attn = q8_attn
+        # Stop a draft when the drafter gives its best token less than this
+        # probability. Zero turns the test off. NP_GEMMA_MTP_PMIN sets it.
+        self.p_min = float(os.environ.get("NP_GEMMA_MTP_PMIN", "0"))
         self.st = SafeTensors(os.path.join(path, "model.safetensors"))
         get = self.st.get
         self.layers = []
@@ -139,6 +142,15 @@ class Assistant:
         q = ops.rms_norm(q, w["self_attn.q_norm"], eps)
         cos, sin = self._cos_sin(plan, pos)
         q = rope_mod.apply(q[None], cos, sin)[0]
+        if layer is None:
+            # The E4B cache keeps the key and the value that the shared layers
+            # reuse, for each layer type, with the shape (heads, keys, dim).
+            store = cache.shared[plan.kind if hasattr(plan, "kind") else
+                                 ("sliding_attention" if plan.is_sliding else "full_attention")]
+            window = self.cfg.sliding_window if plan.is_sliding else 0
+            o = ops.attn_decode_f32(np.ascontiguousarray(q), store[0][:, :pos, :],
+                                    store[1][:, :pos, :], pos, 0, window)
+            return self.linear(o.reshape(1, nq * hd), w["self_attn.o_proj"])
         if self.q8_attn and ops.attn_ready() and cache.q8_ready(layer):
             # The int8 copy of the target cache, with the fused kernel of the
             # decode step. It reads a quarter of the bytes of the float copy.
@@ -175,7 +187,7 @@ class Assistant:
         u = self.linear(np.concatenate([emb, h], axis=-1).astype(np.float32), self.pre)
         for i, w in enumerate(self.layers):
             plan = self.cfg.plan[i]
-            layer = layers[0] if plan.is_sliding else layers[1]
+            layer = None if layers is None else (layers[0] if plan.is_sliding else layers[1])
             a = ops.rms_norm(u, w["input_layernorm"], eps)
             a = self._attention(a, w, plan, pos, cache, layer)
             u = u + ops.rms_norm(a, w["post_attention_layernorm"], eps)
@@ -211,12 +223,24 @@ class Assistant:
         token is the last accepted token at position pos. The target cache
         holds the rows before pos. h is the target hidden state of the row
         that predicted token.
+
+        With p_min above zero, stop when the probability of the best draft
+        falls below p_min. The first draft is always kept. A draft that the
+        drafter itself doubts is often rejected, and it costs a draft step
+        and a verify row.
         """
-        layers = shared_layers(target.cfg)
+        # The E4B cache gives the shared key and value by layer type. The
+        # other cache gives them by layer index.
+        layers = None if hasattr(cache, "shared") else shared_layers(target.cfg)
         out = []
         for _ in range(n):
             logits, h = self.step(target.embed([token]), h, pos, cache, layers)
-            token = int(np.argmax(logits[0]))
+            row = logits[0]
+            token = int(np.argmax(row))
+            if out and self.p_min > 0.0:
+                p = 1.0 / float(np.exp(row - row[token]).sum())
+                if p < self.p_min:
+                    break
             out.append(token)
             if token in eos_ids:
                 break

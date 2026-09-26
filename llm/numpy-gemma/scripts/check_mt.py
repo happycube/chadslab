@@ -35,19 +35,27 @@ def main():
     ap.add_argument("--gguf", default=GGUF_PATH)
     ap.add_argument("--contexts", type=int, nargs="+", default=[64, 300])
     ap.add_argument("--sizes", type=int, nargs="+", default=[2, 3, 4, 5, 8])
+    ap.add_argument("--e4b", action="store_true", help="The GGUF file is an E4B model.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
     tok = Tokenizer.from_gguf(g)
-    cfg = Config({"text_config": g.text_config()})
-    model = Model(g, cfg).load_all(dtype="int4")
+    if args.e4b:
+        from np_gemma.e4b import E4B, E4BCache, E4BConfig
+        cfg = E4BConfig({"text_config": g.text_config()})
+        model = E4B(g, cfg, mode="int4")
+        new_cache = lambda n: E4BCache(cfg, max_len=n)  # noqa: E731
+    else:
+        cfg = Config({"text_config": g.text_config()})
+        model = Model(g, cfg).load_all(dtype="int4")
+        new_cache = lambda n: KVCache(cfg, max_len=n)  # noqa: E731
     ids = tok.encode(open("README.md").read())
 
     ok = True
     print("%7s %5s %6s %10s %10s %9s %9s" % ("context", "group", "same", "hidden", "logits",
                                              "group ms", "single ms"))
     for n in args.contexts:
-        cache = KVCache(cfg, max_len=n + max(args.sizes) + 8)
+        cache = new_cache(n + max(args.sizes) + 8)
         model.prefill(ids[:n], cache)
         for t in args.sizes:
             batch = ids[n:n + t]

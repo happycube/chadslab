@@ -286,3 +286,53 @@ MTP. 200 tokens, tokens/s of the decode:
 Two drafts give the best total. The MTP decode of numpy-gemma is now faster
 than the plain decode of llama.cpp, which gives 17.01 tokens/s. The MTP
 decode of llama.cpp is faster, with 24.69 tokens/s for mxfp4.
+
+### Phase 4: the 12B and E4B targets
+
+Each target uses its own QAT drafter. The E4B drafter has the centroid
+head. `scripts/check_assistant.py --e4b` gives a relative difference of
+1.4e-06 against transformers, with the same top token at each step.
+
+The E4B model has its own class, so it needed its own small-group path. Its
+bfloat16 matrices use the GEMV kernel for a group, because that kernel runs
+each token with the steps of a one-token call. Before this change, a verify
+batch of E4B used the prompt kernels. MTP was then 0.77 times the plain
+decode, and one prompt gave other token ids after 106 tokens.
+
+`scripts/check_mt.py` gives the same bits for a group and for the single
+steps on both targets. Every prompt of `scripts/check_mtp.py` gives the same
+token ids as the plain decode. Tokens/s of the decode, all four prompts:
+
+    target   plain   n=2     gain   accepted   n=3     gain   accepted
+    26B      13.47   17.25   1.28   75%        16.71   1.24   69%
+    12B       6.01    9.52   1.58   73%         9.71   1.62   65%
+    E4B      12.54   17.85   1.42   61%        17.35   1.38   53%
+
+The 12B gains the most. It is a dense model, so a group of four costs only
+1.3 decode steps. The 26B reads the experts of each token, so a group of four
+costs 1.9 decode steps.
+
+The unsloth E2B and E4B files use the Q4_K types. The GGUF reader of this
+project does not read them, so this plan does not test those two targets.
+
+### Sampling and the server
+
+`mtp_stream` gives the MTP decode to Session and to the server. At each row
+of a verify batch, the target picks its token with the sampler of the plain
+decode. A draft stays while it is the picked token. Thus the MTP decode emits
+the tokens of the plain decode, also with a temperature. With the same seed,
+`scripts/check_mtp_session.py` gives the same tokens in two chat turns, for
+both attention modes.
+
+This rule accepts fewer drafts than the rule min(1, p/q) of speculative
+sampling. At a temperature of 1.0 the test accepts 36 to 55 per cent of the
+drafts. The simple rule needs no drafter probabilities and keeps the exact
+output.
+
+Use MTP from the command line:
+
+    PYTHONPATH=. python scripts/serve.py --gguf MODEL.gguf --mtp DRAFTER_DIR --mtp-n 2
+    PYTHONPATH=. python scripts/gguf_generate.py --gguf MODEL.gguf --mtp DRAFTER_DIR
+
+DRAFTER_DIR is the snapshot directory of the drafter. NP_GEMMA_MTP=0 turns
+the drafter off.

@@ -489,10 +489,15 @@ class E4B:
         bfloat16 copy and the bfloat16 kernel.
         """
         if self.mode == "int4":
+            # A small token group (an MTP verify step) uses the kernels that
+            # give each token the bits of a decode step.
+            mt = ops.mt_ready(x.shape[0])
             if self._q4:
                 entry = self.q4(module)
                 if entry is not None:
                     packed, scales = entry
+                    if mt:
+                        return ops.linear_int4_mt(x, packed, scales)
                     return ops.linear_int4(x, packed, scales)
             else:
                 entry = self.packed(module)
@@ -501,6 +506,8 @@ class E4B:
                     return cops.ct_linear(x, words, scale, bits)
             w16 = self.W16(module)
             if w16 is not None:
+                if mt:
+                    return ops.linear_bf16_mt(x, w16)
                 return ops.linear_bf16(x, w16)
         return ops.linear(x, self.W(module))
 
@@ -511,12 +518,15 @@ class E4B:
         The model then opens one OpenMP region instead of one for each matrix.
         Return a list of arrays in the order of `modules`.
         """
+        mt = ops.mt_ready(x.shape[0])
         if (self.mode != "int4" or not self._q4 or len(modules) < 2
-                or x.shape[0] != 1 or not ops.int4_multi4_ready()):
+                or (x.shape[0] != 1 and not mt) or not ops.int4_multi4_ready()):
             return [self.linear(x, m) for m in modules]
         entries = [self.q4(m) for m in modules]
         if any(e is None for e in entries):
             return [self.linear(x, m) for m in modules]
+        if mt:
+            return ops.int4_multi4_mt(entries, x, x.shape[-1])[:len(modules)]
         outs = ops.int4_multi4(entries, x, x.shape[-1])[:len(modules)]
         return [None if o is None else o.reshape(1, -1) for o in outs]
 
@@ -669,6 +679,19 @@ class E4B:
             raise RuntimeError("layer %d sees %d positions, expected %d"
                                % (plan.idx, npos, start_pos + ntok))
 
+        slide = bool(plan.window) and os.environ.get("NP_GEMMA_SLIDE", "1") == "1"
+        if (1 < ntok and ops.attn_ready() and self.mode == "int4"
+                and ops.mt_ready(ntok)):
+            # A small token group: the decode-step attention for each token,
+            # over the keys that a decode step of that token sees.
+            out = np.empty((ntok, plan.num_q_heads, head_dim), dtype=np.float32)
+            for j in range(ntok):
+                pos = start_pos + j
+                lo = max(0, pos - plan.window + 1) if slide else 0
+                out[j] = ops.attn_decode_f32(q[j:j + 1], k[:, lo:pos + 1, :],
+                                             v[:, lo:pos + 1, :], pos, lo, plan.window)[0]
+            return self.linear(out.reshape(ntok, plan.q_dim), p + "self_attn.o_proj")
+
         positions = np.arange(start_pos, start_pos + ntok, dtype=np.int32)
         base = 0
         # A sliding layer sees only the last window keys. Drop the keys that no
@@ -779,6 +802,15 @@ class E4B:
         for i in range(cfg.num_hidden_layers):
             x = self.layer(x, per_layer[:, i, :], i, cache, start_pos, hook)
         return ops.rms_norm(x, self.T(PREFIX + "norm.weight"), cfg.rms_norm_eps)
+
+    def embed(self, input_ids):
+        """Return the scaled token embeddings, the input of layer 0."""
+        ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
+        return self.embed_rows(PREFIX + "embed_tokens", ids) * self.cfg.embed_scale
+
+    def prefill(self, ids, cache, start=0):
+        """Run the prompt into the cache. Return the final hidden states."""
+        return self.forward(ids, cache=cache, start_pos=start)
 
     def logits(self, hidden, softcap=True):
         """Project the hidden state onto the vocabulary."""
