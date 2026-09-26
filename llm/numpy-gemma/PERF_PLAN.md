@@ -229,6 +229,21 @@ path keeps its kernels and its bits.
 
 - 2a: split the decode kernels into a body and a wrapper. Test: the Paris
   test and `scripts/check_mt.py` give the same bits.
+
+  Done. Each decode kernel of the 26B, the MTP group, and the E4B now has a
+  body and a wrapper. The fused entry points have a body that calls two
+  bodies.
+
+  `scripts/check_kernels_ab.py` saves the output of a fixed workload and
+  compares it later. The workload covers the prompt pass, three decode
+  steps, groups of 2, 3, and 5 tokens, and contexts of 40, 300, and 1100.
+  All 39 arrays of the 26B are the same bit for bit, with the int8 and the
+  float attention. With 6 threads in place of 18 they are also the same.
+  All 26 arrays of the E4B are the same.
+
+  The step time does not change: 3
+  alternate runs gave 68.5 to 74.9 ms for the old code and 69.4 to 71.0 ms
+  for the new code.
 - 2b: the record format, the environment, the scalar operations, the C
   interpreter, the Python interpreter, and the compiler, with the
   operations of one 26B layer. Test: the C program and

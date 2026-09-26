@@ -1863,7 +1863,7 @@ void gemma_int4_set_rows4(int on)
     gemma_int4_rows4 = on ? 1 : 0;
 }
 
-void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, float *out,
+static void gemma_int4_linear_body(const uint8_t *w, const float *scales, const float *x, float *out,
                        int rows, int cols, int tokens, int group)
 {
     /* The fast dot uses a group of 32 values. ops.linear_int4 sends only that
@@ -1873,7 +1873,7 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
     int stride = (cols / 32) * 18;
     if (gemma_int4_rows4 && tokens == 1) {
         int blocks = (rows + 3) / 4;
-        #pragma omp parallel for schedule(static)
+        #pragma omp for schedule(static)
         for (int b = 0; b < blocks; ++b) {
             int i = b * 4;
             int left = rows - i;
@@ -1895,7 +1895,7 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
         }
         return;
     }
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         const uint8_t *wi = w + (size_t)i * (size_t)stride;
         const float *si = scales + (size_t)i * (size_t)groups;
@@ -1906,13 +1906,20 @@ void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, fl
     }
 }
 
+void gemma_int4_linear(const uint8_t *w, const float *scales, const float *x, float *out,
+                       int rows, int cols, int tokens, int group)
+{
+    #pragma omp parallel
+    gemma_int4_linear_body(w, scales, x, out, rows, cols, tokens, group);
+}
+
 /* ---------- four int4 matrices on one x row ----------
  * The query, the key, and the value projection of one attention layer share
  * the x row. Three calls then start three OpenMP regions for the same x. This
  * kernel runs up to four matrices in one region. A null weight pointer skips
  * a matrix. The MLP gate and up projection can use the same kernel.
  */
-void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
+static void gemma_int4_multi4_body(const uint8_t *w0, const float *s0, float *o0, int rows0,
                        const uint8_t *w1, const float *s1, float *o1, int rows1,
                        const uint8_t *w2, const float *s2, float *o2, int rows2,
                        const uint8_t *w3, const float *s3, float *o3, int rows3,
@@ -1925,7 +1932,7 @@ void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
     int b2 = w2 ? (rows2 + 3) / 4 : 0;
     int b3 = w3 ? (rows3 + 3) / 4 : 0;
     long total = (long)b0 + (long)b1 + (long)b2 + (long)b3;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (long t = 0; t < total; ++t) {
         const uint8_t *w = w0;
         const float *s = s0;
@@ -1964,6 +1971,16 @@ void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
     }
 }
 
+void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
+                       const uint8_t *w1, const float *s1, float *o1, int rows1,
+                       const uint8_t *w2, const float *s2, float *o2, int rows2,
+                       const uint8_t *w3, const float *s3, float *o3, int rows3,
+                       const float *x, int cols)
+{
+    #pragma omp parallel
+    gemma_int4_multi4_body(w0, s0, o0, rows0, w1, s1, o1, rows1, w2, s2, o2, rows2, w3, s3, o3, rows3, x, cols);
+}
+
 /* ---------- int4 mixture of experts ----------
  * A mixture-of-experts layer selects a small set of experts for each token.
  * A one-row call for each expert then starts one OpenMP region for each
@@ -1980,7 +1997,7 @@ void gemma_int4_multi4(const uint8_t *w0, const float *s0, float *o0, int rows0,
  *     out[j * rows + r] = sum_k W[ids[j]][r][k] * x[j * xstride + k].
  * An xstride of 0 gives the same x to every job. That is a decode step.
  */
-void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
+static void gemma_int4_moe_gemv_body(const uint8_t *w, const float *scales,
                          const float *x, const int *ids, int jobs,
                          float *out, int rows, int cols, int xstride)
 {
@@ -1990,7 +2007,7 @@ void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
     size_t expert_scales = (size_t)rows * (size_t)groups;
     int blocks = (rows + 3) / 4;
     long total = (long)jobs * (long)blocks;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (long t = 0; t < total; ++t) {
         int j = (int)(t / blocks);
         int i = (int)(t % blocks) * 4;
@@ -2015,6 +2032,14 @@ void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
             }
         }
     }
+}
+
+void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
+                         const float *x, const int *ids, int jobs,
+                         float *out, int rows, int cols, int xstride)
+{
+    #pragma omp parallel
+    gemma_int4_moe_gemv_body(w, scales, x, ids, jobs, out, rows, cols, xstride);
 }
 
 /* ---------- int4 GEMV for a small group of tokens ----------
@@ -2120,7 +2145,7 @@ static inline void i4_rows_mt(const uint8_t *w, const float *s, int rows, int co
 #define I4MT_MAX 16
 
 /* x is (tokens, cols) and out is (tokens, rows). */
-void gemma_int4_linear_mt(const uint8_t *w, const float *scales, const float *x,
+static void gemma_int4_linear_mt_body(const uint8_t *w, const float *scales, const float *x,
                           float *out, int rows, int cols, int tokens)
 {
     const float *xs[I4MT_MAX];
@@ -2130,14 +2155,21 @@ void gemma_int4_linear_mt(const uint8_t *w, const float *scales, const float *x,
         outs[t] = out + (size_t)t * (size_t)rows;
     }
     int blocks = (rows + 3) / 4;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int b = 0; b < blocks; ++b) {
         i4_rows_mt(w, scales, rows, cols, b * 4, xs, outs, tokens);
     }
 }
 
+void gemma_int4_linear_mt(const uint8_t *w, const float *scales, const float *x,
+                          float *out, int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_int4_linear_mt_body(w, scales, x, out, rows, cols, tokens);
+}
+
 /* Up to four matrices on the same x rows. Matrix k writes (tokens, rows_k). */
-void gemma_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int rows0,
+static void gemma_int4_multi4_mt_body(const uint8_t *w0, const float *s0, float *o0, int rows0,
                           const uint8_t *w1, const float *s1, float *o1, int rows1,
                           const uint8_t *w2, const float *s2, float *o2, int rows2,
                           const uint8_t *w3, const float *s3, float *o3, int rows3,
@@ -2157,7 +2189,7 @@ void gemma_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int row
     for (int t = 0; t < tokens; ++t) {
         xs[t] = x + (size_t)t * (size_t)cols;
     }
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (long u = 0; u < total; ++u) {
         int k = 0;
         long v = u;
@@ -2173,11 +2205,21 @@ void gemma_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int row
     }
 }
 
+void gemma_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int rows0,
+                          const uint8_t *w1, const float *s1, float *o1, int rows1,
+                          const uint8_t *w2, const float *s2, float *o2, int rows2,
+                          const uint8_t *w3, const float *s3, float *o3, int rows3,
+                          const float *x, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_int4_multi4_mt_body(w0, s0, o0, rows0, w1, s1, o1, rows1, w2, s2, o2, rows2, w3, s3, o3, rows3, x, cols, tokens);
+}
+
 /* The selected experts of a small group of tokens. Job j is one expert,
  * ids[j], with the pairs poff[j] to poff[j + 1] - 1. Pair p reads the x row
  * xi[p] (the stride is xstride) and writes the out row p. Each expert is read
  * one time for all of its tokens. */
-void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *x,
+static void gemma_int4_moe_gemv_mt_body(const uint8_t *w, const float *scales, const float *x,
                             const int *ids, const int *poff, const int *xi, int jobs,
                             float *out, int rows, int cols, int xstride)
 {
@@ -2186,7 +2228,7 @@ void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *
     size_t expert_scales = (size_t)rows * (size_t)groups;
     int blocks = (rows + 3) / 4;
     long total = (long)jobs * (long)blocks;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (long u = 0; u < total; ++u) {
         int j = (int)(u / blocks);
         int i = (int)(u % blocks) * 4;
@@ -2202,6 +2244,14 @@ void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *
         i4_rows_mt(w + (size_t)e * expert_bytes, scales + (size_t)e * expert_scales,
                    rows, cols, i, xs, outs, np);
     }
+}
+
+void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *x,
+                            const int *ids, const int *poff, const int *xi, int jobs,
+                            float *out, int rows, int cols, int xstride)
+{
+    #pragma omp parallel
+    gemma_int4_moe_gemv_mt_body(w, scales, x, ids, poff, xi, jobs, out, rows, cols, xstride);
 }
 
 void gemma_gelu_mul(const float *x, float *out, int rows, int inner);
@@ -2711,11 +2761,11 @@ static float dot_q6k_row_scalar(const uint8_t *w, const float *x, int cols)
 }
 
 /* Multiply x by W. W is Q6_K data. Scalar form. */
-void gemma_q6k_scalar(const uint8_t *w, const float *x, float *out,
+static void gemma_q6k_scalar_body(const uint8_t *w, const float *x, float *out,
                       int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         const uint8_t *wi = w + (size_t)i * row_bytes;
         for (int t = 0; t < tokens; ++t) {
@@ -2723,6 +2773,13 @@ void gemma_q6k_scalar(const uint8_t *w, const float *x, float *out,
                 dot_q6k_row_scalar(wi, x + (size_t)t * (size_t)cols, cols);
         }
     }
+}
+
+void gemma_q6k_scalar(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_q6k_scalar_body(w, x, out, rows, cols, tokens);
 }
 
 #if GEMMA_X86
@@ -2800,11 +2857,11 @@ static float dot_q6k_row_avx2(const uint8_t *w, const float *x, int cols)
 /* A group of tokens runs the one-token dot for each token. The weight row
  * stays in the cache between the tokens, so the memory reads one row. */
 __attribute__((target("avx2,fma")))
-void gemma_q6k_avx2(const uint8_t *w, const float *x, float *out,
+static void gemma_q6k_avx2_body(const uint8_t *w, const float *x, float *out,
                     int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         for (int t = 0; t < tokens; ++t) {
             out[(size_t)t * (size_t)rows + i] =
@@ -2812,6 +2869,13 @@ void gemma_q6k_avx2(const uint8_t *w, const float *x, float *out,
                                  x + (size_t)t * (size_t)cols, cols);
         }
     }
+}
+
+void gemma_q6k_avx2(const uint8_t *w, const float *x, float *out,
+                    int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_q6k_avx2_body(w, x, out, rows, cols, tokens);
 }
 
 /* Widen 16 signed 8-bit values to one float32 vector. Subtract 32. */
@@ -2945,18 +3009,18 @@ static void dot_q6k_rows_avx512(const uint8_t *w, const float *x, int cols,
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
-void gemma_q6k_avx512(const uint8_t *w, const float *x, float *out,
+static void gemma_q6k_avx512_body(const uint8_t *w, const float *x, float *out,
                       int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
     if (tokens == 1) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp for schedule(static)
         for (int i = 0; i < rows; ++i) {
             out[i] = dot_q6k_row_avx512(w + (size_t)i * row_bytes, x, cols);
         }
         return;
     }
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         float sums[Q6K_TMAX];
         for (int t0 = 0; t0 < tokens; t0 += Q6K_TMAX) {
@@ -2968,6 +3032,13 @@ void gemma_q6k_avx512(const uint8_t *w, const float *x, float *out,
             }
         }
     }
+}
+
+void gemma_q6k_avx512(const uint8_t *w, const float *x, float *out,
+                      int rows, int cols, int tokens)
+{
+    #pragma omp parallel
+    gemma_q6k_avx512_body(w, x, out, rows, cols, tokens);
 }
 
 /* Multiply x by W. W is Q6_K data. Use the AVX-512 kernel or the AVX2 kernel.
@@ -3000,21 +3071,23 @@ void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
  * call of each small function than in the work. This kernel does the full
  * step. The parallel loop covers the experts.
  */
-void gemma_router(const float *x, const float *scale, const float *proj,
-                  const float *per_expert, int hidden, int experts, int top_k,
-                  float eps, float hscale, float *val, int *idx)
+static void gemma_router_body(const float *x, const float *scale, const float *proj,
+                              const float *per_expert, int hidden, int experts,
+                              int top_k, float eps, float hscale, float *val,
+                              int *idx, float *r, float *logits)
 {
-    float r[hidden];
-    float logits[experts];
-    float ss = 0.0f;
-    for (int k = 0; k < hidden; ++k) {
-        ss += x[k] * x[k];
+    #pragma omp single
+    {
+        float ss = 0.0f;
+        for (int k = 0; k < hidden; ++k) {
+            ss += x[k] * x[k];
+        }
+        float inv = 1.0f / sqrtf(ss / (float)hidden + eps);
+        for (int k = 0; k < hidden; ++k) {
+            r[k] = x[k] * inv * scale[k] * hscale;
+        }
     }
-    float inv = 1.0f / sqrtf(ss / (float)hidden + eps);
-    for (int k = 0; k < hidden; ++k) {
-        r[k] = x[k] * inv * scale[k] * hscale;
-    }
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int e = 0; e < experts; ++e) {
         const float *pe = proj + (size_t)e * (size_t)hidden;
         float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
@@ -3031,54 +3104,68 @@ void gemma_router(const float *x, const float *scale, const float *proj,
         }
         logits[e] = a;
     }
-    float m = logits[0];
-    for (int e = 1; e < experts; ++e) {
-        if (logits[e] > m) {
-            m = logits[e];
-        }
-    }
-    float sum = 0.0f;
-    for (int e = 0; e < experts; ++e) {
-        logits[e] = expf(logits[e] - m);
-        sum += logits[e];
-    }
-    float invs = 1.0f / sum;
-    for (int e = 0; e < experts; ++e) {
-        logits[e] *= invs;
-    }
-    for (int j = 0; j < top_k; ++j) {
-        int best = 0;
-        float bv = logits[0];
+    #pragma omp single
+    {
+        float m = logits[0];
         for (int e = 1; e < experts; ++e) {
-            if (logits[e] > bv) {
-                bv = logits[e];
-                best = e;
+            if (logits[e] > m) {
+                m = logits[e];
             }
         }
-        val[j] = bv;
-        idx[j] = best;
-        logits[best] = -1.0f;
+        float sum = 0.0f;
+        for (int e = 0; e < experts; ++e) {
+            logits[e] = expf(logits[e] - m);
+            sum += logits[e];
+        }
+        float invs = 1.0f / sum;
+        for (int e = 0; e < experts; ++e) {
+            logits[e] *= invs;
+        }
+        for (int j = 0; j < top_k; ++j) {
+            int best = 0;
+            float bv = logits[0];
+            for (int e = 1; e < experts; ++e) {
+                if (logits[e] > bv) {
+                    bv = logits[e];
+                    best = e;
+                }
+            }
+            val[j] = bv;
+            idx[j] = best;
+            logits[best] = -1.0f;
+        }
+        float vs = 0.0f;
+        for (int j = 0; j < top_k; ++j) {
+            vs += val[j];
+        }
+        float invv = 1.0f / vs;
+        for (int j = 0; j < top_k; ++j) {
+            val[j] = val[j] * invv * per_expert[idx[j]];
+        }
     }
-    float vs = 0.0f;
-    for (int j = 0; j < top_k; ++j) {
-        vs += val[j];
-    }
-    float invv = 1.0f / vs;
-    for (int j = 0; j < top_k; ++j) {
-        val[j] = val[j] * invv * per_expert[idx[j]];
-    }
+}
+
+void gemma_router(const float *x, const float *scale, const float *proj,
+                  const float *per_expert, int hidden, int experts, int top_k,
+                  float eps, float hscale, float *val, int *idx)
+{
+    float r[hidden];
+    float logits[experts];
+    #pragma omp parallel
+    gemma_router_body(x, scale, proj, per_expert, hidden, experts, top_k, eps,
+                      hscale, val, idx, r, logits);
 }
 
 /* The router for a small group of tokens. The steps for each token are the
  * steps of gemma_router, so each token selects the same experts with the same
  * weights. One parallel region covers the logits of every token. x is
  * (tokens, hidden), val and idx are (tokens, top_k). tokens is at most 16. */
-void gemma_router_mt(const float *x, const float *scale, const float *proj,
-                     const float *per_expert, int hidden, int experts, int top_k,
-                     float eps, float hscale, float *val, int *idx, int tokens)
+static void gemma_router_mt_body(const float *x, const float *scale, const float *proj,
+                                 const float *per_expert, int hidden, int experts,
+                                 int top_k, float eps, float hscale, float *val,
+                                 int *idx, int tokens, float *r, float *logits)
 {
-    float *r = (float *)malloc((size_t)tokens * (size_t)hidden * sizeof(float));
-    float *logits = (float *)malloc((size_t)tokens * (size_t)experts * sizeof(float));
+    #pragma omp single
     for (int t = 0; t < tokens; ++t) {
         const float *xt = x + (size_t)t * (size_t)hidden;
         float *rt = r + (size_t)t * (size_t)hidden;
@@ -3091,7 +3178,7 @@ void gemma_router_mt(const float *x, const float *scale, const float *proj,
             rt[k] = xt[k] * inv * scale[k] * hscale;
         }
     }
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int e = 0; e < experts; ++e) {
         const float *pe = proj + (size_t)e * (size_t)hidden;
         for (int t = 0; t < tokens; ++t) {
@@ -3111,6 +3198,7 @@ void gemma_router_mt(const float *x, const float *scale, const float *proj,
             logits[(size_t)t * (size_t)experts + e] = a;
         }
     }
+    #pragma omp single
     for (int t = 0; t < tokens; ++t) {
         float *lg = logits + (size_t)t * (size_t)experts;
         float *vt = val + (size_t)t * (size_t)top_k;
@@ -3152,6 +3240,17 @@ void gemma_router_mt(const float *x, const float *scale, const float *proj,
             vt[j] = vt[j] * invv * per_expert[it[j]];
         }
     }
+}
+
+void gemma_router_mt(const float *x, const float *scale, const float *proj,
+                     const float *per_expert, int hidden, int experts, int top_k,
+                     float eps, float hscale, float *val, int *idx, int tokens)
+{
+    float *r = (float *)malloc((size_t)tokens * (size_t)hidden * sizeof(float));
+    float *logits = (float *)malloc((size_t)tokens * (size_t)experts * sizeof(float));
+    #pragma omp parallel
+    gemma_router_mt_body(x, scale, proj, per_expert, hidden, experts, top_k, eps,
+                         hscale, val, idx, tokens, r, logits);
     free(r);
     free(logits);
 }
@@ -3162,12 +3261,12 @@ void gemma_router_mt(const float *x, const float *scale, const float *proj,
  * all three in one parallel loop. The value has no weight. The rows are
  * (tokens * heads, head_dim) and the data changes in place.
  */
-void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
-                    float *k, const float *k_w, int k_rows,
-                    float *v, int v_rows, int head_dim, float eps)
+static void gemma_qkv_norm_body(float *q, const float *q_w, int q_rows,
+                                float *k, const float *k_w, int k_rows,
+                                float *v, int v_rows, int head_dim, float eps)
 {
     int total = q_rows + k_rows + v_rows;
-    #pragma omp parallel for if(total >= 8) schedule(static)
+    #pragma omp for schedule(static)
     for (int r = 0; r < total; ++r) {
         float *x;
         const float *w;
@@ -3200,6 +3299,15 @@ void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
     }
 }
 
+void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
+                    float *k, const float *k_w, int k_rows,
+                    float *v, int v_rows, int head_dim, float eps)
+{
+    int total = q_rows + k_rows + v_rows;
+    #pragma omp parallel if(total >= 8)
+    gemma_qkv_norm_body(q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps);
+}
+
 /* ---------- rotary position embedding ----------
  * Apply RoPE to the query and the key in place. The value does not turn. The
  * cos and sin tables have one row for each token and the full head width.
@@ -3214,13 +3322,13 @@ void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
 #if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("-ffp-contract=off")))
 #endif
-void gemma_rope(float *q, int q_rows, int q_heads,
-                float *k, int k_rows, int k_heads,
-                const float *cos, const float *sin, int head_dim)
+static void gemma_rope_body(float *q, int q_rows, int q_heads,
+                            float *k, int k_rows, int k_heads,
+                            const float *cos, const float *sin, int head_dim)
 {
     int d = head_dim / 2;
     int total = q_rows + k_rows;
-    #pragma omp parallel for if(total >= 8) schedule(static)
+    #pragma omp for schedule(static)
     for (int r = 0; r < total; ++r) {
         float *x;
         int tok;
@@ -3241,6 +3349,15 @@ void gemma_rope(float *q, int q_rows, int q_heads,
             x[i + d] = b * c[i] + a * s[i];
         }
     }
+}
+
+void gemma_rope(float *q, int q_rows, int q_heads,
+                float *k, int k_rows, int k_heads,
+                const float *cos, const float *sin, int head_dim)
+{
+    int total = q_rows + k_rows;
+    #pragma omp parallel if(total >= 8)
+    gemma_rope_body(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim);
 }
 
 /* ---------- fused attention for one query token ----------
@@ -3491,7 +3608,7 @@ static inline void attn_decode_head(const int8_t *qh, const float *qsh,
     }
 }
 
-void gemma_attn_decode(const int8_t *qq, const float *qs,
+static void gemma_attn_decode_body(const int8_t *qq, const float *qs,
                        const int8_t *kq, const float *ks,
                        const int8_t *vq, const float *vs,
                        float *scores, float *out,
@@ -3501,7 +3618,7 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
     int n_rep = q_heads / kv_heads;
     size_t kv_stride = (size_t)kv_heads * (size_t)head_dim;
     size_t ks_stride = (size_t)kv_heads * (size_t)g;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int h = 0; h < q_heads; ++h) {
         attn_decode_head(qq + (size_t)h * (size_t)head_dim, qs + (size_t)h * (size_t)g,
                          kq, ks, vq, vs, scores + (size_t)h * (size_t)n,
@@ -3510,12 +3627,22 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
     }
 }
 
+void gemma_attn_decode(const int8_t *qq, const float *qs,
+                       const int8_t *kq, const float *ks,
+                       const int8_t *vq, const float *vs,
+                       float *scores, float *out,
+                       int q_heads, int kv_heads, int head_dim, int n)
+{
+    #pragma omp parallel
+    gemma_attn_decode_body(qq, qs, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, n);
+}
+
 /* The fused decode attention for a small group of query tokens in one
  * parallel region. Token t reads the key rows lo[t] to lo[t] + n[t] - 1 of the
  * int8 cache, which is what a decode step of that token reads. qq is
  * (tokens, q_heads, head_dim), qs is (tokens, q_heads, groups), scores holds
  * tokens * q_heads * nmax values, and out is (tokens, q_heads, head_dim). */
-void gemma_attn_decode_mt(const int8_t *qq, const float *qs,
+static void gemma_attn_decode_mt_body(const int8_t *qq, const float *qs,
                           const int8_t *kq, const float *ks,
                           const int8_t *vq, const float *vs,
                           float *scores, float *out,
@@ -3527,7 +3654,7 @@ void gemma_attn_decode_mt(const int8_t *qq, const float *qs,
     size_t kv_stride = (size_t)kv_heads * (size_t)head_dim;
     size_t ks_stride = (size_t)kv_heads * (size_t)g;
     int total = tokens * q_heads;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int u = 0; u < total; ++u) {
         int t = u / q_heads;
         int h = u % q_heads;
@@ -3539,6 +3666,17 @@ void gemma_attn_decode_mt(const int8_t *qq, const float *qs,
                          out + (size_t)u * (size_t)head_dim, h / n_rep, head_dim,
                          kv_stride, ks_stride, n[t]);
     }
+}
+
+void gemma_attn_decode_mt(const int8_t *qq, const float *qs,
+                          const int8_t *kq, const float *ks,
+                          const int8_t *vq, const float *vs,
+                          float *scores, float *out,
+                          int q_heads, int kv_heads, int head_dim,
+                          const int *lo, const int *n, int nmax, int tokens)
+{
+    #pragma omp parallel
+    gemma_attn_decode_mt_body(qq, qs, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, lo, n, nmax, tokens);
 }
 
 /* ---------- elementwise kernels ----------
@@ -3678,6 +3816,18 @@ static inline void gemma_rms_norm_row(const float *xi, const float *w,
 }
 
 /* Normalize the last axis of x. Multiply by the weight when it is present. */
+/* The body for a caller that is already in a region. Each row belongs to one
+ * thread. */
+static void gemma_rms_norm_body(const float *x, const float *w, float *out,
+                                int rows, int cols, float eps)
+{
+    #pragma omp for schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
+                           out + (size_t)i * (size_t)cols, cols, eps);
+    }
+}
+
 void gemma_rms_norm(const float *x, const float *w, float *out,
                     int rows, int cols, float eps)
 {
@@ -3691,11 +3841,8 @@ void gemma_rms_norm(const float *x, const float *w, float *out,
         }
         return;
     }
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < rows; ++i) {
-        gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
-                           out + (size_t)i * (size_t)cols, cols, eps);
-    }
+    #pragma omp parallel
+    gemma_rms_norm_body(x, w, out, rows, cols, eps);
 }
 
 /* The tanh of 16 float values.
@@ -3745,29 +3892,36 @@ static inline __m512 gemma_tanh_ps(__m512 x)
  * monotonic, so this step cannot change the choice of a greedy token. It does
  * change the value, and the sampling path needs the value.
  */
-void gemma_softcap(const float *x, float *out, int n, float cap)
+static void gemma_softcap_body(const float *x, float *out, int n, float cap)
 {
 #if GEMMA_X86 && defined(__AVX512F__)
     const __m512 rcap = _mm512_set1_ps(1.0f / cap);
     const __m512 cv = _mm512_set1_ps(cap);
     const int nv = n & ~15;
-    #pragma omp parallel for if(n >= 65536) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < nv; i += 16) {
         const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(x + i), rcap);
         _mm512_storeu_ps(out + i, _mm512_mul_ps(gemma_tanh_ps(v), cv));
     }
+    #pragma omp single
     for (int i = nv; i < n; ++i) {
         out[i] = tanhf(x[i] / cap) * cap;
     }
 #else
-    #pragma omp parallel for if(n >= 65536) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < n; ++i) {
         out[i] = tanhf(x[i] / cap) * cap;
     }
 #endif
 }
 
-void gemma_gelu(const float *x, float *out, int n)
+void gemma_softcap(const float *x, float *out, int n, float cap)
+{
+    #pragma omp parallel if(n >= 65536)
+    gemma_softcap_body(x, out, n, cap);
+}
+
+static void gemma_gelu_body(const float *x, float *out, int n)
 {
     const float c = 0.7978845608028654f;
 #if GEMMA_X86 && defined(__AVX512F__)
@@ -3776,7 +3930,7 @@ void gemma_gelu(const float *x, float *out, int n)
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 k3 = _mm512_set1_ps(0.044715f);
     const int nv = n & ~15;
-    #pragma omp parallel for if(n >= 65536) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < nv; i += 16) {
         __m512 v = _mm512_loadu_ps(x + i);
         __m512 v3 = _mm512_mul_ps(_mm512_mul_ps(v, v), v);
@@ -3785,17 +3939,24 @@ void gemma_gelu(const float *x, float *out, int n)
                                  _mm512_add_ps(one, gemma_tanh_ps(u)));
         _mm512_storeu_ps(out + i, r);
     }
+    #pragma omp single
     for (int i = nv; i < n; ++i) {
         float v = x[i];
         out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
     }
 #else
-    #pragma omp parallel for if(n >= 65536) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < n; ++i) {
         float v = x[i];
         out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
     }
 #endif
+}
+
+void gemma_gelu(const float *x, float *out, int n)
+{
+    #pragma omp parallel if(n >= 65536)
+    gemma_gelu_body(x, out, n);
 }
 
 /* ---------- float32 kernel for a comparison ---------- */
@@ -3903,11 +4064,11 @@ static inline float gemma_quant_group32(const float *x, int8_t *q, int32_t *sum)
 /* Quantize the last axis of x with one scale for each group of 32 values.
  * qx gets one int8 for each value, with the shape (tokens, cols). sx gets one
  * float32 for each group. sumx gets the integer sum of each group. */
-void gemma_quantize_q8_groups(const float *x, int8_t *qx, float *sx,
+static void gemma_quantize_q8_groups_body(const float *x, int8_t *qx, float *sx,
                               int32_t *sumx, int rows, int cols)
 {
     const int groups = cols / 32;
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int t = 0; t < rows; ++t) {
         const float *xt = x + (size_t)t * (size_t)cols;
         int8_t *qt = qx + (size_t)t * (size_t)cols;
@@ -3918,6 +4079,13 @@ void gemma_quantize_q8_groups(const float *x, int8_t *qx, float *sx,
                                         qt + (size_t)g * 32, mt + g);
         }
     }
+}
+
+void gemma_quantize_q8_groups(const float *x, int8_t *qx, float *sx,
+                              int32_t *sumx, int rows, int cols)
+{
+    #pragma omp parallel
+    gemma_quantize_q8_groups_body(x, qx, sx, sumx, rows, cols);
 }
 
 /* Quantize the last axis of x to int8 and write the transposed layout. The
@@ -4728,7 +4896,7 @@ void gemma_int4_q8_moe_run(const uint8_t *w, const float *scales,
 /* Apply the GELU to the gate half of x and multiply by the up half. x has two
  * inner values in each row: the gate first, then the up. out has one inner
  * value in each row. One pass avoids the temporaries of the NumPy path. */
-void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
+static void gemma_gelu_mul_body(const float *x, float *out, int rows, int inner)
 {
     const float c = 0.7978845608028654f;
 #if GEMMA_X86 && defined(__AVX512F__)
@@ -4737,7 +4905,7 @@ void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 k3 = _mm512_set1_ps(0.044715f);
     const int nv = inner & ~15;
-    #pragma omp parallel for if(rows >= 8) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         const float *g = x + (size_t)i * 2 * (size_t)inner;
         const float *u = g + inner;
@@ -4756,7 +4924,7 @@ void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
         }
     }
 #else
-    #pragma omp parallel for if(rows >= 8) schedule(static)
+    #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         const float *g = x + (size_t)i * 2 * (size_t)inner;
         const float *u = g + inner;
@@ -4767,6 +4935,12 @@ void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
         }
     }
 #endif
+}
+
+void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
+{
+    #pragma omp parallel if(rows >= 8)
+    gemma_gelu_mul_body(x, out, rows, inner);
 }
 
 /* Add the weighted expert output to the rows of out. de holds one row for each
@@ -4895,10 +5069,10 @@ void gemma_moe_gemv_gelu(const uint8_t *w, const float *scales, const float *x,
  * position is positions[token]. The key of column c has the position base + c.
  * A key is masked when its position is after the query or when the distance is
  * the window or more. A window of zero turns the window off. */
-void gemma_softmax_mask(float *x, int rows, int cols, const int32_t *positions,
+static void gemma_softmax_mask_body(float *x, int rows, int cols, const int32_t *positions,
                         int n_tokens, int n_rep, int base, int window)
 {
-    #pragma omp parallel for if(rows >= 8) schedule(static)
+    #pragma omp for schedule(static)
     for (int r = 0; r < rows; ++r) {
         const int tok = (r / n_rep) % n_tokens;
         const int q = positions[tok];
@@ -4926,6 +5100,13 @@ void gemma_softmax_mask(float *x, int rows, int cols, const int32_t *positions,
             row[c] *= inv;
         }
     }
+}
+
+void gemma_softmax_mask(float *x, int rows, int cols, const int32_t *positions,
+                        int n_tokens, int n_rep, int base, int window)
+{
+    #pragma omp parallel if(rows >= 8)
+    gemma_softmax_mask_body(x, rows, cols, positions, n_tokens, n_rep, base, window);
 }
 
 /* ---------- flash attention for the prompt ----------
@@ -5956,3 +6137,103 @@ void gemma_ct_linear(const uint32_t *w, const float *scale, const float *x,
 }
 
 
+
+/* ---------- bodies of the fused entry points ----------
+ * Each kernel above has a body and a wrapper. The body holds the loops with an
+ * orphaned "omp for". The wrapper opens the region and calls the body. A caller
+ * that is already in a region, such as the program interpreter of
+ * PERF_PLAN.md (phase 2), calls the bodies. The threads then stay in one
+ * region for many kernels.
+ *
+ * The fused entry points call two kernels. Their bodies call the two bodies in
+ * the same order. An "omp for" and an "omp single" end with a barrier, so the
+ * second step sees the whole result of the first. The entry points keep their
+ * own calls, so the result of the Python path does not change.
+ */
+
+static void gemma_q6k_linear_body(const uint8_t *w, const float *x, float *out,
+                                  int rows, int cols, int tokens)
+{
+#if GEMMA_X86
+    if (gemma_have_avx512()) {
+        gemma_q6k_avx512_body(w, x, out, rows, cols, tokens);
+    } else {
+        gemma_q6k_avx2_body(w, x, out, rows, cols, tokens);
+    }
+#else
+    gemma_q6k_scalar_body(w, x, out, rows, cols, tokens);
+#endif
+}
+
+static void gemma_rms_norm_multi4_body(const float *x, const float *wn, float *scratch,
+                                       int cols, float eps,
+                                       const uint8_t *w0, const float *s0, float *o0, int r0,
+                                       const uint8_t *w1, const float *s1, float *o1, int r1,
+                                       const uint8_t *w2, const float *s2, float *o2, int r2,
+                                       const uint8_t *w3, const float *s3, float *o3, int r3)
+{
+    #pragma omp single
+    gemma_rms_norm_row(x, wn, scratch, cols, eps);
+    gemma_int4_multi4_body(w0, s0, o0, r0, w1, s1, o1, r1,
+                           w2, s2, o2, r2, w3, s3, o3, r3, scratch, cols);
+}
+
+static void gemma_gelu_mul_int4_body(const float *g, const float *u, int inner,
+                                     float *scratch, const uint8_t *w, const float *s,
+                                     float *out, int rows, int cols)
+{
+    #pragma omp single
+    gemma_gelu_mul_pair(g, u, scratch, inner);
+    gemma_int4_linear_body(w, s, scratch, out, rows, cols, 1, 32);
+}
+
+static void gemma_moe_gemv_gelu_body(const uint8_t *w, const float *scales, const float *x,
+                                     const int *ids, int jobs, float *act, float *out,
+                                     int rows, int cols, int xstride, int inner)
+{
+    gemma_int4_moe_gemv_body(w, scales, x, ids, jobs, act, rows, cols, xstride);
+    gemma_gelu_mul_body(act, out, jobs, inner);
+}
+
+static void gemma_moe_gemv_gelu_mt_body(const uint8_t *w, const float *scales,
+                                        const float *x, const int *ids, const int *poff,
+                                        const int *xi, int jobs, float *act, float *out,
+                                        int rows, int cols, int xstride, int inner)
+{
+    gemma_int4_moe_gemv_mt_body(w, scales, x, ids, poff, xi, jobs, act, rows, cols, xstride);
+    gemma_gelu_mul_body(act, out, poff[jobs], inner);
+}
+
+static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
+                                     float *k, const float *k_w, int k_rows,
+                                     float *v, int v_rows, const float *cos,
+                                     const float *sin, int q_heads, int k_heads,
+                                     int head_dim, float eps)
+{
+    gemma_qkv_norm_body(q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps);
+    gemma_rope_body(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim);
+}
+
+/* Keep the bodies that only the interpreter calls. The interpreter comes in
+ * phase 2b. */
+void gemma_bodies_keep(void);
+void gemma_bodies_keep(void)
+{
+    (void)gemma_q6k_linear_body;
+    (void)gemma_rms_norm_multi4_body;
+    (void)gemma_gelu_mul_int4_body;
+    (void)gemma_moe_gemv_gelu_body;
+    (void)gemma_moe_gemv_gelu_mt_body;
+    (void)gemma_qkv_norm_rope_body;
+    (void)gemma_router_body;
+    (void)gemma_router_mt_body;
+    (void)gemma_softcap_body;
+    (void)gemma_gelu_body;
+    (void)gemma_rms_norm_body;
+    (void)gemma_quantize_q8_groups_body;
+    (void)gemma_attn_decode_body;
+    (void)gemma_attn_decode_mt_body;
+    (void)gemma_softmax_mask_body;
+    (void)gemma_int4_linear_mt_body;
+    (void)gemma_int4_multi4_mt_body;
+}
