@@ -94,30 +94,111 @@ token ids do not change. The cost falls to n log n.
   new encode on README.md and on the chat prompts of the check scripts.
 - Expect: README.md in less than 2 s in place of 598 s.
 
-### Phase 2: one C call for each layer
+Done in commit 28ab64e. README.md now takes 0.71 s. The token ids are the
+same as the old code on 308 random pieces. They are the same as the ids of
+the Hugging Face tokenizer on four whole files of up to 31852 tokens.
 
-Add `gemma_decode_layer`. It runs one decoder layer of the 26B model in one
-OpenMP region. The region covers the norms, the projections, the rope, the
-cache write, and the attention. It also covers the dense MLP, the router,
-and the experts. An `omp for` with a barrier replaces each call.
-A step of one row, such as a norm, runs in an `omp single`.
+### Phase 2: a program that C runs
 
-The layer calls the same inline dot functions as the current kernels. Each
-output value comes from one thread, as it does now. Thus the result keeps
-its bits.
+Python describes the forward pass as data, and a small interpreter in C runs
+it. The model structure stays in Python, and C holds only general kernels.
+One call to C then runs a whole decode step.
 
-- Python keeps the embedding, the loop over the 30 layers, the output head,
-  and the cache management. A table of weight addresses is made one time at
-  load. The step then makes about 32 calls in place of 420.
-- The sliding cache drops old rows in Python before the call, as it does
-  now. The C code writes the new row into the buffer that Python gives.
-- The same function takes a group of up to 16 tokens. It then uses the
-  small-group kernels of the MTP verify step.
-- Test: a new check that runs the old path and the new path on the same
-  tokens and compares the hidden state bit for bit. Use one token and
-  groups of 2 to 8, and a context below and above 128 and 1024.
-- Expect: 11 to 14 ms less for each step, about 55 ms. That is 18 tokens/s,
-  near llama.cpp.
+#### The expression form
+
+A graph builder for each model gives the forward pass as nested lists, in
+the style of Lisp. One layer of the 26B model:
+
+    (layer i
+      (let h   (rms_norm x (w input_layernorm)))
+      (let qkv (int4_multi4 h (w q_proj) (w k_proj) (w v_proj)))
+      (qkv_norm_rope qkv (w q_norm) (w k_norm) pos)
+      (kv_write i qkv pos)
+      (let a   (attn_decode qkv i pos))
+      (let o   (int4 (w o_proj) a))
+      (set x   (add x (rms_norm o (w post_attention_layernorm))))
+      (let g   (rms_norm_multi4 x (w pre_feedforward_layernorm)
+                                  (w gate_proj) (w up_proj)))
+      (let m   (gelu_mul_int4 g (w down_proj)))
+      (let r   (router x (w router)))
+      (let e   (moe (rms_norm x (w pre_feedforward_layernorm_2)) r (w experts)))
+      (let f   (add (rms_norm m (w post_feedforward_layernorm_1))
+                    (rms_norm e (w post_feedforward_layernorm_2))))
+      (set x   (mul (add x (rms_norm f (w post_feedforward_layernorm)))
+                    (w layer_scalar))))
+
+In Python this is a tree of tuples. The 12B, 26B, and E4B models each get
+a builder. A new fusion is a new operation name and a new kernel.
+
+#### The compiler
+
+The compiler walks the tree and makes a flat list of operations:
+
+1. Put the operations in the order of the tree. Give each value a buffer.
+   Use the buffer of a value again after its last use.
+2. Mark a barrier before an operation that reads a buffer that an earlier
+   operation wrote after the last barrier. Two operations with no such link
+   run with no barrier between them, for example the router and the dense
+   MLP.
+3. Write each operation as one record of fixed size: an operation code, a
+   barrier flag, integer arguments, and addresses. A NumPy structured array
+   holds the records, so C reads them with no conversion.
+
+The compiler also prints the list in a readable form. Use the print to
+debug a program.
+
+#### The interpreter
+
+`gemma_run(program, count, state)` opens one OpenMP region and walks the
+records. Each operation is a kernel body with an orphaned `omp for`. An
+orphaned `omp for` binds to the region of the caller, so the threads stay
+in the region for the whole step. A one-row operation, such as a norm, runs
+in an `omp single`. A barrier flag gives an `omp barrier`.
+
+The kernels of today open their own region. Split each one into a body and
+a wrapper. The wrapper opens the region and calls the body, so the Python
+path keeps its kernels and its bits.
+
+#### The dynamic parts
+
+Some values change for each step. The program does not hold them. It holds
+the address of a small state record that Python writes before each call:
+
+- The position and the token count. The rope, the cache write, and the
+  attention compute their rows and their window from these values.
+- The first row of each sliding cache. The cache drops old rows in Python
+  before the call, as it does now.
+- The selected experts. The router writes them into a buffer, and the moe
+  operation reads that buffer in C.
+
+A cache buffer can move when it grows. The cache then increments a version
+number, and the model builds the program again. A build takes a few
+milliseconds and happens rarely.
+
+#### Why this form
+
+- One program serves the decode step, the MTP verify group of up to 16
+  tokens, and the three models. Each needs a builder, not new C code.
+- A Python interpreter of the same records calls the kernels of today. It
+  runs one operation at a time, so a check can compare the C result and the
+  Python result after each operation, bit for bit. The first difference
+  names the faulty operation.
+- The interpreter can record the cycles of each operation. That replaces
+  `.cache/kern_time.py` with an exact profile inside the region.
+
+#### Steps
+
+- 2a: split the decode kernels into a body and a wrapper. Test: the Paris
+  test and `scripts/check_mt.py` give the same bits.
+- 2b: the record format, the C interpreter, the Python interpreter, and the
+  compiler, with the operations of one 26B layer. Test: the C program and
+  the Python path give the same bits for one layer.
+- 2c: the whole decode step of the 26B in one program, with the output
+  head. Python keeps the embedding, the sampler, and the cache management.
+- 2d: the group of 2 to 16 tokens, then the 12B and the E4B builders.
+
+Expect 11 to 14 ms less for each step of the 26B, about 55 ms. That is 18
+tokens/s, near llama.cpp. Set NP_GEMMA_PROGRAM=0 to use the Python path.
 
 ### Phase 3: the slow kernels
 
@@ -189,13 +270,18 @@ Make the plan of this phase after the measurement.
 ## Risks
 
 - Phase 2 moves the layer loop out of Python. The hooks of the trace and
-  check scripts then see only the layer output. Keep the Python path, with
-  NP_GEMMA_LAYER_C=0, for those scripts.
-- The C layer must know the cache layout, the sliding window, and the int8
-  copy of the cache. An error there gives a wrong result with no crash. The
-  bit check against the Python path is the defense.
-- The 12B, 26B, and E4B models have different layers. Start with the 26B,
-  then add the dense layer of the 12B. The E4B has the per-layer input and
-  the shared key and value layers, so it comes last.
+  check scripts then see no values inside the step. Keep the Python path,
+  with NP_GEMMA_PROGRAM=0, for those scripts.
+- The operations must know the cache layout, the sliding window, and the
+  int8 copy of the cache. An error there gives a wrong result with no
+  crash. The check of each operation against the Python interpreter is the
+  defense.
+- An orphaned `omp for` in a kernel body must see the same schedule in and
+  out of the program. A schedule that is not static can give another split
+  of the rows. The bits do not change when each output comes from one
+  thread, but a reduction over threads can change its bits.
+- The absence of a barrier gives a race, and a race can pass a short test.
+  The compiler marks the barriers from the buffers, not by hand. Run the bit
+  checks many times, with 2, 6, and 18 threads.
 - A change of the sum order in phase 3 or phase 4 can change a token. Keep
   each such change behind a variable until the token checks pass.
