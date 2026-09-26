@@ -147,38 +147,77 @@ The compiler walks the tree and makes a flat list of operations:
 The compiler also prints the list in a readable form. Use the print to
 debug a program.
 
+#### The program is a lambda
+
+The values that change for each step are not in a separate record. They
+are the parameters of the program, and they live in the program itself. A
+step program of the 26B starts like this:
+
+    (lambda (pos ntok base kcache vcache)
+      (let lo (max 0 (- pos (- window 1) base)))
+      (let n  (- (+ pos ntok) base lo))
+      ...
+      (attn_decode q (row kcache lo) (row vcache lo) n)
+      ...)
+
+The record array has two parts:
+
+1. The environment. It has one slot for each parameter and for each
+   variable of the program. A slot holds an int64, a float64, or an address.
+2. The code. It has one record for each operation. An operand of a record
+   has a tag. The tag says that the operand is a literal, a slot of the
+   environment, or a buffer.
+
+Python calls the program with `prog(pos=37, ntok=1, base=0, ...)`. The call
+writes the arguments into the slots of the environment, and then it calls
+C. Thus the state is part of the code, and a print of the program shows the
+current values of its parameters.
+
+The parameters are:
+
+- The position and the token count. The rope, the cache write, and the
+  attention compute their rows and their window from these values, with
+  the scalar operations below.
+- The first row of each sliding cache. The cache drops old rows in Python
+  before the call, as it does now.
+- The address of each cache buffer. A buffer can move when it grows. Python
+  then writes the new address into its slot. The program stays the same.
+
+The selected experts are data, not parameters. The router writes them into
+a buffer, and the moe operation reads that buffer.
+
+#### Scalar operations
+
+A small integer language computes the values that the kernels need: `+`,
+`-`, `*`, `min`, `max`, and `select`. It has no loop. The rules for the
+window, the row of the rope, and the key count are thus in the program.
+They are not in each C kernel. The kernels then take plain counts and
+addresses.
+
+Each thread evaluates each scalar operation for itself, into a private copy
+of the environment. The operations are cheap and give the same value in
+every thread. Thus they need no barrier, and no thread writes a shared
+slot.
+
 #### The interpreter
 
-`gemma_run(program, count, state)` opens one OpenMP region and walks the
-records. Each operation is a kernel body with an orphaned `omp for`. An
-orphaned `omp for` binds to the region of the caller, so the threads stay
-in the region for the whole step. A one-row operation, such as a norm, runs
-in an `omp single`. A barrier flag gives an `omp barrier`.
+`gemma_run(program)` opens one OpenMP region. Each thread copies the
+environment, and then all threads walk the records. A kernel operation is a
+kernel body with an orphaned `omp for`. An orphaned `omp for` binds to the
+region of the caller, so the threads stay in the region for the whole step.
+A one-row operation, such as a norm, runs in an `omp single`. A barrier
+flag gives an `omp barrier`.
 
 The kernels of today open their own region. Split each one into a body and
 a wrapper. The wrapper opens the region and calls the body, so the Python
 path keeps its kernels and its bits.
 
-#### The dynamic parts
-
-Some values change for each step. The program does not hold them. It holds
-the address of a small state record that Python writes before each call:
-
-- The position and the token count. The rope, the cache write, and the
-  attention compute their rows and their window from these values.
-- The first row of each sliding cache. The cache drops old rows in Python
-  before the call, as it does now.
-- The selected experts. The router writes them into a buffer, and the moe
-  operation reads that buffer in C.
-
-A cache buffer can move when it grows. The cache then increments a version
-number, and the model builds the program again. A build takes a few
-milliseconds and happens rarely.
-
 #### Why this form
 
 - One program serves the decode step, the MTP verify group of up to 16
   tokens, and the three models. Each needs a builder, not new C code.
+- The program holds its own state. A call binds the parameters, so a
+  cache that grows does not force a new build of the program.
 - A Python interpreter of the same records calls the kernels of today. It
   runs one operation at a time, so a check can compare the C result and the
   Python result after each operation, bit for bit. The first difference
@@ -190,8 +229,9 @@ milliseconds and happens rarely.
 
 - 2a: split the decode kernels into a body and a wrapper. Test: the Paris
   test and `scripts/check_mt.py` give the same bits.
-- 2b: the record format, the C interpreter, the Python interpreter, and the
-  compiler, with the operations of one 26B layer. Test: the C program and
+- 2b: the record format, the environment, the scalar operations, the C
+  interpreter, the Python interpreter, and the compiler, with the
+  operations of one 26B layer. Test: the C program and
   the Python path give the same bits for one layer.
 - 2c: the whole decode step of the 26B in one program, with the output
   head. Python keeps the embedding, the sampler, and the cache management.
