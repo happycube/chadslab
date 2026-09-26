@@ -45,6 +45,12 @@ def main():
                     help="Attention over the key and value cache. float is exact."
                          " q8 is about 1.6 times faster and less accurate, which can"
                          " make a long greedy generation repeat itself.")
+    ap.add_argument("--mtp", default=None, metavar="DIR",
+                    help="The snapshot directory of the Gemma 4 assistant model (the"
+                         " MTP drafter). See MTP_DRAFTER_QUANT.md, step 1.")
+    ap.add_argument("--mtp-n", type=int, default=2,
+                    help="The count of drafts for each MTP step.")
+    ap.add_argument("--mtp-dtype", choices=("int4", "int8", "f32"), default="int4")
     args = ap.parse_args()
 
     # The int8 cache quantizes the keys and the values. It is faster and it
@@ -70,9 +76,14 @@ def main():
         (int(rec["top_k"]) if rec["top_k"] is not None else None)
     print("sampling temperature=%s top_p=%s top_k=%s" % (temperature, top_p, top_k),
           flush=True)
+    drafter = None
+    if args.mtp:
+        from np_gemma.assistant import Assistant
+        print("loading the MTP drafter %s ..." % args.mtp, flush=True)
+        drafter = Assistant(args.mtp, dtype=args.mtp_dtype)
     backend = Backend(model, tok, cfg, model_id=model_id, thinking=args.thinking,
                       max_tokens=args.max_tokens, temperature=temperature,
-                      top_k=top_k, top_p=top_p)
+                      top_k=top_k, top_p=top_p, drafter=drafter, n_draft=args.mtp_n)
     serve(backend, host=args.host, port=args.port, quiet=args.quiet)
     return 0
 

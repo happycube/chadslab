@@ -130,8 +130,12 @@ class Backend:
 
     def __init__(self, model, tokenizer, cfg=None, model_id="np-gemma",
                  thinking=False, max_tokens=1024, temperature=1.0, top_k=None,
-                 top_p=None):
+                 top_p=None, drafter=None, n_draft=2):
         self.model = model
+        # The MTP drafter and the count of drafts for each step. None turns
+        # MTP off.
+        self.drafter = drafter
+        self.n_draft = n_draft
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.model_id = model_id
@@ -207,7 +211,8 @@ class Backend:
             self.sessions.remove(best)
             self.sessions.insert(0, best)
             return best, best_n
-        best = Session(self.model, max_len=len(prompt_ids) + max_tokens + 8)
+        best = Session(self.model, max_len=len(prompt_ids) + max_tokens + 8,
+                       drafter=self.drafter, n_draft=self.n_draft)
         self.sessions.insert(0, best)
         del self.sessions[self.max_sessions:]
         return best, 0
@@ -219,6 +224,11 @@ class Backend:
               file=sys.stderr, flush=True)
         yield from session.generate_stream(prompt_ids, max_new_tokens=max_tokens,
                                            eos_ids=eos_ids, sampler=sampler)
+        st = session.mtp_stats
+        if self.drafter is not None and st.get("drafts"):
+            print('[np-gemma] mtp steps=%d drafts=%d accepted=%d (%d%%)' % (
+                st["steps"], st["drafts"], st["accepted"],
+                100 * st["accepted"] // st["drafts"]), file=sys.stderr, flush=True)
 
 
 class _Handler(BaseHTTPRequestHandler):

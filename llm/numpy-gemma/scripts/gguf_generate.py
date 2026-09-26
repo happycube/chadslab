@@ -35,6 +35,11 @@ def main():
     ap.add_argument("--raw", "--no-chat-template", action="store_true",
                     help="Do not use the chat template.")
     ap.add_argument("--system", default=None, help="A system message for the chat template.")
+    ap.add_argument("--mtp", default=None, metavar="DIR",
+                    help="The snapshot directory of the Gemma 4 assistant model. The"
+                         " decode then uses MTP. The token ids do not change.")
+    ap.add_argument("--mtp-n", type=int, default=2, help="The count of drafts for each step.")
+    ap.add_argument("--mtp-dtype", choices=("int4", "int8", "f32"), default="int4")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
@@ -54,6 +59,26 @@ def main():
         text = tok.apply_chat_template(messages, add_generation_prompt=True, thinking=False)
         ids = tok.encode(text)
     cache = KVCache(cfg, max_len=len(ids) + args.max_new_tokens + 4)
+    if args.mtp:
+        from np_gemma.assistant import Assistant, mtp_generate
+        drafter = Assistant(args.mtp, dtype=args.mtp_dtype)
+        st = {}
+        gens = mtp_generate(model, drafter, ids, cache, args.max_new_tokens,
+                            args.mtp_n, set(tok.stop_ids), st)
+        if gens and gens[-1] in tok.stop_ids:
+            gens = gens[:-1]
+        print("prefill %4d tokens %7.2f s  %6.2f tok/s" % (
+            len(ids), st["prefill_s"], len(ids) / st["prefill_s"]), flush=True)
+        print("decode  %4d tokens %7.2f s  %6.2f tok/s" % (
+            len(gens), st["decode_s"], len(gens) / st["decode_s"]), flush=True)
+        print("mtp steps %d drafts %d accepted %d (%d%%)" % (
+            st["steps"], st["drafts"], st["accepted"],
+            100 * st["accepted"] // max(1, st["drafts"])))
+        print("prompt_ids %s" % ids)
+        print("gen_ids %s" % gens)
+        print("text %r" % tok.decode(gens))
+        g.close()
+        return 0
     t0 = time.perf_counter()
     x = model.prefill(ids, cache)
     prefill_s = time.perf_counter() - t0

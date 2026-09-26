@@ -223,55 +223,92 @@ class Assistant:
         return out
 
 
-def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=3,
-                 eos_ids=(), stats=None):
-    """Generate tokens with greedy selection and MTP. Return the new tokens.
+def mtp_enabled():
+    """Return False when NP_GEMMA_MTP=0 turns the drafter off."""
+    return os.environ.get("NP_GEMMA_MTP", "1") != "0"
 
-    The result is the same as the plain greedy decode when the batch and the
-    single-token paths of the target give the same argmax. stats, when given,
-    is a dict that receives the counts of steps, drafts, and accepted drafts,
-    and the time of the prompt pass and of the decode.
+
+def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
+               max_new_tokens, stats=None):
+    """Yield the new tokens of an MTP decode, one at a time.
+
+    ids holds the tokens in the cache, and the function extends it with the
+    rows that it keeps. nxt is the first new token, which the cache does not
+    hold yet, and h is the target hidden state of the row that predicted it.
+    pick(logits) selects a token from one row of target logits; it is the
+    sampler of the plain decode.
+
+    The target picks its own token at each row of a verify batch, with the
+    sampler of the plain decode. A draft is kept while it is the token that
+    the target picked. Thus every emitted token is the token that the plain
+    decode emits, and pick runs one time for each emitted token, in the same
+    order. With greedy selection, or with a sampler that has a seed, the text
+    is the same as the text of the plain decode.
+    """
+    pos = len(ids)
+    emitted = 0
+    if stats is not None:
+        stats.setdefault("steps", 0)
+        stats.setdefault("drafts", 0)
+        stats.setdefault("accepted", 0)
+    while True:
+        yield nxt
+        emitted += 1
+        if nxt in eos_ids or emitted >= max_new_tokens:
+            return
+        k = min(n_draft, max_new_tokens - emitted)
+        d = drafter.draft(target, nxt, h, pos, cache, k, eos_ids)
+        batch = [nxt] + d
+        x = target.forward(batch, cache=cache, start_pos=pos)
+        logits = target.logits(x)
+        # Row j gives the token after batch[j]. Keep the drafts while they
+        # match the token that the target picks.
+        j = 0
+        while True:
+            tok = pick(logits[j])
+            if j < len(d) and tok == d[j]:
+                j += 1
+                continue
+            break
+        if stats is not None:
+            stats["steps"] += 1
+            stats["drafts"] += len(d)
+            stats["accepted"] += j
+        # The cache keeps the rows of batch[0] to batch[j]. The rows after
+        # them hold rejected drafts.
+        ids.extend(batch[:j + 1])
+        pos += j + 1
+        cache.truncate(pos)
+        for t in d[:j]:
+            yield t
+            emitted += 1
+            if t in eos_ids or emitted >= max_new_tokens:
+                return
+        h = x[j:j + 1]
+        nxt = tok
+
+
+def greedy_pick(logits):
+    """Return the most probable token of one row of logits."""
+    return int(np.argmax(logits))
+
+
+def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=2,
+                 eos_ids=(), stats=None, pick=greedy_pick):
+    """Run the prompt, then generate tokens with MTP. Return the new tokens.
+
+    The result is the same as the plain decode with the same pick. stats,
+    when given, is a dict that receives the counts of steps, drafts, and
+    accepted drafts, and the time of the prompt pass and of the decode.
     """
     ids = list(ids)
     t0 = time.perf_counter()
     x = target.prefill(ids, cache)
     t1 = time.perf_counter()
     h = x[-1:]
-    nxt = int(np.argmax(target.logits(h)[0]))
-    out = []
-    pos = len(ids)
-    steps = drafts = accepted = 0
-    while True:
-        out.append(nxt)
-        if nxt in eos_ids or len(out) >= max_new_tokens:
-            break
-        k = min(n_draft, max_new_tokens - len(out))
-        d = drafter.draft(target, nxt, h, pos, cache, k, eos_ids) if k > 0 else []
-        batch = [nxt] + d
-        x = target.forward(batch, cache=cache, start_pos=pos)
-        pred = np.argmax(target.logits(x), axis=-1)
-        # Row i predicts the token after batch[i]. Keep the drafts while
-        # they match the target.
-        j = 0
-        while j < len(d) and int(pred[j]) == d[j]:
-            j += 1
-        steps += 1
-        drafts += len(d)
-        accepted += j
-        stop = False
-        for t in d[:j]:
-            out.append(t)
-            if t in eos_ids or len(out) >= max_new_tokens:
-                stop = True
-                break
-        if stop:
-            break
-        # The rows after the last kept token hold rejected drafts.
-        pos += j + 1
-        cache.truncate(pos)
-        h = x[j:j + 1]
-        nxt = int(pred[j])
-    if stats is not None:
-        stats.update(steps=steps, drafts=drafts, accepted=accepted,
-                     prefill_s=t1 - t0, decode_s=time.perf_counter() - t1)
-    return out[:max_new_tokens]
+    nxt = pick(target.logits(h)[0])
+    st = {} if stats is None else stats
+    out = list(mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids,
+                          pick, max_new_tokens, st))
+    st.update(prefill_s=t1 - t0, decode_s=time.perf_counter() - t1)
+    return out

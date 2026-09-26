@@ -1071,9 +1071,14 @@ class Session:
     Use reset() to start a new conversation.
     """
 
-    def __init__(self, model, max_len=8192):
+    def __init__(self, model, max_len=8192, drafter=None, n_draft=2):
         self.model = model
         self.max_len = max_len
+        # The MTP drafter (np_gemma.assistant.Assistant). None turns MTP off.
+        self.drafter = drafter
+        self.n_draft = n_draft
+        # The counts of the last MTP generation: steps, drafts, accepted.
+        self.mtp_stats = {}
         self.cache = None
         self.ids = []
         self._x = None
@@ -1157,6 +1162,18 @@ class Session:
         sampler.reset(ids)
         x = self._x
         pos = len(ids)
+        if self.drafter is not None and max_new_tokens > 0:
+            from .assistant import mtp_enabled, mtp_stream
+            if mtp_enabled():
+                # The drafter proposes tokens and one pass of the model checks
+                # them. The sampler picks each token, as below, so the tokens
+                # are the tokens of the plain loop.
+                nxt = sampler(self.model.logits(x[-1:])[0])
+                self.mtp_stats = {}
+                yield from mtp_stream(self.model, self.drafter, self.cache, self.ids,
+                                      x[-1:], nxt, self.n_draft, eos_ids, sampler,
+                                      max_new_tokens, self.mtp_stats)
+                return
         for _ in range(max_new_tokens):
             nxt = sampler(self.model.logits(x[-1:])[0])
             yield nxt
