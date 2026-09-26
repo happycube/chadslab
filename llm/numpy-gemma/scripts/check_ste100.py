@@ -31,8 +31,13 @@ paragraph at 78 columns and a wrapped sentence is not two sentences.
 
 Run:
 
-    python3 scripts/check_ste100.py README.md
-    python3 scripts/check_ste100.py README.md --list
+    python3 check_ste100.py document.md
+    python3 check_ste100.py document.md --ing-nouns domain_terms.txt
+    python3 check_ste100.py document.md --list
+
+The script uses only the Python standard library. Use --ing-nouns one or more
+times to allow technical nouns from a plain-text word list. Put one word on
+each line. Lines that start with # are comments.
 """
 from __future__ import annotations
 
@@ -40,23 +45,13 @@ import argparse
 import re
 import sys
 
-# An "-ing" word that is a technical noun of this project. Add a word here only
-# when it names a thing and not an action.
-ING_NOUNS = {
-    "embedding", "embeddings", "padding", "scaling", "sampling", "mapping",
-    "caching", "pooling", "training", "quantizing", "tiling", "batching",
-    "routing", "scoring", "masking", "streaming", "nesting", "threading",
-    "timing", "chunking", "prefilling", "decoding", "encoding", "profiling",
-    "benchmarking", "processing", "packing", "unpacking", "loading",
-    "opening", "closing", "reading", "writing", "building", "copying",
-    "meaning", "warning", "setting", "settings", "meeting", "string",
-    "strings", "during", "nothing", "something", "everything", "anything",
-    "according", "existing", "remaining", "following", "corresponding",
-    "sliding", "sharding", "tokenizing", "detokenizing", "scheduling",
-    "binding", "linking", "drawing", "fitting", "shipping", "printing",
-    "testing", "checking", "listing", "grouping", "sorting", "running",
-    "learning",
-    "rounding", "working", "thinking", "reasoning", "weighting",
+GENERIC_ING_NOUNS = {
+    "according", "anything", "building", "checking", "closing", "copying",
+    "drawing", "during", "everything", "existing", "fitting", "following",
+    "learning", "listing", "meaning", "meeting", "nothing", "opening",
+    "printing", "reading", "reasoning", "remaining", "running", "setting",
+    "settings", "shipping", "something", "sorting", "string", "strings",
+    "testing", "thinking", "warning", "working", "writing",
 }
 
 MODALS = ("should", "may", "might", "could", "would")
@@ -186,8 +181,10 @@ def is_instruction(text):
     return words[0].lower() in IMPERATIVE
 
 
-def check(path, show_list=False):
-    lines = open(path).read().split("\n")
+def check(path, show_list=False, ing_nouns=()):
+    known_ing_nouns = GENERIC_ING_NOUNS | {word.lower() for word in ing_nouns}
+    with open(path, encoding="utf-8") as source:
+        lines = source.read().split("\n")
     prose = prose_lines(lines)
     bad = []
 
@@ -204,10 +201,10 @@ def check(path, show_list=False):
                 ("which", WHICH)):
             if label == "not approved verb form (continuous)":
                 hits = [m.group(2) for m in CONTINUOUS.finditer(plain)
-                        if m.group(2).lower() not in ING_NOUNS]
+                        if m.group(2).lower() not in known_ing_nouns]
             elif label == "-ing word that is not a known noun":
                 hits = [h for h in ING.findall(plain)
-                        if h.lower() not in ING_NOUNS]
+                        if h.lower() not in known_ing_nouns]
             else:
                 hits = [m.group(0) for m in pattern.finditer(plain)]
             for hit in hits:
@@ -243,8 +240,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
     ap.add_argument("--list", action="store_true", help="show the notes too")
+    ap.add_argument("--ing-nouns", action="append", default=[], metavar="FILE",
+                    help="plain-text list of accepted technical nouns; can repeat")
     args = ap.parse_args()
-    return check(args.path, args.list)
+    ing_nouns = set()
+    for path in args.ing_nouns:
+        with open(path, encoding="utf-8") as source:
+            for line in source:
+                word = line.partition("#")[0].strip().lower()
+                if word:
+                    ing_nouns.add(word)
+    return check(args.path, args.list, ing_nouns)
 
 
 if __name__ == "__main__":

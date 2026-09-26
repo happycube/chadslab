@@ -2814,7 +2814,9 @@ void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
         float s = 1.0f / sqrtf(ss / (float)head_dim + eps);
         if (w != NULL) {
             for (int i = 0; i < head_dim; ++i) {
-                x[i] *= s * w[i];
+                /* The same order as gemma_rms_norm, so the two give the same
+                 * bits. */
+                x[i] = x[i] * s * w[i];
             }
         } else {
             for (int i = 0; i < head_dim; ++i) {
@@ -2830,6 +2832,14 @@ void gemma_qkv_norm(float *q, const float *q_w, int q_rows,
  * The two halves of the head use the first half of the table, because the
  * table joins the frequency vector to itself.
  */
+/* The numpy path computes x * cos + rotate_half(x) * sin with two multiplies
+ * and one add. A fused multiply and add rounds one time fewer, so the two
+ * forms differ in the last bit. The model is sensitive to that difference
+ * over a long context, and the two norm kernels of this file agree with the
+ * numpy path exactly. Turn the contraction off here as well. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("-ffp-contract=off")))
+#endif
 void gemma_rope(float *q, int q_rows, int q_heads,
                 float *k, int k_rows, int k_heads,
                 const float *cos, const float *sin, int head_dim)
@@ -2893,7 +2903,6 @@ static inline int32_t dot_i8_i8(const int8_t *a, const int8_t *b, int n)
 }
 #endif
 
-__attribute__((target("avx2,fma")))
 /* Return the dot product of two float32 rows. */
 #if GEMMA_X86 && defined(__AVX512F__)
 static inline float dot_f32_f32(const float *a, const float *b, int n)
@@ -3054,6 +3063,9 @@ void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
     }
 }
 
+/* The int8 attention for one query token. The attribute keeps the AVX2
+ * version, which the baseline build needs. */
+__attribute__((target("avx2,fma")))
 void gemma_attn_decode(const int8_t *qq, const float *qs,
                        const int8_t *kq, const float *ks,
                        const int8_t *vq, const float *vs,
@@ -3122,28 +3134,153 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
  * decode step does not pay for a thread team.
  */
 
+/* The sum of the squares of one row.
+ *
+ * A plain loop is one chain of additions. The latency of an addition is about
+ * 4 cycles, so the loop takes one value for 4 cycles and the multiply units
+ * wait. Four accumulators break the chain, and the fused multiply and add
+ * then works on four vectors at the same time. The result differs from the
+ * left to right sum in the last bits. The check
+ * scripts/check_rms_norm.py gives the size of that difference.
+ */
+static inline float gemma_sum_sq(const float *x, int n)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 a0 = _mm512_setzero_ps();
+    __m512 a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps();
+    __m512 a3 = _mm512_setzero_ps();
+    int k = 0;
+    for (; k + 64 <= n; k += 64) {
+        const __m512 v0 = _mm512_loadu_ps(x + k);
+        const __m512 v1 = _mm512_loadu_ps(x + k + 16);
+        const __m512 v2 = _mm512_loadu_ps(x + k + 32);
+        const __m512 v3 = _mm512_loadu_ps(x + k + 48);
+        a0 = _mm512_fmadd_ps(v0, v0, a0);
+        a1 = _mm512_fmadd_ps(v1, v1, a1);
+        a2 = _mm512_fmadd_ps(v2, v2, a2);
+        a3 = _mm512_fmadd_ps(v3, v3, a3);
+    }
+    for (; k + 16 <= n; k += 16) {
+        const __m512 v = _mm512_loadu_ps(x + k);
+        a0 = _mm512_fmadd_ps(v, v, a0);
+    }
+    const __m512 t = _mm512_add_ps(_mm512_add_ps(a0, a1),
+                                   _mm512_add_ps(a2, a3));
+    float ss = _mm512_reduce_add_ps(t);
+    for (; k < n; ++k) {
+        ss += x[k] * x[k];
+    }
+    return ss;
+#elif GEMMA_X86
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps();
+    __m256 a3 = _mm256_setzero_ps();
+    int k = 0;
+    for (; k + 32 <= n; k += 32) {
+        const __m256 v0 = _mm256_loadu_ps(x + k);
+        const __m256 v1 = _mm256_loadu_ps(x + k + 8);
+        const __m256 v2 = _mm256_loadu_ps(x + k + 16);
+        const __m256 v3 = _mm256_loadu_ps(x + k + 24);
+        a0 = _mm256_fmadd_ps(v0, v0, a0);
+        a1 = _mm256_fmadd_ps(v1, v1, a1);
+        a2 = _mm256_fmadd_ps(v2, v2, a2);
+        a3 = _mm256_fmadd_ps(v3, v3, a3);
+    }
+    for (; k + 8 <= n; k += 8) {
+        const __m256 v = _mm256_loadu_ps(x + k);
+        a0 = _mm256_fmadd_ps(v, v, a0);
+    }
+    const __m256 t = _mm256_add_ps(_mm256_add_ps(a0, a1),
+                                   _mm256_add_ps(a2, a3));
+    __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(t),
+                           _mm256_extractf128_ps(t, 1));
+    s4 = _mm_hadd_ps(s4, s4);
+    s4 = _mm_hadd_ps(s4, s4);
+    float ss = _mm_cvtss_f32(s4);
+    for (; k < n; ++k) {
+        ss += x[k] * x[k];
+    }
+    return ss;
+#else
+    float ss = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        ss += x[k] * x[k];
+    }
+    return ss;
+#endif
+}
+
+/* Multiply one row by the scale s and by the weight w. A null w skips the
+ * weight. The order of the operations is the order of the scalar form. */
+static inline void gemma_scale_row(const float *x, const float *w, float *o,
+                                   int n, float s)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    const __m512 sv = _mm512_set1_ps(s);
+    int k = 0;
+    if (w != NULL) {
+        for (; k + 16 <= n; k += 16) {
+            const __m512 xv = _mm512_loadu_ps(x + k);
+            const __m512 wv = _mm512_loadu_ps(w + k);
+            _mm512_storeu_ps(o + k, _mm512_mul_ps(_mm512_mul_ps(xv, sv), wv));
+        }
+    } else {
+        for (; k + 16 <= n; k += 16) {
+            const __m512 xv = _mm512_loadu_ps(x + k);
+            _mm512_storeu_ps(o + k, _mm512_mul_ps(xv, sv));
+        }
+    }
+    if (w != NULL) {
+        for (; k < n; ++k) {
+            o[k] = x[k] * s * w[k];
+        }
+    } else {
+        for (; k < n; ++k) {
+            o[k] = x[k] * s;
+        }
+    }
+#else
+    if (w != NULL) {
+        for (int k = 0; k < n; ++k) {
+            o[k] = x[k] * s * w[k];
+        }
+    } else {
+        for (int k = 0; k < n; ++k) {
+            o[k] = x[k] * s;
+        }
+    }
+#endif
+}
+
+/* One row of the normalization. */
+static inline void gemma_rms_norm_row(const float *xi, const float *w,
+                                      float *oi, int cols, float eps)
+{
+    const float ss = gemma_sum_sq(xi, cols);
+    const float s = 1.0f / sqrtf(ss / (float)cols + eps);
+    gemma_scale_row(xi, w, oi, cols, s);
+}
+
 /* Normalize the last axis of x. Multiply by the weight when it is present. */
 void gemma_rms_norm(const float *x, const float *w, float *out,
                     int rows, int cols, float eps)
 {
-    #pragma omp parallel for if(rows >= 8) schedule(static)
+    /* A decode step has one row, and the work of that row is below the cost of
+     * the thread team. The small case therefore stays out of the OpenMP
+     * runtime. The measurement gives about 2 microseconds for the entry. */
+    if (rows < 8) {
+        for (int i = 0; i < rows; ++i) {
+            gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
+                               out + (size_t)i * (size_t)cols, cols, eps);
+        }
+        return;
+    }
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; ++i) {
-        const float *xi = x + (size_t)i * (size_t)cols;
-        float ss = 0.0f;
-        for (int k = 0; k < cols; ++k) {
-            ss += xi[k] * xi[k];
-        }
-        float s = 1.0f / sqrtf(ss / (float)cols + eps);
-        float *oi = out + (size_t)i * (size_t)cols;
-        if (w != NULL) {
-            for (int k = 0; k < cols; ++k) {
-                oi[k] = xi[k] * s * w[k];
-            }
-        } else {
-            for (int k = 0; k < cols; ++k) {
-                oi[k] = xi[k] * s;
-            }
-        }
+        gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
+                           out + (size_t)i * (size_t)cols, cols, eps);
     }
 }
 
@@ -3187,6 +3324,35 @@ static inline __m512 gemma_tanh_ps(__m512 x)
 #endif
 
 /* Apply the tanh approximation of GELU to n values. */
+/* Limit the size of the logits: out = tanh(x / cap) * cap.
+ *
+ * The logits are as wide as the vocabulary, 262144 values for the 26B model,
+ * so one call costs 0.39 ms in NumPy against about 0.03 ms here. The tanh is
+ * monotonic, so this step cannot change the choice of a greedy token. It does
+ * change the value, and the sampling path needs the value.
+ */
+void gemma_softcap(const float *x, float *out, int n, float cap)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    const __m512 rcap = _mm512_set1_ps(1.0f / cap);
+    const __m512 cv = _mm512_set1_ps(cap);
+    const int nv = n & ~15;
+    #pragma omp parallel for if(n >= 65536) schedule(static)
+    for (int i = 0; i < nv; i += 16) {
+        const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(x + i), rcap);
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(gemma_tanh_ps(v), cv));
+    }
+    for (int i = nv; i < n; ++i) {
+        out[i] = tanhf(x[i] / cap) * cap;
+    }
+#else
+    #pragma omp parallel for if(n >= 65536) schedule(static)
+    for (int i = 0; i < n; ++i) {
+        out[i] = tanhf(x[i] / cap) * cap;
+    }
+#endif
+}
+
 void gemma_gelu(const float *x, float *out, int n)
 {
     const float c = 0.7978845608028654f;
@@ -3762,6 +3928,284 @@ void gemma_int4_q8_tile_run32(const uint8_t *w, const float *scales,
 #endif
 }
 
+/* ---------- int8 dot product for one token ----------
+ * A decode step holds one token. The int8 tile keeps tokens in its lanes, so
+ * one token uses one lane of sixteen and the caller must pad the activation
+ * buffer. This kernel keeps rows in its lanes and one token in the group.
+ * Thus no lane is idle and the activation needs no padding.
+ *
+ * The instruction vpdpbusd does 32 byte products and adds them to eight int32
+ * lanes. That is 8 times the work of one add in the same time. The C test
+ * .cache/gemv.c gives 1.3 to 1.5 times the speed of the float kernel at the
+ * matrix sizes of the 26B model, and 80 to 90 percent of a pure memory read.
+ *
+ * I4QG_MR gives the rows of one pass. A block of I4QG_MR rows reads the
+ * activation group one time, so the activation load costs 1/I4QG_MR for each
+ * row. I4QG_MR is 8 because 8 rows fill the eight int32 lanes of one 256-bit
+ * register.
+ */
+#define I4QG_MR 8
+
+/* One row of one group of the int8 dot product. R is the row in the block. The
+ * macro lets the row loop below keep a fixed count, which the compiler
+ * unrolls. The count of the rows is not known at compile time in the general
+ * case, and the variable loop is 5 to 10 percent slower. */
+#define I4QG_ROW(R)                                                          \
+    do {                                                                     \
+        const uint8_t *b = wb + (size_t)(R) * wstride                        \
+                           + (size_t)g * 18 + 2;                             \
+        const __m128i raw = _mm_loadu_si128((const __m128i *)b);             \
+        const __m128i lo = _mm_and_si128(raw, m4);                           \
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);        \
+        const __m256i wv = _mm256_set_m128i(hi, lo);                         \
+        __m256i d = _mm256_dpbusd_epi32(_mm256_setzero_si256(), wv, qv);     \
+        d = _mm256_sub_epi32(d, corr);                                       \
+        const __m256 sc = _mm256_mul_ps(                                     \
+            _mm256_set1_ps(sb[(size_t)(R) * (size_t)groups + g]), sxv);      \
+        facc[R] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), sc, facc[R]);       \
+    } while (0)
+
+/* One row block of the int8 dot product. rb selects the block. */
+static void gemma_int4_q8_gemv_block(const uint8_t *w, const float *scales,
+                                     const int8_t *qx, const float *sx,
+                                     const int32_t *sumx, float *out,
+                                     int rows, int cols, int rb)
+{
+    const int groups = cols / 32;
+    const size_t wstride = (size_t)groups * 18;
+    const int i0 = rb * I4QG_MR;
+    int nrow = rows - i0;
+    if (nrow > I4QG_MR) {
+        nrow = I4QG_MR;
+    }
+#if GEMMA_X86 && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const uint8_t *wb = w + (size_t)i0 * wstride;
+    const float *sb = scales + (size_t)i0 * (size_t)groups;
+    __m256 facc[I4QG_MR];
+    for (int r = 0; r < I4QG_MR; ++r) {
+        facc[r] = _mm256_setzero_ps();
+    }
+    for (int g = 0; g < groups; ++g) {
+        /* The q8 group is one 32-byte block. Bytes 0 to 15 hold columns 0 to
+         * 15 and bytes 16 to 31 hold columns 16 to 31. That is the order of
+         * the low and the high nibbles of the weight block. */
+        const __m256i qv = _mm256_loadu_si256(
+            (const __m256i *)(qx + (size_t)g * 32));
+        const __m256 sxv = _mm256_set1_ps(sx[g]);
+        /* vpdpbusd holds the weight as an unsigned byte, so the nibble keeps
+         * its value 0 to 15 and the dot product is too large by 8 times the
+         * activation sum. Remove that part from lane 0 of the accumulator.
+         * The later sum of the lanes removes it one time for the group. The
+         * instruction vpdpbssd, which needs no correction, is not in the
+         * AVX512-VNNI set. */
+        const __m256i corr = _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, 8 * sumx[g]);
+        if (nrow == I4QG_MR) {
+            I4QG_ROW(0);
+            I4QG_ROW(1);
+            I4QG_ROW(2);
+            I4QG_ROW(3);
+            I4QG_ROW(4);
+            I4QG_ROW(5);
+            I4QG_ROW(6);
+            I4QG_ROW(7);
+        } else {
+            for (int r = 0; r < nrow; ++r) {
+                I4QG_ROW(r);
+            }
+        }
+    }
+    for (int r = 0; r < I4QG_MR; ++r) {
+        if (r >= nrow) {
+            break;
+        }
+        const __m128 slo = _mm256_castps256_ps128(facc[r]);
+        const __m128 shi = _mm256_extractf128_ps(facc[r], 1);
+        __m128 s = _mm_add_ps(slo, shi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        out[i0 + r] = _mm_cvtss_f32(s);
+    }
+#else
+    /* A machine without VNNI uses the plain integer multiply. */
+    for (int r = 0; r < nrow; ++r) {
+        const uint8_t *wi = w + (size_t)(i0 + r) * wstride;
+        const float *si = scales + (size_t)(i0 + r) * (size_t)groups;
+        float acc = 0.0f;
+        for (int g = 0; g < groups; ++g) {
+            const uint8_t *b = wi + (size_t)g * 18 + 2;
+            int32_t dot = 0;
+            for (int k = 0; k < 16; ++k) {
+                dot += (b[k] & 0x0F) * (int32_t)qx[(size_t)g * 32 + k];
+                dot += ((b[k] >> 4) & 0x0F)
+                       * (int32_t)qx[(size_t)g * 32 + 16 + k];
+            }
+            dot -= 8 * sumx[g];
+            acc += (float)dot * si[g] * sx[g];
+        }
+        out[i0 + r] = acc;
+    }
+#endif
+}
+
+#undef I4QG_ROW
+
+/* The full int8 dot product for one token. qx, sx, and sumx hold the
+ * quantized activation of one row, as quantize_q8_groups gives it. */
+void gemma_int4_q8_gemv(const uint8_t *w, const float *scales,
+                        const int8_t *qx, const float *sx,
+                        const int32_t *sumx, float *out, int rows, int cols)
+{
+    const int nrb = (rows + I4QG_MR - 1) / I4QG_MR;
+    #pragma omp parallel for schedule(static)
+    for (int rb = 0; rb < nrb; ++rb) {
+        gemma_int4_q8_gemv_block(w, scales, qx, sx, sumx, out, rows, cols, rb);
+    }
+}
+
+/* Scratch for the quantized activation of one row. The entry points below run
+ * on the calling thread of the Python process, so one buffer is sufficient.
+ * The buffer holds the widest matrix that the process has seen. */
+static int8_t *g_i4qx = NULL;
+static float *g_i4qs = NULL;
+static int32_t *g_i4qm = NULL;
+static int g_i4qcap = 0;
+
+/* Make the scratch hold cols columns. Return 0 when the memory is not there. */
+static int gemma_i4q_scratch(int cols)
+{
+    if (cols <= g_i4qcap) {
+        return 1;
+    }
+    const int groups = cols / 32;
+    free(g_i4qx);
+    free(g_i4qs);
+    free(g_i4qm);
+    g_i4qx = (int8_t *)malloc((size_t)cols);
+    g_i4qs = (float *)malloc((size_t)groups * sizeof(float));
+    g_i4qm = (int32_t *)malloc((size_t)groups * sizeof(int32_t));
+    if (g_i4qx == NULL || g_i4qs == NULL || g_i4qm == NULL) {
+        free(g_i4qx);
+        free(g_i4qs);
+        free(g_i4qm);
+        g_i4qx = NULL;
+        g_i4qs = NULL;
+        g_i4qm = NULL;
+        g_i4qcap = 0;
+        return 0;
+    }
+    g_i4qcap = cols;
+    return 1;
+}
+
+/* Quantize one row of x to int8 in the group layout. */
+static void gemma_i4q_row(const float *x, int cols)
+{
+    const int groups = cols / 32;
+    for (int g = 0; g < groups; ++g) {
+        g_i4qs[g] = gemma_quant_group32(x + (size_t)g * 32,
+                                        g_i4qx + (size_t)g * 32, &g_i4qm[g]);
+    }
+}
+
+/* The int8 dot product for one token, from a float32 activation. The
+ * quantization and the dot product stay in one call, so the caller starts one
+ * parallel region and pays for one ctypes call. That matters: at the matrix
+ * sizes of a decode step the call overhead is larger than the kernel. */
+void gemma_int4_q8_gemv_x(const uint8_t *w, const float *scales, const float *x,
+                          float *out, int rows, int cols)
+{
+    if (!gemma_i4q_scratch(cols)) {
+        return;
+    }
+    gemma_i4q_row(x, cols);
+    gemma_int4_q8_gemv(w, scales, g_i4qx, g_i4qs, g_i4qm, out, rows, cols);
+}
+
+/* Up to four int4 matrices on the same one-row activation. The quantization
+ * runs one time for all of them. One parallel region covers all four. */
+void gemma_int4_q8_multi4(const uint8_t *w0, const float *s0, float *o0, int r0,
+                          const uint8_t *w1, const float *s1, float *o1, int r1,
+                          const uint8_t *w2, const float *s2, float *o2, int r2,
+                          const uint8_t *w3, const float *s3, float *o3, int r3,
+                          const float *x, int cols)
+{
+    const uint8_t *ws[4] = {w0, w1, w2, w3};
+    const float *ss[4] = {s0, s1, s2, s3};
+    float *os[4] = {o0, o1, o2, o3};
+    const int rs[4] = {r0, r1, r2, r3};
+    int off[4];
+    int total = 0;
+    for (int i = 0; i < 4; ++i) {
+        off[i] = total;
+        if (rs[i] > 0) {
+            total += (rs[i] + I4QG_MR - 1) / I4QG_MR;
+        }
+    }
+    if (total == 0 || !gemma_i4q_scratch(cols)) {
+        return;
+    }
+    gemma_i4q_row(x, cols);
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < total; ++b) {
+        int i = 3;
+        while (i > 0 && (rs[i] <= 0 || b < off[i])) {
+            --i;
+        }
+        gemma_int4_q8_gemv_block(ws[i], ss[i], g_i4qx, g_i4qs, g_i4qm, os[i],
+                                 rs[i], cols, b - off[i]);
+    }
+}
+
+/* ---------- int8 mixture of experts for a decode step ----------
+ * The int4 expert kernel holds four rows in its float lanes, so a decode step
+ * reads each selected expert with the plain multiply. This kernel holds eight
+ * rows in the int32 lanes of vpdpbusd instead. One call quantizes the row of
+ * each job and runs every job in one parallel region.
+ *
+ * w has the shape (experts, rows, groups, 18). ids gives the selected expert
+ * of each job. x holds one row for each job, with a stride of xstride. A
+ * stride of 0 gives the same row to every job.
+ */
+void gemma_int4_q8_moe_gemv(const uint8_t *w, const float *scales,
+                            const float *x, const int32_t *ids, int jobs,
+                            float *out, int rows, int cols, int xstride)
+{
+    const int groups = cols / 32;
+    const size_t wstride = (size_t)groups * 18;
+    const int nrb = (rows + I4QG_MR - 1) / I4QG_MR;
+    /* One slice of the scratch for each job. */
+    if (jobs <= 0 || !gemma_i4q_scratch(cols * jobs)) {
+        return;
+    }
+    int8_t *qx = g_i4qx;
+    float *sx = g_i4qs;
+    int32_t *sumx = g_i4qm;
+    const size_t qstride = (size_t)cols;
+    const size_t sstride = (size_t)groups;
+    for (int j = 0; j < jobs; ++j) {
+        const float *xj = x + (xstride != 0 ? (size_t)j * (size_t)xstride : 0);
+        for (int g = 0; g < groups; ++g) {
+            sx[(size_t)j * sstride + g] = gemma_quant_group32(
+                xj + (size_t)g * 32, qx + (size_t)j * qstride + (size_t)g * 32,
+                &sumx[(size_t)j * sstride + g]);
+        }
+    }
+    #pragma omp parallel for schedule(static) collapse(2)
+    for (int j = 0; j < jobs; ++j) {
+        for (int rb = 0; rb < nrb; ++rb) {
+            const size_t e = (size_t)ids[j];
+            gemma_int4_q8_gemv_block(w + e * (size_t)rows * wstride,
+                                     scales + e * (size_t)rows * (size_t)groups,
+                                     qx + (size_t)j * qstride,
+                                     sx + (size_t)j * sstride,
+                                     sumx + (size_t)j * sstride,
+                                     out + (size_t)j * (size_t)rows,
+                                     rows, cols, rb);
+        }
+    }
+}
+
 /* ---------- int8 mixture of experts for a prompt ----------
  * The model gives each expert a different group of tokens. A call for each
  * expert then starts a small parallel region for each expert. A group of
@@ -3873,6 +4317,31 @@ void gemma_int4_q8_moe_run(const uint8_t *w, const float *scales,
 void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
 {
     const float c = 0.7978845608028654f;
+#if GEMMA_X86 && defined(__AVX512F__)
+    const __m512 cv = _mm512_set1_ps(c);
+    const __m512 half = _mm512_set1_ps(0.5f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 k3 = _mm512_set1_ps(0.044715f);
+    const int nv = inner & ~15;
+    #pragma omp parallel for if(rows >= 8) schedule(static)
+    for (int i = 0; i < rows; ++i) {
+        const float *g = x + (size_t)i * 2 * (size_t)inner;
+        const float *u = g + inner;
+        float *o = out + (size_t)i * (size_t)inner;
+        for (int j = 0; j < nv; j += 16) {
+            const __m512 v = _mm512_loadu_ps(g + j);
+            const __m512 v3 = _mm512_mul_ps(_mm512_mul_ps(v, v), v);
+            const __m512 t = _mm512_mul_ps(cv, _mm512_fmadd_ps(k3, v3, v));
+            const __m512 r = _mm512_mul_ps(_mm512_mul_ps(half, v),
+                                           _mm512_add_ps(one, gemma_tanh_ps(t)));
+            _mm512_storeu_ps(o + j, _mm512_mul_ps(r, _mm512_loadu_ps(u + j)));
+        }
+        for (int j = nv; j < inner; ++j) {
+            const float v = g[j];
+            o[j] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[j];
+        }
+    }
+#else
     #pragma omp parallel for if(rows >= 8) schedule(static)
     for (int i = 0; i < rows; ++i) {
         const float *g = x + (size_t)i * 2 * (size_t)inner;
@@ -3883,6 +4352,7 @@ void gemma_gelu_mul(const float *x, float *out, int rows, int inner)
             o[j] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[j];
         }
     }
+#endif
 }
 
 /* Add the weighted expert output to the rows of out. de holds one row for each
@@ -3911,6 +4381,98 @@ void gemma_moe_scatter(float *out, const float *de, const int32_t *rows,
             }
         }
     }
+}
+
+/* ---------- fused entry points for a decode step ----------
+ * A decode step of the 26B model makes about 600 calls to this library. Each
+ * call costs several microseconds before the kernel starts, because Python
+ * must read the address of every array. The boundary between Python and C is
+ * therefore a real part of the step.
+ *
+ * Every function below runs two kernels in one call. Each one is a
+ * composition of the kernels above: the arithmetic is the arithmetic of those
+ * kernels, in the same order. Thus the result does not change and the checks
+ * of the model still hold.
+ */
+
+/* out = gelu(g) * u for n values, with the gate and the up part in separate
+ * arrays. That is the shape of the shared MLP of the 26B model. */
+void gemma_gelu_mul_pair(const float *g, const float *u, float *out, int n)
+{
+    const float c = 0.7978845608028654f;
+#if GEMMA_X86 && defined(__AVX512F__)
+    const __m512 cv = _mm512_set1_ps(c);
+    const __m512 half = _mm512_set1_ps(0.5f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 k3 = _mm512_set1_ps(0.044715f);
+    const int nv = n & ~15;
+    for (int i = 0; i < nv; i += 16) {
+        const __m512 v = _mm512_loadu_ps(g + i);
+        const __m512 v3 = _mm512_mul_ps(_mm512_mul_ps(v, v), v);
+        const __m512 t = _mm512_mul_ps(cv, _mm512_fmadd_ps(k3, v3, v));
+        const __m512 r = _mm512_mul_ps(_mm512_mul_ps(half, v),
+                                       _mm512_add_ps(one, gemma_tanh_ps(t)));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(r, _mm512_loadu_ps(u + i)));
+    }
+    for (int i = nv; i < n; ++i) {
+        const float v = g[i];
+        out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[i];
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        const float v = g[i];
+        out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[i];
+    }
+#endif
+}
+
+/* The three norms of the query, the key, and the value, and then the rotation
+ * of the query and the key. v and k may be null. */
+void gemma_qkv_norm_rope(float *q, const float *q_w, int q_rows,
+                         float *k, const float *k_w, int k_rows,
+                         float *v, int v_rows, const float *cos,
+                         const float *sin, int q_heads, int k_heads,
+                         int head_dim, float eps)
+{
+    gemma_qkv_norm(q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps);
+    gemma_rope(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim);
+}
+
+/* The norm of one row, then up to four int4 matrices on the result. scratch
+ * holds cols values and belongs to the caller, which reuses it. */
+void gemma_rms_norm_multi4(const float *x, const float *wn, float *scratch,
+                           int cols, float eps,
+                           const uint8_t *w0, const float *s0, float *o0, int r0,
+                           const uint8_t *w1, const float *s1, float *o1, int r1,
+                           const uint8_t *w2, const float *s2, float *o2, int r2,
+                           const uint8_t *w3, const float *s3, float *o3, int r3)
+{
+    gemma_rms_norm(x, wn, scratch, 1, cols, eps);
+    gemma_int4_multi4(w0, s0, o0, r0, w1, s1, o1, r1,
+                      w2, s2, o2, r2, w3, s3, o3, r3, scratch, cols);
+}
+
+/* gelu(g) * u, then one int4 matrix on the result. The gate and the up part
+ * have inner values. The matrix has cols columns. scratch holds inner values
+ * and belongs to the caller. */
+void gemma_gelu_mul_int4(const float *g, const float *u, int inner,
+                         float *scratch, const uint8_t *w, const float *s,
+                         float *out, int rows, int cols)
+{
+    gemma_gelu_mul_pair(g, u, scratch, inner);
+    gemma_int4_linear(w, s, scratch, out, rows, cols, 1, 32);
+}
+
+/* The gate and up projection of the selected experts, then the GELU and the
+ * multiply. act holds one row of 2 * inner values for each job and out holds
+ * one row of inner values for each job. The two buffers must not overlap: the
+ * output of one job would otherwise fall on the up part of another job. */
+void gemma_moe_gemv_gelu(const uint8_t *w, const float *scales, const float *x,
+                         const int *ids, int jobs, float *act, float *out,
+                         int rows, int cols, int xstride, int inner)
+{
+    gemma_int4_moe_gemv(w, scales, x, ids, jobs, act, rows, cols, xstride);
+    gemma_gelu_mul(act, out, jobs, inner);
 }
 
 /* Apply the causal mask, the sliding window mask, and the softmax to the last

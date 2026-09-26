@@ -4,14 +4,15 @@ The model has 48 decoder layers. This module gives two classes:
     KVCache  Store the keys and values of each layer.
     Model    Load the weights and run the model.
 
-Two weight modes are available:
-    f32   Keep the weights in float32 format. This mode is fast. It uses about
-          70 GB of memory.
-    bf16  Keep the weights in bfloat16 format. Convert the weights during each
-          multiply. This mode uses about 24 GB of memory. It is slower.
+Four weight modes are available:
+    f32   Keep float32 weights. This mode uses about 70 GB of memory.
+    bf16  Keep bfloat16 weights. This mode uses about 24 GB of memory.
+    int8  Keep int8 weights. This mode uses about 12 GB of memory.
+    int4  Keep packed 4-bit weights. This mode uses about 9 GB of memory.
 
-Call load_all() one time. Then run many prompts. Use dtype "f32" for speed.
-Use dtype "bf16" when memory is small.
+For int4, reuse packed source weights when the input format supports them.
+Otherwise, quantize the source weights during loading. Call load_all() once,
+then run many prompts.
 """
 from __future__ import annotations
 
@@ -266,6 +267,8 @@ class Model:
         self._dtype = "f32"
         self._cache = None
         self._cache_write = None
+        # The cosine and sine tables of the rope, by layer type and position.
+        self._rope_cache = {}
         # The w4a16 checkpoint keeps the packed 4-bit weights and the scales
         # from the quantization-aware training.
         self._w4a16 = (PREFIX + "layers.0.mlp.gate_proj.weight_packed") in st.names()
@@ -296,8 +299,8 @@ class Model:
             for key in _MOE_NORM_KEYS:
                 w[key] = self.st.get(p + key + ".weight")
         if dtype in ("int8", "int4"):
-            # Read the quantized weights from the cache. Quantize the weights
-            # and write the cache when the cache is not ready.
+            # Read the runtime weights from the cache when available. Otherwise,
+            # reuse or repack source int4 data, or quantize unquantized weights.
             quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
             suffix = ".q" if dtype == "int8" else ".q4"
             src_keys = list(_PROJ_KEYS) + ([] if plan.k_eq_v else ["self_attn.v_proj"])
@@ -346,9 +349,9 @@ class Model:
     def _load_expert(self, src, dtype):
         """Load one 3-D expert tensor.
 
-        The int4 mode uses the packed data of the source when the source gives
-        it. Then the code does not quantize again. The other modes convert the
-        data.
+        The int4 mode reuses packed source data when the reader supports it.
+        Otherwise, it quantizes the source values. Int8 also quantizes the
+        source values. Float modes keep their source precision.
         """
         n = self.cfg.num_experts
         if dtype == "int4" and hasattr(self.st, "int4_row_slice"):
@@ -393,10 +396,11 @@ class Model:
     def load_all(self, dtype="f32"):
         """Load all layers and the embedding table. Keep the data in memory.
 
-        Use dtype "f32" for speed. Use dtype "bf16", "int8", or "int4" for a
-        smaller memory use. The int8 and int4 modes read the converted weights
-        from a local cache. The first load writes the cache. Later loads read
-        it.
+        Use dtype "f32", "bf16", "int8", or "int4" to select the weight
+        format. Int8 and int4 use the local weight cache when the source allows
+        it. A cache miss writes the runtime representation; later loads reuse
+        it. Int4 readers can reuse packed source weights without quantizing
+        them again.
         """
         dtype = dtype.lower()
         if dtype not in ("f32", "bf16", "int8", "int4"):
@@ -562,8 +566,8 @@ class Model:
         dn_q, dn_s = w["experts.down_proj"]
         ids = np.unique(idx).astype(np.int32)
         cols = h.shape[1]
-        act = ops.int4_moe_gemv(gu_q, gu_s, h, ids, gu_q.shape[1], cols, 0)
-        act = ops.gelu_tanh(act[:, :inner]) * act[:, inner:]
+        act = ops.moe_gemv_gelu(gu_q, gu_s, h, ids, gu_q.shape[1], cols, 0,
+                                inner)
         de = ops.int4_moe_gemv(dn_q, dn_s, act, ids, dn_q.shape[1], inner, inner)
         out = np.zeros_like(h)
         for j in range(ids.size):
@@ -572,8 +576,27 @@ class Model:
         return out
 
     def _rope(self, plan, positions):
-        """Return the cosine and sine tables for one layer at the given positions."""
-        return rope_mod.cos_sin(self.cfg.rope_inv_freq(plan), positions)
+        """Return the cosine and sine tables for one layer at the positions.
+
+        Every layer of the same type uses the same table, so a prompt of 30
+        layers makes two tables in place of 30. One table costs about 55
+        microseconds. A long generation makes a new table for each token, so
+        the cache holds a few entries.
+        """
+        key = (plan.is_sliding, plan.head_dim, int(positions[0]),
+               int(positions.size))
+        entry = self._rope_cache.get(key)
+        if entry is None:
+            if len(self._rope_cache) > 8:
+                self._rope_cache.clear()
+            cos, sin = rope_mod.cos_sin(self.cfg.rope_inv_freq(plan), positions)
+            # Keep the address with the table. Every layer of the same type
+            # uses this table, and the read of the address costs about 1.5
+            # microseconds, so 30 layers must not read it 30 times. The cache
+            # holds the table, so the address stays good.
+            entry = (cos, sin, cos.ctypes.data, sin.ctypes.data)
+            self._rope_cache[key] = entry
+        return entry
 
     # ---- forward -----------------------------------------------------------
     def embed(self, input_ids):
@@ -611,8 +634,9 @@ class Model:
         for i in range(n):
             plan = cfg.plan[i]
             w = self.load_layer(i)
-            cos, sin = self._rope(plan, positions)
-            x = self._decoder_layer(x, w, plan, cos, sin, positions, i, hook, cache)
+            cos, sin, cos_a, sin_a = self._rope(plan, positions)
+            x = self._decoder_layer(x, w, plan, cos, sin, positions, i, hook,
+                                    cache, cos_a, sin_a)
             self.free_layer(i)
         if n == cfg.num_hidden_layers:
             norm_w = self._norm_w if self._norm_w is not None else self.st.get(PREFIX + "norm.weight")
@@ -621,25 +645,51 @@ class Model:
             emit(hook, "last_hidden_state", x)
         return x
 
-    def _decoder_layer(self, x, w, plan, cos, sin, positions, i, hook, cache):
+    def _decoder_layer(self, x, w, plan, cos, sin, positions, i, hook, cache,
+                       cos_a=None, sin_a=None):
         """Run one decoder layer. Use four normalization steps and two residual adds."""
         eps = self.cfg.rms_norm_eps
         p = "layers." + str(i) + "."
         residual = x
         h = ops.rms_norm(x, w["input_layernorm"], eps)
         emit(hook, p + "input_layernorm", h)
-        h = self._attention(h, w, plan, cos, sin, positions, i, p, hook, cache)
+        h = self._attention(h, w, plan, cos, sin, positions, i, p, hook, cache,
+                            cos_a, sin_a)
         h = ops.rms_norm(h, w["post_attention_layernorm"], eps)
         emit(hook, p + "post_attention_layernorm", h)
         x = residual + h
         residual = x
-        h = ops.rms_norm(x, w["pre_feedforward_layernorm"], eps)
-        emit(hook, p + "pre_feedforward_layernorm", h)
-        g = self.linear(h, w["mlp.gate_proj"])
+        fuse_norm = (x.shape[0] == 1 and self._dtype == "int4"
+                     and ops.int4_multi4_ready())
+        if fuse_norm:
+            # The norm of the row, then the gate and the up projection, in one
+            # call. The two projections also share the input row: one kernel
+            # call runs both. One read of 6.7 MB is faster than two reads of
+            # 3.3 MB: 38.8 GB/s against 31.5 on the 26B model.
+            h = None
+            g, u = ops.rms_norm_multi4(
+                x, w["pre_feedforward_layernorm"], eps,
+                [w["mlp.gate_proj"], w["mlp.up_proj"]],
+                self.cfg.hidden_size)[:2]
+            g = g.reshape(1, -1)
+            u = u.reshape(1, -1)
+        else:
+            h = ops.rms_norm(x, w["pre_feedforward_layernorm"], eps)
+            emit(hook, p + "pre_feedforward_layernorm", h)
+            g = self.linear(h, w["mlp.gate_proj"])
+            u = self.linear(h, w["mlp.up_proj"])
         emit(hook, p + "mlp.gate_proj", g)
-        u = self.linear(h, w["mlp.up_proj"])
         emit(hook, p + "mlp.up_proj", u)
-        m = self.linear(ops.gelu_tanh(g) * u, w["mlp.down_proj"])
+        if fuse_norm:
+            # gelu(g) * u, then the down projection, in one call. The down
+            # projection reads the inner values, which is the width of the
+            # gate and the up projection together.
+            m = ops.gelu_mul_int4(g.reshape(-1), u.reshape(-1),
+                                  w["mlp.down_proj"][0], w["mlp.down_proj"][1],
+                                  self.cfg.hidden_size, self.cfg.intermediate_size)
+            m = m.reshape(1, -1)
+        else:
+            m = self.linear(ops.gelu_tanh(g) * u, w["mlp.down_proj"])
         emit(hook, p + "mlp.down_proj", m)
         if self.cfg.enable_moe_block:
             # The mixture-of-experts block is additive and parallel to the
@@ -664,7 +714,8 @@ class Model:
         emit(hook, p + "out", x)
         return x
 
-    def _attention(self, x, w, plan, cos, sin, positions, i, p, hook, cache):
+    def _attention(self, x, w, plan, cos, sin, positions, i, p, hook, cache,
+                   cos_a=None, sin_a=None):
         """Run the attention part of one layer.
 
         For a sliding layer, keep only the keys inside the window and mask the
@@ -698,11 +749,13 @@ class Model:
             v2 = np.ascontiguousarray(vf).reshape(t * plan.num_kv_heads, hd)
 
         if ops.qkv_ready():
-            # One call for the three norms and one call for the two rotations.
-            ops.qkv_norm(q2, w["self_attn.q_norm"], k2, w["self_attn.k_norm"], v2, eps)
+            # One call for the three norms and the two rotations.
+            ops.qkv_norm_rope(q2, w["self_attn.q_norm"], k2,
+                              w["self_attn.k_norm"], v2, cos, sin,
+                              plan.num_q_heads, plan.num_kv_heads, hd, eps,
+                              cos_a, sin_a)
             emit(hook, p + "self_attn.q_norm", q2)
             emit(hook, p + "self_attn.k_norm", k2)
-            ops.rope_apply(q2, k2, cos, sin, plan.num_q_heads, plan.num_kv_heads, hd)
             q = q2.reshape(t, plan.num_q_heads, hd)
             k = k2.reshape(t, plan.num_kv_heads, hd)
             v = v2.reshape(t, plan.num_kv_heads, hd)
@@ -868,9 +921,10 @@ class Model:
                 stop = off + chunk
                 if stop > n_tok:
                     stop = n_tok
-                cos, sin = self._rope(plan, pos[off:stop])
+                cos, sin, cos_a, sin_a = self._rope(plan, pos[off:stop])
                 x[off:stop] = self._decoder_layer(
-                    x[off:stop], w, plan, cos, sin, pos[off:stop], i, hook, cache)
+                    x[off:stop], w, plan, cos, sin, pos[off:stop], i, hook,
+                    cache, cos_a, sin_a)
             self.free_layer(i)
         norm_w = self._norm_w if self._norm_w is not None else self.st.get(PREFIX + "norm.weight")
         x = ops.rms_norm(x, norm_w, cfg.rms_norm_eps)

@@ -116,6 +116,69 @@ def check_moe(rng):
     return err < 2e-5
 
 
+def check_gemv(rng, rows, cols):
+    """Compare the one-token int8 dot product with the same reference."""
+    w = rng.standard_normal((rows, cols)).astype(np.float32)
+    packed, scales = ops.quantize_int4(w, group=32)
+    x = rng.standard_normal((1, cols)).astype(np.float32) * 1.5
+    qx, sx, sumx = cops.quantize_q8_groups(x)
+    out = cops.int4_q8_gemv(qx[0], sx[0], sumx[0], packed, scales)
+    # The reference uses the same quantized activations, so only the kernel
+    # arithmetic is under test.
+    qd = (qx[0].astype(np.float32) * np.repeat(sx[0], 32)).astype(np.float32)
+    ref = qd @ ops.dequantize_int4(packed, scales).T
+    err = np.max(np.abs(out - ref)) / (np.max(np.abs(ref)) + 1e-30)
+    disp = ops.linear_int4_numpy(x, packed, scales)[0]
+    derr = np.max(np.abs(out - disp)) / (np.max(np.abs(disp)) + 1e-30)
+    print("gemv rows=%d cols=%d: q8 rel=%.3e float rel=%.3e"
+          % (rows, cols, err, derr))
+    return err < 2e-5
+
+
+def check_gemv_paths(rng):
+    """Compare the fused entry points with one call for each matrix."""
+    mats = []
+    for rows in (4096, 1024, 1024, 2112):
+        w = rng.standard_normal((rows, 2816)).astype(np.float32)
+        mats.append(ops.quantize_int4(w, group=32))
+    x = rng.standard_normal((1, 2816)).astype(np.float32)
+    fused = cops.int4_q8_gemv_x(x, mats[0][0], mats[0][1])
+    qx, sx, sumx = cops.quantize_q8_groups(x)
+    split = cops.int4_q8_gemv(qx[0], sx[0], sumx[0], mats[0][0], mats[0][1])
+    ok = np.array_equal(fused, split)
+    print("gemv_x:             fused==split %s" % ok)
+    outs = cops.int4_q8_multi4(mats[:3] + [None], x, 2816)
+    for i in range(3):
+        ref = ops.linear_int4_numpy(x, mats[i][0], mats[i][1])[0]
+        rel = np.max(np.abs(outs[i] - ref)) / (np.max(np.abs(ref)) + 1e-30)
+        print("multi4 slot %d:      float rel=%.3e" % (i, rel))
+        ok = rel < 2e-2 and ok
+    ok = outs[3] is None and ok
+    return ok
+
+
+def check_moe_gemv(rng):
+    """Compare the int8 expert kernel with one call for each expert."""
+    ne, rows, cols = 4, 1408, 2816
+    w = rng.standard_normal((ne * rows, cols)).astype(np.float32)
+    p4, s4 = ops.quantize_int4(w, group=32)
+    p4 = p4.reshape(ne, rows, cols // 32, 18)
+    s4 = s4.reshape(ne, rows, cols // 32)
+    ids = np.array([0, 2, 3], dtype=np.int32)
+    x = rng.standard_normal((3, cols)).astype(np.float32)
+    ok = True
+    for stride, src in ((cols, x), (0, x[:1])):
+        out = cops.int4_q8_moe_gemv(p4, s4, src, ids, rows, cols, stride)
+        for j in range(ids.size):
+            # A stride of zero gives row 0 to every job.
+            row = src[:1] if stride == 0 else src[j:j + 1]
+            ref = ops.linear_int4_numpy(row, p4[ids[j]], s4[ids[j]])[0]
+            rel = np.max(np.abs(out[j] - ref)) / (np.max(np.abs(ref)) + 1e-30)
+            print("moe_gemv stride=%d j=%d: float rel=%.3e" % (stride, j, rel))
+            ok = rel < 2e-2 and ok
+    return ok
+
+
 def main():
     if not cops.available():
         print("no C library")
@@ -124,6 +187,12 @@ def main():
     rng = np.random.default_rng(1234)
     ok = check_groups(rng)
     ok = check_t(rng) and ok
+    ok = check_gemv(rng, 34, 128) and ok
+    ok = check_gemv(rng, 8, 32) and ok
+    ok = check_gemv(rng, 71, 96) and ok
+    ok = check_gemv(rng, 512, 704) and ok
+    ok = check_gemv_paths(rng) and ok
+    ok = check_moe_gemv(rng) and ok
     for tokens in TOKENS:
         ok = check_tile(rng, 34, 128, tokens) and ok
     ok = check_tile(rng, 17, 64, 5) and ok

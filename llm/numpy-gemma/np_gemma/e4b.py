@@ -625,30 +625,43 @@ class E4B:
         ntok = h.shape[0]
         head_dim = plan.head_dim
 
+        # One call gives the norm of the query, the key, and the value, and a
+        # second call gives the two rope rotations. The kernels work in place
+        # and use the OpenMP pool. Three separate norms and two separate
+        # rotations make five calls and five regions for each layer, and the
+        # NumPy rotation also builds a second array for each call.
         if plan.shared:
+            # The key and the value of a shared layer belong to the layer that
+            # stored them, and they are already normal and turned.
             q = self.linear(h, p + "self_attn.q_proj")
-            k, v = cache.shared_kv(plan)
+            q = q.reshape(ntok * plan.num_q_heads, head_dim)
+            ops.qkv_norm(q, self.T(p + "self_attn.q_norm.weight"),
+                         None, None, None, cfg.rms_norm_eps)
         else:
             # The query, the key, and the value projection share the input
             # row. One kernel call runs all three.
             q, k, v = self.linear_multi(
                 h, [p + "self_attn.q_proj", p + "self_attn.k_proj",
                     p + "self_attn.v_proj"])
-
-        q = q.reshape(ntok, plan.num_q_heads, head_dim)
-        q = ops.rms_norm(q, self.T(p + "self_attn.q_norm.weight"), cfg.rms_norm_eps)
-
-        if not plan.shared:
-            k = k.reshape(ntok, plan.num_kv_heads, head_dim)
-            k = ops.rms_norm(k, self.T(p + "self_attn.k_norm.weight"), cfg.rms_norm_eps)
-            v = v.reshape(ntok, plan.num_kv_heads, head_dim)
-            # The value norm has no scale. Normalize only.
-            v = ops.rms_norm(v, None, cfg.rms_norm_eps)
+            q = q.reshape(ntok * plan.num_q_heads, head_dim)
+            k = k.reshape(ntok * plan.num_kv_heads, head_dim)
+            v = v.reshape(ntok * plan.num_kv_heads, head_dim)
+            # The value norm has no scale. Give None for its weight.
+            ops.qkv_norm(q, self.T(p + "self_attn.q_norm.weight"),
+                         k, self.T(p + "self_attn.k_norm.weight"), v,
+                         cfg.rms_norm_eps)
 
         cos, sin = self.rope_tables(plan, start_pos, ntok)
-        q = rope_mod.apply(q, cos, sin)
-        if not plan.shared:
-            k = rope_mod.apply(k, cos, sin)
+        if plan.shared:
+            ops.rope_apply(q, None, cos, sin, plan.num_q_heads, 0, head_dim)
+            q = q.reshape(ntok, plan.num_q_heads, head_dim)
+            k, v = cache.shared_kv(plan)
+        else:
+            ops.rope_apply(q, k, cos, sin, plan.num_q_heads,
+                           plan.num_kv_heads, head_dim)
+            q = q.reshape(ntok, plan.num_q_heads, head_dim)
+            k = k.reshape(ntok, plan.num_kv_heads, head_dim)
+            v = v.reshape(ntok, plan.num_kv_heads, head_dim)
             k, v = cache.append(plan, k, v, start_pos)
 
         npos = k.shape[1]

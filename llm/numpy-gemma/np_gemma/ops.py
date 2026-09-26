@@ -32,6 +32,35 @@ except Exception:
 # The constant sqrt(2/pi). The GELU function uses it.
 GELU_C = 0.7978845608028654
 
+# The state of the C library and the choice of kernel path. A decode step calls
+# the functions below about 600 times for each token, and a lookup of the
+# environment costs about 3 microseconds of the step. Every value here is
+# therefore read one time, at import. Set the environment variables before the
+# import of this module.
+_COPS_READY = _cops is not None and _cops.available()
+_KERNEL_MODE = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
+_FUSED_QKV = os.environ.get("NP_GEMMA_FUSED_QKV", "1") == "1"
+_INT4_MULTI4 = os.environ.get("NP_GEMMA_INT4_MULTI4", "1") == "1"
+_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "1") == "1"
+_INT4_Q8_GEMV = os.environ.get("NP_GEMMA_INT4_Q8_GEMV", "0") == "1"
+# The int8 tile needs AVX-512. The int8 dot product for one token needs VNNI.
+_INT4_Q8_OK = _INT4_Q8 and _COPS_READY and bool(getattr(_cops, "AVX512", False))
+_INT4_Q8_GEMV_OK = (_INT4_Q8_GEMV and _COPS_READY
+                    and bool(getattr(_cops, "VNNI", False)))
+_QKV_OK = _FUSED_QKV and _COPS_READY
+_MULTI4_OK = _INT4_MULTI4 and _COPS_READY
+
+# A one-value array for a kernel argument that the kernel does not read. A
+# shared layer of the E4B model has no key of its own.
+_EMPTY_F32 = np.zeros(1, dtype=np.float32)
+
+
+def _w32(w):
+    """Return a weight as a contiguous float32 array. None gives an empty one."""
+    if w is None:
+        return _EMPTY_F32
+    return np.ascontiguousarray(w, dtype=np.float32)
+
 
 def rms_norm(x, weight=None, eps=1e-6):
     """Normalize the last axis of x. Multiply by the weight.
@@ -40,12 +69,13 @@ def rms_norm(x, weight=None, eps=1e-6):
 
     Note: the weight is the full scale. Do not add 1 to the weight.
     """
-    x32 = np.asarray(x, dtype=np.float32)
-    if _cops is not None and _cops.available() and x32.ndim >= 1:
-        shape = x32.shape
-        x2 = np.ascontiguousarray(x32).reshape(-1, shape[-1])
-        w2 = None if weight is None else np.ascontiguousarray(weight, dtype=np.float32)
+    if _COPS_READY:
+        x2 = np.ascontiguousarray(x, dtype=np.float32)
+        shape = x2.shape
+        x2 = x2.reshape(-1, shape[-1])
+        w2 = None if weight is None else _w32(weight)
         return _cops.rms_norm(x2, w2, eps).reshape(shape)
+    x32 = np.asarray(x, dtype=np.float32)
     # Calculate the mean of the squares. Add eps for stability.
     mean_sq = np.mean(x32 * x32, axis=-1, keepdims=True) + eps
     y = x32 * np.power(mean_sq, -0.5)
@@ -153,9 +183,9 @@ def linear_bf16(x, w_u16, chunk=LINEAR_BF16_CHUNK):
     Set the environment variable NP_GEMMA_KERNEL to "c", "numba", or "numpy" to
     select one kernel.
     """
-    mode = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
+    mode = _KERNEL_MODE
     if mode != "numpy":
-        if mode in ("auto", "c") and _cops is not None and _cops.available():
+        if mode in ("auto", "c") and _COPS_READY:
             return _cops.linear_bf16(x, w_u16)
         if mode in ("auto", "numba") and _numba_ops is not None and _numba_ops.enabled():
             return _numba_ops.linear_bf16(x, w_u16)
@@ -203,8 +233,7 @@ def linear_q6k(x, w_bytes, cols):
     in one row. The C kernel keeps the weights in the Q6_K format. Thus the
     output head reads 6.05 bits for each weight in place of 16 bits.
     """
-    mode = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
-    if mode != "numpy" and _cops is not None and _cops.available():
+    if _KERNEL_MODE != "numpy" and _COPS_READY:
         return _cops.linear_q6k(x, w_bytes, cols)
     return linear_q6k_numpy(x, w_bytes, cols)
 
@@ -215,22 +244,44 @@ ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
 
 
 def qkv_ready():
-    """Return True when the fused norm and RoPE kernels are ready."""
-    return _cops is not None and _cops.available()
+    """Return True when the fused norm and RoPE kernels are ready.
+
+    Set NP_GEMMA_FUSED_QKV=0 to give each tensor its own norm and its own
+    rotation. That is three norm calls and two rope calls for each layer in
+    place of two calls.
+    """
+    return _QKV_OK
 
 
 def qkv_norm(q, q_w, k, k_w, v, eps):
-    """Apply the RMSNorm of the query, the key, and the value in place."""
-    _cops.qkv_norm(q, np.ascontiguousarray(q_w, dtype=np.float32), q.shape[0],
-                   k, np.ascontiguousarray(k_w, dtype=np.float32), k.shape[0],
-                   v, 0 if v is None else v.shape[0], q.shape[1], eps)
+    """Apply the RMSNorm of the query, the key, and the value in place.
 
+    q, k, and v are (rows, head_dim). A shared layer of the E4B model has no
+    key and no value of its own, so k and v may be None. The value norm of
+    that model has no weight, so k_w and the weight of the value may be None.
+    """
+    if qkv_ready():
+        _cops.qkv_norm(q, _w32(q_w), q.shape[0],
+                       k, _w32(k_w), 0 if k is None else k.shape[0],
+                       v, 0 if v is None else v.shape[0], q.shape[1], eps)
+        return
+    for x, w in ((q, q_w), (k, k_w), (v, None)):
+        if x is not None:
+            x[:] = rms_norm(x, w, eps)
 
 def rope_apply(q, k, cos, sin, q_heads, k_heads, head_dim):
-    """Apply RoPE to the query and the key in place."""
-    _cops.rope_apply(q, q.shape[0], q_heads, k, k.shape[0], k_heads,
-                     np.ascontiguousarray(cos, dtype=np.float32),
-                     np.ascontiguousarray(sin, dtype=np.float32), head_dim)
+    """Apply RoPE to the query and the key in place. k may be None."""
+    if qkv_ready():
+        _cops.rope_apply(q, q.shape[0], q_heads,
+                         k, 0 if k is None else k.shape[0], k_heads,
+                         np.ascontiguousarray(cos, dtype=np.float32),
+                         np.ascontiguousarray(sin, dtype=np.float32), head_dim)
+        return
+    from . import rope as _rope
+    for x, heads in ((q, q_heads), (k, k_heads)):
+        if x is not None:
+            y = x.reshape(-1, heads, head_dim)
+            y[:] = _rope.apply(y, cos, sin)
 
 
 def router_ready():
@@ -253,19 +304,122 @@ def router(x, scale, proj, per_expert, top_k, eps, hscale):
     return val, idx.astype(np.int64)
 
 
+# Use the fused entry points of the C library for a decode step. Each one runs
+# two kernels in one call. Set NP_GEMMA_FUSED_STEP=0 to compare with the
+# separate calls.
+_FUSED_STEP = os.environ.get("NP_GEMMA_FUSED_STEP", "1") == "1"
+_FUSED_OK = _FUSED_STEP and _COPS_READY
+
+# A scratch buffer for the fused entry points. It belongs to this module. A
+# caller must not keep a result across another call that uses the same size.
+#
+# The address is kept with the buffer. One decode step hands this buffer to
+# the same kernel 30 times, one for each layer, and the read of the address
+# costs about 1.5 microseconds.
+_SCRATCH = np.zeros(1, dtype=np.float32)
+_SCRATCH_A = _SCRATCH.ctypes.data
+
+
+def _scratch(n):
+    """Return (buffer, address) for a scratch of at least n float32 values.
+
+    The buffer is made one time and reused. The address goes with it, so the
+    caller does not read it again.
+    """
+    global _SCRATCH, _SCRATCH_A
+    if _SCRATCH.size < n:
+        _SCRATCH = np.empty(n, dtype=np.float32)
+        _SCRATCH_A = _SCRATCH.ctypes.data
+    return _SCRATCH, _SCRATCH_A
+
+
+def qkv_norm_rope(q, q_w, k, k_w, v, cos, sin, q_heads, k_heads, head_dim, eps,
+                  cos_a=None, sin_a=None):
+    """The three norms of the attention block and the two rotations.
+
+    One call in place of two. q, k, and v are (rows, head_dim). k and v may be
+    None. cos_a and sin_a give the addresses of the tables, which the caller
+    read one time. They are for the fused call only.
+    """
+    if _FUSED_OK:
+        _cops.qkv_norm_rope(
+            q, None if q_w is None else _w32(q_w), k,
+            None if k_w is None else _w32(k_w), v,
+            cos if cos_a is None else cos_a,
+            sin if sin_a is None else sin_a,
+            q_heads, k_heads, head_dim, eps)
+        return
+    qkv_norm(q, q_w, k, k_w, v, eps)
+    rope_apply(q, k, cos, sin, q_heads, k_heads, head_dim)
+
+
+def rms_norm_multi4(x, wn, eps, mats, cols):
+    """Normalize one row, then run up to four int4 matrices on the result.
+
+    One call in place of two. mats is a list of up to four (packed, scales)
+    pairs. A None entry skips a matrix. Return a list of results, or None for
+    a skipped matrix.
+    """
+    if _FUSED_OK:
+        _buf, addr = _scratch(cols)
+        return _cops.rms_norm_multi4(
+            np.ascontiguousarray(x, dtype=np.float32),
+            None if wn is None else _w32(wn), addr, eps, mats, cols)
+    h = rms_norm(x, wn, eps)
+    h = np.ascontiguousarray(h, dtype=np.float32).reshape(1, -1)
+    if _COPS_READY:
+        # The kernel that the model used before the fusion. It gives the same
+        # bits as the fused call.
+        return int4_multi4(mats, h, cols)
+    return [None if m is None else linear_int4(h, m[0], m[1]).reshape(-1)
+            for m in mats]
+
+
+def gelu_mul_int4(g, u, packed, scales, rows, cols):
+    """gelu(g) * u, then one int4 matrix on the result."""
+    if _FUSED_OK:
+        _buf, addr = _scratch(g.size)
+        return _cops.gelu_mul_int4(g, u, addr, packed, scales, rows, cols)
+    h = (gelu_tanh(g) * u).reshape(1, -1)
+    return linear_int4(h, packed, scales).reshape(-1)
+
+
+def moe_gemv_gelu(w, scales, x, ids, rows, cols, xstride, inner):
+    """The gate and up projection of the selected experts, then the GELU.
+
+    One call in place of two. Return one row of inner values for each job.
+    """
+    if _FUSED_OK:
+        return _cops.moe_gemv_gelu(w, scales, x, ids, ids.size, rows, cols,
+                                   xstride, inner)
+    act = int4_moe_gemv(w, scales, x, ids, rows, cols, xstride)
+    return gelu_tanh(act[:, :inner]) * act[:, inner:]
+
+
 def int4_multi4_ready():
     """Return True when the fused multi-matrix kernel is ready.
 
     Set NP_GEMMA_INT4_MULTI4=0 to compare the fused kernel with one call for
     each matrix.
     """
-    if os.environ.get("NP_GEMMA_INT4_MULTI4", "1") != "1":
-        return False
-    return _cops is not None and _cops.available()
+    return _MULTI4_OK
+
+
+# The activation format for the matrices of one token. The int8 form reads 8
+# weight rows in one multiply, but it must apply the group scale in float32
+# afterwards. The C test .cache/gemv_real.c gives 1.0 to 1.2 times the speed of
+# the float form, and the end-to-end test cannot separate the two from the
+# machine noise. The float form is therefore the default. Set
+# NP_GEMMA_INT4_Q8_GEMV=1 to select the int8 form on a machine with VNNI.
+def gemv_mode():
+    """Return "float" or "int8", the activation format for one token."""
+    return "int8" if _INT4_Q8_GEMV else "float"
 
 
 def int4_multi4(mats, x, cols):
     """Run up to four int4 matrices on the same one-row x."""
+    if _INT4_Q8_GEMV_OK:
+        return _cops.int4_q8_multi4(mats, x, cols)
     return _cops.int4_multi4(mats, x, cols)
 
 
@@ -350,9 +504,12 @@ def int4_moe_gemv(w, scales, x, ids, rows, cols, xstride):
     """Multiply each selected expert matrix by its input row.
 
     Use the fused kernel when the C library is ready. Otherwise, run one call
-    for each expert.
+    for each expert. When the machine has VNNI, use the int8 activation, which
+    holds eight weight rows in the lanes of one multiply.
     """
-    if _cops is not None and _cops.available():
+    if _COPS_READY:
+        if _INT4_Q8_GEMV_OK:
+            return _cops.int4_q8_moe_gemv(w, scales, x, ids, rows, cols, xstride)
         return _cops.int4_moe_gemv(w, scales, x, ids, rows, cols, xstride)
     ids = np.asarray(ids, dtype=np.int64)
     out = np.empty((ids.size, rows), dtype=np.float32)
@@ -461,7 +618,6 @@ def linear_int4_numpy(x, packed, scales):
 # activations to int8 with one scale for each group of 32 columns. The dot then
 # uses the integer multiply maddubs. Set NP_GEMMA_INT4_Q8=0 to compare with
 # the float path. The 26B model gives the same token ids on the Paris test.
-_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "1") == "1"
 # The smallest token count for the int8 tile. A smaller count wastes the token
 # lanes and pays for the quantization of the activations.
 _INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))
@@ -475,9 +631,32 @@ if _INT4_Q8_TB == 8 and _cops is not None and _cops.available():
 
 def int4_q8_ready():
     """Return True when the int4 kernel with int8 activations is ready."""
-    if not _INT4_Q8:
-        return False
-    return _cops is not None and _cops.available() and _cops.AVX512
+    return _INT4_Q8_OK
+
+
+def int4_q8_gemv_ready():
+    """Return True when the int8 dot product for one token is ready.
+
+    A machine without VNNI keeps the float kernels. Set
+    NP_GEMMA_INT4_Q8_GEMV=0 for a comparison on a machine with VNNI.
+    """
+    return _INT4_Q8_GEMV_OK
+
+
+def linear_int4_q8_gemv(x, packed, scales):
+    """Multiply a one-row x by W with int8 activations.
+
+    The C kernel uses the integer multiply vpdpbusd, which does 32 byte
+    products in one step. The weight rows fill the lanes of the register, so no
+    lane is idle. The kernel quantizes the activation itself, because a
+    separate quantization call costs more than the kernel at this size.
+    """
+    return _cops.int4_q8_gemv_x(x, packed, scales)
+
+
+def int4_q8_multi4(mats, x, cols):
+    """Run up to four int4 matrices on the same one-row x with int8 data."""
+    return _cops.int4_q8_multi4(mats, x, cols)
 
 
 def linear_int4_q8(x, packed, scales):
@@ -567,23 +746,22 @@ def linear_int4(x, packed, scales):
     Use the C kernel when the C path is available. Otherwise, dequantize W and
     use NumPy.
     """
-    mode = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
-    if mode != "numpy" and _cops is not None and _cops.available():
-        group = int4_group(packed, scales)
-        # The C kernel uses the block-32 layout. Use NumPy for another group.
-        if group == INT4_GROUP:
-            tokens = x.shape[0]
-            if tokens >= _INT4_Q8_TOKENS and int4_q8_ready():
-                return linear_int4_q8(x, packed, scales)
-            if tokens >= _INT4_GEMM_TOKENS:
-                xt = np.ascontiguousarray(x.T)
-                return _cops.linear_int4_gemm(x, xt, packed, scales, group)
-            if tokens >= _cops.INT4_TILE_TOKENS:
-                # A small group of tokens. Use the token-vectorized tile. It
-                # reads the x block one time for several weight rows.
-                xt = np.ascontiguousarray(x.T)
-                return _cops.linear_int4_tile(x, xt, packed, scales, group)
-            return _cops.linear_int4(x, packed, scales, group)
+    if _KERNEL_MODE != "numpy" and _COPS_READY:
+        group = INT4_GROUP
+        tokens = x.shape[0]
+        if tokens == 1 and _INT4_Q8_GEMV_OK:
+            return linear_int4_q8_gemv(x, packed, scales)
+        if tokens >= _INT4_Q8_TOKENS and _INT4_Q8_OK:
+            return linear_int4_q8(x, packed, scales)
+        if tokens >= _INT4_GEMM_TOKENS:
+            xt = np.ascontiguousarray(x.T)
+            return _cops.linear_int4_gemm(x, xt, packed, scales, group)
+        if tokens >= _cops.INT4_TILE_TOKENS:
+            # A small group of tokens. Use the token-vectorized tile. It reads
+            # the x block one time for several weight rows.
+            xt = np.ascontiguousarray(x.T)
+            return _cops.linear_int4_tile(x, xt, packed, scales, group)
+        return _cops.linear_int4(x, packed, scales, group)
     return linear_int4_numpy(x, packed, scales)
 
 
@@ -615,7 +793,7 @@ def linear_int8(x, q, scales, packed=None):
     to int8. The kernel uses integer multiply and add.
     Use the NumPy path for a group of columns or when the C path is absent.
     """
-    mode = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
+    mode = _KERNEL_MODE
     if mode != "numpy" and _cops is not None and _cops.available():
         group = int8_group(q, scales)
         # The integer kernel quantizes the activations too. This step causes a
@@ -655,9 +833,9 @@ def gelu_tanh(x):
 
     This function agrees with torch.nn.functional.gelu(approximate="tanh").
     """
-    x = np.asarray(x, dtype=np.float32)
-    if _cops is not None and _cops.available():
+    if _COPS_READY:
         return _cops.gelu(x)
+    x = np.asarray(x, dtype=np.float32)
     return 0.5 * x * (1.0 + np.tanh(GELU_C * (x + 0.044715 * x * x * x)))
 
 
@@ -668,9 +846,9 @@ def softmax_mask(scores, positions, n_rep, base, window):
     position of each query token. The kernel works in place and gives the
     probabilities of the last axis.
     """
-    scores = np.ascontiguousarray(scores, dtype=np.float32)
-    positions = np.ascontiguousarray(positions, dtype=np.int32)
-    if _cops is not None and _cops.available() and scores.ndim == 4:
+    if _COPS_READY and scores.ndim == 4:
+        scores = np.ascontiguousarray(scores, dtype=np.float32)
+        positions = np.ascontiguousarray(positions, dtype=np.int32)
         _cops.softmax_mask(scores, positions, n_rep, base, window)
         return scores
     kpos = base + np.arange(scores.shape[-1])
@@ -717,5 +895,11 @@ def softmax(x, axis=-1):
 
 
 def softcap(logits, cap):
-    """Limit the size of the logits. Apply tanh(logits / cap) * cap."""
+    """Limit the size of the logits. Apply tanh(logits / cap) * cap.
+
+    The tanh is monotonic, so this step cannot change the choice of a greedy
+    token. The sampling path needs the value, so the step stays.
+    """
+    if _COPS_READY:
+        return _cops.softcap(logits, cap)
     return np.tanh(np.asarray(logits, dtype=np.float32) / cap) * cap

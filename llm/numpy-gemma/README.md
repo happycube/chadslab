@@ -16,8 +16,19 @@ weight. See the section "Gemma 4 E4B".
 
 This file follows ASD-STE100, Simplified Technical English. A sentence in a
 description has 25 words or less. A sentence in an instruction has 20 words or
-less. `scripts/check_ste100.py` checks these rules and the approved verb forms.
+less.
+
+`scripts/check_ste100.py` checks a mechanical subset of these rules on
+any Markdown file. It uses only the Python standard library. Use `--ing-nouns`
+to add technical terms for a subject area. It does not check the full standard.
+
+Run it on this file with `python3 scripts/check_ste100.py README.md --ing-nouns scripts/ste100_ing_nouns.txt`.
+
 The commands, the tables, and the quoted model output keep their own words.
+
+Start with [LEARNING.md](LEARNING.md) to follow the dense 12B code path. The
+overview page uses the 26B model. Its layer count and dimensions do not describe
+the 12B model.
 
 The runtime does five tasks:
 1. Read the SafeTensors weights. Convert bfloat16 data to float32 or int8 data.
@@ -29,6 +40,7 @@ The runtime does five tasks:
 ## Files
 
     numpy-gemma/
+    ├── LEARNING.md         Follow the dense 12B path. Check each step.
     ├── WEIGHT_STRUCTURE.md  Four negative results on the linear-algebraic structure of the weights.
     ├── how-llms-work.html  Walk through the eight phases of inference, for a newcomer.
     ├── pipeline.html      The pipeline, with the performance, memory, and quality tradeoffs.
@@ -88,7 +100,8 @@ The runtime does five tasks:
         ├── e4b_generate.py     Generate E4B text. Check the ids against HF.
         ├── check_ct.py         Check the compressed-tensors reader against the library.
         ├── check_ct_kernel.py  Check the packed 4-bit and 2-bit C kernel, every column.
-        ├── check_ste100.py     Check this file against ASD-STE100, Simplified Technical English.
+        ├── check_ste100.py     Check any Markdown file against a rule subset.
+        ├── ste100_ing_nouns.txt  Allow project-specific technical nouns.
         ├── bench_ct_kernel.py  Compare the packed kernel with the float32 multiply.
         ├── profile_e4b.py      Split one decode step. Find why a token is slow.
         ├── profile_e4b_gguf.py Split a decode step of a GGUF file. Show each group.
@@ -102,6 +115,32 @@ The runtime does five tasks:
 
 ## Start here
 
+### Download model files
+
+Google hosts the model files on Hugging Face:
+
+* [Gemma 4 12B QAT, unquantized](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-unquantized) — use this as `SNAP`.
+* [Gemma 4 12B QAT, w4a16](https://huggingface.co/google/gemma-4-12B-it-qat-w4a16-ct) — use this as `SNAP4`.
+* [Gemma 4 E4B QAT, mobile compressed tensors](https://huggingface.co/google/gemma-4-E4B-it-qat-mobile-ct) — use this as `SNAP4B` for E4B.
+
+Hugging Face requires approval for Gemma downloads. Sign in, open each model
+page that you need, and accept its terms. Then run the commands below from the
+`numpy-gemma` directory. The adjacent project setup installs the Hugging Face
+client. See its [setup guide](../gemma4-12b-qat-pytorch/README.md) if its virtual
+environment is not ready.
+
+    cd ../gemma4-12b-qat-pytorch
+    source .venv/bin/activate
+    hf auth login
+    python scripts/download_model.py
+    python scripts/download_model.py --model google/gemma-4-12B-it-qat-w4a16-ct
+    python scripts/download_model.py --model google/gemma-4-E4B-it-qat-mobile-ct
+
+The first command downloads the 12B unquantized QAT checkpoint. Run the other
+commands only when you need those models. Each command prints its snapshot path.
+Use that full path for `SNAP`, `SNAP4`, or `SNAP4B` below. The files are large;
+the 12B unquantized checkpoint is about 24 GB.
+
 Set the paths one time:
 
     cd numpy-gemma
@@ -112,6 +151,8 @@ Set the paths one time:
 SNAP is the unquantized checkpoint. SNAP4 is the 4-bit checkpoint from the
 quantization-aware training. Use the full path. The command "find" can give the
 wrong model, because the cache holds two models.
+    The snapshot revisions above match the recorded runs. Use the paths printed by
+    the downloader if your cache has a different revision.
 
 Set the thread values before the first command:
 
@@ -199,6 +240,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
     NP_GEMMA_ATTN          1                       1 uses the fused attention. 0 uses the batched matmul and the NumPy path for a comparison.
+    NP_GEMMA_FUSED_QKV     1                       1 gives the query, the key, and the value their norm in one call, and the query and the key their rope in one call. 0 gives each tensor its own call.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
     NP_GEMMA_ARCH          auto                    avx2 or avx512 forces one C library.
@@ -213,6 +255,8 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_INT4_Q8       1                       1 uses the int8 tile for the int4 kernel. That tile is faster from two tokens up.
     NP_GEMMA_INT4_Q8_TOKENS 2                       The smallest token count for the int8 tile. A lower value is slower for one token.
     NP_GEMMA_INT4_MULTI4   1                       1 runs the query, key, and value in one call, and the gate with the up projection. 0 gives one call for each matrix.
+    NP_GEMMA_INT4_Q8_GEMV  0                       1 uses the int8 activation for the matrices of one token, on a machine with VNNI. It is not faster. See "What llama.cpp does differently".
+    NP_GEMMA_FUSED_STEP    1                       1 uses the fused entry points of the C library for a decode step. 0 gives one call for each kernel, which is slower by about 4 per cent.
     NP_GEMMA_E4B_BF16      1                       1 keeps a bfloat16 copy of a large weight that the quantization did not touch. 0 uses the float32 BLAS path.
     NP_GEMMA_E4B_BF16_MIN  1048576                 The smallest value count for the bfloat16 copy. A smaller matrix keeps the float32 path.
 
@@ -940,6 +984,111 @@ Two notes:
     against 0.33 s. This is the same effect the section "Start here" notes for
     the int8 kernel of the 12B model.
 
+### The elementwise kernels
+
+`gemma_rms_norm` normalizes the last axis of a tensor. A decode step calls it
+211 times for each token, on rows of 256 to 2816 values. The cost of one call
+is now nearly the same for every row length. Thus the fixed cost of the call is
+the larger part:
+
+    cols            1     256     704    2816
+    microseconds  7.58   7.71    7.86    8.42
+
+That measurement uses buffers that are already in place, so it holds the kernel
+and the call and not the Python. A call of `gemma_gelu` on one value gives the
+floor of a C call on this machine: about 5.9 microseconds. The work of the
+normalization is therefore about 0.9 microseconds for a row of 2816 values.
+
+The first form of the kernel summed the squares in one chain. The latency of an
+addition is about 4 cycles, so that loop used one value for 4 cycles and the
+multiply units waited. The kernel now uses four accumulators at 512 bits, which
+takes the multiply and the add of 64 values in each step. The work of one row
+fell from 7.1 to 2.5 microseconds.
+
+The sum now adds the values in a different order, so the result differs from a
+left to right sum in the last bits. `scripts/check_rms_norm.py` gives the size
+of that difference against a float64 reference. It is 1.1e-07 or better over 14
+shapes, and the rounding of the true value to float32 alone is 3 to 5e-07. The
+generated token ids of the 12B, the 26B, and the E4B do not change.
+
+A decode step has one row, and the work of that row is below the cost of a
+thread team. For fewer than 8 rows the kernel therefore stays out of the OpenMP
+runtime. That step alone saved about 1 microsecond for each call.
+
+### The cost of a call to C
+
+A decode step of the 26B model made about 600 calls to the C library. Each call
+passes pointers, and the cost of a call is almost all in the pointers. The
+measurement below uses an empty C function, so the times are the cost of the
+call alone:
+
+    the call                                      microseconds
+    ctypes, no argument                                   0.24
+    ctypes, each int argument                             0.10
+    ctypes, each pointer argument                         1.73
+    one read of ndarray.ctypes.data                       1.5
+
+Thus a call with three pointers costs about 5 microseconds before the kernel
+starts, and the read of `.ctypes.data` is the larger part of that. A run of
+`gemma_rms_norm` with the buffers already in place gives 6.0 microseconds when
+the code reads `.ctypes.data` for each call. It gives 1.6 microseconds when the
+code keeps the addresses. The Python wrapper above the call costs a further 4
+to 5 microseconds.
+
+`.cache/addr_reuse.py` counts the buffers that one function hands to the C
+library more than one time. One decode step of the 26B model hands over 1412
+arrays. Only 112 of those are a second use of a buffer by the same function.
+The rest are new activations, or a weight that a different function uses.
+
+    function            extra reads    the buffer
+    qkv_norm_rope                54    the cosine and sine tables
+    rms_norm_multi4              29    the scratch of the module
+    gelu_mul_int4                29    the scratch of the module
+
+A first measurement gave 633 extra reads. That number was wrong. The count
+used the identity of each array, and an array that is no longer alive lets a
+new array take the same identity. The script now holds a reference to every
+array that it counts.
+
+The three buffers above now keep their address with the buffer. The scratch
+carries it, and the rope table cache carries it next to the table. The count
+of extra reads is 0.
+
+That saves about 0.17 ms of a step, or 0.2 per cent. It is too small to
+separate from the noise of the machine.
+
+The other 1300 reads are not a repeat inside one function. To remove those, a
+buffer must keep its address across calls, and the model must own a pool of
+buffers for that. A pool carries a real danger: a caller that keeps a result
+while the next call writes into the same buffer.
+
+Two changes follow.
+
+**The environment is read one time.** The functions of `ops.py` asked for
+`NP_GEMMA_KERNEL`, `NP_GEMMA_INT4_Q8_GEMV`, and three more variables on every
+call. A lookup of the environment costs about 3 microseconds, and a decode step
+made 360 of them. Every value is now read at the import of the module. Set
+these variables before the import.
+
+**Two kernels run in one call.** The C library now gives four fused entry
+points. Each one is a composition of kernels that already exist, so the result
+does not change:
+
+    gemma_qkv_norm_rope    the three norms and the two rotations
+    gemma_rms_norm_multi4  the norm of a row, then up to four int4 matrices
+    gemma_gelu_mul_int4    gelu(g) * u, then one int4 matrix
+    gemma_moe_gemv_gelu    the gate and up projection, then the GELU
+
+The fused form is 3.8 per cent faster at the decode of the 26B model. Four
+interleaved pairs of `tg128` gave 12.38 tokens a second without the fusion and
+12.85 with it. The generated token ids are equal for the 12B, the 26B, and the
+E4B, and for a prompt of 1024 tokens. Set `NP_GEMMA_FUSED_STEP=0` for the
+separate calls.
+
+The count of calls for each token falls from about 600 to about 420. The
+remaining calls are the four large matrix kernels, which do most of the work,
+and the norm calls that the fusion does not reach.
+
 ### The Q4_0 GGUF source
 
 `np_gemma/gguf.py` reads the GGUF file with NumPy only. It maps the names of
@@ -1295,30 +1444,251 @@ The build is `llama.cpp/build-vnni` with AVX-512 VNNI. The command is:
         PYTHONPATH=. $PY scripts/bench_gguf_models.py --gguf FILE \
         --prompt 512 --gen 128 --reps 2
 
-The two runtimes run in turn, for three rounds. The table gives the mean:
+The two runtimes run in turn, for three rounds. The table gives the mean. The
+earlier run carried a machine load of 18 and the run below carried a load of 2.
+Thus the two runs do not agree in the last digit of each value. Both runtimes
+gain from the lighter load, so the ratio moves less than the value. The table
+below is the later run:
 
     model              runtime        pp512     tg128
-    gemma-4-12B Q4_0   llama.cpp      44.1 t/s   7.52 t/s
-    gemma-4-12B Q4_0   numpy-gemma    31.2 t/s   5.34 t/s
-    gemma-4-26B Q4_0   llama.cpp      83.1 t/s  18.02 t/s
-    gemma-4-26B Q4_0   numpy-gemma    69.7 t/s  11.68 t/s
-    gemma-4-E4B Q4_0   llama.cpp     107.8 t/s  16.10 t/s
-    gemma-4-E4B Q4_0   numpy-gemma    80.9 t/s  11.20 t/s
+    gemma-4-12B Q4_0   llama.cpp      42.4 t/s   7.46 t/s
+    gemma-4-12B Q4_0   numpy-gemma    29.0 t/s   5.53 t/s
+    gemma-4-26B Q4_0   llama.cpp      81.0 t/s  18.43 t/s
+    gemma-4-26B Q4_0   numpy-gemma    76.9 t/s  12.20 t/s
+    gemma-4-E4B Q4_0   llama.cpp     106.8 t/s  16.17 t/s
+    gemma-4-E4B Q4_0   numpy-gemma    73.3 t/s  11.26 t/s
 
     model              pp512   tg128
-    gemma-4-12B        1.41x   1.41x
-    gemma-4-26B        1.19x   1.54x
-    gemma-4-E4B        1.33x   1.44x
+    gemma-4-12B        1.46x   1.35x
+    gemma-4-26B        1.05x   1.51x
+    gemma-4-E4B        1.46x   1.44x
+
+The runs before that one gave other ratios. For the 12B they were 1.53 and 1.43,
+then 1.46 and 1.38. For the 26B they were 1.09 and 1.57, then 1.09 and 1.55. For
+the E4B they were 1.53 and 1.47, then 1.47 and 1.46. The runs agree on the
+ratios to about 0.05. The clock of the machine was about 2.3 GHz in every run;
+see "Memory bandwidth".
 
 Three points follow from the table:
 
 1.  The prompt pass of the 26B model is at parity. The mixture-of-experts
     prefill of this runtime is competitive with llama.cpp.
 2.  The 12B model has the smallest margin. It is a dense model, so each token
-    reads 6.48 GiB. The rate of llama.cpp is 52 GB/s against a machine rate of
-    59.8 GB/s. This runtime reaches 37 GB/s. Both sit near the limit.
-3.  The decode of the E4B model was the largest gap. The section below closes
-    most of it.
+    reads 6.48 GiB. The rate of llama.cpp is 53 GB/s against a machine rate of
+    59.8 GB/s. This runtime reaches 38 GB/s. Both sit near the limit.
+3.  The decode of the 26B model is the largest gap.
+
+#### The A4B decode
+
+The 26B model is a mixture of experts with 4B active parameters. One token
+reads 2390 MB:
+
+    part                   bytes
+    the experts            801 MB    8 of 128 experts for each of 30 layers
+    the attention          681 MB    the query, key, value, and output maps
+    the output head        605 MB    Q6_K
+    the dense feed-forward 301 MB    the gate, the up map, and the down map
+
+`scripts/profile_gguf_decode.py` gives the stage report and `glue26.py` in the
+cache directory gives each call. At a context of 512 tokens:
+
+    call                  calls   seconds   share   rate
+    experts                  60   21.5 ms    21%   37 GB/s
+    projections             120   16.7 ms    16%   30 GB/s
+    output head               1   16.0 ms    15%   38 GB/s
+    query, key, value        30   11.3 ms    11%   50 GB/s
+    attention                30   11.1 ms    11%
+    norms                   211    5.5 ms     5%
+    router                   30    3.8 ms     4%
+    the Python of the loop    1   12.4 ms    12%
+
+The machine reads at 59.8 GB/s. The model reaches 27 GB/s for each token
+against 43 GB/s for llama.cpp. The size of one matrix explains most of the
+difference, because the matrices of this model are small. One process gives
+this curve, so the readings share one load:
+
+    matrix                        rate
+    6.7 MB merged gate and up   34.5 GB/s
+   14.8 MB (the E4B gate)       42.2 GB/s
+   17.8 MB, the 8 experts       38.0 GB/s
+
+The 26B model has 90 matrices of 3.3 MB. The same kernel reads the larger E4B
+matrix at 42 GB/s. A small block does not reach the rate of the memory.
+
+Two changes follow from the profile:
+
+*   The gate and the up map of the dense feed-forward part share the input
+    row. One call for both reads 6.7 MB in place of two reads of 3.3 MB. In
+    one process, over the 30 layers, the pair goes from 212.6 to 172.5
+    microseconds for each layer, which is 31.5 to 38.8 GB/s.
+*   The rope table is now made one time for each layer type in place of one
+    time for each layer. A prompt of 30 layers makes two tables.
+
+The attention of this model already used the fused kernel, and it is 1.28
+times faster than the batched matmul here.
+
+#### Two ideas that the measurement does not support
+
+**A larger expert read does not help.** The 8 experts of one layer are 8
+blocks of 2.23 MB. One test read one contiguous region of 17.8 MB in place of
+the 8 blocks of the same total size. The rates are 37.7 and 38.8 GB/s. The
+reason is below: the kernel is limited by its instructions, so a longer read
+does not raise the rate.
+
+A second test used 16 experts in place of 8. The read went from 17.8 MB to
+35.7 MB, and the rate went from 38.9 to 39.9 GB/s. The order of the experts
+also does not matter: 8 scattered experts and experts 0 to 7 both give
+39 GB/s.
+
+**A chunked prompt does not help either.** The C flash kernel walks only the
+keys that the sliding window leaves visible. It already skips the keys that a
+chunk can drop. The kernel is ahead of the batched matmul at every length:
+1.08 times at 512 tokens, 1.25 times at 1024, and 1.48 times at 2048.
+
+#### What llama.cpp does differently
+
+llama.cpp repacks a Q4_0 tensor when the model loads. One block holds the
+scales of 8 rows and the nibbles of those 8 rows in pieces of 8 bytes. The
+nibbles become signed values. The buffer type is "CPU_REPACK". The multiply
+then uses an int8 kernel that covers 8 rows for each pass, with the activation
+as Q8_0.
+
+This project uses a float32 kernel over 4 rows for a decode step. It also has
+an int8 kernel, but that one puts 16 *tokens* in the lanes of a tile. For one
+token the lanes hold one token and 15 empty ones. The kernel is then 2.2 times
+slower than the float kernel. It gives 17.3 GB/s against 38.6 for the maps of
+the 26B. It has the wrong shape for a decode step.
+
+The int8 form of llama.cpp was put into this project and measured. The result
+is that the shape is **not** the answer. The new kernel
+`gemma_int4_q8_gemv` gives 1.0 to 1.2 times the rate of the float kernel. It is
+not the 1.5 to 1.9 times that an earlier test gave.
+
+Two smaller tests belong with this list:
+
+*   **The work between the calls is not the cost.** 30 small maps read in a
+    loop give 32.3 GB/s. The same loop with a norm and an add between the calls
+    gives 26.6 GB/s, and the difference is the time of the norm itself. Thus
+    the read keeps its rate.
+*   **llama.cpp does not use a prefetch instruction.** The repacked kernel has
+    no `_mm_prefetch` call, and it uses the AVX2 form rather than VNNI.
+
+**An earlier reading of the two kernels was wrong.** Two faults made the int8
+form look better than it is:
+
+*   The first test did not empty the cache between the calls. It gave rates
+    above the rate of a pure read for the same buffer. The data came from the
+    cache, not from the memory.
+*   The second test compared the int8 form with a float kernel that the author
+    wrote for the test. That kernel was about two times slower than the float
+    kernel of this project, `dot4_i4_f32`. A comparison against it says nothing
+    about the code that runs.
+
+The test `.cache/gemv_real.c` corrects both faults. It holds a copy of
+`dot4_i4_f32`. It writes 512 MB between the calls. The speed uses the bytes of
+the packed matrix and the bytes of the scale. The result at the map sizes of
+the 26B model is:
+
+    size         read   float   int8 8 rows   int8, no scale
+     1.36 MB    38.4    25.0      30.4           33.4
+     2.73 MB    51.5    30.8      29.3           37.0
+     4.09 MB    48.3    39.1      39.1           42.7
+     5.45 MB    61.4    41.2      42.7           46.5
+     7.93 MB    50.0    42.9      48.8           49.3
+    63.44 MB    56.5    52.6      52.9           55.5
+
+The rates are GB/s. The column "int8 8 rows" is the kernel of this project.
+The column "int8, no scale" leaves out the group scale, and it gives the upper
+limit of the integer multiply. The noise of one row is about 10 per cent, so
+one row can move by more than the difference between two columns.
+
+The int8 form is 0.95 to 1.21 times the float form. The mean is about 1.04.
+
+**The group scale is the reason.** The machine has hardware counters, so the
+two kernels were measured directly. `perf stat` ran each inner loop with one
+thread and a matrix of 5.45 MB, which stays in the 24.75 MB last level cache.
+That setting removes the memory from the question and shows the work of the
+instructions alone. The counters give:
+
+    kernel            cycles/repetition   instructions   IPC   port0  port1  port5
+    float, 4 rows             1,778,139      3,515,030  1.98    83%     5%    83%
+    int8, 8 rows              1,631,647      3,317,532  2.03    55%    55%    60%
+    int8, no scale              766,396      1,960,555  2.36    62%    63%    66%
+
+The counter `uops_dispatched_port.port_N` gives the port columns. A port at 100
+per cent is a port with no free slot in any cycle.
+
+**The scale is the cost.** The int8 kernel without the group scale is **2.32
+times** faster than the float kernel. With the scale it is only 1.09 times
+faster. The scale therefore takes back the whole advantage of the integer
+multiply.
+
+The reason is the width. For each row and each group the int8 kernel runs four
+steps at 256 bits. The steps are the subtraction of the nibble bias and the
+change from int32 to float32. They also include the multiply by the scale of
+the group and the fused multiply and add.
+
+The float kernel applies its scale in the fused multiply and add that it
+already runs. That operation is 512 bits wide, one time for the whole group.
+Thus the scale work of the int8 kernel is about four times the
+scale work of the float kernel for each value.
+
+A second measurement agrees. The int8 kernel reaches the rate of a pure read
+at the large sizes, and the float kernel reaches 86 per cent of it. That
+difference, about 1.14 times, is the whole gain of a decode step.
+
+**A note on the model.** `llvm-mca` reads the assembly of a loop and predicts
+the ports and the cycles. Give it the two group loops:
+
+    loop               instructions   cycles/group   cycles for 8 rows
+    float, 4 rows                50          17.10               34.20
+    int8, 8 rows                108          32.28               32.28
+
+That is 1.06 times for the int8 form, and the counters give 1.09 times. The
+model and the machine agree on the comparison.
+
+The model does not agree on the port numbers. It says 95 per cent for the float
+loop and 85 per cent for the int8 loop. The counters say 83 and 55 per cent.
+The reason is that the model assumes that every load comes from the first level
+cache. The real kernel waits on the memory, and the wait spreads the work over
+more cycles, so each port is less busy. **Use the model for a comparison of two
+kernels, not for the absolute port numbers.**
+
+An earlier version of this section gave 1.50 times for the int8 form, from a
+port table of 93 per cent. Those numbers were wrong. The tool took the wrong
+block of assembly. For the float kernel it read the horizontal reduction at the
+end of the kernel in place of the group loop. The reduction is shorter than the
+loop, so the comparison had no meaning. The numbers above come from the markers
+`LLVM-MCA-BEGIN` and `LLVM-MCA-END`, which name the loop itself.
+
+The decode of the 26B model shows the same result. Each of the three int4
+kernels has an int8 form, and each one is a little faster:
+
+    stage                   float    int8    change
+    mixture of experts       20.9    20.2     -3%
+    four matrices, one call  17.2    15.8     -8%
+    one matrix per call       9.5     8.8     -7%
+
+The total step time does not show the gain. The four int4 kernels are about
+half of a decode step. A cut of 6 per cent of them is therefore about 3 per
+cent of the step. The machine noise between two runs of the model is plus or
+minus 8 per cent. Five interleaved pairs of `tg96` gave a median of 11.14
+tokens a second for the float form and 10.90 for the int8 form. The two are
+the same within the noise.
+
+The int8 form is therefore **off by default**. Set `NP_GEMMA_INT4_Q8_GEMV=1`
+to use it. The code is in `gemma_int4_q8_gemv` and its three entry points
+`gemma_int4_q8_gemv_x`, `gemma_int4_q8_multi4`, and `gemma_int4_q8_moe_gemv`.
+The checks in `scripts/check_int4_q8.py` cover all of them.
+
+**The interleaved layout is also not the answer.** A test of the two layouts
+with the same access gave 1.0 to 1.2 times.
+
+**What remains.** llama.cpp is 1.57 times faster than this project at the
+decode of the A4B. The int4 kernel is not that difference. The stage report of
+`.cache/kern_time.py` gives the parts that are left. The output head reads
+605 MB of Q6_K data for each token. The 211 norm calls cost 4 ms of a 79 ms
+step. Those are the next places to look.
 
 #### The E4B decode at a long context
 
@@ -1357,6 +1727,23 @@ the hardware prefetch jump over the other head for each key. The cache now
 keeps (kv_heads, keys, head_dim), so the keys of one head follow each other. A
 measurement of the dot product alone gives 69 us for the first order and 29 us
 for the second.
+
+**The norm and the rope now use two calls.** Each layer gave the query, the
+key, and the value their own norm, and then turned the query and the key with
+their own rope. That is five calls and five OpenMP regions for each layer, and
+the NumPy rotation also builds a second array for each call. `ops.qkv_norm`
+and `ops.rope_apply` do the same work in two calls, in place.
+
+The two fused kernels agree with the path they replace to the last bit. The
+first form of the rope kernel did not. A fused multiply and add rounds one
+time fewer than the two multiplies and the add of the NumPy form. The model is
+sensitive to that difference over a long context: one token of a 1024-token
+prompt changed. The attribute `fp-contract=off` on the kernel removes the
+difference.
+
+The decode step loses 4 to 5 per cent from this change, and the number of
+calls for a token falls by 72. The prompt pass does not change.
+`NP_GEMMA_FUSED_QKV=0` selects the older path for a comparison.
 
 The generation at the context of the benchmark went from 8.52 to 11.20 tokens
 for each second. `NP_GEMMA_ATTN=0` selects the older matmul path for a
@@ -1410,6 +1797,7 @@ the same measurement differ by 5 to 10 per cent.
     Cached decode vs the whole sequence         8/8 ids equal
     int8 tile with VNNI, 12 token counts        relative 3.6e-07 or better
     GELU kernel against float64                 max difference 4.3e-07
+    RMSNorm kernel against float64, 14 shapes   max difference 1.1e-07
 
 The GELU check gives the same error for the AVX-512 build and the AVX2 build.
 98.2 per cent of the values agree bit for bit between the two builds, and the
@@ -1457,6 +1845,24 @@ These facts are necessary. A generic transformer will give wrong output.
   channel.
 
 ## Memory bandwidth
+
+**The clock of this machine is low.** The governor is `intel_pstate` in
+`powersave` mode with `energy_performance_preference` of `balance_performance`.
+The cores idle at 1.2 GHz and the maximum is 4.6 GHz. One busy core runs at
+about 2.3 GHz, and it stays there. A run of 13 seconds gave 2.34 GHz. A run of
+0.14 seconds gave 2.30 GHz.
+
+Thus the clock does not rise with a longer load. The base clock of the part is
+3.0 GHz.
+
+    sudo cpupower frequency-set -g performance
+
+That command puts the clock at the maximum. It is not applied here, because the
+machine has other users. Every absolute number in this document comes from a
+machine at about 2.3 GHz. A comparison between two versions of this project is
+not affected, because both ran at the same clock. A comparison of a compute
+bound stage against the memory rate is affected, because the memory rate does
+not change with the clock.
 
 The machine gives more bandwidth than the kernels use. Measured with
 scripts/membw.c (6 threads, one 4 GB array):
@@ -1620,6 +2026,31 @@ each token in the history for the penalties.
 9. Make the int8 tile faster for the prompt. It is 80 per cent of a prompt
    pass at about 900 GFLOP/s. A copy of a weight as int8 can remove the
    unpack of each 4-bit block, at the cost of a larger weight.
+10. ~~Give the decode step an int8 kernel with 8 rows for each pass and one
+    token lane.~~ **Done. It does not help.** See "What llama.cpp does
+    differently". The kernel `gemma_int4_q8_gemv` is correct and it is 1.0 to
+    1.2 times the float kernel, but the group scale costs it the gain. The
+    int8 form is off by default, behind `NP_GEMMA_INT4_Q8_GEMV=1`.
+11. ~~Make `gemma_rms_norm` use more than one value for each cycle.~~ **Done.**
+    The sum of the squares was one chain of additions with a latency of 4
+    cycles for each value. It now uses four accumulators at 512 bits. The work
+    of one call fell from 7.1 to 2.5 microseconds. The fixed cost of the call
+    is now the larger part. See "The elementwise kernels".
+12. ~~Cut the cost of a call to C.~~ **Done, in part.** The environment is now
+    read one time, and four fused entry points run two kernels in one call.
+    The decode of the 26B model gained 3.8 per cent, and the count of calls for
+    each token fell from about 600 to about 420. See "The cost of a call to C".
+13. Keep the address of a buffer across calls. A decode step hands about 1300
+    arrays to the C library, and each read of `ndarray.ctypes.data` costs about
+    1.5 microseconds. That is 2 ms of a 72 ms step. A pool of buffers that the
+    model owns can remove most of it. The danger is a caller that keeps a
+    result while the next call writes into the same buffer. A smaller step
+    with no danger is to keep the address of a weight, which the program never
+    changes.
+14. Reach the remaining fusion. The norm of the input of the attention block
+    and the norm of the post-attention state are still separate calls. Both
+    feed a matrix kernel, so both can join it as the gate and the up projection
+    now do.
 
 ## Sample run
 

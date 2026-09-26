@@ -185,6 +185,18 @@ try:
         _lib.gemma_int4_q8_tile_run32.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                                   _void_p, _void_p, _int, _int, _int, _int]
         _lib.gemma_int4_q8_tile_run32.restype = None
+        _lib.gemma_int4_q8_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                            _void_p, _void_p, _int, _int]
+        _lib.gemma_int4_q8_gemv.restype = None
+        _lib.gemma_int4_q8_gemv_x.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                              _int, _int]
+        _lib.gemma_int4_q8_gemv_x.restype = None
+        _lib.gemma_int4_q8_multi4.argtypes = (
+            [_void_p, _void_p, _void_p, _int] * 4) + [_void_p, _int]
+        _lib.gemma_int4_q8_multi4.restype = None
+        _lib.gemma_int4_q8_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                _int, _void_p, _int, _int, _int]
+        _lib.gemma_int4_q8_moe_gemv.restype = None
         _lib.gemma_quantize_q8_t_moe.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                                  _void_p, _int, _int, _void_p, _void_p,
                                                  _int]
@@ -235,6 +247,24 @@ try:
         _lib.gemma_rms_norm.restype = None
         _lib.gemma_gelu.argtypes = [_void_p, _void_p, _int]
         _lib.gemma_gelu.restype = None
+        _lib.gemma_softcap.argtypes = [_void_p, _void_p, _int, ctypes.c_float]
+        _lib.gemma_softcap.restype = None
+        _lib.gemma_qkv_norm_rope.argtypes = [
+            _void_p, _void_p, _int, _void_p, _void_p, _int, _void_p, _int,
+            _void_p, _void_p, _int, _int, _int, ctypes.c_float]
+        _lib.gemma_qkv_norm_rope.restype = None
+        _lib.gemma_rms_norm_multi4.argtypes = (
+            [_void_p, _void_p, _void_p, _int, ctypes.c_float]
+            + [_void_p, _void_p, _void_p, _int] * 4)
+        _lib.gemma_rms_norm_multi4.restype = None
+        _lib.gemma_gelu_mul_int4.argtypes = [
+            _void_p, _void_p, _int, _void_p, _void_p, _void_p, _void_p,
+            _int, _int]
+        _lib.gemma_gelu_mul_int4.restype = None
+        _lib.gemma_moe_gemv_gelu.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                             _int, _void_p, _void_p, _int, _int,
+                                             _int, _int]
+        _lib.gemma_moe_gemv_gelu.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -549,6 +579,20 @@ def linear_int4_tile(x, xt, packed, scales, group):
     return out
 
 
+def _pa(a):
+    """Return the address of a buffer argument.
+
+    An argument is an array, or an address that the caller read one time. The
+    second form is for a buffer that one function hands to this function more
+    than one time. The read of `ndarray.ctypes.data` costs about 1.5
+    microseconds, because it builds two objects, so it must not happen again
+    for each call.
+    """
+    if a is None or isinstance(a, int):
+        return a
+    return a.ctypes.data
+
+
 def quantize_q8_groups(x):
     """Quantize the last axis of x to int8 with one scale for each group of 32.
 
@@ -625,6 +669,91 @@ def int4_q8_tile32(qxt, sx, sumx, packed, scales, group, tokens):
                                   qxt.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
                                   out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
                                   ctypes.c_int(tokens), ctypes.c_int(stride))
+    return out
+
+
+def int4_q8_gemv(qx, sx, sumx, packed, scales):
+    """Multiply one token by W with int8 activations. W is packed 4-bit data.
+
+    qx is (cols,) int8, sx is (groups,) float32, and sumx is (groups,) int32,
+    all from quantize_q8_groups. The kernel keeps the weight rows in the lanes
+    of one register and the token in the group, so no lane is idle.
+    """
+    qx = np.ascontiguousarray(qx, dtype=np.int8)
+    sx = np.ascontiguousarray(sx, dtype=np.float32)
+    sumx = np.ascontiguousarray(sumx, dtype=np.int32)
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    rows = packed.shape[0]
+    cols = packed.shape[1] * 32
+    out = np.empty(rows, dtype=np.float32)
+    _lib.gemma_int4_q8_gemv(packed.ctypes.data, scales.ctypes.data,
+                            qx.ctypes.data, sx.ctypes.data, sumx.ctypes.data,
+                            out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols))
+    return out
+
+
+def int4_q8_gemv_x(x, packed, scales):
+    """Multiply a one-row x by W with int8 activations, from a float32 x.
+
+    The quantization of x and the dot product stay in one call, so the caller
+    starts one parallel region and pays for one call.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    rows = packed.shape[0]
+    cols = packed.shape[1] * 32
+    out = np.empty(rows, dtype=np.float32)
+    _lib.gemma_int4_q8_gemv_x(packed.ctypes.data, scales.ctypes.data,
+                              x.ctypes.data, out.ctypes.data,
+                              ctypes.c_int(rows), ctypes.c_int(cols))
+    return out
+
+
+def int4_q8_multi4(mats, x, cols):
+    """Run up to four int4 matrices on the same one-row x with int8 data.
+
+    mats is a list of up to four (packed, scales) pairs. A None entry skips a
+    matrix. Return a list of float32 outputs, or None for a skipped matrix.
+    The activation is quantized one time for all four matrices.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    args = []
+    outs = []
+    for i in range(4):
+        if i < len(mats) and mats[i] is not None:
+            w, s = mats[i]
+            w = np.ascontiguousarray(w, dtype=np.uint8)
+            s = np.ascontiguousarray(s, dtype=np.float32)
+            o = np.empty(w.shape[0], dtype=np.float32)
+            args += [w.ctypes.data, s.ctypes.data, o.ctypes.data,
+                     ctypes.c_int(w.shape[0])]
+            outs.append(o)
+        else:
+            args += [None, None, None, ctypes.c_int(0)]
+            outs.append(None)
+    args += [x.ctypes.data, ctypes.c_int(cols)]
+    _lib.gemma_int4_q8_multi4(*args)
+    return outs
+
+
+def int4_q8_moe_gemv(w, scales, x, ids, rows, cols, xstride):
+    """Multiply each selected expert matrix by its input row with int8 data.
+
+    w has the shape (experts, rows, groups, 18). scales has the shape
+    (experts, rows, groups). ids gives the selected experts. x has one row for
+    each job, with a stride of xstride. A stride of 0 gives the same x to each
+    job. Return (jobs, rows).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    ids = np.ascontiguousarray(ids, dtype=np.int32)
+    jobs = int(ids.size)
+    out = np.empty((jobs, rows), dtype=np.float32)
+    _lib.gemma_int4_q8_moe_gemv(w.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                                ids.ctypes.data, ctypes.c_int(jobs),
+                                out.ctypes.data, ctypes.c_int(rows),
+                                ctypes.c_int(cols), ctypes.c_int(xstride))
     return out
 
 
@@ -756,18 +885,24 @@ def linear_f32(x, w):
 
 
 def qkv_norm(q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps):
-    """Apply the RMSNorm of the query, the key, and the value in place."""
+    """Apply the RMSNorm of the query, the key, and the value in place.
+
+    A data pointer may be None. Then the matching row count must be zero. A
+    shared layer of the E4B model has no key and no value of its own.
+    """
     _lib.gemma_qkv_norm(q.ctypes.data, q_w.ctypes.data, ctypes.c_int(q_rows),
-                        k.ctypes.data, k_w.ctypes.data, ctypes.c_int(k_rows),
+                        None if k is None else k.ctypes.data, k_w.ctypes.data,
+                        ctypes.c_int(k_rows),
                         None if v is None else v.ctypes.data, ctypes.c_int(v_rows),
                         ctypes.c_int(head_dim), ctypes.c_float(eps))
 
 
 def rope_apply(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim):
-    """Apply RoPE to the query and the key in place."""
+    """Apply RoPE to the query and the key in place. k may be None."""
     _lib.gemma_rope(q.ctypes.data, ctypes.c_int(q_rows), ctypes.c_int(q_heads),
-                    k.ctypes.data, ctypes.c_int(k_rows), ctypes.c_int(k_heads),
-                    cos.ctypes.data, sin.ctypes.data, ctypes.c_int(head_dim))
+                    None if k is None else k.ctypes.data, ctypes.c_int(k_rows),
+                    ctypes.c_int(k_heads), cos.ctypes.data, sin.ctypes.data,
+                    ctypes.c_int(head_dim))
 
 
 def router(x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale, val, idx):
@@ -853,9 +988,18 @@ def rms_norm(x, w, eps):
     x = np.ascontiguousarray(x, dtype=np.float32)
     rows, cols = x.shape
     out = np.empty_like(x)
-    wp = None if w is None else w.ctypes.data
+    wp = _pa(w)
     _lib.gemma_rms_norm(x.ctypes.data, wp, out.ctypes.data,
                         ctypes.c_int(rows), ctypes.c_int(cols), ctypes.c_float(eps))
+    return out
+
+
+def softcap(logits, cap):
+    """Return tanh(logits / cap) * cap. The kernel works out of place."""
+    x = np.ascontiguousarray(logits, dtype=np.float32)
+    out = np.empty_like(x)
+    _lib.gemma_softcap(x.ctypes.data, out.ctypes.data, ctypes.c_int(x.size),
+                       ctypes.c_float(cap))
     return out
 
 
@@ -864,4 +1008,70 @@ def gelu(x):
     x = np.ascontiguousarray(x, dtype=np.float32)
     out = np.empty_like(x)
     _lib.gemma_gelu(x.ctypes.data, out.ctypes.data, ctypes.c_int(x.size))
+    return out
+
+
+def qkv_norm_rope(q, q_w, k, k_w, v, cos, sin, q_heads, k_heads, head_dim, eps):
+    """The three norms and the two rotations of one attention block.
+
+    One call in place of two. q, k, and v are (rows, head_dim). k and v may be
+    None. cos and sin must be contiguous float32.
+    """
+    z = 0
+    _lib.gemma_qkv_norm_rope(
+        q.ctypes.data, _pa(q_w) or z, q.shape[0],
+        z if k is None else k.ctypes.data, _pa(k_w) or z,
+        0 if k is None else k.shape[0],
+        z if v is None else v.ctypes.data, 0 if v is None else v.shape[0],
+        _pa(cos), _pa(sin), ctypes.c_int(q_heads),
+        ctypes.c_int(k_heads), ctypes.c_int(head_dim), ctypes.c_float(eps))
+
+
+def rms_norm_multi4(x, wn, scratch, eps, mats, cols):
+    """Normalize one row, then run up to four int4 matrices on the result.
+
+    mats is a list of up to four (packed, scales) pairs. A None entry skips a
+    matrix. Return a list of float32 outputs, or None for a skipped matrix.
+    scratch holds cols float32 values and belongs to the caller.
+    """
+    args = []
+    outs = []
+    for i in range(4):
+        if i < len(mats) and mats[i] is not None:
+            w, sc = mats[i]
+            o = np.empty(w.shape[0], dtype=np.float32)
+            args += [w.ctypes.data, sc.ctypes.data, o.ctypes.data,
+                     ctypes.c_int(w.shape[0])]
+            outs.append(o)
+        else:
+            args += [None, None, None, ctypes.c_int(0)]
+            outs.append(None)
+    _lib.gemma_rms_norm_multi4(x.ctypes.data, _pa(wn), _pa(scratch),
+                               ctypes.c_int(cols), ctypes.c_float(eps), *args)
+    return outs
+
+
+def gelu_mul_int4(g, u, scratch, packed, scales, rows, cols):
+    """gelu(g) * u, then one int4 matrix. scratch holds the inner values."""
+    o = np.empty(rows, dtype=np.float32)
+    _lib.gemma_gelu_mul_int4(g.ctypes.data, u.ctypes.data, ctypes.c_int(g.size),
+                             _pa(scratch), _pa(packed),
+                             _pa(scales), o.ctypes.data,
+                             ctypes.c_int(rows), ctypes.c_int(cols))
+    return o
+
+
+def moe_gemv_gelu(w, scales, x, ids, jobs, rows, cols, xstride, inner):
+    """The gate and up projection of the experts, then the GELU and multiply.
+
+    Return one row of inner values for each job. The gate and the up part go
+    into a scratch buffer of the call.
+    """
+    act = np.empty((jobs, 2 * inner), dtype=np.float32)
+    out = np.empty((jobs, inner), dtype=np.float32)
+    _lib.gemma_moe_gemv_gelu(w.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                             ids.ctypes.data, ctypes.c_int(jobs),
+                             act.ctypes.data, out.ctypes.data,
+                             ctypes.c_int(rows), ctypes.c_int(cols),
+                             ctypes.c_int(xstride), ctypes.c_int(inner))
     return out
