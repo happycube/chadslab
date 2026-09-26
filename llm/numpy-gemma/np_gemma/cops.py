@@ -268,6 +268,10 @@ try:
         _lib.gemma_attn_decode_mt.argtypes = [_void_p] * 8 + [_int, _int, _int,
                                                                _void_p, _void_p, _int, _int]
         _lib.gemma_attn_decode_mt.restype = None
+        _lib.gemma_run.argtypes = [_void_p, _int]
+        _lib.gemma_run.restype = _int
+        _lib.gemma_gp_record_size.argtypes = []
+        _lib.gemma_gp_record_size.restype = _int
         _lib.gemma_router_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                          _int, _int, _int, ctypes.c_float, ctypes.c_float,
                                          _void_p, _void_p, _int]
@@ -1226,3 +1230,13 @@ def linear_bf16_gemv(x, w_u16):
     """
     x = np.ascontiguousarray(x, dtype=np.float32)
     return _call(_lib.gemma_bf16_linear, w_u16, x)
+
+
+def gp_run(buf, limit=-1):
+    """Run a program of np_gemma.program. buf is its int64 array."""
+    return _lib.gemma_run(buf.ctypes.data, ctypes.c_int(limit))
+
+
+def gp_record_size():
+    """Return the size of one program record in C."""
+    return _lib.gemma_gp_record_size()

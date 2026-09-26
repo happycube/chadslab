@@ -6151,6 +6151,7 @@ void gemma_ct_linear(const uint32_t *w, const float *scale, const float *x,
  * own calls, so the result of the Python path does not change.
  */
 
+__attribute__((unused))
 static void gemma_q6k_linear_body(const uint8_t *w, const float *x, float *out,
                                   int rows, int cols, int tokens)
 {
@@ -6195,6 +6196,7 @@ static void gemma_moe_gemv_gelu_body(const uint8_t *w, const float *scales, cons
     gemma_gelu_mul_body(act, out, jobs, inner);
 }
 
+__attribute__((unused))
 static void gemma_moe_gemv_gelu_mt_body(const uint8_t *w, const float *scales,
                                         const float *x, const int *ids, const int *poff,
                                         const int *xi, int jobs, float *act, float *out,
@@ -6214,26 +6216,327 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
     gemma_rope_body(q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim);
 }
 
-/* Keep the bodies that only the interpreter calls. The interpreter comes in
- * phase 2b. */
-void gemma_bodies_keep(void);
-void gemma_bodies_keep(void)
+
+/* ---------- the program interpreter ----------
+ * PERF_PLAN.md, phase 2. Python builds a program (np_gemma/program.py) and
+ * this code runs it. The program is one int64 array:
+ *
+ *     int64  magic, env count, record count, 0
+ *     int64  env[env count]         the slots: parameters and variables
+ *     record code[record count]
+ *
+ * A record has an operation code, flags, and GP_NARG operands. A tag gives
+ * the kind of each operand: an integer literal (an address is an integer), a
+ * float literal (the bits of a float32), or a slot of the environment.
+ *
+ * gemma_run opens one OpenMP region for the whole program. Each thread copies
+ * the environment. A scalar operation writes the private copy of each thread,
+ * so the scalar operations need no barrier and no thread writes shared data.
+ * A kernel operation calls the body of a kernel. The loops of a body are an
+ * orphaned "omp for", which ends with a barrier. A one-row operation runs in
+ * an "omp single", which also ends with a barrier.
+ *
+ * limit runs only the first limit records. A check compares the buffers after
+ * each prefix with the Python interpreter, and the first difference names the
+ * faulty operation. A limit below zero runs every record.
+ */
+
+#define GP_NARG 24
+#define GP_MAGIC 0x4750524f47303031LL   /* "GPROG001" */
+
+typedef struct {
+    int32_t op;
+    int32_t flags;
+    uint8_t tag[GP_NARG];
+    int64_t v[GP_NARG];
+} gp_rec;
+
+enum { GP_T_NONE = 0, GP_T_INT = 1, GP_T_F32 = 2, GP_T_SLOT = 3 };
+
+enum {
+    GP_S_MOV = 1, GP_S_ADD = 2, GP_S_SUB = 3, GP_S_MUL = 4, GP_S_MAX = 5,
+    GP_S_MIN = 6,
+    GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19,
+    GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
+    GP_GELU_MUL_INT4 = 35,
+    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50,
+    GP_ROUTER = 64, GP_MOE = 65,
+};
+
+int gemma_gp_record_size(void)
 {
-    (void)gemma_q6k_linear_body;
-    (void)gemma_rms_norm_multi4_body;
-    (void)gemma_gelu_mul_int4_body;
-    (void)gemma_moe_gemv_gelu_body;
-    (void)gemma_moe_gemv_gelu_mt_body;
-    (void)gemma_qkv_norm_rope_body;
-    (void)gemma_router_body;
-    (void)gemma_router_mt_body;
-    (void)gemma_softcap_body;
-    (void)gemma_gelu_body;
-    (void)gemma_rms_norm_body;
-    (void)gemma_quantize_q8_groups_body;
-    (void)gemma_attn_decode_body;
-    (void)gemma_attn_decode_mt_body;
-    (void)gemma_softmax_mask_body;
-    (void)gemma_int4_linear_mt_body;
-    (void)gemma_int4_multi4_mt_body;
+    return (int)sizeof(gp_rec);
+}
+
+static inline int64_t gp_i(const gp_rec *r, const int64_t *e, int k)
+{
+    return r->tag[k] == GP_T_SLOT ? e[r->v[k]] : r->v[k];
+}
+
+static inline float gp_f(const gp_rec *r, const int64_t *e, int k)
+{
+    uint32_t u = (uint32_t)gp_i(r, e, k);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+#define GP_P(T, k) ((T *)(intptr_t)gp_i(r, e, (k)))
+#define GP_I(k) ((int)gp_i(r, e, (k)))
+
+/* out += d * v, one multiply and one add for each value, as NumPy does. A fused
+ * multiply and add rounds one time and gives other bits. */
+__attribute__((optimize("fp-contract=off")))
+static void gp_add_scaled(float *out, const float *d, float v, int n)
+{
+    for (int c = 0; c < n; ++c) {
+        float p = d[c] * v;
+        out[c] = out[c] + p;
+    }
+}
+
+/* The experts of one token, as Model._moe_one_token does it: the selected
+ * experts in the order of their index, then the sum of their outputs with the
+ * router weights in that order. */
+static void gp_moe_one(const gp_rec *r, const int64_t *e)
+{
+    const float *h = GP_P(const float, 0);
+    const float *val = GP_P(const float, 1);
+    const int32_t *idx = GP_P(const int32_t, 2);
+    int top_k = GP_I(3);
+    const uint8_t *gu_w = GP_P(const uint8_t, 4);
+    const float *gu_s = GP_P(const float, 5);
+    const uint8_t *dn_w = GP_P(const uint8_t, 6);
+    const float *dn_s = GP_P(const float, 7);
+    int gu_rows = GP_I(8);
+    int cols = GP_I(9);
+    int dn_rows = GP_I(10);
+    int inner = GP_I(11);
+    int32_t *ids = GP_P(int32_t, 12);
+    float *act = GP_P(float, 13);
+    float *act2 = GP_P(float, 14);
+    float *de = GP_P(float, 15);
+    float *out = GP_P(float, 16);
+    #pragma omp single
+    {
+        /* np.unique: the router gives distinct experts, so a sort is enough. */
+        for (int j = 0; j < top_k; ++j) {
+            ids[j] = idx[j];
+        }
+        for (int j = 1; j < top_k; ++j) {
+            int32_t x = ids[j];
+            int k = j - 1;
+            while (k >= 0 && ids[k] > x) {
+                ids[k + 1] = ids[k];
+                --k;
+            }
+            ids[k + 1] = x;
+        }
+    }
+    gemma_moe_gemv_gelu_body(gu_w, gu_s, h, ids, top_k, act, act2, gu_rows, cols, 0, inner);
+    gemma_int4_moe_gemv_body(dn_w, dn_s, act2, ids, top_k, de, dn_rows, inner, inner);
+    #pragma omp single
+    {
+        for (int c = 0; c < dn_rows; ++c) {
+            out[c] = 0.0f;
+        }
+        for (int j = 0; j < top_k; ++j) {
+            int s = 0;
+            while (idx[s] != ids[j]) {
+                ++s;
+            }
+            gp_add_scaled(out, de + (size_t)j * (size_t)dn_rows, val[s], dn_rows);
+        }
+    }
+}
+
+static void gp_step(const gp_rec *r, int64_t *e)
+{
+    switch (r->op) {
+    /* ---- scalar operations: every thread, private copy ---- */
+    case GP_S_MOV: e[r->v[0]] = gp_i(r, e, 1); break;
+    case GP_S_ADD: e[r->v[0]] = gp_i(r, e, 1) + gp_i(r, e, 2); break;
+    case GP_S_SUB: e[r->v[0]] = gp_i(r, e, 1) - gp_i(r, e, 2); break;
+    case GP_S_MUL: e[r->v[0]] = gp_i(r, e, 1) * gp_i(r, e, 2); break;
+    case GP_S_MAX: {
+        int64_t a = gp_i(r, e, 1), b = gp_i(r, e, 2);
+        e[r->v[0]] = a > b ? a : b;
+        break;
+    }
+    case GP_S_MIN: {
+        int64_t a = gp_i(r, e, 1), b = gp_i(r, e, 2);
+        e[r->v[0]] = a < b ? a : b;
+        break;
+    }
+    /* ---- one-row operations ---- */
+    case GP_RMS_NORM: {
+        /* x, w (0 for none), out, rows, cols, eps */
+        const float *x = GP_P(const float, 0);
+        const float *w = GP_P(const float, 1);
+        float *out = GP_P(float, 2);
+        int rows = GP_I(3), cols = GP_I(4);
+        float eps = gp_f(r, e, 5);
+        #pragma omp single
+        for (int i = 0; i < rows; ++i) {
+            gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
+                               out + (size_t)i * (size_t)cols, cols, eps);
+        }
+        break;
+    }
+    case GP_ADD: {
+        /* a, b, out, n */
+        const float *a = GP_P(const float, 0);
+        const float *b = GP_P(const float, 1);
+        float *out = GP_P(float, 2);
+        int n = GP_I(3);
+        #pragma omp single
+        for (int i = 0; i < n; ++i) {
+            out[i] = a[i] + b[i];
+        }
+        break;
+    }
+    case GP_MUL_S: {
+        /* x, s (float), out, n */
+        const float *x = GP_P(const float, 0);
+        float sc = gp_f(r, e, 1);
+        float *out = GP_P(float, 2);
+        int n = GP_I(3);
+        #pragma omp single
+        for (int i = 0; i < n; ++i) {
+            out[i] = x[i] * sc;
+        }
+        break;
+    }
+    case GP_COPY: {
+        /* src, dst, bytes */
+        const void *src = GP_P(const void, 0);
+        void *dst = GP_P(void, 1);
+        size_t n = (size_t)gp_i(r, e, 2);
+        #pragma omp single
+        memcpy(dst, src, n);
+        break;
+    }
+    /* ---- int4 matrices ---- */
+    case GP_INT4_LINEAR:
+        /* x, w, s, out, rows, cols */
+        gemma_int4_linear_body(GP_P(const uint8_t, 1), GP_P(const float, 2),
+                               GP_P(const float, 0), GP_P(float, 3),
+                               GP_I(4), GP_I(5), 1, 32);
+        break;
+    case GP_INT4_MULTI4:
+        /* x, cols, then (w, s, out, rows) four times */
+        gemma_int4_multi4_body(GP_P(const uint8_t, 2), GP_P(const float, 3), GP_P(float, 4), GP_I(5),
+                               GP_P(const uint8_t, 6), GP_P(const float, 7), GP_P(float, 8), GP_I(9),
+                               GP_P(const uint8_t, 10), GP_P(const float, 11), GP_P(float, 12), GP_I(13),
+                               GP_P(const uint8_t, 14), GP_P(const float, 15), GP_P(float, 16), GP_I(17),
+                               GP_P(const float, 0), GP_I(1));
+        break;
+    case GP_RMS_NORM_MULTI4:
+        /* x, wn, scratch, cols, eps, then (w, s, out, rows) four times */
+        gemma_rms_norm_multi4_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2),
+                                   GP_I(3), gp_f(r, e, 4),
+                                   GP_P(const uint8_t, 5), GP_P(const float, 6), GP_P(float, 7), GP_I(8),
+                                   GP_P(const uint8_t, 9), GP_P(const float, 10), GP_P(float, 11), GP_I(12),
+                                   GP_P(const uint8_t, 13), GP_P(const float, 14), GP_P(float, 15), GP_I(16),
+                                   GP_P(const uint8_t, 17), GP_P(const float, 18), GP_P(float, 19), GP_I(20));
+        break;
+    case GP_GELU_MUL_INT4:
+        /* g, u, inner, scratch, w, s, out, rows, cols */
+        gemma_gelu_mul_int4_body(GP_P(const float, 0), GP_P(const float, 1), GP_I(2),
+                                 GP_P(float, 3), GP_P(const uint8_t, 4), GP_P(const float, 5),
+                                 GP_P(float, 6), GP_I(7), GP_I(8));
+        break;
+    /* ---- attention ---- */
+    case GP_QKV_NORM_ROPE:
+        /* q, q_w, q_rows, k, k_w, k_rows, v, v_rows, cos, sin, q_heads,
+         * k_heads, head_dim, eps */
+        gemma_qkv_norm_rope_body(GP_P(float, 0), GP_P(const float, 1), GP_I(2),
+                                 GP_P(float, 3), GP_P(const float, 4), GP_I(5),
+                                 GP_P(float, 6), GP_I(7),
+                                 GP_P(const float, 8), GP_P(const float, 9),
+                                 GP_I(10), GP_I(11), GP_I(12), gp_f(r, e, 13));
+        break;
+    case GP_KV_WRITE: {
+        /* k, v, kd, vd, kqd, ksd, vqd, vsd, n: store one row of the float
+         * cache and of its int8 copy */
+        const float *k = GP_P(const float, 0);
+        const float *v = GP_P(const float, 1);
+        float *kd = GP_P(float, 2);
+        float *vd = GP_P(float, 3);
+        int8_t *kqd = GP_P(int8_t, 4);
+        float *ksd = GP_P(float, 5);
+        int8_t *vqd = GP_P(int8_t, 6);
+        float *vsd = GP_P(float, 7);
+        int n = GP_I(8);
+        #pragma omp single
+        {
+            int32_t junk;
+            memcpy(kd, k, (size_t)n * sizeof(float));
+            memcpy(vd, v, (size_t)n * sizeof(float));
+            for (int g = 0; g < n / 32; ++g) {
+                ksd[g] = gemma_quant_group32(k + (size_t)g * 32, kqd + (size_t)g * 32, &junk);
+                vsd[g] = gemma_quant_group32(v + (size_t)g * 32, vqd + (size_t)g * 32, &junk);
+            }
+        }
+        break;
+    }
+    case GP_ATTN_Q8: {
+        /* q, qq, qs, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+         * head_dim, n: the fused attention of one query over the int8 cache */
+        const float *q = GP_P(const float, 0);
+        int8_t *qq = GP_P(int8_t, 1);
+        float *qs = GP_P(float, 2);
+        int q_heads = GP_I(9), head_dim = GP_I(11);
+        #pragma omp single
+        {
+            int32_t junk;
+            for (int g = 0; g < q_heads * head_dim / 32; ++g) {
+                qs[g] = gemma_quant_group32(q + (size_t)g * 32, qq + (size_t)g * 32, &junk);
+            }
+        }
+        gemma_attn_decode_body(qq, qs, GP_P(const int8_t, 3), GP_P(const float, 4),
+                               GP_P(const int8_t, 5), GP_P(const float, 6),
+                               GP_P(float, 7), GP_P(float, 8),
+                               q_heads, GP_I(10), head_dim, GP_I(12));
+        break;
+    }
+    /* ---- mixture of experts ---- */
+    case GP_ROUTER:
+        /* x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale,
+         * val, idx, r, logits */
+        gemma_router_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2),
+                          GP_P(const float, 3), GP_I(4), GP_I(5), GP_I(6),
+                          gp_f(r, e, 7), gp_f(r, e, 8), GP_P(float, 9), GP_P(int, 10),
+                          GP_P(float, 11), GP_P(float, 12));
+        break;
+    case GP_MOE:
+        gp_moe_one(r, e);
+        break;
+    default:
+        break;
+    }
+}
+
+int gemma_run(const int64_t *prog, int limit)
+{
+    if (prog[0] != GP_MAGIC) {
+        return -1;
+    }
+    const int n_env = (int)prog[1];
+    int n_code = (int)prog[2];
+    const int64_t *env0 = prog + 4;
+    const gp_rec *code = (const gp_rec *)(env0 + n_env);
+    if (limit >= 0 && limit < n_code) {
+        n_code = limit;
+    }
+    #pragma omp parallel
+    {
+        int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
+        memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
+        for (int pc = 0; pc < n_code; ++pc) {
+            gp_step(code + pc, e);
+        }
+        free(e);
+    }
+    return 0;
 }

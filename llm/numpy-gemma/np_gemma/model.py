@@ -135,9 +135,13 @@ class KVCache:
         self.vq[layer] = qv
         self.vs[layer] = qvs
 
-    def write(self, layer, start_pos, k, v):
-        """Store a block of keys and values. start_pos is the position of k[0]."""
-        t = k.shape[0]
+    def prepare(self, layer, start_pos, t):
+        """Make room for t rows at start_pos. Return the buffer row of start_pos.
+
+        A sliding layer drops its oldest rows here, and a buffer grows here.
+        write calls this first. The program of a decode step (np_gemma.program)
+        calls it before the step and then writes the rows in C.
+        """
         end = start_pos + t
         if self.cfg.plan[layer].is_sliding:
             w = self.window
@@ -168,17 +172,21 @@ class KVCache:
             need = end - self.base[layer]
             if need > self.k[layer].shape[0]:
                 self._grow(layer, max(need, 2 * w))
-            start = start_pos - self.base[layer]
-            self.k[layer][start:start + t] = k
-            self.v[layer][start:start + t] = v
         else:
             if self.k[layer] is None or self.k[layer].shape[0] < end:
                 cap = max(self.max_len, end)
                 if self.k[layer] is not None:
                     cap = max(cap, self.k[layer].shape[0] * 2)
                 self._grow(layer, cap)
-            self.k[layer][start_pos:end] = k
-            self.v[layer][start_pos:end] = v
+        return start_pos - self.base[layer]
+
+    def write(self, layer, start_pos, k, v):
+        """Store a block of keys and values. start_pos is the position of k[0]."""
+        t = k.shape[0]
+        end = start_pos + t
+        start = self.prepare(layer, start_pos, t)
+        self.k[layer][start:start + t] = k
+        self.v[layer][start:start + t] = v
         self.end[layer] = end
         # Keep an int8 copy for the fused attention of a decode step. Build it
         # only when the cache is long enough that the fused path pays for the
