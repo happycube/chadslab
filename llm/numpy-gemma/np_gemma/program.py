@@ -37,7 +37,7 @@ The entry points:
     decode_step(model, ...)     bind the step, run it, return the hidden state
     compile_layers(model, ...)  the program of some layers, for a check
 
-The attention mode attn is "q8" or "f32". The mode "q8" reads the int8 copy
+The attention mode attn is "qc" or "f32". The mode "qc" reads the int16 copy
 of the cache (NP_GEMMA_ATTN=1, the default). The mode "f32" reads the float
 cache (NP_GEMMA_ATTN=0, the default of the server).
 Model.forward uses decode_step for one token when ready() allows it. The
@@ -68,8 +68,8 @@ S_MOV, S_ADD, S_SUB, S_MUL, S_MAX, S_MIN = 1, 2, 3, 4, 5, 6
 RMS_NORM, ADD, MUL_S, COPY, GELU, MUL = 16, 17, 18, 19, 20, 21
 INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
 INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, BF16_LINEAR = 36, 37, 38, 39
-QKV_NORM_ROPE, KV_WRITE, ATTN_Q8, ATTN_F32 = 48, 49, 50, 51
-ATTN_Q8_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
+QKV_NORM_ROPE, KV_WRITE, ATTN_QC, ATTN_F32 = 48, 49, 50, 51
+ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
 ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
 
 OP_NAMES = {v: k for k, v in dict(
@@ -77,9 +77,9 @@ OP_NAMES = {v: k for k, v in dict(
     RMS_NORM=RMS_NORM, ADD=ADD, MUL_S=MUL_S, COPY=COPY, INT4_LINEAR=INT4_LINEAR,
     INT4_MULTI4=INT4_MULTI4, RMS_NORM_MULTI4=RMS_NORM_MULTI4,
     GELU_MUL_INT4=GELU_MUL_INT4, QKV_NORM_ROPE=QKV_NORM_ROPE, KV_WRITE=KV_WRITE,
-    ATTN_Q8=ATTN_Q8, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
+    ATTN_QC=ATTN_QC, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
     INT4_LINEAR_MT=INT4_LINEAR_MT, INT4_MULTI4_MT=INT4_MULTI4_MT,
-    GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_Q8_MT=ATTN_Q8_MT, ATTN_F32_MT=ATTN_F32_MT,
+    GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_QC_MT=ATTN_QC_MT, ATTN_F32_MT=ATTN_F32_MT,
     ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
     ATTN_F32H=ATTN_F32H).items()}
@@ -322,19 +322,19 @@ def _py_step(op, a, e):
         _arr(V(3), n)[:] = v
         if not V(4):
             return
-        kq, ks = ops.quantize_q8(k.reshape(-1, 32))
-        vq, vs = ops.quantize_q8(v.reshape(-1, 32))
-        _arr(V(4), n, ctypes.c_int8)[:] = kq.reshape(-1)
+        kq, ks = ops.quantize_i16(k.reshape(-1, 32))
+        vq, vs = ops.quantize_i16(v.reshape(-1, 32))
+        _arr(V(4), n, ctypes.c_int16)[:] = kq.reshape(-1)
         _arr(V(5), n // 32)[:] = ks.reshape(-1)
-        _arr(V(6), n, ctypes.c_int8)[:] = vq.reshape(-1)
+        _arr(V(6), n, ctypes.c_int16)[:] = vq.reshape(-1)
         _arr(V(7), n // 32)[:] = vs.reshape(-1)
-    elif op == ATTN_Q8:
-        qh, kvh, hd, n = V(9), V(10), V(11), V(12)
+    elif op == ATTN_QC:
+        qh, kvh, hd, n = V(7), V(8), V(9), V(10)
         q = _arr(V(0), qh * hd)
-        o = ops.attn_decode(q.reshape(qh, hd), _arr(V(3), n * kvh * hd, ctypes.c_int8),
-                            _arr(V(4), n * kvh * hd // 32), _arr(V(5), n * kvh * hd, ctypes.c_int8),
-                            _arr(V(6), n * kvh * hd // 32), qh, kvh, hd, n)
-        _arr(V(8), qh * hd)[:] = o.reshape(-1)
+        o = ops.attn_decode(q.reshape(qh, hd), _arr(V(1), n * kvh * hd, ctypes.c_int16),
+                            _arr(V(2), n * kvh * hd // 32), _arr(V(3), n * kvh * hd, ctypes.c_int16),
+                            _arr(V(4), n * kvh * hd // 32), qh, kvh, hd, n)
+        _arr(V(6), qh * hd)[:] = o.reshape(-1)
     elif op == ATTN_F32:
         qh, kvh, hd, n = V(5), V(6), V(7), V(8)
         o = cops.attn_decode_f32s(_arr(V(0), qh * hd).reshape(qh, hd),
@@ -375,9 +375,9 @@ def _py_step(op, a, e):
         g = _arr(V(0), rows * inner).reshape(rows, inner)
         u = _arr(V(1), rows * inner).reshape(rows, inner)
         _arr(V(2), rows * inner)[:] = ops.gelu_mul_rows(g, u).reshape(-1)
-    elif op in (ATTN_Q8_MT, ATTN_F32_MT):
-        q8 = op == ATTN_Q8_MT
-        o = 9 if q8 else 5
+    elif op in (ATTN_QC_MT, ATTN_F32_MT):
+        qc = op == ATTN_QC_MT
+        o = 7 if qc else 5
         qh, kvh, hd, t = V(o), V(o + 1), V(o + 2), V(o + 3)
         pos, base, window = V(o + 4), V(o + 5), V(o + 6)
         q = _arr(V(0), t * qh * hd).reshape(t, qh, hd)
@@ -386,12 +386,12 @@ def _py_step(op, a, e):
         n = p_ + 1 - base - lo
         rows = int((n + lo).max())
         per = kvh * hd
-        out = _arr(V(8 if q8 else 4), t * qh * hd).reshape(t, qh, hd)
-        if q8:
-            kq = _arr(V(3), rows * per, ctypes.c_int8).reshape(rows, kvh, hd)
-            ks = _arr(V(4), rows * per // 32).reshape(rows, kvh, hd // 32)
-            vq = _arr(V(5), rows * per, ctypes.c_int8).reshape(rows, kvh, hd)
-            vs = _arr(V(6), rows * per // 32).reshape(rows, kvh, hd // 32)
+        out = _arr(V(6 if qc else 4), t * qh * hd).reshape(t, qh, hd)
+        if qc:
+            kq = _arr(V(1), rows * per, ctypes.c_int16).reshape(rows, kvh, hd)
+            ks = _arr(V(2), rows * per // 32).reshape(rows, kvh, hd // 32)
+            vq = _arr(V(3), rows * per, ctypes.c_int16).reshape(rows, kvh, hd)
+            vs = _arr(V(4), rows * per // 32).reshape(rows, kvh, hd // 32)
             out[:] = ops.attn_decode_mt(q, kq, ks, vq, vs, qh, kvh, hd, lo, n)
         else:
             K = _arr(V(1), rows * per).reshape(rows, kvh, hd)
@@ -736,17 +736,18 @@ def _addr(c, base, row, stride):
     return c.scalar("+", [base, c.scalar("*", [row, stride])])
 
 
-def k_kv_write(c, layer, k, v, row, q8=1):
-    """(kv_write layer k v row q8): store the key and the value at the
-    buffer row of the cache of a layer. With q8, also store the int8 copy, as
-    KVCache._store_q8 does. The addresses come from the slots of the layer
+def k_kv_write(c, layer, k, v, row, qc=1):
+    """(kv_write layer k v row qc): store the key and the value at the
+    buffer row of the cache of a layer. With qc, also store the int16 copy, as
+    KVCache._store_qc does. The addresses come from the slots of the layer
     and the row, with scalar operations."""
     plan = c.cfg.plan[layer]
     per = plan.num_kv_heads * plan.head_dim
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
-    if q8:
-        q = [_addr(c, s("kq"), row, per), _addr(c, s("ks"), row, 4 * (per // 32)),
-             _addr(c, s("vq"), row, per), _addr(c, s("vs"), row, 4 * (per // 32))]
+    if qc:
+        # An int16 row has 2 bytes for each value and 4 bytes for each scale.
+        q = [_addr(c, s("kq"), row, 2 * per), _addr(c, s("ks"), row, 4 * (per // 32)),
+             _addr(c, s("vq"), row, 2 * per), _addr(c, s("vs"), row, 4 * (per // 32))]
     else:
         q = [0, 0, 0, 0]
     # The rows of a group are adjacent in the cache, so one copy stores them.
@@ -754,17 +755,17 @@ def k_kv_write(c, layer, k, v, row, q8=1):
              _addr(c, s("k"), row, 4 * per), _addr(c, s("v"), row, 4 * per), *q, k.size)
 
 
-def k_attn_q8(c, layer, q, lo, n):
-    """(attn_q8 layer q lo n): the fused attention of one query over n rows
-    of the int8 cache, from buffer row lo. As Model._attend_one."""
+def k_attn_qc(c, layer, q, lo, n):
+    """(attn_qc layer q lo n): the fused attention of one float32 query over
+    n rows of the int16 cache, from buffer row lo. As Model._attend_one."""
     plan = c.cfg.plan[layer]
     hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
     per = kvh * hd
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
     out = c.buffer((1, qh * hd))
-    c.p.emit(ATTN_Q8, q, c.buffer(qh * hd, np.int8), c.buffer(qh * hd // 32),
-             _addr(c, s("kq"), lo, per), _addr(c, s("ks"), lo, 4 * (per // 32)),
-             _addr(c, s("vq"), lo, per), _addr(c, s("vs"), lo, 4 * (per // 32)),
+    c.p.emit(ATTN_QC, q,
+             _addr(c, s("kq"), lo, 2 * per), _addr(c, s("ks"), lo, 4 * (per // 32)),
+             _addr(c, s("vq"), lo, 2 * per), _addr(c, s("vs"), lo, 4 * (per // 32)),
              c.p.slot("scores"), out, qh, kvh, hd, n)
     return out
 
@@ -786,21 +787,22 @@ def k_attn_f32(c, layer, q, lo, n):
 
 
 def k_attn_rows(c, layer, q, attn):
-    """(attn_rows_q8 layer q) or (attn_rows_f32 layer q): the attention of a
-    group of queries. The first form reads the int8 cache, and the second
-    reads the float cache. Each row of q is one query. Query j has the position pos + j. The operation finds the
-    key rows of each query from pos, the base of the layer, and the window.
-    As the group path of Model._attention."""
+    """(attn_rows_qc layer q) or (attn_rows_f32 layer q): the attention of a
+    group of queries. The first form reads the int16 cache, and the second
+    reads the float cache. Each row of q is one query. Query j has the
+    position pos + j. The operation finds the key rows of each query from
+    pos, the base of the layer, and the window. As the group path of
+    Model._attention."""
     plan = c.cfg.plan[layer]
     hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
     t = q.size // (qh * hd)
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
     out = c.buffer((t, qh * hd))
     pos, base, window = c.p.slot("pos"), s("base"), plan.sliding_window or 0
-    if attn == "q8":
-        c.p.emit(ATTN_Q8_MT, q, c.buffer(t * qh * hd, np.int8), c.buffer(t * qh * hd // 32),
-                 s("kq"), s("ks"), s("vq"), s("vs"), c.p.slot("scores"), out, qh, kvh, hd,
-                 t, pos, base, window, np.zeros(t, np.int32), np.zeros(t, np.int32))
+    if attn == "qc":
+        c.p.emit(ATTN_QC_MT, q, s("kq"), s("ks"), s("vq"), s("vs"), c.p.slot("scores"), out,
+                 qh, kvh, hd, t, pos, base, window, np.zeros(t, np.int32),
+                 np.zeros(t, np.int32))
     else:
         c.p.emit(ATTN_F32_MT, q, s("k"), s("v"), c.p.slot("scores"), out, qh, kvh, hd, t,
                  pos, base, window)
@@ -957,11 +959,11 @@ KERNELS = {
     "int4": k_int4,
     "qkv_norm_rope": k_qkv_norm_rope,
     "kv_write": k_kv_write,
-    "attn_q8": k_attn_q8,
+    "attn_qc": k_attn_qc,
     "attn_f32": k_attn_f32,
     # The mode is part of the name. A bare string operand is a name for the
     # compiler, so the form cannot give the mode as an operand.
-    "attn_rows_q8": lambda c, layer, q: k_attn_rows(c, layer, q, "q8"),
+    "attn_rows_qc": lambda c, layer, q: k_attn_rows(c, layer, q, "qc"),
     "attn_rows_f32": lambda c, layer, q: k_attn_rows(c, layer, q, "f32"),
     "router": k_router,
     "gelu": k_gelu,
@@ -979,14 +981,15 @@ KERNELS = {
 
 # ---- the forms of the 26B model -------------------------------------------------
 
-def layer_form(model, i, attn="q8", t=1):
+def layer_form(model, i, attn="qc", t=1):
     """Return one decoder layer as a nested expression.
 
     The expression follows Model._decoder_layer and Model._attention for t
     tokens. The kernel operations select the kernels of one token or of a
     group from the row count of their input. The attention of a group finds
-    the key rows of each query itself. The mode attn is "q8" for the int8 cache and "f32" for the float
-    cache. x is the hidden state. The layer changes it in place. A model with the
+    the key rows of each query itself. The mode attn is "qc" for the int16
+    cache and "f32" for the float cache. x is the hidden state. The layer
+    changes it in place. A model with the
     mixture-of-experts block (the 26B) adds the router and the experts; the
     dense model (the 12B) does not.
     """
@@ -1009,7 +1012,7 @@ def layer_form(model, i, attn="q8", t=1):
         lo = ("max", 0, ("-", "pos", plan.sliding_window - 1, base))
     else:
         lo = 0
-    q8 = 1 if attn == "q8" else 0
+    qc = 1 if attn == "qc" else 0
     if t == 1:
         attn_forms = (("let", "lo", lo),
                       ("let", "n", ("-", ("+", "pos", 1), base, "lo")),
@@ -1030,7 +1033,7 @@ def layer_form(model, i, attn="q8", t=1):
             ("qkv_norm_rope", "q", "k", "v", w("self_attn.q_norm"), w("self_attn.k_norm"),
              "cos." + kind, "sin." + kind, i),
             ("let", "row", ("-", "pos", base)),
-            ("kv_write", i, "k", "v", "row", q8),
+            ("kv_write", i, "k", "v", "row", qc),
             *attn_forms,
             ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
             ("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),
@@ -1042,7 +1045,7 @@ def layer_form(model, i, attn="q8", t=1):
             ("set", "x", ("mul", "x", w("layer_scalar"))))
 
 
-def step_form(model, attn="q8", t=1):
+def step_form(model, attn="qc", t=1):
     """Return a whole decode step of t tokens: every layer, then the final
     norm into xn."""
     layers = [layer_form(model, i, attn, t) for i in range(model.cfg.num_hidden_layers)]
@@ -1079,7 +1082,7 @@ def format_form(form, indent=0):
     return "\n".join(parts) + ")"
 
 
-def compile_layers(model, layers, attn="q8", t=1):
+def compile_layers(model, layers, attn="qc", t=1):
     """Compile decoder layers for t tokens into one Program. The buffer "x"
     is the input and the output."""
     c = Compiler(model)
@@ -1093,7 +1096,7 @@ def compile_layers(model, layers, attn="q8", t=1):
     return c.p.finish()
 
 
-def compile_step(model, attn="q8", t=1):
+def compile_step(model, attn="qc", t=1):
     """Compile a whole step of t tokens. "x" is the input embedding and "xn"
     the hidden state after the final norm, the input of the output head. A
     step of 2 to 16 tokens is the verify step of MTP."""
@@ -1110,13 +1113,13 @@ def compile_step(model, attn="q8", t=1):
 def ready(model, cache):
     """Return the attention mode of a step program for this cache, or None.
 
-    The int8 mode needs the int8 copy of every layer. It is on after 128
+    The mode "qc" needs the int16 copy of every layer. It is on after 128
     tokens. Before that, the Python path runs the step, because the step
-    that turns the int8 copy on also quantizes the old rows.
+    that turns the int16 copy on also quantizes the old rows.
     """
     if ops.attn_ready():
-        if all(cache.q8_ready(i) for i in range(model.cfg.num_hidden_layers)):
-            return "q8"
+        if all(cache.qc_ready(i) for i in range(model.cfg.num_hidden_layers)):
+            return "qc"
         return None
     return "f32"
 
@@ -1145,20 +1148,20 @@ def bind_step(prog, model, cache, pos):
     """Prepare the cache for the tokens of a step and bind the parameters.
 
     The cache work stays in Python: KVCache.prepare drops old rows and grows
-    a buffer. The program then writes the new rows in C. The int8 copy of the
-    cache must be on for every layer of the program.
+    a buffer. The program then writes the new rows in C. In the mode "qc",
+    the int16 copy of the cache must be on for every layer of the program.
     """
     kw = {"pos": pos}
     keep = []
-    q8 = getattr(prog, "attn", "q8") == "q8"
+    qc = getattr(prog, "attn", "qc") == "qc"
     t = getattr(prog, "tokens", 1)
     for i in prog.layers:
-        assert not q8 or cache.q8_ready(i), "the program needs the int8 cache"
+        assert not qc or cache.qc_ready(i), "the program needs the int16 cache"
         cache.prepare(i, pos, t)
         cache.end[i] = pos + t
         kw.update({"base.%d" % i: cache.base[i], "k.%d" % i: cache.k[i],
                    "v.%d" % i: cache.v[i]})
-        if q8:
+        if qc:
             kw.update({"kq.%d" % i: cache.kq[i], "ks.%d" % i: cache.ks[i],
                        "vq.%d" % i: cache.vq[i], "vs.%d" % i: cache.vs[i]})
     positions = np.arange(pos, pos + t)

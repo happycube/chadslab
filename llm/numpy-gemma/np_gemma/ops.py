@@ -238,8 +238,8 @@ def linear_q6k(x, w_bytes, cols):
     return linear_q6k_numpy(x, w_bytes, cols)
 
 
-# The key and value cache keeps an int8 copy only when it holds at least this
-# many values. Below it the float32 path is faster.
+# The key and value cache keeps an int16 copy only when it holds at least this
+# many rows. Below it the float32 path is faster.
 ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
 
 
@@ -473,10 +473,12 @@ def int4_multi4(mats, x, cols):
 
 
 def attn_ready():
-    """Return True when the fused attention kernel is ready.
+    """Return True when the fused attention over the int16 cache is ready.
 
-    Set NP_GEMMA_ATTN=0 to use the float32 key and value cache and the NumPy
-    attention path. That path matches the reference more closely.
+    Set NP_GEMMA_ATTN=0 to use the float32 key and value cache. The two give
+    about the same result. The int16 copy with a float32 query changes the
+    attention output by about 4e-5 of its size, and a logit by at most
+    0.0014. The int16 copy reads about half the bytes of the float cache.
     """
     if os.environ.get("NP_GEMMA_ATTN", "1") == "0":
         return False
@@ -502,22 +504,30 @@ def quantize_q8(x):
     return q.reshape(shape), scale.reshape(shape[:-1])
 
 
-def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
-    """Run the fused attention for one query token.
+def quantize_i16(x):
+    """Quantize x to int16. The last axis of x is one group of 32 values.
 
-    q is the query after RoPE, with the shape (q_heads, head_dim). The key and
-    value caches hold int8 values and one float32 scale for each group of 32.
-    Return the attention output, with the shape (q_heads, head_dim).
+    Return the int16 data with the shape of x, and one float32 scale for each
+    group, with the shape x.shape[:-1]. This is the convention of
+    quantize_q8. The scale is the largest magnitude of the group over 32767.
+    The C code rounds to the nearest even value, and the program of a decode
+    step uses the same code.
     """
-    g = head_dim // 32
-    qq, qs = quantize_q8(q.reshape(q_heads, g, 32))
-    qq = np.ascontiguousarray(qq).reshape(q_heads, head_dim)
-    qs = np.ascontiguousarray(qs)
-    scores = np.empty((q_heads, n), dtype=np.float32)
-    out = np.empty((q_heads, head_dim), dtype=np.float32)
-    _cops.attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
-                      q_heads, kv_heads, head_dim, n)
-    return out
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    assert x.shape[-1] == 32, "the last axis must be one group of 32 values"
+    q, s = _cops.quantize_i16_groups(x.reshape(-1))
+    return q.reshape(x.shape), s.reshape(x.shape[:-1])
+
+
+def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
+    """Run the fused attention for one query token over the int16 cache.
+
+    q is the float32 query after RoPE, with the shape (q_heads, head_dim). The
+    key and value caches hold int16 values and one float32 scale for each
+    group of 32. The query stays float32. Return (q_heads, head_dim).
+    """
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(q_heads, head_dim)
+    return _cops.attn_decode_i16(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n)
 
 
 def attn_decode_f32s(q, k, v, pos, base, window):
@@ -533,17 +543,13 @@ def attn_decode_f32s(q, k, v, pos, base, window):
 def attn_decode_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
     """Run the fused attention for a small group of query tokens in one call.
 
-    q is (tokens, q_heads, head_dim). Token t reads the cache rows lo[t] to
-    lo[t] + n[t] - 1. Each token gets the bits of attn_decode on those rows.
-    Return (tokens, q_heads, head_dim).
+    q is (tokens, q_heads, head_dim). Token t reads the rows lo[t] to
+    lo[t] + n[t] - 1 of the int16 cache. Each token gets the bits of
+    attn_decode on those rows. Return (tokens, q_heads, head_dim).
     """
     t = q.shape[0]
-    g = head_dim // 32
-    qq, qs = quantize_q8(q.reshape(t, q_heads, g, 32))
-    qq = np.ascontiguousarray(qq).reshape(t, q_heads, head_dim)
-    qs = np.ascontiguousarray(qs)
-    return _cops.attn_decode_mt(qq, qs, kq, ks, vq, vs, q_heads, kv_heads,
-                                head_dim, lo, n)
+    q = np.ascontiguousarray(q, dtype=np.float32).reshape(t, q_heads, head_dim)
+    return _cops.attn_decode_i16_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n)
 
 
 def attn_decode_f32(q, k, v, pos, base=0, window=0):

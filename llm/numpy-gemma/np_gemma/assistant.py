@@ -72,7 +72,7 @@ class Assistant:
         self.cfg = Config({"text_config": raw["text_config"]})
         self.backbone = raw["backbone_hidden_size"]
         self.dtype = dtype
-        # Read the int8 copy of the target cache when it is ready. Set False
+        # Read the int16 copy of the target cache when it is ready. Set False
         # to read the float copy, as the check against transformers does.
         self.q8_attn = q8_attn
         # Stop a draft when the drafter gives its best token less than this
@@ -152,10 +152,10 @@ class Assistant:
             o = ops.attn_decode_f32(np.ascontiguousarray(q), store[0][:, :pos, :],
                                     store[1][:, :pos, :], pos, 0, window)
             return self.linear(o.reshape(1, nq * hd), w["self_attn.o_proj"])
-        if self.q8_attn and ops.attn_ready() and cache.q8_ready(layer):
-            # The int8 copy of the target cache, with the fused kernel of the
-            # decode step. It reads a quarter of the bytes of the float copy.
-            kq, ks, vq, vs, base = cache.read_q8(layer, pos)
+        if self.q8_attn and ops.attn_ready() and cache.qc_ready(layer):
+            # The int16 copy of the target cache, with the fused kernel of the
+            # decode step. It reads about half the bytes of the float copy.
+            kq, ks, vq, vs, base = cache.read_qc(layer, pos)
             lo = max(0, pos - self.cfg.sliding_window + 1 - base) if plan.is_sliding else 0
             o = ops.attn_decode(np.ascontiguousarray(q), kq[lo:], ks[lo:], vq[lo:], vs[lo:],
                                 nq, kq.shape[1], hd, kq.shape[0] - lo)

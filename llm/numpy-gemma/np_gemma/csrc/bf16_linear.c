@@ -3710,6 +3710,210 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
     gemma_attn_decode_body(qq, qs, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, n);
 }
 
+/* ---------- the int16 copy of the key and value cache ----------
+ *
+ * The cache keeps a copy of each key and value as int16, with one float32
+ * scale for each group of 32 values. The query stays float32. The error of
+ * the attention output is then about 4e-5 of its size. An int8 copy with an
+ * int8 query gave about 1e-2, which moved a logit by up to 2.6. The int16
+ * copy reads 2.125 bytes for each value, against 4 for the float cache.
+ *
+ * The quantizer is plain C with lrintf, which rounds to the nearest even
+ * value. Every caller uses it, so the Python path and the program give the
+ * same bits. */
+static inline float gemma_quant_group32_i16(const float *x, int16_t *q)
+{
+    float amax = 0.0f;
+    for (int k = 0; k < 32; ++k) {
+        float a = fabsf(x[k]);
+        if (a > amax) {
+            amax = a;
+        }
+    }
+    float sc = amax > 0.0f ? amax / 32767.0f : 1e-12f;
+    for (int k = 0; k < 32; ++k) {
+        long v = lrintf(x[k] / sc);
+        if (v > 32767) {
+            v = 32767;
+        }
+        if (v < -32767) {
+            v = -32767;
+        }
+        q[k] = (int16_t)v;
+    }
+    return sc;
+}
+
+/* Quantize groups of 32 values to int16. x holds groups * 32 values. */
+static void gemma_quantize_i16_groups_body(const float *x, int16_t *q, float *s,
+                                           long groups)
+{
+    #pragma omp for schedule(static)
+    for (long g = 0; g < groups; ++g) {
+        s[g] = gemma_quant_group32_i16(x + (size_t)g * 32, q + (size_t)g * 32);
+    }
+}
+
+void gemma_quantize_i16_groups(const float *x, int16_t *q, float *s, long groups)
+{
+    #pragma omp parallel if(groups >= 1024)
+    gemma_quantize_i16_groups_body(x, q, s, groups);
+}
+
+/* The dot product of 32 float32 values and 32 int16 values. */
+static inline float dot32_f32_i16(const float *a, const int16_t *b)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 b0 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+        _mm256_loadu_si256((const __m256i *)b)));
+    __m512 b1 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+        _mm256_loadu_si256((const __m256i *)(b + 16))));
+    __m512 acc = _mm512_mul_ps(_mm512_loadu_ps(a), b0);
+    acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + 16), b1, acc);
+    return _mm512_reduce_add_ps(acc);
+#elif GEMMA_X86
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < 32; i += 8) {
+        __m256 bv = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+            _mm_loadu_si128((const __m128i *)(b + i))));
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), bv, acc);
+    }
+    return hsum256_ps(acc);
+#else
+    float acc = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        acc += a[i] * (float)b[i];
+    }
+    return acc;
+#endif
+}
+
+/* One query head over n rows of the int16 cache. qh is float32. */
+static inline void attn_i16_head(const float *qh, const int16_t *kq, const float *ks,
+                                 const int16_t *vq, const float *vs, float *sc,
+                                 float *oh, int kv, int head_dim, size_t kv_stride,
+                                 size_t ks_stride, int n)
+{
+    int g = head_dim / 32;
+    for (int j = 0; j < n; ++j) {
+        const int16_t *kp = kq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *ksp = ks + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        float s = 0.0f;
+        for (int gg = 0; gg < g; ++gg) {
+            s += dot32_f32_i16(qh + (size_t)gg * 32, kp + (size_t)gg * 32) * ksp[gg];
+        }
+        sc[j] = s;
+    }
+    float m = sc[0];
+    for (int j = 1; j < n; ++j) {
+        if (sc[j] > m) {
+            m = sc[j];
+        }
+    }
+    float l = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float e = expf(sc[j] - m);
+        sc[j] = e;
+        l += e;
+    }
+    float inv = 1.0f / l;
+    for (int d = 0; d < head_dim; ++d) {
+        oh[d] = 0.0f;
+    }
+    for (int j = 0; j < n; ++j) {
+        float p = sc[j] * inv;
+        const int16_t *vp = vq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *vsp = vs + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        for (int gg = 0; gg < g; ++gg) {
+            const int16_t *vpp = vp + (size_t)gg * 32;
+            float *op = oh + (size_t)gg * 32;
+#if GEMMA_X86 && defined(__AVX512F__)
+            __m512 pv = _mm512_set1_ps(p * vsp[gg]);
+            for (int i = 0; i < 32; i += 16) {
+                __m512 vf = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(
+                    _mm256_loadu_si256((const __m256i *)(vpp + i))));
+                _mm512_storeu_ps(op + i, _mm512_fmadd_ps(pv, vf, _mm512_loadu_ps(op + i)));
+            }
+#elif GEMMA_X86
+            __m256 pv = _mm256_set1_ps(p * vsp[gg]);
+            for (int i = 0; i < 32; i += 8) {
+                __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+                    _mm_loadu_si128((const __m128i *)(vpp + i))));
+                _mm256_storeu_ps(op + i, _mm256_fmadd_ps(pv, vf, _mm256_loadu_ps(op + i)));
+            }
+#else
+            float pv = p * vsp[gg];
+            for (int i = 0; i < 32; ++i) {
+                op[i] += pv * (float)vpp[i];
+            }
+#endif
+        }
+    }
+}
+
+/* The attention of one float32 query over n rows of the int16 cache. q is
+ * (q_heads, head_dim). scores holds q_heads * n values. */
+static void gemma_attn_decode_i16_body(const float *q, const int16_t *kq, const float *ks,
+                                       const int16_t *vq, const float *vs, float *scores,
+                                       float *out, int q_heads, int kv_heads,
+                                       int head_dim, int n)
+{
+    int n_rep = q_heads / kv_heads;
+    size_t kv_stride = (size_t)kv_heads * (size_t)head_dim;
+    size_t ks_stride = (size_t)kv_heads * (size_t)(head_dim / 32);
+    #pragma omp for schedule(static)
+    for (int h = 0; h < q_heads; ++h) {
+        attn_i16_head(q + (size_t)h * (size_t)head_dim, kq, ks, vq, vs,
+                      scores + (size_t)h * (size_t)n, out + (size_t)h * (size_t)head_dim,
+                      h / n_rep, head_dim, kv_stride, ks_stride, n);
+    }
+}
+
+void gemma_attn_decode_i16(const float *q, const int16_t *kq, const float *ks,
+                           const int16_t *vq, const float *vs, float *scores,
+                           float *out, int q_heads, int kv_heads, int head_dim, int n)
+{
+    #pragma omp parallel
+    gemma_attn_decode_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                               head_dim, n);
+}
+
+/* The same for a group of queries. Query t reads the rows lo[t] to
+ * lo[t] + n[t] - 1. A decode step of that query reads the same rows. q is
+ * (tokens, q_heads, head_dim). scores holds tokens * q_heads * nmax values. */
+static void gemma_attn_decode_i16_mt_body(const float *q, const int16_t *kq,
+                                          const float *ks, const int16_t *vq,
+                                          const float *vs, float *scores, float *out,
+                                          int q_heads, int kv_heads, int head_dim,
+                                          const int *lo, const int *n, int nmax,
+                                          int tokens)
+{
+    int n_rep = q_heads / kv_heads;
+    size_t kv_stride = (size_t)kv_heads * (size_t)head_dim;
+    size_t ks_stride = (size_t)kv_heads * (size_t)(head_dim / 32);
+    int total = tokens * q_heads;
+    #pragma omp for schedule(static)
+    for (int u = 0; u < total; ++u) {
+        int t = u / q_heads;
+        int h = u % q_heads;
+        size_t r = (size_t)lo[t];
+        attn_i16_head(q + (size_t)u * (size_t)head_dim, kq + r * kv_stride,
+                      ks + r * ks_stride, vq + r * kv_stride, vs + r * ks_stride,
+                      scores + (size_t)u * (size_t)nmax, out + (size_t)u * (size_t)head_dim,
+                      h / n_rep, head_dim, kv_stride, ks_stride, n[t]);
+    }
+}
+
+void gemma_attn_decode_i16_mt(const float *q, const int16_t *kq, const float *ks,
+                              const int16_t *vq, const float *vs, float *scores,
+                              float *out, int q_heads, int kv_heads, int head_dim,
+                              const int *lo, const int *n, int nmax, int tokens)
+{
+    #pragma omp parallel
+    gemma_attn_decode_i16_mt_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                  head_dim, lo, n, nmax, tokens);
+}
+
 /* The fused decode attention for a small group of query tokens in one
  * parallel region. Token t reads the key rows lo[t] to lo[t] + n[t] - 1 of the
  * int8 cache. A decode step of that token reads the same rows.
@@ -6336,8 +6540,8 @@ enum {
     GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
     GP_GELU_MUL_INT4 = 35, GP_INT4_LINEAR_MT = 36, GP_INT4_MULTI4_MT = 37,
     GP_GELU_MUL_ROWS = 38, GP_BF16_LINEAR = 39,
-    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50, GP_ATTN_F32 = 51,
-    GP_ATTN_Q8_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
+    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_QC = 50, GP_ATTN_F32 = 51,
+    GP_ATTN_QC_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
 };
@@ -6690,51 +6894,38 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                  GP_I(10), GP_I(11), GP_I(12), gp_f(r, e, 13));
         break;
     case GP_KV_WRITE: {
-        /* k, v, kd, vd, kqd, ksd, vqd, vsd, n: store one row of the float
-         * cache and of its int8 copy */
+        /* Operands: k, v, kd, vd, kqd, ksd, vqd, vsd, n.
+         * Store the rows of the float cache and of its int16 copy. A cache
+         * with no int16 copy gives null addresses. */
         const float *k = GP_P(const float, 0);
         const float *v = GP_P(const float, 1);
         float *kd = GP_P(float, 2);
         float *vd = GP_P(float, 3);
-        int8_t *kqd = GP_P(int8_t, 4);
+        int16_t *kqd = GP_P(int16_t, 4);
         float *ksd = GP_P(float, 5);
-        int8_t *vqd = GP_P(int8_t, 6);
+        int16_t *vqd = GP_P(int16_t, 6);
         float *vsd = GP_P(float, 7);
         int n = GP_I(8);
         #pragma omp single
         {
-            int32_t junk;
             memcpy(kd, k, (size_t)n * sizeof(float));
             memcpy(vd, v, (size_t)n * sizeof(float));
-            /* A cache with no int8 copy gives null addresses. */
             for (int g = 0; kqd != NULL && g < n / 32; ++g) {
-                ksd[g] = gemma_quant_group32(k + (size_t)g * 32, kqd + (size_t)g * 32, &junk);
-                vsd[g] = gemma_quant_group32(v + (size_t)g * 32, vqd + (size_t)g * 32, &junk);
+                ksd[g] = gemma_quant_group32_i16(k + (size_t)g * 32, kqd + (size_t)g * 32);
+                vsd[g] = gemma_quant_group32_i16(v + (size_t)g * 32, vqd + (size_t)g * 32);
             }
         }
         break;
     }
-    case GP_ATTN_Q8: {
-        /* Operands: q, qq, qs, kq, ks, vq, vs, scores, out, q_heads,
-         * kv_heads, head_dim, n.
-         * The fused attention of one query over the int8 cache. */
-        const float *q = GP_P(const float, 0);
-        int8_t *qq = GP_P(int8_t, 1);
-        float *qs = GP_P(float, 2);
-        int q_heads = GP_I(9), head_dim = GP_I(11);
-        #pragma omp single
-        {
-            int32_t junk;
-            for (int g = 0; g < q_heads * head_dim / 32; ++g) {
-                qs[g] = gemma_quant_group32(q + (size_t)g * 32, qq + (size_t)g * 32, &junk);
-            }
-        }
-        gemma_attn_decode_body(qq, qs, GP_P(const int8_t, 3), GP_P(const float, 4),
-                               GP_P(const int8_t, 5), GP_P(const float, 6),
-                               GP_P(float, 7), GP_P(float, 8),
-                               q_heads, GP_I(10), head_dim, GP_I(12));
+    case GP_ATTN_QC:
+        /* Operands: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+         * head_dim, n.
+         * The attention of one float32 query over the int16 cache. */
+        gemma_attn_decode_i16_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                   GP_P(const float, 2), GP_P(const int16_t, 3),
+                                   GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                   GP_I(7), GP_I(8), GP_I(9), GP_I(10));
         break;
-    }
     case GP_ATTN_F32:
         /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
          * pos, base, window.
@@ -6746,37 +6937,27 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                    GP_I(7), GP_I(7), (long)GP_I(6) * GP_I(7),
                                    (long)GP_I(6) * GP_I(7), GP_I(9), GP_I(10), GP_I(11));
         break;
-    case GP_ATTN_Q8_MT: {
-        /* Operands: q, qq, qs, kq, ks, vq, vs, scores, out, q_heads,
-         * kv_heads, head_dim, tokens, pos, base, window, lo, n.
-         * The fused attention of a group of queries over the int8 cache. The
-         * cache addresses point at buffer row 0. lo and n are scratch. */
-        const float *q = GP_P(const float, 0);
-        int8_t *qq = GP_P(int8_t, 1);
-        float *qs = GP_P(float, 2);
-        int q_heads = GP_I(9), kv_heads = GP_I(10), head_dim = GP_I(11);
-        int tokens = GP_I(12), window = GP_I(15);
-        int64_t pos = gp_i(r, e, 13), base = gp_i(r, e, 14);
-        int *lo = GP_P(int, 16);
-        int *n = GP_P(int, 17);
+    case GP_ATTN_QC_MT: {
+        /* Operands: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+         * head_dim, tokens, pos, base, window, lo, n.
+         * The attention of a group of float32 queries over the int16 cache.
+         * The cache addresses point at buffer row 0. lo and n are scratch. */
+        int tokens = GP_I(10), window = GP_I(13);
+        int64_t pos = gp_i(r, e, 11), base = gp_i(r, e, 12);
+        int *lo = GP_P(int, 14);
+        int *n = GP_P(int, 15);
         #pragma omp single
-        {
-            int32_t junk;
-            for (int g = 0; g < tokens * q_heads * head_dim / 32; ++g) {
-                qs[g] = gemma_quant_group32(q + (size_t)g * 32, qq + (size_t)g * 32, &junk);
-            }
-            for (int j = 0; j < tokens; ++j) {
-                gp_rows(pos, base, window, j, lo + j, n + j);
-            }
+        for (int j = 0; j < tokens; ++j) {
+            gp_rows(pos, base, window, j, lo + j, n + j);
         }
         int nmax = 0;
         for (int j = 0; j < tokens; ++j) {
             nmax = n[j] > nmax ? n[j] : nmax;
         }
-        gemma_attn_decode_mt_body(qq, qs, GP_P(const int8_t, 3), GP_P(const float, 4),
-                                  GP_P(const int8_t, 5), GP_P(const float, 6),
-                                  GP_P(float, 7), GP_P(float, 8), q_heads, kv_heads,
-                                  head_dim, lo, n, nmax, tokens);
+        gemma_attn_decode_i16_mt_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                      GP_P(const float, 2), GP_P(const int16_t, 3),
+                                      GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                      GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens);
         break;
     }
     case GP_ATTN_F32_MT: {

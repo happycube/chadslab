@@ -434,16 +434,37 @@ has 199 tokens.
 The new C kernel of the float cache is as close to the reference as the old
 NumPy attention. The two differ by at most 3e-5.
 
-**Fix it, or stop the use of it: the int8 cache.** The attention over the
-int8 cache (NP_GEMMA_ATTN=1) gives an error of up to 2.64 in a logit. The
-float cache gives 0.0003.
+**Fixed: the cache copy is now int16.** The attention over the int8 cache
+copy gave an error of up to 2.64 in a logit. A study of the error shows the
+cause. The query, the keys, and the values each gave about one third of it.
+Thus a change to one part does not fix it:
 
-The int8 cache is the default of Model, and the program of
-a decode step uses it after 128 tokens. The server already uses the float
-cache. The float cache costs more memory bandwidth for a long context.
-Measure the speed of the two modes. Then make the float cache the default,
-or make the int8 attention more accurate. A scale for each group of 16
-values is one way.
+    cache copy                      error of the attention output
+    int8 q, k, v (the old code)     1.1e-02
+    int8 k, v, float q              9.9e-03
+    int8, groups of 16              8.4e-03
+    bfloat16 k, v, float q          2.8e-03
+    int16 k, v, float q             4.0e-05
+
+The copy is now int16, with one scale for each group of 32 values, and the
+query stays float32. The copy reads 2.125 bytes for each value, against
+1.125 for int8 and 4 for float. The table gives the logits against the
+reference, with a float prompt pass:
+
+    cache            max |d|   mean |d|    top-1
+    int8 (old)       2.64      0.283       100%
+    int16            0.0014    0.00019     100%
+    float            0.0003    0.00004     100%
+
+The decode of the 26B has the speed of the old int8 copy:
+
+    context   int16      float      int8 (old)
+    512       59.0 ms    59.4 ms    58.4 ms
+    2048      69.9 ms    74.3 ms    70.2 ms
+    4096      73.7 ms    84.1 ms    72.2 ms
+
+The server now uses the int16 copy by default (--kv-attn int16). The
+program and the Python path keep the same bits in the new mode.
 
 The int8 activations of the prompt pass (NP_GEMMA_INT4_Q8=1, the default)
 give the largest error. One matrix product is off by about 0.6 per cent.

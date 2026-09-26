@@ -18,7 +18,7 @@ s = Session(m, max_len=len(ids) + 20)
 s.prefill(ids)
 
 cap = {'cur': -1}
-orig_attn, orig_read = ops.attn_decode, KVCache.read_q8
+orig_attn, orig_read = ops.attn_decode, KVCache.read_qc
 def pr(self, layer, end):
     cap['cur'] = layer
     cap.setdefault('n', {})[layer] = end - self.base[layer]
@@ -28,10 +28,10 @@ def pa(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n, *a, **k):
     cap.setdefault('q', {})[L] = np.array(q)
     cap.setdefault('meta', {})[L] = (q_heads, kv_heads, head_dim, n, getattr(s.cache, 'attn_min'))
     return orig_attn(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n, *a, **k)
-KVCache.read_q8 = pr
+KVCache.read_qc = pr
 ops.attn_decode = pa
 m.forward(ids[-1:], cache=s.cache, start_pos=len(ids) - 1)
-KVCache.read_q8 = orig_read
+KVCache.read_qc = orig_read
 ops.attn_decode = orig_attn
 
 def softmax(z):

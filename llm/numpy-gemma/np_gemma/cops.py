@@ -270,6 +270,13 @@ try:
         _lib.gemma_attn_decode_mt.restype = None
         _lib.gemma_attn_decode_f32s.argtypes = [_void_p] * 5 + [_int] * 7
         _lib.gemma_attn_decode_f32s.restype = None
+        _lib.gemma_quantize_i16_groups.argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
+        _lib.gemma_quantize_i16_groups.restype = None
+        _lib.gemma_attn_decode_i16.argtypes = [_void_p] * 7 + [_int] * 4
+        _lib.gemma_attn_decode_i16.restype = None
+        _lib.gemma_attn_decode_i16_mt.argtypes = [_void_p] * 7 + [_int] * 3 + [
+            _void_p, _void_p, _int, _int]
+        _lib.gemma_attn_decode_i16_mt.restype = None
         _lib.gemma_run.argtypes = [_void_p, _int]
         _lib.gemma_run.restype = _int
         _lib.gemma_gp_record_size.argtypes = []
@@ -1259,4 +1266,40 @@ def attn_decode_f32s(q, k, v, pos, base, window):
     _lib.gemma_attn_decode_f32s(q.ctypes.data, k.ctypes.data, v.ctypes.data,
                                 scores.ctypes.data, out.ctypes.data, qh, kvh, hd, n,
                                 int(pos), int(base), int(window))
+    return out
+
+
+def quantize_i16_groups(x):
+    """Quantize groups of 32 float32 values to int16. Return (q, scales)."""
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
+    groups = x.size // 32
+    q = np.empty(x.size, dtype=np.int16)
+    s = np.empty(groups, dtype=np.float32)
+    _lib.gemma_quantize_i16_groups(x.ctypes.data, q.ctypes.data, s.ctypes.data,
+                                   ctypes.c_long(groups))
+    return q, s
+
+
+def attn_decode_i16(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
+    """The attention of one float32 query over n rows of the int16 cache."""
+    scores = np.empty((q_heads, n), dtype=np.float32)
+    out = np.empty((q_heads, head_dim), dtype=np.float32)
+    _lib.gemma_attn_decode_i16(q.ctypes.data, kq.ctypes.data, ks.ctypes.data,
+                               vq.ctypes.data, vs.ctypes.data, scores.ctypes.data,
+                               out.ctypes.data, q_heads, kv_heads, head_dim, int(n))
+    return out
+
+
+def attn_decode_i16_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
+    """The attention of a group of float32 queries over the int16 cache."""
+    lo = np.ascontiguousarray(lo, dtype=np.int32)
+    n = np.ascontiguousarray(n, dtype=np.int32)
+    t = int(lo.size)
+    nmax = int(n.max())
+    scores = np.empty((t, q_heads, nmax), dtype=np.float32)
+    out = np.empty((t, q_heads, head_dim), dtype=np.float32)
+    _lib.gemma_attn_decode_i16_mt(q.ctypes.data, kq.ctypes.data, ks.ctypes.data,
+                                  vq.ctypes.data, vs.ctypes.data, scores.ctypes.data,
+                                  out.ctypes.data, q_heads, kv_heads, head_dim,
+                                  lo.ctypes.data, n.ctypes.data, nmax, t)
     return out

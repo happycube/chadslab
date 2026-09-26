@@ -41,10 +41,11 @@ def main():
     ap.add_argument("--thinking", action="store_true",
                     help="Open the thought channel of the chat template.")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--kv-attn", choices=["float", "q8"], default="float",
-                    help="Attention over the key and value cache. float is exact."
-                         " q8 is about 1.6 times faster and less accurate, which can"
-                         " make a long greedy generation repeat itself.")
+    ap.add_argument("--kv-attn", choices=["int16", "float"], default="int16",
+                    help="Attention over the key and value cache. int16 reads an int16"
+                         " copy of the cache with a float query. Its error is about 4e-5"
+                         " of the attention output, and at a long context it reads half"
+                         " the bytes of float. float reads the float cache.")
     ap.add_argument("--mtp", default=None, metavar="DIR",
                     help="The snapshot directory of the Gemma 4 assistant model (the"
                          " MTP drafter). See MTP_DRAFTER_QUANT.md, step 1.")
@@ -53,10 +54,11 @@ def main():
     ap.add_argument("--mtp-dtype", choices=("int4", "int8", "f32"), default="int4")
     args = ap.parse_args()
 
-    # The int8 cache quantizes the keys and the values. It is faster and it
-    # changes the hidden state by about 0.3 per cent, which is enough to send a
-    # long greedy generation into a loop. Use it only when it is asked for.
-    os.environ["NP_GEMMA_ATTN"] = "1" if args.kv_attn == "q8" else "0"
+    # The cache copy was int8 with an int8 query. Its error sent a long greedy
+    # generation into a loop, so the server used the float cache. The copy is
+    # now int16 with a float query, which is as accurate as the float cache
+    # and faster at a long context.
+    os.environ["NP_GEMMA_ATTN"] = "1" if args.kv_attn == "int16" else "0"
 
     g = GGUF(args.gguf)
     tok = Tokenizer(args.tokenizer) if args.tokenizer else Tokenizer.from_gguf(g)

@@ -84,15 +84,15 @@ class KVCache:
         n = cfg.num_hidden_layers
         self.k = [None] * n
         self.v = [None] * n
-        self.kq = [None] * n     # int8 copy of k for the fused attention
+        self.kq = [None] * n     # int16 copy of k for the fused attention
         self.ks = [None] * n     # one float32 scale for each group of 32
-        self.vq = [None] * n     # int8 copy of v for the fused attention
+        self.vq = [None] * n     # int16 copy of v for the fused attention
         self.vs = [None] * n
         self.base = [0] * n      # absolute position of buffer row 0
         self.end = [0] * n       # absolute position after the last stored row
-        self._q8_on = [False] * n
+        self._qc_on = [False] * n
         self.attn_min = ops.ATTN_MIN
-        # The int8 copy is only useful to the fused attention. The float path
+        # The int16 copy is only useful to the fused attention. The float path
         # never reads it, so do not build it and do not spend the memory.
         self.attn_on = ops.attn_ready()
 
@@ -109,9 +109,9 @@ class KVCache:
         return (cap, plan.num_kv_heads, plan.head_dim // 32)
 
     def _alloc_q(self, layer, cap):
-        self.kq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        self.kq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int16)
         self.ks[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-        self.vq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        self.vq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int16)
         self.vs[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
 
     def _alloc(self, layer, cap):
@@ -132,9 +132,9 @@ class KVCache:
         if not self.attn_on:
             return
         ok = 0 if self.kq[layer] is None else self.kq[layer].shape[0]
-        qk = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        qk = np.empty(self._shape_q(layer, cap), dtype=np.int16)
         qks = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-        qv = np.empty(self._shape_q(layer, cap), dtype=np.int8)
+        qv = np.empty(self._shape_q(layer, cap), dtype=np.int16)
         qvs = np.empty(self._shape_s(layer, cap), dtype=np.float32)
         if ok:
             qk[:ok] = self.kq[layer][:ok]
@@ -174,7 +174,7 @@ class KVCache:
                 if rows > 0:
                     self.k[layer][:rows] = self.k[layer][off:off + rows]
                     self.v[layer][:rows] = self.v[layer][off:off + rows]
-                    if self._q8_on[layer]:
+                    if self._qc_on[layer]:
                         self.kq[layer][:rows] = self.kq[layer][off:off + rows]
                         self.ks[layer][:rows] = self.ks[layer][off:off + rows]
                         self.vq[layer][:rows] = self.vq[layer][off:off + rows]
@@ -199,24 +199,24 @@ class KVCache:
         self.k[layer][start:start + t] = k
         self.v[layer][start:start + t] = v
         self.end[layer] = end
-        # Keep an int8 copy for the fused attention of a decode step. Build it
+        # Keep an int16 copy for the fused attention of a decode step. Build it
         # only when the cache is long enough that the fused path pays for the
         # work of the quantization.
         if self.attn_on and end - self.base[layer] >= self.attn_min:
-            if not self._q8_on[layer]:
+            if not self._qc_on[layer]:
                 self._quantize_all(layer)
-                self._q8_on[layer] = True
+                self._qc_on[layer] = True
             else:
-                self._store_q8(layer, start_pos - self.base[layer], k, v)
+                self._store_qc(layer, start_pos - self.base[layer], k, v)
 
-    def _store_q8(self, layer, start, k, v):
-        """Store the int8 copy of a block of keys and values."""
+    def _store_qc(self, layer, start, k, v):
+        """Store the int16 copy of a block of keys and values."""
         t = k.shape[0]
         plan = self.cfg.plan[layer]
         g = plan.head_dim // 32
         nkv = plan.num_kv_heads
-        kq, ks = ops.quantize_q8(k.reshape(t, nkv, g, 32))
-        vq, vs = ops.quantize_q8(v.reshape(t, nkv, g, 32))
+        kq, ks = ops.quantize_i16(k.reshape(t, nkv, g, 32))
+        vq, vs = ops.quantize_i16(v.reshape(t, nkv, g, 32))
         self.kq[layer][start:start + t] = kq.reshape(t, nkv, g * 32)
         self.ks[layer][start:start + t] = ks
         self.vq[layer][start:start + t] = vq.reshape(t, nkv, g * 32)
@@ -231,14 +231,15 @@ class KVCache:
         """Quantize every stored row of one layer from the float32 copy."""
         n = self.end[layer] - self.base[layer]
         if n > 0:
-            self._store_q8(layer, 0, self.k[layer][:n], self.v[layer][:n])
+            self._store_qc(layer, 0, self.k[layer][:n], self.v[layer][:n])
 
-    def q8_ready(self, layer):
-        """Return True when the int8 copy of one layer is ready."""
-        return self._q8_on[layer]
+    def qc_ready(self, layer):
+        """Return True when the int16 copy of one layer is ready."""
+        return self._qc_on[layer]
 
-    def read_q8(self, layer, end):
-        """Return the int8 keys, the int8 values, and the position of row 0."""
+    def read_qc(self, layer, end):
+        """Return the int16 keys and values, their scales, and the position of
+        row 0."""
         base = self.base[layer]
         n = end - base
         return (self.kq[layer][:n], self.ks[layer][:n],
@@ -859,16 +860,16 @@ class Model:
 
         if cache is not None:
             start = int(positions[0])
-            q8_before = cache.q8_ready(i)
+            qc_before = cache.qc_ready(i)
             cache.write(i, start, k, v)
             if t == 1 or mt:
                 # A decode step, or a small group that repeats the decode step
                 # for each token. Row j sees the cache rows up to its position.
                 o = None
-                if mt and ops.attn_ready() and cache.q8_ready(i) and (
-                        q8_before or start + 1 - cache.base[i] >= cache.attn_min):
-                    # Every row uses the int8 cache. One call serves the group.
-                    kq, ks, vq, vs, base = cache.read_q8(i, start + t)
+                if mt and ops.attn_ready() and cache.qc_ready(i) and (
+                        qc_before or start + 1 - cache.base[i] >= cache.attn_min):
+                    # Every row uses the int16 cache. One call serves the group.
+                    kq, ks, vq, vs, base = cache.read_qc(i, start + t)
                     pos = start + np.arange(t)
                     window = plan.sliding_window or 0
                     lo = np.maximum(0, pos - window + 1 - base) if window else np.zeros(t, np.int64)
@@ -879,7 +880,7 @@ class Model:
                     o = np.empty((t, plan.q_dim), dtype=np.float32)
                     for j in range(t):
                         o[j] = self._attend_one(q[j:j + 1], plan, i, start + j, cache,
-                                                q8_before)
+                                                qc_before)
                 if mt:
                     out = ops.linear_int4_mt(o, *w["self_attn.o_proj"])
                 else:
@@ -915,11 +916,11 @@ class Model:
         emit(hook, p + "self_attn.o_proj", out)
         return out
 
-    def _attend_one(self, q, plan, i, pos, cache, q8_before):
+    def _attend_one(self, q, plan, i, pos, cache, qc_before):
         """Run the attention of one query at pos over the cache. Return (q_dim,).
 
-        Use the int8 cache when a decode step at pos uses it. That is true
-        when the int8 copy is on before the write. It is also true when the
+        Use the int16 cache when a decode step at pos uses it. That is true
+        when the int16 copy is on before the write. It is also true when the
         write turns the copy on at pos + 1 rows. Otherwise use the float cache.
 
         A sliding layer reads only the rows of the window. The cache can hold
@@ -927,9 +928,9 @@ class Model:
         """
         hd = plan.head_dim
         window = plan.sliding_window or 0
-        if ops.attn_ready() and cache.q8_ready(i) and (
-                q8_before or pos + 1 - cache.base[i] >= cache.attn_min):
-            kq, ks, vq, vs, base = cache.read_q8(i, pos + 1)
+        if ops.attn_ready() and cache.qc_ready(i) and (
+                qc_before or pos + 1 - cache.base[i] >= cache.attn_min):
+            kq, ks, vq, vs, base = cache.read_qc(i, pos + 1)
             lo = max(0, pos - window + 1 - base) if window else 0
             o = ops.attn_decode(q[0], kq[lo:], ks[lo:], vq[lo:], vs[lo:],
                                 plan.num_q_heads, plan.num_kv_heads, hd,

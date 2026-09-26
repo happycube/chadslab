@@ -16,8 +16,8 @@ last rows. The np step runs the prompt pass on the first tokens. Then it runs
 one decode step for each remaining token, with the true token as input. It
 compares four settings of this runtime:
 
-1. The int8 cache with the program of a decode step.
-2. The int8 cache with the Python loop.
+1. The int16 cache with the program of a decode step.
+2. The int16 cache with the Python loop.
 3. The float cache with the C attention kernel and the program.
 4. The float cache with the NumPy attention of the old code.
 """
@@ -92,8 +92,8 @@ def run_np(args):
     model = Model(g, cfg).load_all(dtype="int4")
 
     settings = [
-        ("int8 cache, program", "1", True, True),
-        ("int8 cache, Python loop", "1", True, False),
+        ("int16 cache, program", "1", True, True),
+        ("int16 cache, Python loop", "1", True, False),
         ("float cache, C kernel, program", "0", True, True),
         ("float cache, NumPy (old)", "0", False, False),
     ]
@@ -121,9 +121,9 @@ def run_np(args):
     a = outs["float cache, C kernel, program"]
     b = outs["float cache, NumPy (old)"]
     print("float cache, C kernel against NumPy: max |d| %.2e" % np.abs(a - b).max())
-    c = outs["int8 cache, program"]
-    e = outs["int8 cache, Python loop"]
-    print("int8 cache, program against Python loop: %s" % (
+    c = outs["int16 cache, program"]
+    e = outs["int16 cache, Python loop"]
+    print("int16 cache, program against Python loop: %s" % (
         "same bits" if np.array_equal(c, e) else "max |d| %.2e" % np.abs(c - e).max()))
 
 

@@ -38,14 +38,14 @@ PARTS = ("k", "v", "kq", "ks", "vq", "vs")
 def snap(cache, i):
     s = {n: None if getattr(cache, n)[i] is None else getattr(cache, n)[i].copy()
          for n in PARTS}
-    s.update(base=cache.base[i], end=cache.end[i], q8=cache._q8_on[i])
+    s.update(base=cache.base[i], end=cache.end[i], qc=cache._qc_on[i])
     return s
 
 
 def restore(cache, i, s):
     for n in PARTS:
         getattr(cache, n)[i] = None if s[n] is None else s[n].copy()
-    cache.base[i], cache.end[i], cache._q8_on[i] = s["base"], s["end"], s["q8"]
+    cache.base[i], cache.end[i], cache._qc_on[i] = s["base"], s["end"], s["qc"]
 
 
 def rows(cache, i, pos):
@@ -154,7 +154,7 @@ def main():
         print(format_form(layer_form(model, layers[0])))
         print(compile_layers(model, [layers[0]]).dump())
 
-    attn = "q8" if ops.attn_ready() else "f32"
+    attn = "qc" if ops.attn_ready() else "f32"
     print("attention mode:", attn)
     ok = True
     progs = {i: compile_layers(model, [i], attn) for i in layers}

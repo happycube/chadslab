@@ -239,7 +239,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel. Set it to 1 for the E4B int4 mode as well: that mode is about eight times slower with a BLAS pool.
     OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
-    NP_GEMMA_ATTN          1                       1 uses the fused attention. 0 uses the batched matmul and the NumPy path for a comparison.
+    NP_GEMMA_ATTN          1                       1 uses the fused attention over an int16 copy of the cache, with a float query. 0 uses the float cache. The two give about the same result. The server uses 1 (--kv-attn int16).
     NP_GEMMA_FUSED_QKV     1                       1 gives the query, the key, and the value their norm in one call, and the query and the key their rope in one call. 0 gives each tensor its own call.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
@@ -695,6 +695,13 @@ The cache also held an int8 copy of every key and value for the fused
 attention. The float32 path never reads that copy. The code now builds it only
 when NP_GEMMA_ATTN is 1. Then the default float mode does not spend the memory
 or the quantization time. That copy is the difference between the two columns.
+
+The copy is now int16, with a float query. The int8 copy with an int8 query
+moved a logit by up to 2.6 against the reference. The int16 copy moves a
+logit by at most 0.0014, and the float cache by 0.0003 (PERF_PLAN.md,
+"Accuracy against the reference"). The
+int16 copy is about two times the size of the int8 copy in the table. The
+server now uses it by default.
 
 Check the bound and the output:
 
