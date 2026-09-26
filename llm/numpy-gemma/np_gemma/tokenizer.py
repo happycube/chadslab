@@ -12,6 +12,7 @@ This module also supplies the chat template.
 """
 from __future__ import annotations
 
+import heapq
 import json
 import os
 from pathlib import Path
@@ -106,22 +107,58 @@ class Tokenizer:
     def _bpe(self, piece):
         """Merge adjacent symbols.
 
-        Always merge the pair with the lowest rank. Stop when no adjacent pair
-        has a rank.
+        Always merge the pair with the lowest rank. For an equal rank, merge
+        the first pair. Stop when no adjacent pair has a rank.
+
+        Gemma splits no words before the BPE, so a piece can be a whole
+        document. A scan of every pair for each merge is then quadratic. This
+        code keeps the pairs in a heap and the symbols in a linked list, so
+        the cost is n log n. A symbol keeps the index of its first character,
+        so the index gives the order of the symbols. The heap key is (rank,
+        index), which selects the same pair as the scan. A merge makes the
+        heap entries of its two old pairs stale; the pop skips them.
         """
         syms = self._initial(piece)
-        while len(syms) > 1:
-            best_rank = None
-            best_i = -1
-            for i in range(len(syms) - 1):
-                r = self.merges.get((syms[i], syms[i + 1]))
-                if r is not None and (best_rank is None or r < best_rank):
-                    best_rank = r
-                    best_i = i
-            if best_i < 0:
-                break
-            syms[best_i:best_i + 2] = [syms[best_i] + syms[best_i + 1]]
-        return syms
+        n = len(syms)
+        if n < 2:
+            return syms
+        merges = self.merges
+        nxt = list(range(1, n + 1))
+        nxt[-1] = -1
+        prv = list(range(-1, n - 1))
+        heap = []
+        for i in range(n - 1):
+            r = merges.get((syms[i], syms[i + 1]))
+            if r is not None:
+                heap.append((r, i, i + 1, syms[i], syms[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            _r, i, j, a, b = heapq.heappop(heap)
+            # Skip a pair that a merge changed or removed.
+            if nxt[i] != j or syms[i] != a or syms[j] != b:
+                continue
+            ab = a + b
+            syms[i] = ab
+            syms[j] = None
+            k = nxt[j]
+            nxt[i] = k
+            nxt[j] = -2
+            if k != -1:
+                prv[k] = i
+                r = merges.get((ab, syms[k]))
+                if r is not None:
+                    heapq.heappush(heap, (r, i, k, ab, syms[k]))
+            p = prv[i]
+            if p != -1:
+                r = merges.get((syms[p], ab))
+                if r is not None:
+                    heapq.heappush(heap, (r, p, i, syms[p], ab))
+        out = []
+        i = 0
+        while i != -1:
+            out.append(syms[i])
+            i = nxt[i]
+        return out
 
     def _matches_added(self, text, i):
         """Return the special token that starts at position i.
