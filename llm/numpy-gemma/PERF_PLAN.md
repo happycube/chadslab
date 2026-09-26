@@ -248,6 +248,21 @@ path keeps its kernels and its bits.
   interpreter, the Python interpreter, and the compiler, with the
   operations of one 26B layer. Test: the C program and
   the Python path give the same bits for one layer.
+
+  Done. `np_gemma/program.py` has the compiler, the 26B layer form, and the
+  Python interpreter. `gemma_run` in the C file is the interpreter. The
+  program needs the int8 cache, which is on after 128 tokens. The cache
+  work stays in Python, in `KVCache.prepare`.
+
+  `scripts/check_program.py` gives the same bits as the Python path. It
+  tests layer 0 (sliding), 5, and 29 (global) at a context of 200 and of
+  1100, with the C and the Python interpreter. It checks the hidden state
+  and the new cache row. All 30 layers in one program (1350 records) also
+  give the same bits.
+
+  The 30 layers take 44 ms in the program, against about 57 ms in the
+  Python loop. The bind of the parameters takes 0.8 ms. With the output
+  head, a step is thus about 56 ms.
 - 2c: the whole decode step of the 26B in one program, with the output
   head. Python keeps the embedding, the sampler, and the cache management.
 - 2d: the group of 2 to 16 tokens, then the 12B and the E4B builders.
