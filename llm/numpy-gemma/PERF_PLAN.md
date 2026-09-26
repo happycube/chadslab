@@ -309,6 +309,31 @@ path keeps its kernels and its bits.
   about 1.19 times. The prompt pass is at the same speed as llama.cpp.
 - 2d: the group of 2 to 16 tokens, then the 12B and the E4B builders.
 
+  Done for the group. The layer form is the same for one token and for a
+  group.
+
+  Each kernel operation selects the kernel of one token or of a group
+  from the row count of its input, as the Python path does. The attention
+  of a group finds the key rows of each query itself. New operations:
+  INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, ATTN_Q8_MT, ATTN_F32_MT,
+  ROUTER_MT, and MOE_MT. The model keeps one program for each attention
+  mode and group size.
+
+  `scripts/check_program.py` gives the same bits as the Python path for
+  steps of 1, 2, 3, 4, and 8 tokens through Model.forward, in both modes.
+  A group of four takes 114.5 ms in the program, against 145.7 ms in the
+  Python loop, and one token takes 54.5 ms.
+
+  One fault of the first version is worth a note. The form gave the
+  attention mode as the string "q8", and the compiler read the string as
+  the name of a parameter. The group then used the float cache in the int8
+  mode. The attention mode is now part of the operation name. The compiler
+  also stops at a name that no let gives and that is not a parameter.
+
+  With the program, the MTP decode of the 26B gives 19.55 tokens/s with two
+  drafts. The plain decode gives 14.79 in the same run (1.32 times).
+  Every prompt gives the same token ids with and without MTP.
+
 Expect 11 to 14 ms less for each step of the 26B, about 55 ms. That is 18
 tokens/s, near llama.cpp. Set NP_GEMMA_PROGRAM=0 to use the Python path.
 
@@ -386,6 +411,17 @@ has 199 tokens.
 
 The new C kernel of the float cache is as close to the reference as the old
 NumPy attention. The two differ by at most 3e-5.
+
+**Fix it, or stop the use of it: the int8 cache.** The attention over the
+int8 cache (NP_GEMMA_ATTN=1) gives an error of up to 2.64 in a logit. The
+float cache gives 0.0003.
+
+The int8 cache is the default of Model, and the program of
+a decode step uses it after 128 tokens. The server already uses the float
+cache. The float cache costs more memory bandwidth for a long context.
+Measure the speed of the two modes. Then make the float cache the default,
+or make the int8 attention more accurate. A scale for each group of 16
+values is one way.
 
 The int8 activations of the prompt pass (NP_GEMMA_INT4_Q8=1, the default)
 give the largest error. One matrix product is off by about 0.6 per cent.

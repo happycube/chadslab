@@ -173,27 +173,31 @@ def main():
           % (cfg.num_hidden_layers, len(allp.recs), "same" if same else "DIFFERENT",
              1000 * min(t_py), 1000 * min(t_c)))
 
-    # Decode steps through Model.forward, with the program off and on.
+    # Steps through Model.forward, with the program off and on. A step of
+    # more than one token is the verify group of MTP.
+    sizes = [1, 3, 1, 2, 4, 1, 8, 1]
     res = {}
     for on in (False, True):
         model_mod._PROGRAM = on
         cache = KVCache(cfg, max_len=n + 64)
         model.prefill(ids[:n], cache)
-        xs, ts = [], []
-        for k in range(8):
+        xs, ts = [], {}
+        pos = n
+        for t in sizes:
             t0 = time.perf_counter()
-            x = model.forward([ids[n + k]], cache=cache, start_pos=n + k)
+            x = model.forward(ids[pos:pos + t], cache=cache, start_pos=pos)
             lg = model.logits(x)
-            ts.append(time.perf_counter() - t0)
+            ts.setdefault(t, []).append(time.perf_counter() - t0)
             xs.append((x, lg))
+            pos += t
         res[on] = (xs, ts)
     same = all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
                for a, b in zip(res[False][0], res[True][0]))
     ok = ok and same
-    print("8 decode steps through Model.forward: %s. Step with logits: Python %.1f ms, "
-          "program %.1f ms (median)" % ("same" if same else "DIFFERENT",
-                                       1000 * np.median(res[False][1]),
-                                       1000 * np.median(res[True][1])))
+    print("steps of %s tokens through Model.forward: %s" % (sizes, "same" if same else "DIFFERENT"))
+    for t in sorted(res[True][1]):
+        print("  %d tokens, with logits: Python %.1f ms, program %.1f ms" % (
+            t, 1000 * np.median(res[False][1][t]), 1000 * np.median(res[True][1][t])))
     print("PASS" if ok else "FAIL")
     g.close()
     return 0 if ok else 1

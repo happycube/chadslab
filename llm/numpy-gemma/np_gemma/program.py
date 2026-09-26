@@ -67,15 +67,20 @@ T_NONE, T_INT, T_F32, T_SLOT = 0, 1, 2, 3
 S_MOV, S_ADD, S_SUB, S_MUL, S_MAX, S_MIN = 1, 2, 3, 4, 5, 6
 RMS_NORM, ADD, MUL_S, COPY = 16, 17, 18, 19
 INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
+INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS = 36, 37, 38
 QKV_NORM_ROPE, KV_WRITE, ATTN_Q8, ATTN_F32 = 48, 49, 50, 51
-ROUTER, MOE = 64, 65
+ATTN_Q8_MT, ATTN_F32_MT = 52, 53
+ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
     RMS_NORM=RMS_NORM, ADD=ADD, MUL_S=MUL_S, COPY=COPY, INT4_LINEAR=INT4_LINEAR,
     INT4_MULTI4=INT4_MULTI4, RMS_NORM_MULTI4=RMS_NORM_MULTI4,
     GELU_MUL_INT4=GELU_MUL_INT4, QKV_NORM_ROPE=QKV_NORM_ROPE, KV_WRITE=KV_WRITE,
-    ATTN_Q8=ATTN_Q8, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE).items()}
+    ATTN_Q8=ATTN_Q8, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
+    INT4_LINEAR_MT=INT4_LINEAR_MT, INT4_MULTI4_MT=INT4_MULTI4_MT,
+    GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_Q8_MT=ATTN_Q8_MT, ATTN_F32_MT=ATTN_F32_MT,
+    ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -355,8 +360,79 @@ def _py_step(op, a, e):
         for j in range(ids.size):
             slot = np.nonzero(idx == ids[j])[0]
             out += de[j] * val[slot[0]]
+    elif op == INT4_LINEAR_MT:
+        L.gemma_int4_linear_mt(V(1), V(2), V(0), V(3), V(4), V(5), V(6))
+    elif op == INT4_MULTI4_MT:
+        args = []
+        for m in range(4):
+            b = 3 + 4 * m
+            args += [V(b) or None, V(b + 1) or None, V(b + 2) or None, V(b + 3)]
+        L.gemma_int4_multi4_mt(*args, V(0), V(1), V(2))
+    elif op == GELU_MUL_ROWS:
+        rows, inner = V(3), V(4)
+        g = _arr(V(0), rows * inner).reshape(rows, inner)
+        u = _arr(V(1), rows * inner).reshape(rows, inner)
+        _arr(V(2), rows * inner)[:] = ops.gelu_mul_rows(g, u).reshape(-1)
+    elif op in (ATTN_Q8_MT, ATTN_F32_MT):
+        q8 = op == ATTN_Q8_MT
+        o = 9 if q8 else 5
+        qh, kvh, hd, t = V(o), V(o + 1), V(o + 2), V(o + 3)
+        pos, base, window = V(o + 4), V(o + 5), V(o + 6)
+        q = _arr(V(0), t * qh * hd).reshape(t, qh, hd)
+        p_ = np.arange(t) + pos
+        lo = np.maximum(0, p_ - window + 1 - base) if window else np.zeros(t, np.int64)
+        n = p_ + 1 - base - lo
+        rows = int((n + lo).max())
+        per = kvh * hd
+        out = _arr(V(8 if q8 else 4), t * qh * hd).reshape(t, qh, hd)
+        if q8:
+            kq = _arr(V(3), rows * per, ctypes.c_int8).reshape(rows, kvh, hd)
+            ks = _arr(V(4), rows * per // 32).reshape(rows, kvh, hd // 32)
+            vq = _arr(V(5), rows * per, ctypes.c_int8).reshape(rows, kvh, hd)
+            vs = _arr(V(6), rows * per // 32).reshape(rows, kvh, hd // 32)
+            out[:] = ops.attn_decode_mt(q, kq, ks, vq, vs, qh, kvh, hd, lo, n)
+        else:
+            K = _arr(V(1), rows * per).reshape(rows, kvh, hd)
+            Vv = _arr(V(2), rows * per).reshape(rows, kvh, hd)
+            for j in range(t):
+                out[j] = cops.attn_decode_f32s(q[j], K[lo[j]:lo[j] + n[j]],
+                                               Vv[lo[j]:lo[j] + n[j]], pos + j,
+                                               base + lo[j], window)
+    elif op == ROUTER_MT:
+        L.gemma_router_mt(V(0), V(1), V(2), V(3), V(4), V(5), V(6), F(7), F(8), V(9), V(10),
+                          V(11))
+    elif op == MOE_MT:
+        t, top_k, gu_rows, cols, dn_rows, inner = V(3), V(4), V(9), V(10), V(11), V(12)
+        h = _arr(V(0), t * cols).reshape(t, cols)
+        val = _arr(V(1), t * top_k).reshape(t, top_k)
+        idx = _arr(V(2), t * top_k, ctypes.c_int32).reshape(t, top_k)
+        # The steps of Model._moe_mt.
+        flat = idx.reshape(-1)
+        order = np.argsort(flat, kind="stable")
+        tok = order // top_k
+        slot = order % top_k
+        ids, counts = np.unique(flat, return_counts=True)
+        poff = np.concatenate([[0], np.cumsum(counts)])
+        act = ops.moe_gemv_mt(_ArrW(V(5)), _ArrW(V(6)), h, ids, poff, tok, gu_rows, cols,
+                              cols, inner)
+        de = ops.moe_gemv_mt(_ArrW(V(7)), _ArrW(V(8)), act, ids, poff, np.arange(tok.size),
+                             dn_rows, inner, inner)
+        contrib = de * val[tok, slot][:, None]
+        m = np.argsort(tok, kind="stable").reshape(t, top_k)
+        out = _arr(V(22), t * dn_rows).reshape(t, dn_rows)
+        out[:] = 0.0
+        for k in range(top_k):
+            out += contrib[m[:, k]]
     else:
         raise ValueError("op %d" % op)
+
+
+class _ArrW:
+    """An address in the place of a weight array, for a cops function that
+    reads only .ctypes.data of the weight."""
+
+    def __init__(self, addr):
+        self.ctypes = type("C", (), {"data": addr})()
 
 
 # ---- the compiler --------------------------------------------------------------
@@ -393,14 +469,18 @@ class Compiler:
     def value(self, x):
         """Return the value of an operand of a form.
 
-        A name gives the value of a let, or else a parameter slot. A tuple is
+        A name gives the value of a let, or else a parameter slot of
+        PARAMS or PARAM_PREFIXES. Any other name is an error. A tuple is
         a form to compile. Any other value (an int, a float, an array) stays
         as it is.
         """
         if isinstance(x, str):
             if x in self.env:
                 return self.env[x]
-            return self.p.slot(x)
+            if x in PARAMS or x.startswith(PARAM_PREFIXES):
+                return self.p.slot(x)
+            raise NameError("the form uses %r, which no let gives and which is not "
+                            "a parameter" % x)
         if isinstance(x, tuple):
             return self.expr(x)
         return x
@@ -470,6 +550,12 @@ class Compiler:
         return r
 
 
+# The names of the parameters that bind_step writes. Any other name in a form
+# must come from a let. Thus a name with an error stops the compiler.
+PARAMS = ("pos", "scores")
+PARAM_PREFIXES = ("base.", "cos.", "sin.")
+
+
 SCALAR = {
     "+": (S_ADD, lambda a, b: a + b),
     "-": (S_SUB, lambda a, b: a - b),
@@ -513,13 +599,13 @@ def k_copy(c, x, out=None):
     return out
 
 
-def _mats(mats):
+def _mats(mats, t=1):
     """Return the operands of up to four int4 matrices and their outputs."""
     args, outs = [], []
     for m in range(4):
         if m < len(mats) and mats[m] is not None:
             w, s = mats[m]
-            o = np.zeros((1, w.shape[0]), dtype=np.float32)
+            o = np.zeros((t, w.shape[0]), dtype=np.float32)
             args += [w, s, o, w.shape[0]]
             outs.append(o)
         else:
@@ -529,15 +615,25 @@ def _mats(mats):
 
 def k_int4_multi4(c, x, *mats):
     """(int4_multi4 x m ...): up to four int4 matrices on the row x in one
-    kernel. As ops.int4_multi4. Return one (1, rows) buffer for each matrix."""
-    args, outs = _mats(mats)
-    c.p.emit(INT4_MULTI4, x, x.shape[1], *args)
+    kernel. One row uses ops.int4_multi4, and a group of rows uses
+    ops.int4_multi4_mt. Return one (rows of x, rows of m) buffer for each
+    matrix."""
+    t = x.shape[0]
+    args, outs = _mats(mats, t)
+    if t == 1:
+        c.p.emit(INT4_MULTI4, x, x.shape[1], *args)
+    else:
+        c.p.emit(INT4_MULTI4_MT, x, x.shape[1], t, *args)
     return tuple(outs)
 
 
 def k_rms_norm_multi4(c, x, wn, *mats):
     """(rms_norm_multi4 x wn m ...): the norm of x, then up to four int4
-    matrices on the result. As ops.rms_norm_multi4."""
+    matrices on the result. As ops.rms_norm_multi4. A group makes the norm
+    and the matrices as two operations, as the group path of
+    Model._decoder_layer does."""
+    if x.shape[0] > 1:
+        return k_int4_multi4(c, k_rms_norm(c, x, wn), *mats)
     args, outs = _mats(mats)
     scratch = c.buffer(x.shape[1])
     c.p.emit(RMS_NORM_MULTI4, x, np.ascontiguousarray(wn, dtype=np.float32), scratch,
@@ -547,7 +643,13 @@ def k_rms_norm_multi4(c, x, wn, *mats):
 
 def k_gelu_mul_int4(c, g, u, mat, out=None):
     """(gelu_mul_int4 g u m): gelu(g) * u, then the int4 matrix m. As
-    ops.gelu_mul_int4."""
+    ops.gelu_mul_int4. A group uses ops.gelu_mul_rows and the group matrix
+    kernel."""
+    if g.shape[0] > 1:
+        t, inner = g.shape
+        h = c.buffer((t, inner))
+        c.p.emit(GELU_MUL_ROWS, g, u, h, t, inner)
+        return k_int4(c, mat, h, out)
     w, s = mat
     rows, cols = w.shape[0], g.size
     out = c.buffer((1, rows)) if out is None else out
@@ -556,11 +658,15 @@ def k_gelu_mul_int4(c, g, u, mat, out=None):
 
 
 def k_int4(c, mat, x, out=None):
-    """(int4 m x): the int4 matrix m on the row x. As Model.linear for one
-    token."""
+    """(int4 m x): the int4 matrix m on the rows of x. As Model.linear for
+    one token, and as ops.linear_int4_mt for a group."""
     w, s = mat
-    out = c.buffer((1, w.shape[0])) if out is None else out
-    c.p.emit(INT4_LINEAR, x, w, s, out, w.shape[0], x.shape[1])
+    t = x.shape[0]
+    out = c.buffer((t, w.shape[0])) if out is None else out
+    if t == 1:
+        c.p.emit(INT4_LINEAR, x, w, s, out, w.shape[0], x.shape[1])
+    else:
+        c.p.emit(INT4_LINEAR_MT, x, w, s, out, w.shape[0], x.shape[1], t)
     return out
 
 
@@ -587,15 +693,16 @@ def k_kv_write(c, layer, k, v, row, q8=1):
     KVCache._store_q8 does. The addresses come from the slots of the layer
     and the row, with scalar operations."""
     plan = c.cfg.plan[layer]
-    n = plan.num_kv_heads * plan.head_dim
+    per = plan.num_kv_heads * plan.head_dim
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
     if q8:
-        q = [_addr(c, s("kq"), row, n), _addr(c, s("ks"), row, 4 * (n // 32)),
-             _addr(c, s("vq"), row, n), _addr(c, s("vs"), row, 4 * (n // 32))]
+        q = [_addr(c, s("kq"), row, per), _addr(c, s("ks"), row, 4 * (per // 32)),
+             _addr(c, s("vq"), row, per), _addr(c, s("vs"), row, 4 * (per // 32))]
     else:
         q = [0, 0, 0, 0]
+    # The rows of a group are adjacent in the cache, so one copy stores them.
     c.p.emit(KV_WRITE, k, v,
-             _addr(c, s("k"), row, 4 * n), _addr(c, s("v"), row, 4 * n), *q, n)
+             _addr(c, s("k"), row, 4 * per), _addr(c, s("v"), row, 4 * per), *q, k.size)
 
 
 def k_attn_q8(c, layer, q, lo, n):
@@ -629,15 +736,47 @@ def k_attn_f32(c, layer, q, lo, n):
     return out
 
 
+def k_attn_rows(c, layer, q, attn):
+    """(attn_rows_q8 layer q) or (attn_rows_f32 layer q): the attention of a
+    group of queries. The first form reads the int8 cache, and the second
+    reads the float cache. Each row of q is one query. Query j has the position pos + j. The operation finds the
+    key rows of each query from pos, the base of the layer, and the window.
+    As the group path of Model._attention."""
+    plan = c.cfg.plan[layer]
+    hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
+    t = q.size // (qh * hd)
+    s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
+    out = c.buffer((t, qh * hd))
+    pos, base, window = c.p.slot("pos"), s("base"), plan.sliding_window or 0
+    if attn == "q8":
+        c.p.emit(ATTN_Q8_MT, q, c.buffer(t * qh * hd, np.int8), c.buffer(t * qh * hd // 32),
+                 s("kq"), s("ks"), s("vq"), s("vs"), c.p.slot("scores"), out, qh, kvh, hd,
+                 t, pos, base, window, np.zeros(t, np.int32), np.zeros(t, np.int32))
+    else:
+        c.p.emit(ATTN_F32_MT, q, s("k"), s("v"), c.p.slot("scores"), out, qh, kvh, hd, t,
+                 pos, base, window)
+    return out
+
+
 def k_router(c, x, layer):
     """(router x layer): the router of the mixture of experts. Return the
     weights and the indices of the top experts. As ops.router."""
     w = c.model._layers[layer]
     cfg = c.cfg
     top_k = cfg.top_k_experts
+    t = x.shape[0]
+    proj = np.ascontiguousarray(w["router.proj"], dtype=np.float32)
+    if t > 1:
+        val = c.buffer((t, top_k))
+        idx = np.zeros((t, top_k), dtype=np.int32)
+        c.p.emit(ROUTER_MT, x, np.ascontiguousarray(w["router.scale"], dtype=np.float32),
+                 proj, np.ascontiguousarray(w["router.per_expert_scale"], dtype=np.float32),
+                 x.shape[1], proj.shape[0], top_k, float(c.eps),
+                 float(cfg.hidden_size ** -0.5), val, idx, t,
+                 c.buffer((t, x.shape[1])), c.buffer((t, proj.shape[0])))
+        return val, idx
     val = c.buffer(top_k)
     idx = np.zeros(top_k, dtype=np.int32)
-    proj = np.ascontiguousarray(w["router.proj"], dtype=np.float32)
     c.p.emit(ROUTER, x, np.ascontiguousarray(w["router.scale"], dtype=np.float32), proj,
              np.ascontiguousarray(w["router.per_expert_scale"], dtype=np.float32),
              x.shape[1], proj.shape[0], top_k, float(c.eps),
@@ -653,8 +792,19 @@ def k_moe(c, h, val, idx, layer):
     gu_q, gu_s = w["experts.gate_up_proj"]
     dn_q, dn_s = w["experts.down_proj"]
     inner = c.cfg.moe_intermediate_size
-    top_k = idx.size
     out = c.buffer(h.shape)
+    if h.shape[0] > 1:
+        # The group path. The scratch holds the pairs and the jobs of the
+        # sort in C, then the outputs of the two expert kernels.
+        t, top_k = idx.shape
+        pairs = t * top_k
+        i32 = lambda n: np.zeros(n, dtype=np.int32)  # noqa: E731
+        c.p.emit(MOE_MT, h, val, idx, t, top_k, gu_q, gu_s, dn_q, dn_s, gu_q.shape[1],
+                 h.shape[1], dn_q.shape[1], inner, i32(pairs), i32(pairs), i32(pairs + 1),
+                 i32(pairs), i32(pairs), i32(1), c.buffer((pairs, gu_q.shape[1])),
+                 c.buffer((pairs, inner)), c.buffer((pairs, dn_q.shape[1])), out)
+        return out
+    top_k = idx.size
     c.p.emit(MOE, h, val, idx, top_k, gu_q, gu_s, dn_q, dn_s, gu_q.shape[1], h.shape[1],
              dn_q.shape[1], inner, np.zeros(top_k, dtype=np.int32),
              c.buffer((top_k, 2 * inner)), c.buffer((top_k, inner)),
@@ -675,6 +825,10 @@ KERNELS = {
     "kv_write": k_kv_write,
     "attn_q8": k_attn_q8,
     "attn_f32": k_attn_f32,
+    # The mode is part of the name. A bare string operand is a name for the
+    # compiler, so the form cannot give the mode as an operand.
+    "attn_rows_q8": lambda c, layer, q: k_attn_rows(c, layer, q, "q8"),
+    "attn_rows_f32": lambda c, layer, q: k_attn_rows(c, layer, q, "f32"),
     "router": k_router,
     "moe": k_moe,
 }
@@ -682,11 +836,13 @@ KERNELS = {
 
 # ---- the forms of the 26B model -------------------------------------------------
 
-def layer_form(model, i, attn="q8"):
+def layer_form(model, i, attn="q8", t=1):
     """Return one decoder layer as a nested expression.
 
-    The expression follows Model._decoder_layer and Model._attention for one
-    token. The mode attn is "q8" for the int8 cache and "f32" for the float
+    The expression follows Model._decoder_layer and Model._attention for t
+    tokens. The kernel operations select the kernels of one token or of a
+    group from the row count of their input. The attention of a group finds
+    the key rows of each query itself. The mode attn is "q8" for the int8 cache and "f32" for the float
     cache. x is the hidden state. The layer changes it in place. A model with the
     mixture-of-experts block (the 26B) adds the router and the experts; the
     dense model (the 12B) does not.
@@ -711,6 +867,12 @@ def layer_form(model, i, attn="q8"):
     else:
         lo = 0
     q8 = 1 if attn == "q8" else 0
+    if t == 1:
+        attn_forms = (("let", "lo", lo),
+                      ("let", "n", ("-", ("+", "pos", 1), base, "lo")),
+                      ("let", "a", ("attn_" + attn, i, "q", "lo", "n")))
+    else:
+        attn_forms = (("let", "a", ("attn_rows_" + attn, i, "q")),)
     if cfg.enable_moe_block:
         ffn = (("let", ("val", "idx"), ("router", "x", i)),
                ("let", "e", ("moe", ("rms_norm", "x", w("pre_feedforward_layernorm_2")),
@@ -726,9 +888,7 @@ def layer_form(model, i, attn="q8"):
              "cos." + kind, "sin." + kind, i),
             ("let", "row", ("-", "pos", base)),
             ("kv_write", i, "k", "v", "row", q8),
-            ("let", "lo", lo),
-            ("let", "n", ("-", ("+", "pos", 1), base, "lo")),
-            ("let", "a", ("attn_" + attn, i, "q", "lo", "n")),
+            *attn_forms,
             ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
             ("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),
             ("let", ("g", "u"), ("rms_norm_multi4", "x", w("pre_feedforward_layernorm"),
@@ -739,9 +899,10 @@ def layer_form(model, i, attn="q8"):
             ("set", "x", ("mul", "x", w("layer_scalar"))))
 
 
-def step_form(model, attn="q8"):
-    """Return a whole decode step: every layer, then the final norm into xn."""
-    layers = [layer_form(model, i, attn) for i in range(model.cfg.num_hidden_layers)]
+def step_form(model, attn="q8", t=1):
+    """Return a whole decode step of t tokens: every layer, then the final
+    norm into xn."""
+    layers = [layer_form(model, i, attn, t) for i in range(model.cfg.num_hidden_layers)]
     return ("seq", *layers, ("let", "xn", ("rms_norm", "x", ("w", None, "norm"))))
 
 
@@ -775,28 +936,31 @@ def format_form(form, indent=0):
     return "\n".join(parts) + ")"
 
 
-def compile_layers(model, layers, attn="q8"):
-    """Compile decoder layers into one Program. The buffer "x" is the input
-    and the output."""
+def compile_layers(model, layers, attn="q8", t=1):
+    """Compile decoder layers for t tokens into one Program. The buffer "x"
+    is the input and the output."""
     c = Compiler(model)
-    c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
+    c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
     for i in layers:
-        c.compile(layer_form(model, i, attn))
+        c.compile(layer_form(model, i, attn, t))
     c.p.layers = list(layers)
     c.p.attn = attn
+    c.p.tokens = t
     return c.p.finish()
 
 
-def compile_step(model, attn="q8"):
-    """Compile a whole decode step. "x" is the input embedding and "xn" the
-    hidden state after the final norm, the input of the output head."""
+def compile_step(model, attn="q8", t=1):
+    """Compile a whole step of t tokens. "x" is the input embedding and "xn"
+    the hidden state after the final norm, the input of the output head. A
+    step of 2 to 16 tokens is the verify step of MTP."""
     c = Compiler(model)
-    c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
+    c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
-    c.compile(step_form(model, attn))
+    c.compile(step_form(model, attn, t))
     c.p.layers = list(range(model.cfg.num_hidden_layers))
     c.p.attn = attn
+    c.p.tokens = t
     return c.p.finish()
 
 
@@ -814,22 +978,28 @@ def ready(model, cache):
     return "f32"
 
 
-def decode_step(model, cache, token, pos):
-    """Run one decode step with a program. Return the hidden state after the
-    final norm, shape (1, hidden). The program is made on the first call."""
+def decode_step(model, cache, tokens, pos):
+    """Run a step of one or more tokens with a program. Return the hidden
+    state after the final norm, shape (tokens, hidden).
+
+    The model keeps one program for each attention mode and token count. It
+    makes a program on the first call with that mode and count.
+    """
+    tokens = [int(x) for x in tokens]
     attn = ready(model, cache)
     progs = model.__dict__.setdefault("_programs", {})
-    prog = progs.get(attn)
+    key = (attn, len(tokens))
+    prog = progs.get(key)
     if prog is None:
-        prog = progs[attn] = compile_step(model, attn)
+        prog = progs[key] = compile_step(model, attn, len(tokens))
     bind_step(prog, model, cache, pos)
-    prog.names["x"][:] = model.embed([token])
+    prog.names["x"][:] = model.embed(tokens)
     prog.run()
     return prog.names["xn"].copy()
 
 
 def bind_step(prog, model, cache, pos):
-    """Prepare the cache for one token at pos and bind the parameters.
+    """Prepare the cache for the tokens of a step and bind the parameters.
 
     The cache work stays in Python: KVCache.prepare drops old rows and grows
     a buffer. The program then writes the new rows in C. The int8 copy of the
@@ -838,16 +1008,17 @@ def bind_step(prog, model, cache, pos):
     kw = {"pos": pos}
     keep = []
     q8 = getattr(prog, "attn", "q8") == "q8"
+    t = getattr(prog, "tokens", 1)
     for i in prog.layers:
         assert not q8 or cache.q8_ready(i), "the program needs the int8 cache"
-        cache.prepare(i, pos, 1)
-        cache.end[i] = pos + 1
+        cache.prepare(i, pos, t)
+        cache.end[i] = pos + t
         kw.update({"base.%d" % i: cache.base[i], "k.%d" % i: cache.k[i],
                    "v.%d" % i: cache.v[i]})
         if q8:
             kw.update({"kq.%d" % i: cache.kq[i], "ks.%d" % i: cache.ks[i],
                        "vq.%d" % i: cache.vq[i], "vs.%d" % i: cache.vs[i]})
-    positions = np.array([pos])
+    positions = np.arange(pos, pos + t)
     for kind, sliding in (("s", True), ("f", False)):
         plan = next((model.cfg.plan[i] for i in prog.layers
                      if model.cfg.plan[i].is_sliding == sliding), None)
@@ -857,8 +1028,9 @@ def bind_step(prog, model, cache, pos):
         keep += [cos, sin]
         kw["cos." + kind] = cos
         kw["sin." + kind] = sin
-    # The scores of the widest attention: all query heads over all keys.
-    need = max(model.cfg.plan[i].num_q_heads * (pos + 1) for i in prog.layers)
+    # The scores of the widest attention: all queries of all heads over all
+    # the keys.
+    need = max(t * model.cfg.plan[i].num_q_heads * (pos + t) for i in prog.layers)
     sc = getattr(prog, "scores", None)
     if sc is None or sc.size < need:
         sc = np.zeros(max(need, 2 * (sc.size if sc is not None else 0)), dtype=np.float32)

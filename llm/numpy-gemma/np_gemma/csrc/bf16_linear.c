@@ -6227,7 +6227,6 @@ static void gemma_moe_gemv_gelu_body(const uint8_t *w, const float *scales, cons
     gemma_gelu_mul_body(act, out, jobs, inner);
 }
 
-__attribute__((unused))
 static void gemma_moe_gemv_gelu_mt_body(const uint8_t *w, const float *scales,
                                         const float *x, const int *ids, const int *poff,
                                         const int *xi, int jobs, float *act, float *out,
@@ -6290,9 +6289,11 @@ enum {
     GP_S_MIN = 6,
     GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19,
     GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
-    GP_GELU_MUL_INT4 = 35,
+    GP_GELU_MUL_INT4 = 35, GP_INT4_LINEAR_MT = 36, GP_INT4_MULTI4_MT = 37,
+    GP_GELU_MUL_ROWS = 38,
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_Q8 = 50, GP_ATTN_F32 = 51,
-    GP_ROUTER = 64, GP_MOE = 65,
+    GP_ATTN_Q8_MT = 52, GP_ATTN_F32_MT = 53,
+    GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
 };
 
 int gemma_gp_record_size(void)
@@ -6378,6 +6379,105 @@ static void gp_moe_one(const gp_rec *r, const int64_t *e)
                 ++s;
             }
             gp_add_scaled(out, de + (size_t)j * (size_t)dn_rows, val[s], dn_rows);
+        }
+    }
+}
+
+/* The key rows of query row j of a group: the first row lo and the count n.
+ * The first query has the position pos, and row 0 of the buffer has the
+ * position base. A sliding layer (window > 0) reads only the window. This is
+ * the rule of Model._attention for a group. */
+static inline void gp_rows(int64_t pos, int64_t base, int window, int j,
+                           int *lo, int *n)
+{
+    int64_t p = pos + j;
+    int64_t l = window > 0 ? p - window + 1 - base : 0;
+    if (l < 0) {
+        l = 0;
+    }
+    *lo = (int)l;
+    *n = (int)(p + 1 - base - l);
+}
+
+/* The experts of a group of tokens, as Model._moe_mt does it.
+ *
+ * A pair is one (expert, token). The code sorts the pairs by expert with a
+ * stable sort, so the pairs of one expert keep the order of their tokens.
+ * The kernels then read each expert one time for all of its pairs. Last, each
+ * token adds the outputs of its pairs in the order of the expert index, with
+ * the router weights. */
+static void gp_moe_group(const gp_rec *r, const int64_t *e)
+{
+    const float *h = GP_P(const float, 0);
+    const float *val = GP_P(const float, 1);
+    const int32_t *idx = GP_P(const int32_t, 2);
+    int tokens = GP_I(3);
+    int top_k = GP_I(4);
+    const uint8_t *gu_w = GP_P(const uint8_t, 5);
+    const float *gu_s = GP_P(const float, 6);
+    const uint8_t *dn_w = GP_P(const uint8_t, 7);
+    const float *dn_s = GP_P(const float, 8);
+    int gu_rows = GP_I(9);
+    int cols = GP_I(10);
+    int dn_rows = GP_I(11);
+    int inner = GP_I(12);
+    int32_t *order = GP_P(int32_t, 13);    /* the flat index of each pair */
+    int32_t *ids = GP_P(int32_t, 14);      /* the expert of each job */
+    int32_t *poff = GP_P(int32_t, 15);     /* the first pair of each job */
+    int32_t *xi = GP_P(int32_t, 16);       /* the token of each pair */
+    int32_t *xi2 = GP_P(int32_t, 17);      /* the pair itself */
+    int32_t *jobs_out = GP_P(int32_t, 18);
+    float *act = GP_P(float, 19);
+    float *act2 = GP_P(float, 20);
+    float *de = GP_P(float, 21);
+    float *out = GP_P(float, 22);
+    const int pairs = tokens * top_k;
+    #pragma omp single
+    {
+        /* A stable insertion sort of the flat indices by expert. */
+        for (int f = 0; f < pairs; ++f) {
+            int32_t x = f;
+            int k = f - 1;
+            while (k >= 0 && idx[order[k]] > idx[x]) {
+                order[k + 1] = order[k];
+                --k;
+            }
+            order[k + 1] = x;
+        }
+        int jobs = 0;
+        for (int p = 0; p < pairs; ++p) {
+            int32_t ex = idx[order[p]];
+            if (jobs == 0 || ids[jobs - 1] != ex) {
+                ids[jobs] = ex;
+                poff[jobs] = p;
+                ++jobs;
+            }
+            xi[p] = order[p] / top_k;
+            xi2[p] = p;
+        }
+        poff[jobs] = pairs;
+        jobs_out[0] = jobs;
+    }
+    const int jobs = jobs_out[0];
+    gemma_moe_gemv_gelu_mt_body(gu_w, gu_s, h, ids, poff, xi, jobs, act, act2,
+                                gu_rows, cols, cols, inner);
+    gemma_int4_moe_gemv_mt_body(dn_w, dn_s, act2, ids, poff, xi2, jobs, de,
+                                dn_rows, inner, inner);
+    #pragma omp single
+    {
+        for (int t = 0; t < tokens; ++t) {
+            float *o = out + (size_t)t * (size_t)dn_rows;
+            for (int c = 0; c < dn_rows; ++c) {
+                o[c] = 0.0f;
+            }
+        }
+        /* The pairs are in the order of the expert index. The pairs of one
+         * token therefore come in that order too. */
+        for (int p = 0; p < pairs; ++p) {
+            int f = order[p];
+            int t = f / top_k;
+            gp_add_scaled(out + (size_t)t * (size_t)dn_rows,
+                          de + (size_t)p * (size_t)dn_rows, val[f], dn_rows);
         }
     }
 }
@@ -6478,6 +6578,34 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                  GP_P(float, 3), GP_P(const uint8_t, 4), GP_P(const float, 5),
                                  GP_P(float, 6), GP_I(7), GP_I(8));
         break;
+    case GP_INT4_LINEAR_MT:
+        /* Operands: x, w, s, out, rows, cols, tokens. */
+        gemma_int4_linear_mt_body(GP_P(const uint8_t, 1), GP_P(const float, 2),
+                                  GP_P(const float, 0), GP_P(float, 3),
+                                  GP_I(4), GP_I(5), GP_I(6));
+        break;
+    case GP_INT4_MULTI4_MT:
+        /* Operands: x, cols, tokens, then (w, s, out, rows) four times. */
+        gemma_int4_multi4_mt_body(GP_P(const uint8_t, 3), GP_P(const float, 4), GP_P(float, 5), GP_I(6),
+                                  GP_P(const uint8_t, 7), GP_P(const float, 8), GP_P(float, 9), GP_I(10),
+                                  GP_P(const uint8_t, 11), GP_P(const float, 12), GP_P(float, 13), GP_I(14),
+                                  GP_P(const uint8_t, 15), GP_P(const float, 16), GP_P(float, 17), GP_I(18),
+                                  GP_P(const float, 0), GP_I(1), GP_I(2));
+        break;
+    case GP_GELU_MUL_ROWS: {
+        /* Operands: g, u, out, rows, inner. One call for each row, as
+         * ops.gelu_mul_rows does, so the tail of each row stays the same. */
+        const float *g = GP_P(const float, 0);
+        const float *u = GP_P(const float, 1);
+        float *out = GP_P(float, 2);
+        int rows = GP_I(3), inner = GP_I(4);
+        #pragma omp single
+        for (int i = 0; i < rows; ++i) {
+            gemma_gelu_mul_pair(g + (size_t)i * (size_t)inner, u + (size_t)i * (size_t)inner,
+                                out + (size_t)i * (size_t)inner, inner);
+        }
+        break;
+    }
     /* ---- attention ---- */
     case GP_QKV_NORM_ROPE:
         /* q, q_w, q_rows, k, k_w, k_rows, v, v_rows, cos, sin, q_heads,
@@ -6545,6 +6673,65 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                    GP_I(7), GP_I(7), (long)GP_I(6) * GP_I(7),
                                    (long)GP_I(6) * GP_I(7), GP_I(9), GP_I(10), GP_I(11));
         break;
+    case GP_ATTN_Q8_MT: {
+        /* Operands: q, qq, qs, kq, ks, vq, vs, scores, out, q_heads,
+         * kv_heads, head_dim, tokens, pos, base, window, lo, n.
+         * The fused attention of a group of queries over the int8 cache. The
+         * cache addresses point at buffer row 0. lo and n are scratch. */
+        const float *q = GP_P(const float, 0);
+        int8_t *qq = GP_P(int8_t, 1);
+        float *qs = GP_P(float, 2);
+        int q_heads = GP_I(9), kv_heads = GP_I(10), head_dim = GP_I(11);
+        int tokens = GP_I(12), window = GP_I(15);
+        int64_t pos = gp_i(r, e, 13), base = gp_i(r, e, 14);
+        int *lo = GP_P(int, 16);
+        int *n = GP_P(int, 17);
+        #pragma omp single
+        {
+            int32_t junk;
+            for (int g = 0; g < tokens * q_heads * head_dim / 32; ++g) {
+                qs[g] = gemma_quant_group32(q + (size_t)g * 32, qq + (size_t)g * 32, &junk);
+            }
+            for (int j = 0; j < tokens; ++j) {
+                gp_rows(pos, base, window, j, lo + j, n + j);
+            }
+        }
+        int nmax = 0;
+        for (int j = 0; j < tokens; ++j) {
+            nmax = n[j] > nmax ? n[j] : nmax;
+        }
+        gemma_attn_decode_mt_body(qq, qs, GP_P(const int8_t, 3), GP_P(const float, 4),
+                                  GP_P(const int8_t, 5), GP_P(const float, 6),
+                                  GP_P(float, 7), GP_P(float, 8), q_heads, kv_heads,
+                                  head_dim, lo, n, nmax, tokens);
+        break;
+    }
+    case GP_ATTN_F32_MT: {
+        /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim,
+         * tokens, pos, base, window.
+         * The attention of a group of queries over the float cache. The code
+         * runs one query at a time, as Model._attend_one does it. k and v
+         * point at buffer row 0. */
+        const float *q = GP_P(const float, 0);
+        const float *k = GP_P(const float, 1);
+        const float *v = GP_P(const float, 2);
+        float *out = GP_P(float, 4);
+        int q_heads = GP_I(5), kv_heads = GP_I(6), head_dim = GP_I(7);
+        int tokens = GP_I(8), window = GP_I(11);
+        int64_t pos = gp_i(r, e, 9), base = gp_i(r, e, 10);
+        long row = (long)kv_heads * head_dim;
+        size_t qd = (size_t)q_heads * (size_t)head_dim;
+        for (int j = 0; j < tokens; ++j) {
+            int lo, n;
+            gp_rows(pos, base, window, j, &lo, &n);
+            gemma_attn_decode_f32_body(q + j * qd, k + (size_t)lo * (size_t)row,
+                                       v + (size_t)lo * (size_t)row, GP_P(float, 3),
+                                       out + j * qd, q_heads, kv_heads, head_dim, n,
+                                       head_dim, head_dim, row, row,
+                                       (int)(pos + j), (int)(base + lo), window);
+        }
+        break;
+    }
     /* ---- mixture of experts ---- */
     case GP_ROUTER:
         /* x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale,
@@ -6556,6 +6743,17 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_MOE:
         gp_moe_one(r, e);
+        break;
+    case GP_ROUTER_MT:
+        /* Operands: x, scale, proj, per_expert, hidden, experts, top_k, eps,
+         * hscale, val, idx, tokens, r, logits. */
+        gemma_router_mt_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2),
+                             GP_P(const float, 3), GP_I(4), GP_I(5), GP_I(6),
+                             gp_f(r, e, 7), gp_f(r, e, 8), GP_P(float, 9), GP_P(int, 10),
+                             GP_I(11), GP_P(float, 12), GP_P(float, 13));
+        break;
+    case GP_MOE_MT:
+        gp_moe_group(r, e);
         break;
     default:
         break;

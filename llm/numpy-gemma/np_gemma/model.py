@@ -687,14 +687,16 @@ class Model:
         quick test.
         """
         cfg = self.cfg
-        if (_PROGRAM and len(input_ids) == 1 and hook is None and max_layers is None
-                and isinstance(cache, KVCache) and self._dtype == "int4"
-                and self.keep_weights):
-            # One decode step as one program in C (np_gemma/program.py). The
-            # result has the bits of the Python loop below.
+        t = len(input_ids)
+        if (_PROGRAM and (t == 1 or ops.mt_ready(t)) and hook is None
+                and max_layers is None and isinstance(cache, KVCache)
+                and self._dtype == "int4" and self.keep_weights):
+            # One decode step, or the group of an MTP verify step, as one
+            # program in C (np_gemma/program.py). The result has the bits of
+            # the Python loop below.
             from . import program
             if program.ready(self, cache) is not None:
-                return program.decode_step(self, cache, int(input_ids[0]), int(start_pos))
+                return program.decode_step(self, cache, input_ids, int(start_pos))
         x = self.embed(input_ids)
         if start_pos == 0:
             emit(hook, "embed_tokens", x)
