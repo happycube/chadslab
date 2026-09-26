@@ -405,6 +405,50 @@ def int4_multi4_ready():
     return _MULTI4_OK
 
 
+# The small-group path. An MTP verify step runs the target on two to about
+# eight tokens. These kernels read each weight block one time for the whole
+# group, and they give each token the same bits as a decode step. The path
+# copies the kernels of the float decode step, so it needs the fused step and
+# the float activation. Set NP_GEMMA_MT=0 to use the prompt kernels instead.
+_MT = os.environ.get("NP_GEMMA_MT", "1") == "1"
+
+
+def mt_ready(tokens):
+    """Return True when the small-group kernels serve this token count."""
+    return (_MT and 2 <= tokens <= getattr(_cops, "MT_MAX", 0)
+            and _FUSED_OK and _MULTI4_OK and not _INT4_Q8_GEMV)
+
+
+def router_mt(x, scale, proj, per_expert, top_k, eps, hscale):
+    """Run the router for a small group of tokens, as router does for one."""
+    return _cops.router_mt(x, _w32(scale), _w32(proj), _w32(per_expert),
+                           top_k, eps, hscale)
+
+
+def linear_int4_mt(x, packed, scales):
+    """Multiply a small group of rows of x by W. W is packed 4-bit data."""
+    return _cops.linear_int4_mt(x, packed, scales)
+
+
+def int4_multi4_mt(mats, x, cols):
+    """Run up to four int4 matrices on the same small group of rows."""
+    return _cops.int4_multi4_mt(mats, x, cols)
+
+
+def gelu_mul_rows(g, u):
+    """Return gelu(g) * u one row at a time, as the decode step does.
+
+    The kernel treats a tail shorter than one vector in a different way, so a
+    call for each row keeps the tail of each row the same.
+    """
+    return np.stack([_cops.gelu_mul_pair(g[j], u[j]) for j in range(g.shape[0])])
+
+
+def moe_gemv_mt(w, scales, x, ids, poff, xi, rows, cols, xstride, inner=0):
+    """Run the selected experts of a small group of tokens. See cops.moe_gemv_mt."""
+    return _cops.moe_gemv_mt(w, scales, x, ids, poff, xi, rows, cols, xstride, inner)
+
+
 # The activation format for the matrices of one token. The int8 form reads 8
 # weight rows in one multiply, but it must apply the group scale in float32
 # afterwards. The C test .cache/gemv_real.c gives 1.0 to 1.2 times the speed of
@@ -469,6 +513,22 @@ def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
     _cops.attn_decode(qq, qs, kq, ks, vq, vs, scores, out,
                       q_heads, kv_heads, head_dim, n)
     return out
+
+
+def attn_decode_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
+    """Run the fused attention for a small group of query tokens in one call.
+
+    q is (tokens, q_heads, head_dim). Token t reads the cache rows lo[t] to
+    lo[t] + n[t] - 1. Each token gets the bits of attn_decode on those rows.
+    Return (tokens, q_heads, head_dim).
+    """
+    t = q.shape[0]
+    g = head_dim // 32
+    qq, qs = quantize_q8(q.reshape(t, q_heads, g, 32))
+    qq = np.ascontiguousarray(qq).reshape(t, q_heads, head_dim)
+    qs = np.ascontiguousarray(qs)
+    return _cops.attn_decode_mt(qq, qs, kq, ks, vq, vs, q_heads, kv_heads,
+                                head_dim, lo, n)
 
 
 def attn_decode_f32(q, k, v, pos, base=0, window=0):

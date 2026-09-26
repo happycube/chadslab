@@ -2017,6 +2017,207 @@ void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
     }
 }
 
+/* ---------- int4 GEMV for a small group of tokens ----------
+ * An MTP verify step runs the target on two to eight tokens. The prompt
+ * kernels are tuned for a large token block, and a decode kernel reads the
+ * weights again for each token. These kernels read a weight block one time
+ * for all the tokens.
+ *
+ * The steps for one token are the steps of the one-token kernel, in the same
+ * order. Thus each token gets the same result, bit for bit, as a decode step.
+ * The MTP decode then gives the same text as the plain decode.
+ *
+ * xs gives the address of the x row of each token. The dot writes
+ * r[t * 4 + j] for token t and weight row j.
+ */
+#define I4MT_T 4
+
+#if GEMMA_X86 && defined(__AVX512F__)
+static inline void dot4_i4_f32_mt(const uint8_t *w, int stride, const float *scales,
+                                  const float *const *xs, int nt, int n, float *r)
+{
+    __m512 a[I4MT_T][4];
+    for (int t = 0; t < nt; ++t) {
+        a[t][0] = _mm512_setzero_ps();
+        a[t][1] = _mm512_setzero_ps();
+        a[t][2] = _mm512_setzero_ps();
+        a[t][3] = _mm512_setzero_ps();
+    }
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i b8 = _mm_set1_epi8(8);
+    int groups = n / 32;
+    for (int g = 0; g < groups; ++g) {
+        const uint8_t *p = w + (size_t)g * 18 + 2;
+        __m512 l0, h0, l1, h1, l2, h2, l3, h3;
+        i4_pair(_mm_loadu_si128((const __m128i *)(p)), mask, b8, &l0, &h0);
+        i4_pair(_mm_loadu_si128((const __m128i *)(p + stride)), mask, b8, &l1, &h1);
+        i4_pair(_mm_loadu_si128((const __m128i *)(p + (size_t)2 * stride)), mask, b8, &l2, &h2);
+        i4_pair(_mm_loadu_si128((const __m128i *)(p + (size_t)3 * stride)), mask, b8, &l3, &h3);
+        __m512 s0 = _mm512_set1_ps(scales[g]);
+        __m512 s1 = _mm512_set1_ps(scales[(size_t)groups + g]);
+        __m512 s2 = _mm512_set1_ps(scales[(size_t)2 * groups + g]);
+        __m512 s3 = _mm512_set1_ps(scales[(size_t)3 * groups + g]);
+        for (int t = 0; t < nt; ++t) {
+            __m512 xlo = _mm512_loadu_ps(xs[t] + (size_t)g * 32);
+            __m512 xhi = _mm512_loadu_ps(xs[t] + (size_t)g * 32 + 16);
+            a[t][0] = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l0, _mm512_mul_ps(xhi, h0)), s0, a[t][0]);
+            a[t][1] = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l1, _mm512_mul_ps(xhi, h1)), s1, a[t][1]);
+            a[t][2] = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l2, _mm512_mul_ps(xhi, h2)), s2, a[t][2]);
+            a[t][3] = _mm512_fmadd_ps(_mm512_fmadd_ps(xlo, l3, _mm512_mul_ps(xhi, h3)), s3, a[t][3]);
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        r[t * 4 + 0] = _mm512_reduce_add_ps(a[t][0]);
+        r[t * 4 + 1] = _mm512_reduce_add_ps(a[t][1]);
+        r[t * 4 + 2] = _mm512_reduce_add_ps(a[t][2]);
+        r[t * 4 + 3] = _mm512_reduce_add_ps(a[t][3]);
+    }
+}
+#else
+/* AVX2 and scalar: run the one-token dot for each token. The four weight
+ * rows stay in the L1 cache, so the memory reads them one time. */
+static inline void dot4_i4_f32_mt(const uint8_t *w, int stride, const float *scales,
+                                  const float *const *xs, int nt, int n, float *r)
+{
+    for (int t = 0; t < nt; ++t) {
+        dot4_i4_f32(w, stride, scales, xs[t], n, r + t * 4);
+    }
+}
+#endif
+
+/* Rows i to i + 3 (or fewer at the end) of one matrix for nt tokens. out has
+ * the row stride ostride for each token. */
+static inline void i4_rows_mt(const uint8_t *w, const float *s, int rows, int cols,
+                              int i, const float *const *xs, float *const *outs, int nt)
+{
+    int groups = cols / 32;
+    size_t stride = (size_t)groups * 18;
+    for (int t0 = 0; t0 < nt; t0 += I4MT_T) {
+        int n = nt - t0 < I4MT_T ? nt - t0 : I4MT_T;
+        if (i + 4 <= rows) {
+            float r[I4MT_T * 4];
+            dot4_i4_f32_mt(w + (size_t)i * stride, (int)stride,
+                           s + (size_t)i * (size_t)groups, xs + t0, n, cols, r);
+            for (int t = 0; t < n; ++t) {
+                float *o = outs[t0 + t];
+                o[i] = r[t * 4];
+                o[i + 1] = r[t * 4 + 1];
+                o[i + 2] = r[t * 4 + 2];
+                o[i + 3] = r[t * 4 + 3];
+            }
+        } else {
+            for (int t = 0; t < n; ++t) {
+                for (int q = i; q < rows; ++q) {
+                    outs[t0 + t][q] = dot_i4_f32(w + (size_t)q * stride,
+                                                 s + (size_t)q * (size_t)groups,
+                                                 xs[t0 + t], cols);
+                }
+            }
+        }
+    }
+}
+
+#define I4MT_MAX 16
+
+/* x is (tokens, cols) and out is (tokens, rows). */
+void gemma_int4_linear_mt(const uint8_t *w, const float *scales, const float *x,
+                          float *out, int rows, int cols, int tokens)
+{
+    const float *xs[I4MT_MAX];
+    float *outs[I4MT_MAX];
+    for (int t = 0; t < tokens; ++t) {
+        xs[t] = x + (size_t)t * (size_t)cols;
+        outs[t] = out + (size_t)t * (size_t)rows;
+    }
+    int blocks = (rows + 3) / 4;
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < blocks; ++b) {
+        i4_rows_mt(w, scales, rows, cols, b * 4, xs, outs, tokens);
+    }
+}
+
+/* Up to four matrices on the same x rows. Matrix k writes (tokens, rows_k). */
+void gemma_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int rows0,
+                          const uint8_t *w1, const float *s1, float *o1, int rows1,
+                          const uint8_t *w2, const float *s2, float *o2, int rows2,
+                          const uint8_t *w3, const float *s3, float *o3, int rows3,
+                          const float *x, int cols, int tokens)
+{
+    const uint8_t *ws[4] = {w0, w1, w2, w3};
+    const float *ss[4] = {s0, s1, s2, s3};
+    float *os[4] = {o0, o1, o2, o3};
+    int rs[4] = {rows0, rows1, rows2, rows3};
+    long nb[4];
+    long total = 0;
+    for (int k = 0; k < 4; ++k) {
+        nb[k] = ws[k] ? (rs[k] + 3) / 4 : 0;
+        total += nb[k];
+    }
+    const float *xs[I4MT_MAX];
+    for (int t = 0; t < tokens; ++t) {
+        xs[t] = x + (size_t)t * (size_t)cols;
+    }
+    #pragma omp parallel for schedule(static)
+    for (long u = 0; u < total; ++u) {
+        int k = 0;
+        long v = u;
+        while (v >= nb[k]) {
+            v -= nb[k];
+            ++k;
+        }
+        float *outs[I4MT_MAX];
+        for (int t = 0; t < tokens; ++t) {
+            outs[t] = os[k] + (size_t)t * (size_t)rs[k];
+        }
+        i4_rows_mt(ws[k], ss[k], rs[k], cols, (int)v * 4, xs, outs, tokens);
+    }
+}
+
+/* The selected experts of a small group of tokens. Job j is one expert,
+ * ids[j], with the pairs poff[j] to poff[j + 1] - 1. Pair p reads the x row
+ * xi[p] (the stride is xstride) and writes the out row p. Each expert is read
+ * one time for all of its tokens. */
+void gemma_int4_moe_gemv_mt(const uint8_t *w, const float *scales, const float *x,
+                            const int *ids, const int *poff, const int *xi, int jobs,
+                            float *out, int rows, int cols, int xstride)
+{
+    int groups = cols / 32;
+    size_t expert_bytes = (size_t)rows * (size_t)groups * 18;
+    size_t expert_scales = (size_t)rows * (size_t)groups;
+    int blocks = (rows + 3) / 4;
+    long total = (long)jobs * (long)blocks;
+    #pragma omp parallel for schedule(static)
+    for (long u = 0; u < total; ++u) {
+        int j = (int)(u / blocks);
+        int i = (int)(u % blocks) * 4;
+        int e = ids[j];
+        int np = poff[j + 1] - poff[j];
+        const float *xs[I4MT_MAX];
+        float *outs[I4MT_MAX];
+        for (int q = 0; q < np; ++q) {
+            int p = poff[j] + q;
+            xs[q] = x + (size_t)xi[p] * (size_t)xstride;
+            outs[q] = out + (size_t)p * (size_t)rows;
+        }
+        i4_rows_mt(w + (size_t)e * expert_bytes, scales + (size_t)e * expert_scales,
+                   rows, cols, i, xs, outs, np);
+    }
+}
+
+void gemma_gelu_mul(const float *x, float *out, int rows, int inner);
+
+/* The gate and up projection of the experts for a group of tokens, then the
+ * GELU and the multiply. act holds 2 * inner values and out holds inner
+ * values for each pair. */
+void gemma_moe_gemv_gelu_mt(const uint8_t *w, const float *scales, const float *x,
+                            const int *ids, const int *poff, const int *xi, int jobs,
+                            float *act, float *out, int rows, int cols, int xstride,
+                            int inner)
+{
+    gemma_int4_moe_gemv_mt(w, scales, x, ids, poff, xi, jobs, act, rows, cols, xstride);
+    gemma_gelu_mul(act, out, poff[jobs], inner);
+}
+
 /* ---------- int4 GEMM for a long prompt ----------
  * The one-row dot decodes the packed weights again for each token. This GEMM
  * decodes a row block to a float32 A panel one time and then uses the panel
@@ -2596,15 +2797,20 @@ static float dot_q6k_row_avx2(const uint8_t *w, const float *x, int cols)
     return sum;
 }
 
+/* A group of tokens runs the one-token dot for each token. The weight row
+ * stays in the cache between the tokens, so the memory reads one row. */
 __attribute__((target("avx2,fma")))
 void gemma_q6k_avx2(const uint8_t *w, const float *x, float *out,
                     int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
-    (void)tokens;
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; ++i) {
-        out[i] = dot_q6k_row_avx2(w + (size_t)i * row_bytes, x, cols);
+        for (int t = 0; t < tokens; ++t) {
+            out[(size_t)t * (size_t)rows + i] =
+                dot_q6k_row_avx2(w + (size_t)i * row_bytes,
+                                 x + (size_t)t * (size_t)cols, cols);
+        }
     }
 }
 
@@ -2667,29 +2873,110 @@ static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
     return sum;
 }
 
+/* The dot of one Q6_K row with up to Q6K_TMAX token rows. The kernel decodes
+ * each group of 16 weights one time and uses it for every token. The steps
+ * for one token are the steps of dot_q6k_row_avx512 in the same order, so the
+ * result of each token is the same bit for bit. An MTP verify batch then
+ * gives the same logits as a decode step. */
+#define Q6K_TMAX 8
+
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static void dot_q6k_rows_avx512(const uint8_t *w, const float *x, int cols,
+                                int tokens, float *sums)
+{
+    int nb = cols >> 8;
+    for (int t = 0; t < tokens; ++t) {
+        sums[t] = 0.0f;
+    }
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t *blk = w + (size_t)b * 210u;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        float d = fp16_to_f32((uint16_t)((uint16_t)blk[208] | ((uint16_t)blk[209] << 8)));
+        __m512 acc[Q6K_TMAX];
+        for (int t = 0; t < tokens; ++t) {
+            acc[t] = _mm512_setzero_ps();
+        }
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t *q0 = ql + h * 64;
+            const uint8_t *g0 = qh + h * 32;
+            const int8_t *s0 = sc + h * 8;
+            size_t xo = (size_t)b * 256u + (size_t)h * 128u;
+            for (int l0 = 0; l0 < 32; l0 += 16) {
+                int is = l0 >> 4;
+                __m128i a = _mm_loadu_si128((const __m128i *)(q0 + l0));
+                __m128i c = _mm_loadu_si128((const __m128i *)(q0 + 32 + l0));
+                __m128i g = _mm_loadu_si128((const __m128i *)(g0 + l0));
+                __m128i m0f = _mm_set1_epi8(0x0F);
+                __m128i m3 = _mm_set1_epi8(0x03);
+                __m128i q1 = _mm_or_si128(_mm_and_si128(a, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(g, m3), 4));
+                __m128i q2 = _mm_or_si128(_mm_and_si128(c, m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 2), m3), 4));
+                __m128i q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(a, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 4), m3), 4));
+                __m128i q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(c, 4), m0f),
+                                          _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(g, 6), m3), 4));
+                __m512 k1, k2, k3, k4;
+                Q6K_WIDEN1_512(q1, k1);
+                k1 = _mm512_mul_ps(k1, _mm512_set1_ps((float)s0[is + 0]));
+                Q6K_WIDEN1_512(q2, k2);
+                k2 = _mm512_mul_ps(k2, _mm512_set1_ps((float)s0[is + 2]));
+                Q6K_WIDEN1_512(q3, k3);
+                k3 = _mm512_mul_ps(k3, _mm512_set1_ps((float)s0[is + 4]));
+                Q6K_WIDEN1_512(q4, k4);
+                k4 = _mm512_mul_ps(k4, _mm512_set1_ps((float)s0[is + 6]));
+                for (int t = 0; t < tokens; ++t) {
+                    const float *xh = x + (size_t)t * (size_t)cols + xo;
+                    __m512 v = acc[t];
+                    v = _mm512_fmadd_ps(k1, _mm512_loadu_ps(xh + l0), v);
+                    v = _mm512_fmadd_ps(k2, _mm512_loadu_ps(xh + 32 + l0), v);
+                    v = _mm512_fmadd_ps(k3, _mm512_loadu_ps(xh + 64 + l0), v);
+                    v = _mm512_fmadd_ps(k4, _mm512_loadu_ps(xh + 96 + l0), v);
+                    acc[t] = v;
+                }
+            }
+        }
+        for (int t = 0; t < tokens; ++t) {
+            sums[t] += d * _mm512_reduce_add_ps(acc[t]);
+        }
+    }
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 void gemma_q6k_avx512(const uint8_t *w, const float *x, float *out,
                       int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
-    (void)tokens;
+    if (tokens == 1) {
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            out[i] = dot_q6k_row_avx512(w + (size_t)i * row_bytes, x, cols);
+        }
+        return;
+    }
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; ++i) {
-        out[i] = dot_q6k_row_avx512(w + (size_t)i * row_bytes, x, cols);
+        float sums[Q6K_TMAX];
+        for (int t0 = 0; t0 < tokens; t0 += Q6K_TMAX) {
+            int nt = tokens - t0 < Q6K_TMAX ? tokens - t0 : Q6K_TMAX;
+            dot_q6k_rows_avx512(w + (size_t)i * row_bytes,
+                                x + (size_t)t0 * (size_t)cols, cols, nt, sums);
+            for (int t = 0; t < nt; ++t) {
+                out[(size_t)(t0 + t) * (size_t)rows + i] = sums[t];
+            }
+        }
     }
 }
 
 /* Multiply x by W. W is Q6_K data. Use the AVX-512 kernel or the AVX2 kernel.
- * A token count above one uses the scalar kernel. The output head of this
- * model always uses one token.
+ * Both kernels take a group of tokens. The result of each token is the same
+ * as the result of a call with that token alone.
  */
 void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
                       int rows, int cols, int tokens)
 {
-    if (tokens > 1) {
-        gemma_q6k_scalar(w, x, out, rows, cols, tokens);
-        return;
-    }
     if (gemma_have_avx512()) {
         gemma_q6k_avx512(w, x, out, rows, cols, tokens);
     } else {
@@ -2780,6 +3067,93 @@ void gemma_router(const float *x, const float *scale, const float *proj,
     for (int j = 0; j < top_k; ++j) {
         val[j] = val[j] * invv * per_expert[idx[j]];
     }
+}
+
+/* The router for a small group of tokens. The steps for each token are the
+ * steps of gemma_router, so each token selects the same experts with the same
+ * weights. One parallel region covers the logits of every token. x is
+ * (tokens, hidden), val and idx are (tokens, top_k). tokens is at most 16. */
+void gemma_router_mt(const float *x, const float *scale, const float *proj,
+                     const float *per_expert, int hidden, int experts, int top_k,
+                     float eps, float hscale, float *val, int *idx, int tokens)
+{
+    float *r = (float *)malloc((size_t)tokens * (size_t)hidden * sizeof(float));
+    float *logits = (float *)malloc((size_t)tokens * (size_t)experts * sizeof(float));
+    for (int t = 0; t < tokens; ++t) {
+        const float *xt = x + (size_t)t * (size_t)hidden;
+        float *rt = r + (size_t)t * (size_t)hidden;
+        float ss = 0.0f;
+        for (int k = 0; k < hidden; ++k) {
+            ss += xt[k] * xt[k];
+        }
+        float inv = 1.0f / sqrtf(ss / (float)hidden + eps);
+        for (int k = 0; k < hidden; ++k) {
+            rt[k] = xt[k] * inv * scale[k] * hscale;
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (int e = 0; e < experts; ++e) {
+        const float *pe = proj + (size_t)e * (size_t)hidden;
+        for (int t = 0; t < tokens; ++t) {
+            const float *rt = r + (size_t)t * (size_t)hidden;
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            int k = 0;
+            for (; k + 3 < hidden; k += 4) {
+                a0 += rt[k] * pe[k];
+                a1 += rt[k + 1] * pe[k + 1];
+                a2 += rt[k + 2] * pe[k + 2];
+                a3 += rt[k + 3] * pe[k + 3];
+            }
+            float a = (a0 + a1) + (a2 + a3);
+            for (; k < hidden; ++k) {
+                a += rt[k] * pe[k];
+            }
+            logits[(size_t)t * (size_t)experts + e] = a;
+        }
+    }
+    for (int t = 0; t < tokens; ++t) {
+        float *lg = logits + (size_t)t * (size_t)experts;
+        float *vt = val + (size_t)t * (size_t)top_k;
+        int *it = idx + (size_t)t * (size_t)top_k;
+        float m = lg[0];
+        for (int e = 1; e < experts; ++e) {
+            if (lg[e] > m) {
+                m = lg[e];
+            }
+        }
+        float sum = 0.0f;
+        for (int e = 0; e < experts; ++e) {
+            lg[e] = expf(lg[e] - m);
+            sum += lg[e];
+        }
+        float invs = 1.0f / sum;
+        for (int e = 0; e < experts; ++e) {
+            lg[e] *= invs;
+        }
+        for (int j = 0; j < top_k; ++j) {
+            int best = 0;
+            float bv = lg[0];
+            for (int e = 1; e < experts; ++e) {
+                if (lg[e] > bv) {
+                    bv = lg[e];
+                    best = e;
+                }
+            }
+            vt[j] = bv;
+            it[j] = best;
+            lg[best] = -1.0f;
+        }
+        float vs = 0.0f;
+        for (int j = 0; j < top_k; ++j) {
+            vs += vt[j];
+        }
+        float invv = 1.0f / vs;
+        for (int j = 0; j < top_k; ++j) {
+            vt[j] = vt[j] * invv * per_expert[it[j]];
+        }
+    }
+    free(r);
+    free(logits);
 }
 
 /* ---------- the query, key, and value norm of one layer ----------
@@ -3066,6 +3440,57 @@ void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
 /* The int8 attention for one query token. The attribute keeps the AVX2
  * version, which the baseline build needs. */
 __attribute__((target("avx2,fma")))
+/* One query head of the fused decode attention over n key rows. */
+static inline void attn_decode_head(const int8_t *qh, const float *qsh,
+                                    const int8_t *kq, const float *ks,
+                                    const int8_t *vq, const float *vs,
+                                    float *sc, float *oh, int kv, int head_dim,
+                                    size_t kv_stride, size_t ks_stride, int n)
+{
+    int g = head_dim / 32;
+    for (int j = 0; j < n; ++j) {
+        const int8_t *kp = kq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *ksp = ks + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        float s = 0.0f;
+        for (int gg = 0; gg < g; ++gg) {
+            s += (float)dot_i8_i8(kp + (size_t)gg * 32, qh + (size_t)gg * 32, 32)
+                 * ksp[gg] * qsh[gg];
+        }
+        sc[j] = s;
+    }
+    float m = sc[0];
+    for (int j = 1; j < n; ++j) {
+        if (sc[j] > m) {
+            m = sc[j];
+        }
+    }
+    float l = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float e = expf(sc[j] - m);
+        sc[j] = e;
+        l += e;
+    }
+    float inv = 1.0f / l;
+    for (int d = 0; d < head_dim; ++d) {
+        oh[d] = 0.0f;
+    }
+    for (int j = 0; j < n; ++j) {
+        float p = sc[j] * inv;
+        const int8_t *vp = vq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *vsp = vs + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        for (int gg = 0; gg < g; ++gg) {
+            __m256 pv = _mm256_set1_ps(p * vsp[gg]);
+            const int8_t *vpp = vp + (size_t)gg * 32;
+            float *op = oh + (size_t)gg * 32;
+            for (int i = 0; i < 32; i += 8) {
+                __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i *)(vpp + i))));
+                _mm256_storeu_ps(op + i, _mm256_fmadd_ps(pv, vf, _mm256_loadu_ps(op + i)));
+            }
+        }
+    }
+}
+
 void gemma_attn_decode(const int8_t *qq, const float *qs,
                        const int8_t *kq, const float *ks,
                        const int8_t *vq, const float *vs,
@@ -3078,52 +3503,41 @@ void gemma_attn_decode(const int8_t *qq, const float *qs,
     size_t ks_stride = (size_t)kv_heads * (size_t)g;
     #pragma omp parallel for schedule(static)
     for (int h = 0; h < q_heads; ++h) {
-        int kv = h / n_rep;
-        const int8_t *qh = qq + (size_t)h * (size_t)head_dim;
-        const float *qsh = qs + (size_t)h * (size_t)g;
-        float *sc = scores + (size_t)h * (size_t)n;
-        for (int j = 0; j < n; ++j) {
-            const int8_t *kp = kq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
-            const float *ksp = ks + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
-            float s = 0.0f;
-            for (int gg = 0; gg < g; ++gg) {
-                s += (float)dot_i8_i8(kp + (size_t)gg * 32, qh + (size_t)gg * 32, 32)
-                     * ksp[gg] * qsh[gg];
-            }
-            sc[j] = s;
-        }
-        float m = sc[0];
-        for (int j = 1; j < n; ++j) {
-            if (sc[j] > m) {
-                m = sc[j];
-            }
-        }
-        float l = 0.0f;
-        for (int j = 0; j < n; ++j) {
-            float e = expf(sc[j] - m);
-            sc[j] = e;
-            l += e;
-        }
-        float inv = 1.0f / l;
-        float *oh = out + (size_t)h * (size_t)head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            oh[d] = 0.0f;
-        }
-        for (int j = 0; j < n; ++j) {
-            float p = sc[j] * inv;
-            const int8_t *vp = vq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
-            const float *vsp = vs + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
-            for (int gg = 0; gg < g; ++gg) {
-                __m256 pv = _mm256_set1_ps(p * vsp[gg]);
-                const int8_t *vpp = vp + (size_t)gg * 32;
-                float *op = oh + (size_t)gg * 32;
-                for (int i = 0; i < 32; i += 8) {
-                    __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                        _mm_loadl_epi64((const __m128i *)(vpp + i))));
-                    _mm256_storeu_ps(op + i, _mm256_fmadd_ps(pv, vf, _mm256_loadu_ps(op + i)));
-                }
-            }
-        }
+        attn_decode_head(qq + (size_t)h * (size_t)head_dim, qs + (size_t)h * (size_t)g,
+                         kq, ks, vq, vs, scores + (size_t)h * (size_t)n,
+                         out + (size_t)h * (size_t)head_dim, h / n_rep, head_dim,
+                         kv_stride, ks_stride, n);
+    }
+}
+
+/* The fused decode attention for a small group of query tokens in one
+ * parallel region. Token t reads the key rows lo[t] to lo[t] + n[t] - 1 of the
+ * int8 cache, which is what a decode step of that token reads. qq is
+ * (tokens, q_heads, head_dim), qs is (tokens, q_heads, groups), scores holds
+ * tokens * q_heads * nmax values, and out is (tokens, q_heads, head_dim). */
+void gemma_attn_decode_mt(const int8_t *qq, const float *qs,
+                          const int8_t *kq, const float *ks,
+                          const int8_t *vq, const float *vs,
+                          float *scores, float *out,
+                          int q_heads, int kv_heads, int head_dim,
+                          const int *lo, const int *n, int nmax, int tokens)
+{
+    int g = head_dim / 32;
+    int n_rep = q_heads / kv_heads;
+    size_t kv_stride = (size_t)kv_heads * (size_t)head_dim;
+    size_t ks_stride = (size_t)kv_heads * (size_t)g;
+    int total = tokens * q_heads;
+    #pragma omp parallel for schedule(static)
+    for (int u = 0; u < total; ++u) {
+        int t = u / q_heads;
+        int h = u % q_heads;
+        size_t r = (size_t)lo[t];
+        attn_decode_head(qq + (size_t)u * (size_t)head_dim, qs + (size_t)u * (size_t)g,
+                         kq + r * kv_stride, ks + r * ks_stride,
+                         vq + r * kv_stride, vs + r * ks_stride,
+                         scores + (size_t)u * (size_t)nmax,
+                         out + (size_t)u * (size_t)head_dim, h / n_rep, head_dim,
+                         kv_stride, ks_stride, n[t]);
     }
 }
 

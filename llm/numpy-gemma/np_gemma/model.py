@@ -509,6 +509,13 @@ class Model:
             return ops.router(x, w["router.scale"], w["router.proj"],
                               w["router.per_expert_scale"], self.cfg.top_k_experts,
                               eps, self.cfg.hidden_size ** -0.5)
+        if self._dtype == "int4" and ops.mt_ready(x.shape[0]) and ops.router_ready():
+            # A small group: the steps of the fused router for each token, in
+            # one call. A matrix product over the group sums in another order
+            # and can select another expert.
+            return ops.router_mt(x, w["router.scale"], w["router.proj"],
+                                 w["router.per_expert_scale"], self.cfg.top_k_experts,
+                                 eps, self.cfg.hidden_size ** -0.5)
         r = ops.rms_norm(x, None, eps)
         r = r * w["router.scale"] * (self.cfg.hidden_size ** -0.5)
         logits = ops.linear(r, w["router.proj"])
@@ -526,6 +533,8 @@ class Model:
         """
         if self._dtype == "int4" and h.shape[0] == 1 and ops.int4_moe_ready():
             return self._moe_one_token(h, w, val, idx)
+        if self._dtype == "int4" and ops.mt_ready(h.shape[0]):
+            return self._moe_mt(h, w, val, idx)
         if self._dtype == "int4" and h.shape[0] >= 2 and ops.int4_q8_moe_ready():
             # One parallel region covers every expert of the layer.
             return ops.moe_int4_q8(h, w["experts.gate_up_proj"],
@@ -573,6 +582,40 @@ class Model:
         for j in range(ids.size):
             slot = np.nonzero(idx[0] == ids[j])[0]
             out[0] += de[j] * val[0, slot[0]]
+        return out
+
+    def _moe_mt(self, h, w, val, idx):
+        """Run the selected experts for a small group of tokens.
+
+        Each selected expert is read one time for all of its tokens. A pair is
+        one (expert, token). The pairs of one expert are adjacent. Each token
+        adds its experts in the order of the expert index, as
+        _moe_one_token does, so each token gets the same bits.
+        """
+        inner = self.cfg.moe_intermediate_size
+        gu_q, gu_s = w["experts.gate_up_proj"]
+        dn_q, dn_s = w["experts.down_proj"]
+        t, k = idx.shape
+        flat = idx.reshape(-1)
+        # Sort the pairs by expert. The stable sort keeps the tokens of one
+        # expert in order.
+        order = np.argsort(flat, kind="stable")
+        tok = order // k
+        slot = order % k
+        ids, counts = np.unique(flat, return_counts=True)
+        poff = np.concatenate([[0], np.cumsum(counts)])
+        cols = h.shape[1]
+        act = ops.moe_gemv_mt(gu_q, gu_s, h, ids, poff, tok, gu_q.shape[1],
+                              cols, cols, inner)
+        de = ops.moe_gemv_mt(dn_q, dn_s, act, ids, poff, np.arange(tok.size),
+                             dn_q.shape[1], inner, inner)
+        contrib = de * val[tok, slot][:, None]
+        # Row j of m gives the pairs of token j in the order of the expert
+        # index. Add them in that order, as _moe_one_token does.
+        m = np.argsort(tok, kind="stable").reshape(t, k)
+        out = np.zeros_like(h)
+        for s in range(k):
+            out += contrib[m[:, s]]
         return out
 
     def _rope(self, plan, positions):
@@ -661,6 +704,7 @@ class Model:
         residual = x
         fuse_norm = (x.shape[0] == 1 and self._dtype == "int4"
                      and ops.int4_multi4_ready())
+        mt = self._dtype == "int4" and ops.mt_ready(x.shape[0])
         if fuse_norm:
             # The norm of the row, then the gate and the up projection, in one
             # call. The two projections also share the input row: one kernel
@@ -673,6 +717,12 @@ class Model:
                 self.cfg.hidden_size)[:2]
             g = g.reshape(1, -1)
             u = u.reshape(1, -1)
+        elif mt:
+            # A small group: the same kernels for each token, with one read of
+            # the weights for the whole group.
+            h = ops.rms_norm(x, w["pre_feedforward_layernorm"], eps)
+            g, u = ops.int4_multi4_mt([w["mlp.gate_proj"], w["mlp.up_proj"]],
+                                      h, self.cfg.hidden_size)[:2]
         else:
             h = ops.rms_norm(x, w["pre_feedforward_layernorm"], eps)
             emit(hook, p + "pre_feedforward_layernorm", h)
@@ -688,6 +738,8 @@ class Model:
                                   w["mlp.down_proj"][0], w["mlp.down_proj"][1],
                                   self.cfg.hidden_size, self.cfg.intermediate_size)
             m = m.reshape(1, -1)
+        elif mt:
+            m = ops.linear_int4_mt(ops.gelu_mul_rows(g, u), *w["mlp.down_proj"])
         else:
             m = self.linear(ops.gelu_tanh(g) * u, w["mlp.down_proj"])
         emit(hook, p + "mlp.down_proj", m)
@@ -726,10 +778,15 @@ class Model:
         hd = plan.head_dim
         t = x.shape[0]
 
+        mt = self._dtype == "int4" and ops.mt_ready(t)
         if t == 1 and self._dtype == "int4" and ops.int4_multi4_ready():
             # One call serves the query, the key, and the value projection.
             vp = None if plan.k_eq_v else w["self_attn.v_proj"]
             qf, kf, vf, _ = ops.int4_multi4(
+                [w["self_attn.q_proj"], w["self_attn.k_proj"], vp], x, self.cfg.hidden_size)
+        elif mt:
+            vp = None if plan.k_eq_v else w["self_attn.v_proj"]
+            qf, kf, vf, _ = ops.int4_multi4_mt(
                 [w["self_attn.q_proj"], w["self_attn.k_proj"], vp], x, self.cfg.hidden_size)
         else:
             qf = self.linear(x, w["self_attn.q_proj"])
@@ -772,24 +829,38 @@ class Model:
             k = rope_mod.apply(k, cos, sin)
 
         if cache is not None:
-            start = positions[0]
+            start = int(positions[0])
+            q8_before = cache.q8_ready(i)
             cache.write(i, start, k, v)
-            if t == 1 and ops.attn_ready() and cache.q8_ready(i):
-                kq, ks, vq, vs, _b = cache.read_q8(i, start + t)
-                n = kq.shape[0]
-                o = ops.attn_decode(q[0], kq, ks, vq, vs,
-                                    plan.num_q_heads, plan.num_kv_heads, hd, n)
-                out = self.linear(o.reshape(1, plan.q_dim), w["self_attn.o_proj"])
+            if t == 1 or mt:
+                # A decode step, or a small group that repeats the decode step
+                # for each token. Row j sees the cache rows up to its position.
+                o = None
+                if mt and ops.attn_ready() and cache.q8_ready(i) and (
+                        q8_before or start + 1 - cache.base[i] >= cache.attn_min):
+                    # Every row uses the int8 cache. One call serves the group.
+                    kq, ks, vq, vs, base = cache.read_q8(i, start + t)
+                    pos = start + np.arange(t)
+                    window = plan.sliding_window or 0
+                    lo = np.maximum(0, pos - window + 1 - base) if window else np.zeros(t, np.int64)
+                    o = ops.attn_decode_mt(q, kq, ks, vq, vs, plan.num_q_heads,
+                                           plan.num_kv_heads, hd, lo, pos + 1 - base - lo)
+                    o = o.reshape(t, plan.q_dim)
+                if o is None:
+                    o = np.empty((t, plan.q_dim), dtype=np.float32)
+                    for j in range(t):
+                        o[j] = self._attend_one(q[j:j + 1], plan, i, start + j, cache,
+                                                q8_before)
+                if mt:
+                    out = ops.linear_int4_mt(o, *w["self_attn.o_proj"])
+                else:
+                    out = self.linear(o, w["self_attn.o_proj"])
                 emit(hook, p + "self_attn.o_proj", out)
                 return out
             K, V, base = cache.read(i, start + t)
         else:
             K, V, base = k, v, positions[0]
 
-        # The attention scale is 1.0. Do not divide by sqrt(head_dim).
-        n_rep = plan.num_q_heads // plan.num_kv_heads
-        nk = plan.num_kv_heads
-        n = K.shape[0]
         flash = os.environ.get("NP_GEMMA_FLASH", "0")
         window = plan.sliding_window or 0
         # "slide" combines the two paths: the kernel serves a sliding layer,
@@ -810,6 +881,43 @@ class Model:
             out = self.linear(fo.reshape(t, plan.q_dim), w["self_attn.o_proj"])
             emit(hook, p + "self_attn.o_proj", out)
             return out
+        out = self._attend_rows(q, K, V, base, positions, plan)
+        out = self.linear(out, w["self_attn.o_proj"])
+        emit(hook, p + "self_attn.o_proj", out)
+        return out
+
+    def _attend_one(self, q, plan, i, pos, cache, q8_before):
+        """Run the attention of one query at pos over the cache. Return (q_dim,).
+
+        Use the int8 cache when a decode step at pos uses it: the int8 copy is
+        on before the write, or the write turns it on at pos + 1 rows. A
+        sliding layer reads only the rows of the window. The cache can hold
+        more rows than the window, because it drops old rows in large steps.
+        """
+        hd = plan.head_dim
+        window = plan.sliding_window or 0
+        if ops.attn_ready() and cache.q8_ready(i) and (
+                q8_before or pos + 1 - cache.base[i] >= cache.attn_min):
+            kq, ks, vq, vs, base = cache.read_q8(i, pos + 1)
+            lo = max(0, pos - window + 1 - base) if window else 0
+            o = ops.attn_decode(q[0], kq[lo:], ks[lo:], vq[lo:], vs[lo:],
+                                plan.num_q_heads, plan.num_kv_heads, hd,
+                                kq.shape[0] - lo)
+            return o.reshape(plan.q_dim)
+        K, V, base = cache.read(i, pos + 1)
+        return self._attend_rows(q, K, V, base, np.array([pos]), plan)[0]
+
+    def _attend_rows(self, q, K, V, base, positions, plan):
+        """Run the attention of the queries q over K and V. Return (t, q_dim).
+
+        The causal mask and the window mask come from the positions.
+        """
+        t = q.shape[0]
+        hd = plan.head_dim
+        # The attention scale is 1.0. Do not divide by sqrt(head_dim).
+        n_rep = plan.num_q_heads // plan.num_kv_heads
+        nk = plan.num_kv_heads
+        n = K.shape[0]
         # Drop the keys that are invisible for every query in the block. The
         # causal mask hides the keys after the last query. The window hides
         # the keys before the first query less the window. A key that is
@@ -839,10 +947,7 @@ class Model:
         probs = ops.softmax_mask(scores, positions, n_rep, base, window)
         vb = V.transpose(1, 0, 2)
         out = np.matmul(probs.reshape(nk, t * n_rep, n), vb)
-        out = out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
-        out = self.linear(out, w["self_attn.o_proj"])
-        emit(hook, p + "self_attn.o_proj", out)
-        return out
+        return out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
 
     # ---- output head -------------------------------------------------------
     def logits(self, x, chunk=32768, apply_softcap=True):

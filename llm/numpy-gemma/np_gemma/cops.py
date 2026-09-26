@@ -265,6 +265,29 @@ try:
                                              _int, _void_p, _void_p, _int, _int,
                                              _int, _int]
         _lib.gemma_moe_gemv_gelu.restype = None
+        _lib.gemma_attn_decode_mt.argtypes = [_void_p] * 8 + [_int, _int, _int,
+                                                               _void_p, _void_p, _int, _int]
+        _lib.gemma_attn_decode_mt.restype = None
+        _lib.gemma_router_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                         _int, _int, _int, ctypes.c_float, ctypes.c_float,
+                                         _void_p, _void_p, _int]
+        _lib.gemma_router_mt.restype = None
+        _lib.gemma_gelu_mul_pair.argtypes = [_void_p, _void_p, _void_p, _int]
+        _lib.gemma_gelu_mul_pair.restype = None
+        _lib.gemma_int4_linear_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                              _int, _int, _int]
+        _lib.gemma_int4_linear_mt.restype = None
+        _lib.gemma_int4_multi4_mt.argtypes = (
+            [_void_p, _void_p, _void_p, _int] * 4) + [_void_p, _int, _int]
+        _lib.gemma_int4_multi4_mt.restype = None
+        _lib.gemma_int4_moe_gemv_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                _void_p, _void_p, _int, _void_p,
+                                                _int, _int, _int]
+        _lib.gemma_int4_moe_gemv_mt.restype = None
+        _lib.gemma_moe_gemv_gelu_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                _void_p, _void_p, _int, _void_p,
+                                                _void_p, _int, _int, _int, _int]
+        _lib.gemma_moe_gemv_gelu_mt.restype = None
         _lib.gemma_int8_pair.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_int8_pair.restype = None
         _lib.gemma_int8_pf.argtypes = [_void_p, _void_p, _void_p, _void_p, _int, _int, _int]
@@ -1074,4 +1097,122 @@ def moe_gemv_gelu(w, scales, x, ids, jobs, rows, cols, xstride, inner):
                              act.ctypes.data, out.ctypes.data,
                              ctypes.c_int(rows), ctypes.c_int(cols),
                              ctypes.c_int(xstride), ctypes.c_int(inner))
+    return out
+
+
+# ---- a small group of tokens (the MTP verify step) --------------------------
+# Each kernel gives every token the same result, bit for bit, as the one-token
+# kernel. A group holds at most MT_MAX tokens.
+MT_MAX = 16
+
+
+def linear_int4_mt(x, packed, scales):
+    """Multiply the rows of x by W. W is packed 4-bit data. Return (tokens, rows)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    rows = packed.shape[0]
+    cols = packed.shape[1] * 32
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.gemma_int4_linear_mt(packed.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                              out.ctypes.data, ctypes.c_int(rows), ctypes.c_int(cols),
+                              ctypes.c_int(x.shape[0]))
+    return out
+
+
+def int4_multi4_mt(mats, x, cols):
+    """Run up to four int4 matrices on the same rows of x.
+
+    Return a list of (tokens, rows) outputs, or None for a skipped matrix.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    t = x.shape[0]
+    args = []
+    outs = []
+    for i in range(4):
+        if i < len(mats) and mats[i] is not None:
+            w, s = mats[i]
+            o = np.empty((t, w.shape[0]), dtype=np.float32)
+            args += [w.ctypes.data, s.ctypes.data, o.ctypes.data, ctypes.c_int(w.shape[0])]
+            outs.append(o)
+        else:
+            args += [None, None, None, ctypes.c_int(0)]
+            outs.append(None)
+    args += [x.ctypes.data, ctypes.c_int(cols), ctypes.c_int(t)]
+    _lib.gemma_int4_multi4_mt(*args)
+    return outs
+
+
+def moe_gemv_mt(w, scales, x, ids, poff, xi, rows, cols, xstride, inner=0):
+    """Run the selected experts of a small group of tokens.
+
+    ids gives the expert of each job. The pairs of job j are poff[j] to
+    poff[j + 1] - 1, and pair p reads the x row xi[p]. Return one row for each
+    pair. With inner > 0, apply the GELU and the multiply and return inner
+    values for each pair.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    ids = np.ascontiguousarray(ids, dtype=np.int32)
+    poff = np.ascontiguousarray(poff, dtype=np.int32)
+    xi = np.ascontiguousarray(xi, dtype=np.int32)
+    jobs = int(ids.size)
+    pairs = int(poff[-1])
+    act = np.empty((pairs, rows), dtype=np.float32)
+    if inner:
+        out = np.empty((pairs, inner), dtype=np.float32)
+        _lib.gemma_moe_gemv_gelu_mt(w.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                                    ids.ctypes.data, poff.ctypes.data, xi.ctypes.data,
+                                    ctypes.c_int(jobs), act.ctypes.data, out.ctypes.data,
+                                    ctypes.c_int(rows), ctypes.c_int(cols),
+                                    ctypes.c_int(xstride), ctypes.c_int(inner))
+        return out
+    _lib.gemma_int4_moe_gemv_mt(w.ctypes.data, scales.ctypes.data, x.ctypes.data,
+                                ids.ctypes.data, poff.ctypes.data, xi.ctypes.data,
+                                ctypes.c_int(jobs), act.ctypes.data,
+                                ctypes.c_int(rows), ctypes.c_int(cols),
+                                ctypes.c_int(xstride))
+    return act
+
+
+def gelu_mul_pair(g, u):
+    """Return gelu(g) * u for two float32 arrays of the same size."""
+    g = np.ascontiguousarray(g, dtype=np.float32)
+    u = np.ascontiguousarray(u, dtype=np.float32)
+    out = np.empty_like(g)
+    _lib.gemma_gelu_mul_pair(g.ctypes.data, u.ctypes.data, out.ctypes.data,
+                             ctypes.c_int(g.size))
+    return out
+
+
+def router_mt(x, scale, proj, per_expert, top_k, eps, hscale):
+    """Run the router for a small group of tokens. Return (val, idx)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    t, hidden = x.shape
+    experts = proj.shape[0]
+    val = np.empty((t, top_k), dtype=np.float32)
+    idx = np.empty((t, top_k), dtype=np.int32)
+    _lib.gemma_router_mt(x.ctypes.data, scale.ctypes.data, proj.ctypes.data,
+                         per_expert.ctypes.data, ctypes.c_int(hidden),
+                         ctypes.c_int(experts), ctypes.c_int(top_k),
+                         ctypes.c_float(eps), ctypes.c_float(hscale),
+                         val.ctypes.data, idx.ctypes.data, ctypes.c_int(t))
+    return val, idx.astype(np.int64)
+
+
+def attn_decode_mt(qq, qs, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
+    """Run the fused decode attention for a small group of query tokens.
+
+    qq and qs are the int8 queries and their scales, (tokens, q_heads, ...).
+    Token t reads the cache rows lo[t] to lo[t] + n[t] - 1. Return
+    (tokens, q_heads, head_dim).
+    """
+    lo = np.ascontiguousarray(lo, dtype=np.int32)
+    n = np.ascontiguousarray(n, dtype=np.int32)
+    t = int(lo.size)
+    nmax = int(n.max())
+    scores = np.empty((t, q_heads, nmax), dtype=np.float32)
+    out = np.empty((t, q_heads, head_dim), dtype=np.float32)
+    _lib.gemma_attn_decode_mt(qq.ctypes.data, qs.ctypes.data, kq.ctypes.data, ks.ctypes.data,
+                              vq.ctypes.data, vs.ctypes.data, scores.ctypes.data,
+                              out.ctypes.data, ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
+                              ctypes.c_int(head_dim), lo.ctypes.data, n.ctypes.data,
+                              ctypes.c_int(nmax), ctypes.c_int(t))
     return out

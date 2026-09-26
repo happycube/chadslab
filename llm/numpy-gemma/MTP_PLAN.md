@@ -201,3 +201,88 @@ Each phase ends with a commit and a test.
 - The HF reference feeds the drafter the final-norm hidden state. An older
   llama.cpp comment says "before the final output norm". The current code
   uses the state after the norm. Phase 1 settles this against transformers.
+
+## Results
+
+Phases 0 to 3 are done for the 26B target. The run uses
+OPENBLAS_NUM_THREADS=1 and OMP_WAIT_POLICY=ACTIVE. The BLAS pool of the
+default setting fights the OpenMP kernels and makes a small batch up to five
+times slower.
+
+### Phase 0: the verify cost
+
+`scripts/bench_verify.py` gave these values for the old kernels at a context
+of 512 tokens:
+
+    tokens   int8 path   float path
+    1          85.8 ms     79.6 ms
+    2         404.3 ms    340.8 ms
+    4         685.5 ms    409.3 ms
+
+A batch of four cost five to eight decode steps. Two causes:
+
+- The Q6_K output head sent every batch of two or more tokens to the scalar
+  kernel. It took about 170 ms for each token.
+- The prompt kernels do not suit two to eight tokens. The int8 expert tile
+  computes a block of 16 tokens for each expert, and a verify batch gives one
+  or two tokens to most experts.
+
+### The small-group kernels
+
+New kernels read each weight block one time for a group of up to 16 tokens.
+The steps for one token are the steps of the one-token kernel, in the same
+order. Thus each token gets the same bits as a decode step.
+
+    kernel                  replaces for 2 to 16 tokens
+    gemma_q6k_avx512        the scalar Q6_K head
+    gemma_int4_linear_mt    the four-row int4 GEMV
+    gemma_int4_multi4_mt    the query, key, value, gate, and up calls
+    gemma_int4_moe_gemv_mt  the expert GEMV; one read of each expert
+    gemma_router_mt         the fused router, one call for the group
+    gemma_attn_decode_mt    the fused decode attention, one call
+
+`scripts/check_mt.py` runs a group in one pass and the same tokens one at a
+time. The hidden states and the logits are the same bit for bit. The test
+uses groups of 2, 3, 4, 5, and 8 tokens at a context of 64 and of 300. A group of four
+now costs 137 ms, which is 1.9 decode steps. Set NP_GEMMA_MT=0 to use the
+prompt kernels.
+
+### A fix to the decode attention
+
+The fused decode attention read every row of the sliding cache. The cache
+keeps up to two windows, because it drops old rows in large steps. Thus a
+decode step past 1024 tokens also read keys that the window must hide. The
+decode now reads only the rows of the window. This changes the output of a
+decode step only after 1024 tokens of context.
+
+### Phase 1: the drafter
+
+`scripts/check_assistant.py` compares the NumPy drafter with
+Gemma4AssistantForCausalLM of transformers 5.17.0. It uses the same token,
+the same target hidden state, and the same shared keys and values:
+
+    step   top token     logits (relative)   h (relative)
+    0      563 = 563     3.8e-07             9.4e-07
+    1      506 = 506     7.0e-07             6.2e-07
+    2      17856 = 17856 5.2e-07             3.7e-07
+
+The int4 drafter selects the same three tokens. Its relative error is 6 to 12
+per cent. The transformers code feeds the drafter the target hidden state
+after the final norm, as the plan says.
+
+### Phases 2 and 3: the MTP decode
+
+`scripts/check_mtp.py` runs the plain greedy decode and the MTP decode with
+the int4 drafter. Every prompt gives the same token ids with and without
+MTP. 200 tokens, tokens/s of the decode:
+
+    prompt   plain   n=2     gain   accepted   n=3     gain   accepted
+    code     13.47   17.54   1.30   77%        17.99   1.34   73%
+    prose    13.19   14.54   1.10   55%        12.68   0.96   45%
+    list     13.64   18.17   1.33   82%        18.43   1.35   80%
+    math     13.49   18.28   1.35   83%        17.73   1.31   77%
+    ALL      13.47   17.25   1.28   75%        16.71   1.24   69%
+
+Two drafts give the best total. The MTP decode of numpy-gemma is now faster
+than the plain decode of llama.cpp, which gives 17.01 tokens/s. The MTP
+decode of llama.cpp is faster, with 24.69 tokens/s for mxfp4.
