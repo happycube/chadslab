@@ -3801,11 +3801,15 @@ __device__ float kq_row(int type, const uint8_t *w, const float *x, int cols)
     return sum;
 }
 
+/* The rows of a block of the products of one token (4 was 3% faster than 8,
+ * and 16 or 32 were slower). */
+#define KQ_RPB 4
+
 /* GP_KQ_LINEAR: xq, xs, xm, x, w, type, rows, cols, t, out. */
 __global__ void k_kq_linear(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
-    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int row = blockIdx.x * KQ_RPB + threadIdx.x / 32;
     int rows = DI(6), cols = DI(7), type = DI(5), t = DI(8);
     if (row >= rows) {
         return;
@@ -4271,7 +4275,7 @@ __global__ void k_add_rms(const gp_rec *r, const int64_t *e)
 __global__ void k_kq_multi(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
-    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int row = blockIdx.x * KQ_RPB + threadIdx.x / 32;
     int n = DI(3), cols = DI(1), t = DI(2), m = 0;
     while (m < n && row >= DI(6 + 4 * m)) {
         row -= DI(6 + 4 * m);
@@ -5296,7 +5300,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_kq_gemm<<<dim3((unsigned)cdiv(hlit(r, 6, &bad), KG_B),
                              (unsigned)cdiv(hlit(r, 8, &bad), KG_B)), 256, 0, s>>>(dr, denv);
         } else {
-            k_kq_linear<<<(unsigned)cdiv(hlit(r, 6, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+            k_kq_linear<<<(unsigned)cdiv(hlit(r, 6, &bad), KQ_RPB), 32 * KQ_RPB, 0, s>>>(dr, denv);
         }
         break;
     case GP_KQ_MULTI: {
@@ -5304,7 +5308,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         for (int m = 0; m < hlit(r, 3, &bad); ++m) {
             rows += hlit(r, 6 + 4 * m, &bad);
         }
-        k_kq_multi<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        k_kq_multi<<<(unsigned)cdiv(rows, KQ_RPB), 32 * KQ_RPB, 0, s>>>(dr, denv);
         break;
     }
     case GP_ADD_RMS:
