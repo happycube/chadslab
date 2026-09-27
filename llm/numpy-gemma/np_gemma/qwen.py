@@ -18,10 +18,7 @@ The model has two kinds of layers (config.layer_types):
 Each layer then has 256 experts (8 for each token) and a shared expert with
 a sigmoid gate.
 
-The weights: MLX quantizes each matrix in groups of 64 values along a row:
-w = scale * q + bias, with scale and bias in bfloat16 and q of 4 or 8 bits,
-packed in uint32 words from the low bits up. The bits of a matrix come from
-its shape.
+The weights are in the MLX affine format (np_gemma/mlx_affine.py).
 """
 from __future__ import annotations
 
@@ -30,6 +27,8 @@ import os
 
 import numpy as np
 
+from . import cops, mlx_affine, ops
+from .mlx_affine import QMat
 from .st import SafeTensors
 
 PREFIX = "language_model.model."
@@ -79,62 +78,6 @@ class QwenConfig:
     @property
     def conv_dim(self):
         return 2 * self.lin_key_dim + self.lin_value_dim
-
-
-def bf16(raw):
-    """float32 values of raw bfloat16 bits (uint16)."""
-    return (np.asarray(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
-
-
-class QMat:
-    """One MLX-quantized matrix, or a stack of them (the experts).
-
-    q is the uint32 data, (..., rows, cols * bits / 32). scales and biases are
-    the bfloat16 bits, (..., rows, cols / 64). The arrays are views into the
-    memory maps of the files.
-    """
-
-    group = 64
-
-    def __init__(self, q, scales, biases):
-        self.q = q
-        self.scales = scales
-        self.biases = biases
-        self.rows = q.shape[-2]
-        self.cols = scales.shape[-1] * self.group
-        self.bits = q.shape[-1] * 32 // self.cols
-        assert self.bits in (4, 8), "bits %d" % self.bits
-
-    @property
-    def nbytes(self):
-        return self.q.nbytes + self.scales.nbytes + self.biases.nbytes
-
-    def values(self, q):
-        """The integer values of uint32 words q, (..., rows, cols) as uint8."""
-        b = np.ascontiguousarray(q).view(np.uint8)
-        if self.bits == 8:
-            return b
-        out = np.empty(b.shape[:-1] + (b.shape[-1] * 2,), dtype=np.uint8)
-        out[..., 0::2] = b & 15
-        out[..., 1::2] = b >> 4
-        return out
-
-    def dequant(self, rows=None, expert=None):
-        """Return float32 weights: the matrix, one expert of a stack, or some
-        rows of it."""
-        q, s, b = self.q, self.scales, self.biases
-        if expert is not None:
-            q, s, b = q[expert], s[expert], b[expert]
-        if rows is not None:
-            q, s, b = q[rows], s[rows], b[rows]
-        v = self.values(q).astype(np.float32)
-        g = v.reshape(v.shape[:-1] + (-1, self.group))
-        w = g * bf16(s)[..., None] + bf16(b)[..., None]
-        return w.reshape(v.shape)
-
-    def matvec(self, x, expert=None):
-        """x @ W^T for rows of x, shape (t, cols) -> (t, rows)."""
-        return x @ self.dequant(expert=expert).T
 
 
 def rms_norm(x, w, eps, offset=0.0):
@@ -371,3 +314,141 @@ class Qwen:
             rows = np.arange(r0, min(m.rows, r0 + chunk))
             out[:, rows] = h @ m.dequant(rows=rows).T
         return out
+
+
+# ---- the CPU path with the C kernels (QWEN_PLAN.md, phase 2) ----------------
+
+class QwenCPU(Qwen):
+    """The model with the C kernels of cops: the MLX affine products
+    (csrc/mlx_affine.c), the Gated DeltaNet (csrc/deltanet.c), and the shared
+    ops (rms_norm, the attention of one token). The weights stay in the MLX
+    blocks. The products quantize x to int8 for each group of 64 (as the CPU
+    path of llama.cpp does), so the result is close to the NumPy model, not
+    the same. scripts/check_qwen_cpu.py compares them."""
+
+    def __init__(self, path, cfg=None, layers=None):
+        super().__init__(path, cfg, layers)
+        self._m = {}
+        self._f = {}
+
+    def M(self, name, full=None):
+        m = self._m.get(name)
+        if m is None:
+            m = self._m[name] = self.mat(name, full)
+        return m
+
+    def F(self, name, shape=None):
+        a = self._f.get(name)
+        if a is None:
+            a = np.ascontiguousarray(self.t(name), dtype=np.float32)
+            a = self._f[name] = a.reshape(shape) if shape is not None else a
+        return a
+
+    def lin(self, name, qx, full=None):
+        return mlx_affine.linear(self.M(name, full), qx)
+
+    def norm(self, x, name):
+        return ops.rms_norm(x, self.F(name), self.cfg.rms_norm_eps)
+
+    def layer(self, i, x, cache, pos):
+        p = "layers.%d." % i
+        h = self.norm(x, p + "input_layernorm.weight")
+        if self.cfg.layer_types[i] == "full_attention":
+            x = x + self.full_attention(i, h, cache, pos)
+        else:
+            x = x + self.linear_attention(i, h, cache, pos)
+        return x + self.moe(i, self.norm(x, p + "post_attention_layernorm.weight"))
+
+    def forward(self, ids, cache, start_pos=0, hook=None):
+        x = self.embed(ids)
+        for i in range(self.n_layers):
+            x = self.layer(i, x, cache, start_pos)
+            if hook is not None:
+                hook("layer.%d" % i, x)
+        cache.n = start_pos + len(ids)
+        return self.norm(x, "norm.weight")
+
+    def linear_attention(self, i, h, cache, pos):
+        cfg = self.cfg
+        p = "layers.%d.linear_attn." % i
+        t = h.shape[0]
+        qx = mlx_affine.QX(h)
+        qkv = self.lin(p + "in_proj_qkv", qx)
+        z = self.lin(p + "in_proj_z", qx)
+        b = self.lin(p + "in_proj_b", qx)
+        a = self.lin(p + "in_proj_a", qx)
+        out = np.empty((t, cfg.lin_value_dim), np.float32)
+        cops.gdn_step(qkv, cache.conv[i], self.F(p + "conv1d.weight", (cfg.conv_dim, cfg.conv_kernel)),
+                      z, a, b, self.F(p + "A_log"), self.F(p + "dt_bias"), self.F(p + "norm.weight"),
+                      cache.state[i], out, np.empty((t, cfg.conv_dim), np.float32),
+                      cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim,
+                      cfg.rms_norm_eps)
+        return self.lin(p + "out_proj", mlx_affine.QX(out))
+
+    def full_attention(self, i, h, cache, pos):
+        cfg = self.cfg
+        p = "layers.%d.self_attn." % i
+        t = h.shape[0]
+        nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+        qx = mlx_affine.QX(h)
+        qg = self.lin(p + "q_proj", qx).reshape(t, nq, 2 * hd)
+        q, gate = qg[..., :hd], qg[..., hd:].reshape(t, nq * hd)
+        k = self.lin(p + "k_proj", qx).reshape(t, nk, hd)
+        v = self.lin(p + "v_proj", qx).reshape(t, nk, hd)
+        q = ops.rms_norm(q, self.F(p + "q_norm.weight"), cfg.rms_norm_eps)
+        k = ops.rms_norm(k, self.F(p + "k_norm.weight"), cfg.rms_norm_eps)
+        cos, sin = self.rope(np.arange(pos, pos + t))
+        d = cfg.rotary_dim
+        half = d // 2
+
+        def rot(x):
+            xr = x[..., :d]
+            rh = np.concatenate([-xr[..., half:], xr[..., :half]], axis=-1)
+            return np.concatenate([xr * cos[:, None] + rh * sin[:, None], x[..., d:]], axis=-1)
+
+        q, k = rot(q), rot(k)
+        K, V = cache.kv[i]
+        K[:, pos:pos + t] = k.transpose(1, 0, 2)
+        V[:, pos:pos + t] = v.transpose(1, 0, 2)
+        # The attention kernel of cops has no scale (Gemma uses 1), so the
+        # query takes the scale of Qwen.
+        q = np.ascontiguousarray(q * np.float32(hd ** -0.5))
+        o = np.empty((t, nq, hd), np.float32)
+        for j in range(t):
+            n = pos + j + 1
+            o[j] = ops.attn_decode_f32(q[j], K[:, :n], V[:, :n], pos + j)
+        o = o.reshape(t, nq * hd) * sigmoid(gate)
+        return self.lin(p + "o_proj", mlx_affine.QX(o))
+
+    def moe(self, i, h):
+        cfg = self.cfg
+        p = "layers.%d.mlp." % i
+        t = h.shape[0]
+        qx = mlx_affine.QX(h)
+        logits = self.lin(p + "gate", qx)
+        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = e / e.sum(axis=-1, keepdims=True)
+        top = np.argsort(-probs, axis=-1, kind="stable")[:, :cfg.top_k].astype(np.int32)
+        val = np.take_along_axis(probs, top, axis=-1)
+        val = (val / val.sum(axis=-1, keepdims=True)).astype(np.float32)
+        sgate = sigmoid(self.lin(p + "shared_expert_gate", qx))[:, 0]
+        experts = [self.M(p + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        shared = [self.M(p + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        k, inner, hid = cfg.top_k, cfg.moe_inter, cfg.hidden_size
+        ne = k + 1
+        scratch = (np.empty(ne * 2 * inner, np.float32), np.empty(ne * inner, np.int8),
+                   np.empty(ne * inner // 64, np.float32), np.empty(ne * inner // 64, np.float32),
+                   np.empty(ne * hid, np.float32))
+        out = np.empty((t, hid), np.float32)
+        q4, q8 = qx.get(4), qx.get(8)
+        for j in range(t):
+            cops.ma_moe_step(q4[j], q8[j], qx.xs[j], qx.xsum[j], np.ascontiguousarray(top[j]),
+                             np.ascontiguousarray(val[j]), *experts, shared, sgate[j], hid,
+                             inner, scratch, out[j])
+        return out
+
+    def embed(self, ids):
+        return self.M("embed_tokens").dequant(rows=np.asarray(ids, dtype=np.int64))
+
+    def logits(self, h, chunk=None):
+        return mlx_affine.linear(self.M("lm_head", "language_model.lm_head"), mlx_affine.QX(h))

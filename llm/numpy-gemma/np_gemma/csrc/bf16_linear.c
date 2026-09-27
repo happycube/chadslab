@@ -7749,3 +7749,9 @@ int gemma_run_parts(const int64_t *const *progs, int nparts, int team, int64_t *
     }
     return 0;
 }
+
+/* ---------- the other parts of the library ----------
+ * mlx_affine.c: the MLX affine weight format (mlx-community, OptiQ).
+ * deltanet.c: the Gated DeltaNet (Qwen3.5). */
+#include "mlx_affine.c"
+#include "deltanet.c"

@@ -29,6 +29,8 @@ import numpy as np
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
+# The files that bf16_linear.c includes; the hash of the library covers them.
+_SOURCES = [_SRC, _HERE / "csrc" / "mlx_affine.c", _HERE / "csrc" / "deltanet.c"]
 _LIB_DIR = _HERE / "_libs"
 # The code builds three libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The third adds the VNNI
@@ -101,7 +103,7 @@ def _build(flags=None):
     except Exception:
         version = "unknown"
     key = hashlib.sha256(
-        (_SRC.read_text() + "|" + sys.platform + "|" + platform.machine() + "|" + version + "|"
+        ("".join(p.read_text() for p in _SOURCES) + "|" + sys.platform + "|" + platform.machine() + "|" + version + "|"
          + " ".join(flags)).encode()
     ).hexdigest()[:16]
     lib = _LIB_DIR / ("libgemma_" + key + ".so")
@@ -222,6 +224,18 @@ try:
         _lib.gemma_q6k_rows.argtypes = [_void_p, _void_p, _int, _int, _void_p]
         _lib.gemma_q6k_rows.restype = None
         _lib.gemma_argmax.argtypes = [_void_p, ctypes.c_int64]
+        _lib.ma_quant_x.argtypes = [_void_p, _int, _int, _int, _void_p, _void_p, _void_p]
+        _lib.ma_quant_x.restype = None
+        _lib.ma_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p, _void_p,
+                                   _void_p, _int, _void_p]
+        _lib.ma_linear.restype = None
+        _lib.ma_moe_step.argtypes = [_void_p] * 4 + [_void_p, _void_p, _int] + \
+            [_void_p, _void_p, _void_p, _int] * 6 + \
+            [ctypes.c_float, _int, _int, _void_p, _void_p, _void_p, _void_p, _void_p, _void_p]
+        _lib.ma_moe_step.restype = None
+        _lib.gdn_step.argtypes = [_void_p, _void_p, _void_p, _int] + [_void_p] * 9 + \
+            [_int] * 5 + [ctypes.c_float]
+        _lib.gdn_step.restype = None
         _lib.gemma_argmax.restype = ctypes.c_int64
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                              _int, _void_p, _int, _int, _int]
@@ -592,6 +606,51 @@ def argmax(x):
     """Return the index of the largest value of a float32 vector, as
     np.argmax, about 10 times faster on a row of logits."""
     return int(_lib.gemma_argmax(x.ctypes.data, ctypes.c_int64(x.size)))
+
+
+def ma_quant_x(x, bits, xq, xs, xsum):
+    """Quantize the rows of x (float32, contiguous) for the MLX affine
+    products of bits bits: xq (int8, the shape of x), xs and xsum (one value
+    for each group of 64). See csrc/mlx_affine.c."""
+    t, cols = x.shape
+    _lib.ma_quant_x(x.ctypes.data, t, cols, bits, xq.ctypes.data, xs.ctypes.data, xsum.ctypes.data)
+
+
+def ma_linear(q, scales, biases, bits, rows, cols, xq, xs, xsum, t, out):
+    """out (t x rows) = x W^T for an MLX affine matrix (q, scales, biases)."""
+    _lib.ma_linear(q.ctypes.data, scales.ctypes.data, biases.ctypes.data, bits, rows, cols,
+                   xq.ctypes.data, xs.ctypes.data, xsum.ctypes.data, t, out.ctypes.data)
+
+
+def ma_moe_step(hq4, hq8, hs, hsum, ids, val, gate, up, down, shared, shared_w, hidden, inner,
+                scratch, out):
+    """The experts of one token with MLX affine weights (csrc/mlx_affine.c).
+    gate, up, down are stacks of experts, shared is (gate, up, down) or
+    None; each matrix is (q, scales, biases, bits)."""
+    k = len(ids)
+    z = (None, None, None, 0)
+    sg, su, sd = shared if shared is not None else (z, z, z)
+
+    def m(t):
+        return [None if a is None else a.ctypes.data for a in t[:3]] + [t[3]]
+
+    act, aq, a_s, asum, de = scratch
+    _lib.ma_moe_step(hq4.ctypes.data, hq8.ctypes.data, hs.ctypes.data, hsum.ctypes.data,
+                     ids.ctypes.data, val.ctypes.data, k, *m(gate), *m(up), *m(down), *m(sg),
+                     *m(su), *m(sd), float(shared_w), hidden, inner, act.ctypes.data,
+                     aq.ctypes.data, a_s.ctypes.data, asum.ctypes.data, de.ctypes.data,
+                     out.ctypes.data)
+
+
+def gdn_step(qkv, conv, conv_w, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, k_heads,
+             v_heads, k_dim, v_dim, eps):
+    """The Gated DeltaNet for the rows of qkv, in order (csrc/deltanet.c).
+    conv and S are the state; the call changes them."""
+    t = qkv.shape[0]
+    _lib.gdn_step(qkv.ctypes.data, conv.ctypes.data, conv_w.ctypes.data, conv_w.shape[1],
+                  z.ctypes.data, a.ctypes.data, b.ctypes.data, A_log.ctypes.data,
+                  dt_bias.ctypes.data, norm_w.ctypes.data, S.ctypes.data, out.ctypes.data,
+                  scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps))
 
 
 def q6k_rows(table, ids, cols):

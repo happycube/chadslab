@@ -253,6 +253,34 @@ The CPU path uses the program interpreter (gemma_run) with new records:
 Test: the same tokens as the NumPy model. Measure: the rate against the
 limit of 39 ms, with the profiler of CPU_PLAN.md phase 0.
 
+Status of phase 2 (first part, done):
+
+- The kernels of new types are in two files that bf16_linear.c includes,
+  so they are part of the cops library. The file csrc/mlx_affine.c has the MLX
+  affine format of mlx-community and OptiQ. It has the product, and the
+  experts of a MoE layer with an optional shared expert. The file csrc/deltanet.c has
+  the Gated
+  DeltaNet. The file np_gemma/mlx_affine.py has QMat and the product for
+  Python.
+  The shared operations come from cops (rms_norm, the attention of one
+  token, argmax).
+- QwenCPU (np_gemma/qwen.py) uses them from Python, one call for each
+  operation. It gives 13.1 tok/s for the decode (llama.cpp on the CPU with
+  the GGUF: 10.1), and 98% of the top tokens of the reference on 4 layers
+  (scripts/check_qwen_cpu.py).
+- The sum of x for the bias term is xs * sum(xq), not the sum of x. The
+  weights are s q + b with q >= 0, so s q is far from zero mean. The error
+  of xq cancels only with the bias term of the same xq. With the sum of x,
+  the error was 2%; with the sum of xq it is 0.7%, the error of int8 x.
+
+The next steps of phase 2:
+
+- the program records for the whole step (one parallel region, as the
+  Gemma step);
+- the prompt pass as a product of many tokens (a tile of int8, not blocks
+  of 16 tokens);
+- the profile of CPU_PLAN.md phase 0.
+
 ## Phase 3: the state of the linear layers
 
 The state of a linear layer has no rows, so a cache cannot cut it back.
