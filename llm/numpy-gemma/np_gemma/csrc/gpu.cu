@@ -589,7 +589,7 @@ __global__ void k_kv_write_heads(const gp_rec *r, const int64_t *e)
 #define ATTN_MIN_KEYS 32
 #define ATTN_TILE 128
 #define ATTN_REP 8
-#define ATTN_KEYS 4
+#define ATTN_KEYS 4          /* ATTN_KEYS * ATTN_REP = 32, the lanes of a warp */
 
 /* The keys of a chunk, and the count of chunks, for n keys. */
 __device__ __forceinline__ int attn_len(int n)
@@ -775,33 +775,34 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
                 }
             }
         }
+        /* The 32 sums (ATTN_KEYS keys by ATTN_REP heads) over the lanes, as a
+         * reduce-scatter: at each step a lane keeps half of its values and
+         * sends the other half, so 31 shuffles leave value kk * ATTN_REP + h
+         * on lane kk * ATTN_REP + h (a full sum for each value took 160). */
+        float v[ATTN_KEYS * ATTN_REP];
         #pragma unroll
-        for (int h = 0; h < ATTN_REP; ++h) {
-            if (h < rep) {
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    #pragma unroll
-                    for (int kk = 0; kk < ATTN_KEYS; ++kk) {
-                        s[kk][h] += __shfl_xor_sync(0xffffffff, s[kk][h], off);
-                    }
-                }
+        for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+            #pragma unroll
+            for (int h = 0; h < ATTN_REP; ++h) {
+                v[kk * ATTN_REP + h] = s[kk][h];
             }
         }
-        if (lane == 0) {
+        #pragma unroll
+        for (int off = 16, nv = 32; off > 0; off >>= 1, nv >>= 1) {
+            bool up = (lane & off) != 0;
             #pragma unroll
-            for (int kk = 0; kk < ATTN_KEYS; ++kk) {
-                int j = jb + kk;
-                if (j >= j1) {
-                    break;
-                }
+            for (int x = 0; x < nv / 2; ++x) {
+                float keep = up ? v[x + nv / 2] : v[x];
+                float send = up ? v[x] : v[x + nv / 2];
+                v[x] = keep + __shfl_xor_sync(0xffffffff, send, off);
+            }
+        }
+        {
+            int kk = lane / ATTN_REP, h = lane % ATTN_REP, j = jb + kk;
+            if (h < rep && j < j1) {
                 int64_t kp = a.kp0 + j;
                 bool masked = kp > a.p || (a.window > 0 && a.p - kp >= a.window);
-                #pragma unroll
-                for (int h = 0; h < ATTN_REP; ++h) {
-                    if (h < rep) {
-                        a.sc[(size_t)(kv * rep + h) * n + j] = masked ? -INFINITY : s[kk][h];
-                    }
-                }
+                a.sc[(size_t)(kv * rep + h) * n + j] = masked ? -INFINITY : v[0];
             }
         }
     }
@@ -851,7 +852,7 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
             ps[h * ATTN_TILE + jj] = a.sc[(size_t)(kv * rep + h) * n + t0 + jj];
         }
         __syncthreads();
-        #pragma unroll 4
+        #pragma unroll 8
         for (int jj = grp; jj < tn; jj += groups) {
             float vv[8];
             attn_kv8(a, 0, kv, t0 + jj, 8 * d, vv);
@@ -934,6 +935,193 @@ __global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part
             acc += w[c] * ph[(size_t)c * (hd + 2) + i];
         }
         a.out[(size_t)h * hd + i] = acc * inv;
+    }
+}
+
+
+/* ---------- the decode attention of one query over the int16 cache, in one
+ * pass (flash decoding) ----------
+ * For GP_ATTN_QC with head_dim 256 and 8 query heads for each key head
+ * (Qwen3.5). Each warp takes FD_KEYS keys at a time of its own range of
+ * keys: lane l keeps values 8 l to 8 l + 7 of each head. It loads the keys
+ * and the values of the 4 rows together, computes the 32 scores (4 keys by 8
+ * heads) with a reduce-scatter, and keeps the softmax running (the maximum m
+ * and the sum l of each head). The sums of the values then take the new
+ * weights at once. Each warp writes its part (FD_PARTS parts for each head);
+ * k_attn_fd_join adds the parts. The keys and the values stream without the
+ * phases of k_attn_part, and no scores go to memory. */
+#define FD_KEYS 4
+#define FD_BLOCKS 32                       /* blocks for each key head (32 was best of 32 to 256) */
+#define FD_PARTS (FD_BLOCKS * 4)           /* 4 warps for each block */
+
+__device__ __forceinline__ int fd_len(int n)
+{
+    int len = (n + FD_PARTS - 1) / FD_PARTS;
+    len = len < 16 ? 16 : len;
+    return (len + FD_KEYS - 1) / FD_KEYS * FD_KEYS;
+}
+
+__device__ __forceinline__ void fd_i16x8(uint4 u, float *out)
+{
+    uint32_t w[4] = {u.x, u.y, u.z, u.w};
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        out[2 * t] = (float)(int16_t)(w[t] & 0xffff);
+        out[2 * t + 1] = (float)(int16_t)(w[t] >> 16);
+    }
+}
+
+__global__ void __launch_bounds__(128) k_attn_fd(const gp_rec *r, const int64_t *e, float *part)
+{
+    PDL_START();
+    __shared__ __align__(16) float qs[8 * 256];
+    __shared__ float pw[4][40];
+    attn_d a = attn_get(r, e);
+    int kv = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int n = a.n, len = fd_len(n);
+    int part_id = blockIdx.y * 4 + warp;
+    int j0 = part_id * len, j1 = min(n, j0 + len);
+    for (int i = threadIdx.x; i < 8 * 256; i += blockDim.x) {
+        qs[i] = a.q[(size_t)kv * 8 * 256 + i];
+    }
+    __syncthreads();
+    if (j0 >= n) {
+        return;
+    }
+    float acc[8][8];
+    #pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            acc[h][u] = 0.f;
+        }
+    }
+    float m = -INFINITY, l = 0.f;          /* of head lane % 8 */
+    size_t rs = a.rstride, off = (size_t)kv * 256 + 8 * lane;
+    for (int jb = j0; jb < j1; jb += FD_KEYS) {
+        uint4 kq[FD_KEYS], vq[FD_KEYS];
+        float ks[FD_KEYS], vs[FD_KEYS];
+        #pragma unroll
+        for (int kk = 0; kk < FD_KEYS; ++kk) {
+            int j = min(jb + kk, j1 - 1);
+            size_t o = (size_t)j * rs + off;
+            kq[kk] = *(const uint4 *)(a.kq + o);
+            vq[kk] = *(const uint4 *)(a.vq + o);
+            ks[kk] = a.ks[o / 32];
+            vs[kk] = a.vs[o / 32];
+        }
+        float v[32];
+        #pragma unroll
+        for (int kk = 0; kk < FD_KEYS; ++kk) {
+            float kf[8];
+            fd_i16x8(kq[kk], kf);
+            #pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                const float4 q0 = *(const float4 *)(qs + h * 256 + 8 * lane);
+                const float4 q1 = *(const float4 *)(qs + h * 256 + 8 * lane + 4);
+                float d = q0.x * kf[0] + q0.y * kf[1] + q0.z * kf[2] + q0.w * kf[3] +
+                          q1.x * kf[4] + q1.y * kf[5] + q1.z * kf[6] + q1.w * kf[7];
+                v[kk * 8 + h] = d * ks[kk];
+            }
+        }
+        /* the reduce-scatter of k_attn_part: value kk * 8 + h to lane kk * 8 + h */
+        #pragma unroll
+        for (int o2 = 16, nv = 32; o2 > 0; o2 >>= 1, nv >>= 1) {
+            bool up = (lane & o2) != 0;
+            #pragma unroll
+            for (int x = 0; x < nv / 2; ++x) {
+                float keep = up ? v[x + nv / 2] : v[x];
+                float send = up ? v[x] : v[x + nv / 2];
+                v[x] = keep + __shfl_xor_sync(0xffffffff, send, o2);
+            }
+        }
+        float sc = jb + lane / 8 < j1 ? v[0] : -INFINITY;
+        /* the maximum and the sum of each head over the 4 keys: the lanes
+         * h, h + 8, h + 16, h + 24 */
+        float mx = fmaxf(sc, __shfl_xor_sync(0xffffffff, sc, 8));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 16));
+        float mn = fmaxf(m, mx);
+        float alpha = m == -INFINITY ? 0.f : expf(m - mn);
+        float p = sc == -INFINITY ? 0.f : expf(sc - mn);
+        float ps = p + __shfl_xor_sync(0xffffffff, p, 8);
+        ps += __shfl_xor_sync(0xffffffff, ps, 16);
+        l = l * alpha + ps;
+        m = mn;
+        pw[warp][lane] = p;
+        if (lane < 8) {
+            pw[warp][32 + lane] = alpha;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            float al = pw[warp][32 + h];
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                acc[h][u] *= al;
+            }
+        }
+        #pragma unroll
+        for (int kk = 0; kk < FD_KEYS; ++kk) {
+            float vf[8];
+            fd_i16x8(vq[kk], vf);
+            #pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                float pp = pw[warp][kk * 8 + h] * vs[kk];
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    acc[h][u] += pp * vf[u];
+                }
+            }
+        }
+        __syncwarp();
+    }
+    #pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        float *o = part + ((size_t)(kv * 8 + h) * FD_PARTS + part_id) * 258;
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            o[8 * lane + u] = acc[h][u];
+        }
+        if (lane == h) {
+            o[256] = m;
+            o[257] = l;
+        }
+    }
+}
+
+/* Block (h, x) joins the values x * 128 to x * 128 + 127 of query head h
+ * from the parts of k_attn_fd (as k_attn_join). */
+__global__ void k_attn_fd_join(const gp_rec *r, const int64_t *e, const float *part)
+{
+    PDL_START();
+    __shared__ float w[FD_PARTS];
+    attn_d a = attn_get(r, e);
+    int h = blockIdx.x;
+    int len = fd_len(a.n);
+    int nc = (a.n + len - 1) / len;
+    const float *ph = part + (size_t)h * FD_PARTS * 258;
+    float M = -INFINITY;
+    for (int c = threadIdx.x; c < nc; c += blockDim.x) {
+        M = fmaxf(M, ph[(size_t)c * 258 + 256]);
+    }
+    M = block_max(M);
+    float wl = 0.f;
+    for (int c = threadIdx.x; c < nc; c += blockDim.x) {
+        float mc = ph[(size_t)c * 258 + 256];
+        float wc = mc == -INFINITY ? 0.f : expf(mc - M);
+        w[c] = wc;
+        wl += wc * ph[(size_t)c * 258 + 257];
+    }
+    float wsum = block_sum(wl);
+    float inv = wsum > 0.f ? 1.0f / wsum : 0.f;
+    __syncthreads();
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i < 256) {
+        float acc = 0.f;
+        for (int c = 0; c < nc; ++c) {
+            acc += w[c] * ph[(size_t)c * 258 + i];
+        }
+        a.out[(size_t)h * 256 + i] = acc * inv;
     }
 }
 
@@ -4658,6 +4846,18 @@ static int64_t multi4_rows(const gp_rec *r, int m0, int *bad)
     return rows;
 }
 
+/* NP_GEMMA_GPU_FD=0 keeps k_attn_part for the int16 cache of Qwen3.5 (a
+ * test). */
+static int fd_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_GPU_FD");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                        const int64_t *denv, int *bad)
 {
@@ -4666,6 +4866,12 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
     if ((size_t)qh * ATTN_CHUNKS * (size_t)(hd + 2) > GG_PART_FLOATS ||
         qh % kvh != 0 || qh / kvh > ATTN_REP || (hd != 256 && hd != 512)) {
         *bad = 1;
+        return 0;
+    }
+    if (r->op == GP_ATTN_QC && hd == 256 && qh == 8 * kvh && fd_on() &&
+        (size_t)qh * FD_PARTS * 258 <= GG_PART_FLOATS) {
+        k_attn_fd<<<dim3((unsigned)kvh, FD_BLOCKS), 128, 0, gg_stream>>>(dr, denv, g->part);
+        k_attn_fd_join<<<dim3((unsigned)qh, 2), 128, 0, gg_stream>>>(dr, denv, g->part);
         return 0;
     }
     k_attn_part<<<dim3((unsigned)kvh, ATTN_CHUNKS), 256, 0, gg_stream>>>(dr, denv, g->part);

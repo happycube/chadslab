@@ -557,6 +557,39 @@ other work of the GPU (8.7 GB). The full context of 262144 positions takes
 and the cache then take about 8.5 GB. The attention of int16 costs about
 0.08 ms for each 1000 positions (at 64000: 5.4 ms, f32 6.9 ms).
 
+Status of phase 4 (the decode attention, done):
+
+At 128k positions the attention read the int16 cache at about 240 to 290
+GB/s (54% to 64% of the 448 GB/s of the GPU). Two changes:
+
+- k_attn_part: a group of 4 keys has 32 sums (4 keys by 8 heads). They
+  go over the lanes as a reduce-scatter: 31 shuffles, not 160. Each lane then
+  writes one score.
+- k_attn_fd (GP_ATTN_QC with head_dim 256 and 8 query heads for each key
+  head, Qwen3.5): one pass. Each warp reads the keys and the values of 4
+  rows together, and it keeps the softmax running. No scores go to memory,
+  and the kernel has no phases. Each warp writes a part; k_attn_fd_join
+  adds the parts. 32 blocks for each key head gave the best rate (of 32,
+  64, 128, and 256). NP_GEMMA_GPU_FD=0 selects k_attn_part.
+- The attention of the last layer against the CPU kernel on the same
+  cache: 2.6e-7 (k_attn_part: 2.2e-7). The groups and verify with commit
+  still give the bits of the steps, as the step and a small group use the
+  same kernel.
+
+The attention of 10 layers (the records only):
+
+    position   before (k_attn_part)   reduce-scatter   k_attn_fd
+    32768      -                      -                1.92 ms (371 GB/s)
+    131072     11.8 ms (242 GB/s)     9.9 ms (288)     6.96 ms (410 GB/s)
+
+The decode at 131072 positions with 1 GB of hot experts (HotCache on) went
+from 35.4 to 44.3 tok/s.
+
+The attention used to take 12 of the 28 ms of such a step; now it takes 7.
+Two other attempts were slower. The first kept the scores of a block in
+shared memory; the scores were in L2 before, and the loads became generic.
+The second limited the registers to get 3 blocks for each SM.
+
 ## Phase 5: MTP
 
 The MTP layer has these steps. The matrix fc takes two norms: the row of
