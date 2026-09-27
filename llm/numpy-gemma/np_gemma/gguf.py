@@ -27,18 +27,24 @@ from .ops import to_bf16
 F32, F16, Q4_0, Q4_1 = 0, 1, 2, 3
 Q5_0, Q5_1, Q8_0, Q8_1 = 6, 7, 8, 9
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K = 10, 11, 12, 13, 14, 15
+IQ4_NL = 20
 BF16 = 30
+
+# The 16 values of the 4-bit codes of IQ4_NL (ggml kvalues_iq4nl).
+_IQ4_NL_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89,
+                           113], dtype=np.float32)
 
 # (values in one block, bytes in one block) for each type.
 _BLOCK = {
     F32: (1, 4), F16: (1, 2), BF16: (1, 2),
     Q4_0: (32, 18), Q4_1: (32, 20), Q5_0: (32, 22), Q5_1: (32, 24),
     Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210), Q4_K: (256, 144), Q5_K: (256, 176),
+    IQ4_NL: (32, 18),
 }
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
-    Q4_K: "Q4_K", Q5_K: "Q5_K",
+    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -50,6 +56,8 @@ _BLOCK_DT = {
     Q6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
                     ("sc", "i1", (16,)), ("d", "<f2")]),
     Q8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
+    Q5_1: np.dtype([("d", "<f2"), ("m", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
+    IQ4_NL: np.dtype([("d", "<f2"), ("qs", "u1", (16,))]),
     Q4_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qs", "u1", (128,))]),
     Q5_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qh", "u1", (32,)),
                     ("qs", "u1", (128,))]),
@@ -175,6 +183,23 @@ def _dequant(raw, t, count):
         hi = (q >> 4).astype(np.float32) - 8.0
         out = np.concatenate([lo, hi], axis=1) * d[:, None]
         return out.reshape(-1)[:count]
+    if t == Q5_1:
+        # Value j (j < 16): the low 4 bits of byte j and bit j of qh; value
+        # j + 16: the high 4 bits of byte j and bit j + 16 of qh. d q + m.
+        q = raw["qs"]
+        qh = raw["qh"].astype(np.uint32)[:, None]
+        bits = np.arange(16, dtype=np.uint32)[None, :]
+        lo = (q & 0x0F).astype(np.uint32) | (((qh >> bits) & 1) << 4)
+        hi = (q >> 4).astype(np.uint32) | (((qh >> (bits + 16)) & 1) << 4)
+        v = np.concatenate([lo, hi], axis=1).astype(np.float32)
+        return (v * raw["d"].astype(np.float32)[:, None] +
+                raw["m"].astype(np.float32)[:, None]).reshape(-1)[:count]
+    if t == IQ4_NL:
+        # 4-bit codes into a table of 16 values: the low 4 bits of byte j are
+        # value j, the high 4 bits value j + 16.
+        q = raw["qs"]
+        v = np.concatenate([_IQ4_NL_VALUES[q & 0x0F], _IQ4_NL_VALUES[q >> 4]], axis=1)
+        return (v * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
     if t == Q8_0:
         return (raw["qs"].astype(np.float32) * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
     if t in (Q4_K, Q5_K):

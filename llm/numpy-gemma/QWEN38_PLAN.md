@@ -164,6 +164,37 @@ The work moves to another machine: an RTX 3090 (24 GB, 936 GB/s) on PCIe
 
 ### Phase 1: the NumPy reference
 
+Status (in progress):
+
+- np_gemma/qwen4.py: the NumPy model on the GGUF file (Qwen4, Qwen4Cache,
+  config_from_gguf). A chat prompt gives "The capital of France is Paris."
+- gguf.py reads Q5_1 and IQ4_NL (bit-equal with ggml), and the split files.
+- The DeltaNet of qwen4exp gates its norm with sigmoid, not silu
+  (config.json output_gate_type; llama.cpp qwen4exp.cpp). QwenConfig.lin_gate
+  selects it.
+- scripts/check_qwen4_ngram.py: the n-gram ids equal those of transformers
+  (one pass, and a prompt, then steps; with the eos token of PLE).
+- scripts/check_qwen4.py: the sums of the first 8 layers are within 0.1% to
+  5% of llama.cpp (llama-eval-callback; llama.cpp quantizes x in its
+  products).
+- The reference of llama.cpp (the branch qwen4exp/mtp, build-cuda), with
+  the other load of this machine:
+
+      setup                                  prompt           decode
+      dense part on the GPU, experts on      81 tok/s (512)   17.8 tok/s
+      the CPU (-ngl 99 -ncmoe 48)
+      CPU only (-ngl 0 -nopo 1)              34 tok/s (128)   5.0 tok/s
+      CPU only, MTP (shared Q8_0), 3 drafts  -                9.0 tok/s
+                                                              (82% accepted)
+      CPU only, MTP, 5 drafts                -                8.4 tok/s
+                                                              (71% accepted)
+
+  MTP with the dense part on the GPU did not fit next to the other work of
+  the GPU (8 GB). The drafter needs a compute buffer of 1.7 GB and a cache
+  of the linear states for each draft.
+- Next: the QSA indexer (for more than 2048 tokens), the resident set of
+  the memory map, and a check against transformers.
+
 - QwenConfig for qwen4exp, and the names of the GGUF tensors. Check the
   order of the value heads of the DeltaNet (tiled, as Qwen3.6?).
 - New NumPy parts: the gated residual, the n-gram table (the hash of

@@ -369,7 +369,10 @@ class Qwen:
                 delta = (v[j, hv] - kv_mem) * beta[j, hv]
                 Sh += np.outer(k[j, hk], delta)
                 o[j, hv] = q[j, hk] @ Sh
-        o = rms_norm(o, self.t(p + "norm.weight"), cfg.rms_norm_eps) * silu(z)
+        # The gate of the norm: silu for Qwen3.5, sigmoid for qwen4exp
+        # (config.json output_gate_type).
+        gate = sigmoid(z) if getattr(cfg, "lin_gate", "silu") == "sigmoid" else silu(z)
+        o = rms_norm(o, self.t(p + "norm.weight"), cfg.rms_norm_eps) * gate
         return o.reshape(t, vd) @ self.W(p + "out_proj").T
 
     def moe(self, i, h):
