@@ -330,7 +330,7 @@ def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
 
 def greedy_pick(logits):
     """Return the most probable token of one row of logits."""
-    return int(np.argmax(logits))
+    return ops.argmax(logits)
 
 
 def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=2,

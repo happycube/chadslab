@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import ops
+
 
 def _softmax(x):
     """Return the softmax of one row of float64 values."""
@@ -77,10 +79,15 @@ class Sampler:
 
     def __call__(self, logits):
         """Return the id of the next token and add it to the history."""
+        if self.greedy:
+            # No copy to float64: the argmax of the float32 values is the same.
+            token = ops.argmax(np.ascontiguousarray(logits, dtype=np.float32).reshape(-1))
+            self.counts[token] = self.counts.get(token, 0) + 1
+            return token
         scores = np.asarray(logits, dtype=np.float64).copy()
         scores = self._penalize(scores)
         if self.temperature <= 0.0:
-            token = int(np.argmax(scores))
+            token = ops.argmax(scores)
         else:
             scores /= self.temperature
             if self.top_k is not None:

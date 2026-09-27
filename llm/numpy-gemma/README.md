@@ -272,6 +272,8 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_GPU_HOT       the 26B counts          A file of expert counts (scripts/expert_use.py). With NP_GEMMA_GPU=1, the GPU holds the most used experts of the 26B and runs them. 0 keeps all the experts on the CPU. The default is np_gemma/data/gemma-4-26B-expert-counts.npz.
     NP_GEMMA_GPU_HOT_GB    free less 6 GB          The GPU memory for the hot experts, in GB.
     NP_GEMMA_GPU_TC        1                       1 runs the int4 products and the attention of a large group (a prompt pass) on the tensor cores, with float16 inputs. 8 gives int8 inputs to the products (the Q8_0 form): about 45% faster for the E4B, and 98.6% of the top tokens agree with float32, against 99.9%. 0 keeps float32 kernels. The 26B uses float32 kernels unless NP_GEMMA_GPU_TC_MOE=1.
+    NP_GEMMA_GPU_PDL       1                       0 turns off programmatic dependent launch in the CUDA graphs, for a test. See SPLIT_PLAN.md.
+    NP_GEMMA_GPU_FLASH     0                       1 selects the old attention kernel of a prompt pass (k_flash_tc), for a test.
     NP_GEMMA_GPU_CHUNK     1024                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.9 s for the 26B), so a longer chunk is faster.
     NP_GEMMA_GPU_PREFILL_MIN 128                   A shorter part of a prompt runs on the GPU in groups of 16 tokens, with the experts on the CPU.
     NP_GEMMA_GPU_KV        int16                   The form of the cache of the 26B on the GPU. int16 keeps the int16 copy of the CPU program: about half of the float form. float keeps float32 rows.
@@ -2009,8 +2011,8 @@ measures them:
     E4B on the RTX 5060 Ti    this runtime     llama.cpp (CUDA)
     prompt, 1024 tokens       3107 tok/s       5178 tok/s
     prompt, int8 products     4650 tok/s       -
-    decode                    84 tok/s         112 tok/s
-    decode with MTP           124 tok/s        -
+    decode                    94.5 tok/s       112 tok/s
+    decode with MTP           128 tok/s        -
 
 The prompt pass on the GPU copies the experts that the GPU does not hold for
 each chunk of 1024 tokens. The option works for scripts/gguf_generate.py

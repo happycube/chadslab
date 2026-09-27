@@ -1029,6 +1029,15 @@ def topk_k(x, k):
     return val, idx
 
 
+def argmax(x):
+    """Return the index of the largest value of a vector of logits, as
+    np.argmax. The C function is about 10 times faster; a sampler with no
+    temperature calls it for each token."""
+    if _COPS_READY and x.dtype == np.float32 and x.ndim == 1 and x.flags.c_contiguous:
+        return _cops.argmax(x)
+    return int(np.argmax(x))
+
+
 def gelu_tanh(x):
     """Apply the tanh approximation of GELU.
 

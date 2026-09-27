@@ -2789,6 +2789,49 @@ static inline void q6k_decode_block(const uint8_t *blk, float *y)
     }
 }
 
+/* Return the index of the largest of the n values of x. At an equal value
+ * the lower index wins, as np.argmax. The first pass finds the largest value
+ * with AVX2 max; the second finds its first index with a compare and a mask.
+ * A NaN is not the largest value here (np.argmax gives the NaN). */
+int64_t gemma_argmax(const float *x, int64_t n)
+{
+    float best = -INFINITY;
+    int64_t i = 0;
+#ifdef __AVX2__
+    __m256 m0 = _mm256_set1_ps(-INFINITY), m1 = m0, m2 = m0, m3 = m0;
+    for (; i + 32 <= n; i += 32) {
+        m0 = _mm256_max_ps(m0, _mm256_loadu_ps(x + i));
+        m1 = _mm256_max_ps(m1, _mm256_loadu_ps(x + i + 8));
+        m2 = _mm256_max_ps(m2, _mm256_loadu_ps(x + i + 16));
+        m3 = _mm256_max_ps(m3, _mm256_loadu_ps(x + i + 24));
+    }
+    float t[8];
+    _mm256_storeu_ps(t, _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3)));
+    for (int k = 0; k < 8; ++k) {
+        best = t[k] > best ? t[k] : best;
+    }
+#endif
+    for (; i < n; ++i) {
+        best = x[i] > best ? x[i] : best;
+    }
+    int64_t j = 0;
+#ifdef __AVX2__
+    __m256 b = _mm256_set1_ps(best);
+    for (; j + 8 <= n; j += 8) {
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(x + j), b, _CMP_EQ_OQ));
+        if (mask) {
+            return j + __builtin_ctz(mask);
+        }
+    }
+#endif
+    for (; j < n; ++j) {
+        if (x[j] == best) {
+            return j;
+        }
+    }
+    return 0;
+}
+
 /* Decode the rows ids[0..n) of a Q6_K table into out, shape (n, cols). This
  * is the embedding lookup of a prompt: the rows of the E4B tables are Q6_K. */
 void gemma_q6k_rows(const uint8_t *table, const int64_t *ids, int n, int cols, float *out)

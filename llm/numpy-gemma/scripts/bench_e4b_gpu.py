@@ -24,7 +24,7 @@ import numpy as np
 
 os.environ.setdefault("NP_GEMMA_GPU", "1")
 
-from np_gemma import gpu  # noqa: E402
+from np_gemma import gpu, ops  # noqa: E402
 from np_gemma.assistant import mtp_generate  # noqa: E402
 from np_gemma.e4b import E4B, E4BCache, E4BConfig  # noqa: E402
 from np_gemma.gguf import GGUF  # noqa: E402
@@ -85,13 +85,13 @@ def main():
     def plain():
         cache = E4BCache(cfg, max_len=len(ids) + n + 8)
         x = model.forward(ids, cache=cache)
-        nxt = int(model.logits(x[-1:])[0].argmax())
+        nxt = ops.argmax(model.logits(x[-1:])[0])
         out, pos = [nxt], len(ids)
         t0 = time.perf_counter()
         while len(out) < n and nxt not in eos:
             x = model.forward([nxt], cache=cache, start_pos=pos)
             pos += 1
-            nxt = int(model.logits(x)[0].argmax())
+            nxt = ops.argmax(model.logits(x)[0])
             out.append(nxt)
         return out, (len(out) - 1) / (time.perf_counter() - t0)
 

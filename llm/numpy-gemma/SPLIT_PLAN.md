@@ -855,6 +855,36 @@ Thus programmatic dependent launch (about 2 ms) and a faster host part
 (about 0.8 ms) give the most. A graph with fewer kernels also makes the
 launch shorter, at about 1.5 us for each kernel.
 
+The changes, in order, with the decode rate of the E4B (128 tokens):
+
+    change                                               decode rate
+    before                                               84 tok/s
+    programmatic dependent launch (PDL)                  85 tok/s
+    fused forms in the decode step (add_norm, gelu_mul)  88 tok/s
+    a head kernel for one row, pinned logits             92 tok/s
+    add_norm2: the next norm in the same kernel          93.5 tok/s
+    an argmax in C with AVX2 (0.21 ms to 0.04 ms)        94.5 tok/s
+    llama.cpp, at the same time                          112 tok/s
+
+- PDL: each kernel starts with griddepcontrol.wait, then
+  griddepcontrol.launch_dependents. After the capture of a graph,
+  gg_pdl_edges changes each edge from a kernel to a kernel into a
+  programmatic edge. Alone, it gave little, because the kernels of this
+  runtime had almost no gap between them. With fewer small kernels, it
+  gives about 4 tok/s. A prefetch of the rows of the matrix to L2 before
+  the wait did not help, so it is not in the code.
+- A long run of records now becomes several graphs (32 records, then 160).
+  Nsight Systems then showed a shorter wait for cudaGraphLaunch. But the
+  rate without Nsight Systems did not change: the trace of each node of a
+  graph makes the launch slower.
+- The fused kernels give the same values. MTP gives the same tokens as the
+  plain decode (128 tok/s with 2 drafts).
+
+The kernels of a step now take about 9.9 ms, and the host part about 0.5
+ms. The rest of the difference is in the kernels. These are the norms and
+the small operations that remain, and the attention of one token (13 us
+for each layer). The head takes 1.55 ms, against 1.3 ms.
+
 ### The drafter on the GPU
 
 GPUDrafter compiles one draft step of the E4B assistant for the GPU. The
