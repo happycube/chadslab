@@ -78,9 +78,86 @@ experts in a layer, so the CPU reads a small part of that memory. This is
 the method of the llama.cpp option --n-cpu-moe.
 
 Data crosses the link two times in each layer: the input of the experts to
-the CPU, and their output back to the GPU. That is 60 transfers of 11 KB
+the CPU, and their output back to the GPU. That is 30 round trips of 11 KB
 for each token. The latency of a transfer, not its size, then decides the
-cost.
+cost. On jackal, a round trip takes 12 to 15 microseconds (see the
+measurements). Thus the link adds about 0.4 ms to a step of about 25 ms.
+
+In the 26B, the experts and the dense feed-forward part read the same
+input: the residual after the attention. Thus the GPU can run the dense part
+while the CPU runs the experts. Only the longer of the two is on the
+critical path.
+
+### Hot experts on the GPU
+
+The GPU part of the operation split uses about 1.6 GB. About 5 GB of the free
+memory of the GPU stays empty. An expert of the 26B is about 2.9 MB, so that
+memory holds about 1700 of the 3840 experts. If the router selects some
+experts much more often than others, the GPU can hold the experts that it
+selects most. Then:
+
+- the GPU runs the selected experts that it holds, and the CPU runs the
+  others, at the same time;
+- the time of the CPU part falls with the share of the expert reads that
+  the GPU holds.
+
+This helps only if the use of the experts is not uniform. Phase 0 measures
+the use of each expert on several texts. A set of hot experts from one text
+can be cold on a different text. Thus the measurement selects the set on one
+text and tests it on the others. The set can also change at run time, but a
+copy of an expert over the link takes about 0.4 ms. Thus a change must be
+rare.
+
+A token can select experts on both places. The sum of the outputs then adds
+values from the GPU and from the CPU. Keep the order of the expert index, as
+for the NUMA split. The GPU experts give other bits than the CPU experts.
+Thus the MTP verify step must use the same set as the decode step.
+
+## Measurements on jackal
+
+Phase 0 measures these values. The test programs are
+scripts/pcie_latency.cu and scripts/gpu_gemv_rate.cu.
+
+    measurement                                              value
+    round trip of 11 KB, GPU to CPU to GPU, copy and sync     14.7 us
+    the same, a GPU kernel that polls pinned host memory      11.7 us
+    copy of 256 MB, host to GPU, pinned memory                6.9 GB/s
+    copy of 256 MB, GPU to host, pinned memory                7.2 GB/s
+    read of 1.6 GB on the GPU, float4 loads                   425 GB/s
+    int4 GEMV, 1.6 GB of Q4_0 blocks, 2816 columns            3.9 ms, 414 GB/s
+    int4 GEMV, 55 MB (about one layer)                        0.14 ms, 395 GB/s
+
+The copy of 11 KB takes about 1.6 us at 7 GB/s. The rest of a round trip is
+latency, which is almost the same on each generation of PCIe. Thus the link
+of jackal is not a problem for the decode step. It is slow for large
+copies: the 11 GB of experts take 1.6 s. Thus the prompt pass must not copy
+the experts to the GPU for each batch, as llama.cpp can do.
+
+The GEMV on the GPU gets 97% of the rate of the memory. Four lanes share a
+block of 18 bytes. The first form of the kernel gave each lane one block. It
+got only 58 GB/s, because each read of x then touched 32 cache lines. Thus
+the GPU part of the 26B takes about 4 ms, as the estimate says.
+
+### The use of the experts
+
+scripts/expert_use.py runs the prompt pass of the 26B on 800 tokens of four
+texts: the README, Python code, C code, and notes in English. It counts the
+selections of each expert. The use is far from uniform. In each layer, the
+16 most used experts of 128 get about half of the selections.
+
+The next table selects a set of experts on three texts. It gives the share
+of the selections on the fourth text that the set gets. The set is global:
+a layer can have more experts in the set than another layer.
+
+    experts in the set     readme   python   C      notes
+    480 of 3840 (12%)      47%      43%      44%    40%
+    960 of 3840 (25%)      65%      62%      64%    56%
+    1700 of 3840 (44%)     83%      80%      82%    75%
+    2400 of 3840 (62%)     93%      92%      92%    88%
+
+The texts are short, so these values are approximate. The set of 1700
+experts fits in the free memory of the GPU. It gets 75% to 83% of the expert
+reads. Thus the CPU reads only about a fifth of the expert bytes.
 
 ## The design
 
@@ -97,6 +174,59 @@ then:
 
 The environment of each part holds the same parameters. A call binds them
 one time and writes them into each part.
+
+### Places of the operations in a row split
+
+Each operation of a layer gets one of three places:
+
+- all: each part runs the operation on its own copy of the data. This is
+  for a small operation, such as a norm, an add, or the router. The part
+  writes only its own buffers, so it needs no barrier.
+- rows: each part computes a range of the rows of the output. The output is
+  one buffer that all parts can read. A barrier across the parts follows.
+- one: only part 0 runs the operation, and a barrier follows. This is for an
+  operation that changes shared data in place. Examples are the norm and the
+  rope of the query, the write to the cache, and the attention.
+
+A layer of the 26B then has these places:
+
+    operation                               place
+    input norm                              all
+    q, k, v projections                     rows
+    norm and rope of q, k; cache write      one
+    attention                               one
+    o projection                            rows
+    norm, residual add                      all
+    gate and up projections (with norm)     rows
+    GELU, down projection                   rows
+    router                                  all
+    experts                                 rows (see below)
+    norms, adds, layer scalar               all
+
+A range starts at a multiple of 16 rows. The int4 kernels compute four rows
+together, and the GELU uses 16 values in a vector. At these boundaries each
+part computes each row with the same instructions as one program. Thus the
+parts give the same bits.
+
+The experts split by rows too. Each part holds rows of every expert: a range
+of the gate and up rows, and a range of the down rows. The steps of a part:
+
+1. Run the gate, the up, and the GELU for its range. Write this part of the
+   activation to a shared buffer.
+2. After a barrier, run the down rows of its range on the whole activation.
+3. Add the outputs of the experts for its range of the output, in the order
+   of the expert index.
+
+The load of each part is then the same for each token. A split by expert does not have this
+property: a token can select six experts of one part and two of the other.
+
+The rows of a part are a copy of the weights. On a machine with NUMA, the
+copy goes to the memory of the node of the part. In phase 1, the copies are
+in one memory.
+
+Phase 1 splits only a step of one token. A step of a token group writes its
+outputs as (tokens, rows). A range of rows is then not one block of memory,
+so the kernels need a row stride of the output first.
 
 ### NUMA: nested teams
 
@@ -141,10 +271,13 @@ call from Python.
 ## Phases
 
 - Phase 0: measure. The latency and the rate of a copy over the PCIe link,
-  with pinned memory. The rate of an int4 GEMV on the GPU, against the 448
-  GB/s of its memory. Find a machine with two sockets for the NUMA work.
+  with pinned memory (done, see the measurements). The rate of an int4 GEMV
+  on the GPU, against the 448 GB/s of its memory (done). The use of each
+  expert of the 26B on several texts, for the hot experts (done). Find a
+  machine with two sockets for the NUMA work (open).
 - Phase 1: places and parts in the compiler, and a runtime of several parts
-  on the CPU. Emulate two nodes on jackal. Test: the same bits as one part.
+  on the CPU. Emulate two nodes on jackal. Test: the same bits as one part,
+  for a step of one token.
 - Phase 2: NUMA for real. Node-local weights, threads that stay on their
   node, and the barrier across the nodes. Measure the decode on a machine with two
   sockets, against one team.
@@ -153,7 +286,8 @@ call from Python.
   and the experts. First run the whole E4B on the GPU, because it fits and
   needs no split. Test it against the CPU and the reference.
 - Phase 4: the CPU and GPU split of the 26B. First the operation split, with
-  the experts on the CPU. Then the layer split, to compare. Measure the
+  the experts on the CPU. Then the hot experts on the GPU. Then the layer
+  split, to compare. Measure the
   tokens/s against the CPU program and against llama.cpp with the same
   split.
 - Phase 5: the prompt pass and the MTP group on the GPU. The prompt pass is
@@ -167,21 +301,35 @@ This is an estimate, not a measurement:
     part                                      bytes     place   time
     attention, dense part, router, head       1.6 GB    GPU     about 4 ms
     experts                                   0.8 GB    CPU     about 18 ms
-    60 transfers of 11 KB                     -         link    about 1 to 2 ms
+    30 round trips of 11 KB                   -         link    about 0.4 ms
 
-A step thus takes about 25 ms, or about 40 tokens/s, against 17 now. The
-CPU part and the GPU part do not overlap in one layer, because each needs
-the result of the other. Phase 0 measures the latency of a transfer, which
-can change this estimate by a large amount.
+A step thus takes about 23 to 25 ms, or about 40 tokens/s, against 17 now.
+The attention and the experts do not overlap in one layer, because each
+needs the result of the other. The dense feed-forward part can overlap the
+experts.
+
+With 1700 hot experts on the GPU (about 4.9 GB), the parts change:
+
+    part                                      bytes     place   time
+    attention, dense part, router, head       1.6 GB    GPU     about 4 ms
+    hot experts, about 80% of the reads       0.64 GB   GPU     about 1.6 ms
+    other experts, about 20% of the reads     0.16 GB   CPU     about 4 to 5 ms
+    30 round trips of 11 KB                   -         link    about 0.4 ms
+
+The hot experts on the GPU and the other experts on the CPU run at the same
+time. A step then takes about 10 to 12 ms, or about 80 to 100 tokens/s. The
+CPU part of a layer is small: about two experts. The fixed cost of each
+layer on the CPU (the start of the threads, the barriers) then matters
+more. This estimate is less certain than the first one.
 
 ## Risks
 
 - The GPU of jackal also drives the display. Its free memory changes with
   the use of Xorg and Chrome. The runtime must check the free memory when it
   loads the model.
-- The link is PCIe generation 3 with 8 lanes. If a transfer costs more than
-  about 30 microseconds, the operation split loses to the layer split. Phase
-  0 decides this.
+- The link is PCIe generation 3 with 8 lanes. A round trip costs 12 to 15
+  microseconds, so the operation split is better than the layer split. A
+  large copy is slow, so the weights must not move during a step.
 - A second set of kernels, for the GPU, doubles the work of each new
   operation. Keep the GPU set small: only the operations of the decode step
   at first.
