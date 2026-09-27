@@ -1983,9 +1983,11 @@ that the harness can reach it over the network:
 
     PYTHONPATH=. OMP_NUM_THREADS=18 python scripts/serve.py --gguf PATH --dtype int4 --host 0.0.0.0 --port 8123 --temperature 0.0
 
-With a CUDA GPU and nvcc, --gpu dense puts the weights outside the experts
-(1.66 B weights, about 1 GB) and the output head (0.6 GB) on the GPU. The
-experts (22.8 B weights) stay on the CPU. --gpu hot also puts the most used
+The option --gpu dense needs a CUDA GPU and nvcc. It puts the weights
+outside the experts on the GPU: 1.66 B weights, about 1 GB. It also puts the
+output head (0.6 GB) there. The experts (22.8 B weights) stay on the CPU.
+
+The option --gpu hot also puts the most used
 experts on the GPU, up to --gpu-experts-gb. The server copies the weights at
 the start. On jackal, a greedy generation of the 26B gives the same tokens
 as the CPU:
