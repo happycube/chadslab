@@ -71,6 +71,99 @@ takes at least 39 ms (about 25 tok/s). On the GPU, the dense part takes
 about 4.5 ms at 448 GB/s. The experts on the CPU take about 9 ms, less the
 experts that the GPU holds (HotCache).
 
+## The two files: MLX OptiQ against GGUF
+
+The second file is unsloth/Qwen3.6-35B-A3B-GGUF, UD-Q4_K_M (22.1 GB), in
+models/Qwen3.6-35B-A3B-GGUF. It is the most downloaded GGUF of this model.
+Its types, from its header:
+
+    tensors                                   GGUF type        MLX OptiQ
+    attention, linear attention, shared       Q8_0             8 bits (most)
+    experts: gate and up                      Q4_K             4 bits (most)
+    experts: down                             Q5_K (37 layers),
+                                              Q6_K (3 layers)  4 or 8 bits
+    head                                      Q6_K             8 bits
+    embedding table                           Q8_0             8 bits
+    router, alpha, beta, conv, norms, A, dt   F32              8 bits, bf16
+    MTP layer                                 (not in the file) in the repo
+
+The sizes are almost the same: 19.6 GB of experts in each, and 2.0 GB of
+dense weights that each token reads. Thus the two files have the same
+limit of speed. The work to support each is different.
+
+What is the same for the two files (most of the work):
+
+- the Gated DeltaNet, the gated attention, the experts and the shared
+  expert, the state of the linear layers for Session and MTP;
+- the byte-level BPE tokenizer (tokenizer.json, or the tokens and merges of
+  the GGUF with the pre-tokenizer "qwen35") and the chat template;
+- the program records, the GPU path, and HotCache.
+
+What is different:
+
+    item                      MLX OptiQ                GGUF UD-Q4_K_M
+    weight formats            1 family: affine, groups 4 new formats: Q8_0
+                              of 64, 4 or 8 bits,      (easy), Q4_K and Q5_K
+                              scale and bias in        (super-blocks of 256,
+                              separate arrays          6-bit packed scales and
+                                                       mins), and Q6_K (the
+                                                       CPU and GPU have it)
+    kernels to write          1 family with a bits     Q8_0, Q4_K, Q5_K for
+                              parameter, for each      each kernel kind
+                              kernel kind
+    layout of the tensors     as transformers          changed by the
+                                                       converter (see below)
+    reference for the values  transformers (dequantize llama.cpp on the same
+                              and rename), exact       weights: the logits and
+                                                       each tensor; also
+                                                       transformers after the
+                                                       inverse changes
+    reference for the speed   none on the same weights llama.cpp on the same
+                                                       file
+    MTP                       in the repo (its experts not in this file
+                              are bf16)                (unsloth has a separate
+                                                       MTP-GGUF)
+    loader                    SafeTensors (exists)     GGUF (exists), and the
+                                                       types above
+
+The changes of the converter of llama.cpp (conversion/qwen.py) that the
+GGUF has:
+
+- the value heads of the linear layers go from grouped order to tiled
+  order. This changes qkv (the v rows), z, a, b, A, dt, the v part of
+  conv1d, and the columns of out_proj;
+- 1 is added to each norm weight except the gated norm of the linear
+  layers;
+- A_log becomes -exp(A_log) (ssm_a), and the names change.
+
+The model code can undo the order at load, so the two files use the same
+code. The rows of qkv, z, a, and b move as whole rows of blocks. The
+columns of out_proj move by value heads of 128. That is 4 blocks of Q8_0,
+so whole blocks move and no value changes.
+
+The estimate of the work:
+
+- The formats: MLX needs one family of kernels. It has the product for
+  one token, for a group, and for the experts, on the CPU and on the GPU
+  with the tensor cores. GGUF needs the same kernels for Q8_0, Q4_K, and Q5_K:
+  about 2 to 3 times that work. The K formats have a second level of
+  scales, packed in 6 bits (and a fifth bit for Q5_K).
+- The math of the formats is similar. Both are affine: a scale and an
+  offset for each group of values (MLX: 64 values, scale and bias; Q4_K:
+  32 values, d * sc and dmin * m). For both, a product is
+  sum(scale * dot(q, x)) + sum(offset * sum(x)).
+- The checks: GGUF has llama.cpp on the same weights. That helps most for
+  the linear attention, the hard part: a tensor of each layer can be
+  compared (llama-eval-callback). For MLX, transformers is the reference,
+  and it has the same layout, so the checks are direct.
+
+The decision: build the model on the MLX file first, with the format of a
+matrix behind one interface (the kernels take a format tag). The reference
+is transformers with the same names and order. Then add Q8_0, Q4_K, and
+Q5_K, and the inverse order at load, for the GGUF file. Use llama.cpp on the
+GGUF as the reference for the speed, and as a second reference for the
+values.
+
 ## The references
 
 - transformers 5.17 (the venv of gemma4-12b-qat-pytorch) has
