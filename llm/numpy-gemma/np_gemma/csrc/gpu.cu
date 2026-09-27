@@ -2679,13 +2679,41 @@ __global__ void k_router_logits_mt(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* A test of MTP for the 26B (gg_set_reuse): a value 1 + m lets token j > 0
+ * of a group select only from the experts of token 0, the experts that the
+ * GPU holds (operand 14, the slot of each expert, -1 for a cold expert), and
+ * its own m best experts. With m = 0 the CPU runs only the cold experts of
+ * token 0. The result is not the result of the model. */
+__device__ int g_reuse = 0;
+
 __global__ void k_router_top_mt(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     int j = blockIdx.x, experts = DI(5), top_k = DI(6);
-    router_top_warp(DP(const float, 13) + (size_t)j * experts, DP(const float, 3),
-                    DP(float, 9) + (size_t)j * top_k, DP(int, 10) + (size_t)j * top_k,
-                    experts, top_k);
+    const float *lg = DP(const float, 13) + (size_t)j * experts;
+    /* Only a small group (an MTP verify group), not a prompt pass. */
+    if (g_reuse && j > 0 && DI(11) <= 16 && experts <= 256 && top_k <= 16) {
+        __shared__ float masked[256], v0[16], vj[16];
+        __shared__ int sel0[16], selj[16];
+        const int *slots = DP(const int, 14);
+        int keep = min(g_reuse - 1, top_k);
+        /* The selection of token 0, as block 0 makes it, and the own
+         * selection of token j, best first. */
+        router_top_warp(DP(const float, 13), DP(const float, 3), v0, sel0, experts, top_k);
+        router_top_warp(lg, DP(const float, 3), vj, selj, experts, top_k);
+        __syncwarp();
+        for (int x = threadIdx.x; x < experts; x += 32) {
+            bool ok = slots != NULL && slots[x] >= 0;
+            for (int k = 0; k < top_k; ++k) {
+                ok = ok || sel0[k] == x || (k < keep && selj[k] == x);
+            }
+            masked[x] = ok ? lg[x] : -INFINITY;
+        }
+        __syncwarp();
+        lg = masked;
+    }
+    router_top_warp(lg, DP(const float, 3), DP(float, 9) + (size_t)j * top_k,
+                    DP(int, 10) + (size_t)j * top_k, experts, top_k);
 }
 
 /* ---------- the experts of a large group on the GPU ----------
@@ -4397,6 +4425,17 @@ void *gg_load(const int64_t *prog, int use_graph)
 
 /* Run a program. env holds the values of the slots after the bind; the run
  * computes the scalar slots itself. The run does not wait for the GPU. */
+/* The test of the reuse of experts in an MTP group (k_router_top_mt). */
+int gg_set_reuse(int on)
+{
+    /* In the order of the stream, so the steps before keep their setting. */
+    static int v;
+    v = on;
+    CK(cudaMemcpyToSymbolAsync(g_reuse, &v, sizeof(int), 0, cudaMemcpyHostToDevice, gg_stream));
+    CK(cudaStreamSynchronize(gg_stream));
+    return 0;
+}
+
 int gg_run(void *handle, const int64_t *env)
 {
     gg_prog *g = (gg_prog *)handle;

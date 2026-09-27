@@ -925,6 +925,52 @@ drafter on the GPU removes the cost of the drafts (about 14 ms in a step
 with the CPU drafter). It does not remove the cost of the group. Thus MTP stays
 off by default with NP_GEMMA_GPU=1.
 
+### MTP of the 26B: the reuse of the experts of the first token
+
+The verify group of MTP runs the cold experts of each of its tokens on the
+CPU. The CPU reads each expert one time for all the tokens that use it.
+Thus the cost is the count of different cold experts in each layer. A test
+on 160 tokens of a chat answer (1.5 GB of hot experts) gave:
+
+    tokens in the group    different experts   cold experts
+    1                      8.0                 5.4 (2 GB hot)
+    2                      12.5                8.9
+    3                      16.0                11.7
+
+A test (gg_set_reuse, scripts/bench_mtp_reuse.py) lets each draft token of
+a group select only from the experts that are already there. These are the
+experts of the first token and the hot experts. The router of the group
+(k_router_top_mt) sets the other logits to -inf before the softmax. The
+first token stays exact.
+
+The value 1 + m of gg_set_reuse also lets each
+draft token keep its own m best experts. The result is then not the result
+of the model, so the test also runs the exact model on the new text. It
+gives the share of the tokens that are the best token of the exact model.
+It also gives the mean of log p(best) - log p(token).
+
+    26B, 1.5 GB hot, 3 prompts   rate         best token   log p gap
+    plain decode                 45.8 tok/s   100%         0
+    exact MTP, 2 drafts          53.3 tok/s   100%         0
+    reuse, 2 drafts              76.0 tok/s   81.2%        1.17 nats
+    reuse + own best 2, 2 drafts 70.9 tok/s   93.8%        0.12 nats
+    reuse + own best 4, 2 drafts 65.8 tok/s   98.2%        0.02 nats
+    reuse + own best 4, 3 drafts 61.3 tok/s   97.9%        0.02 nats
+
+The reuse of only the experts of the first token is fast, but the text
+becomes bad. A draft token keeps only about half of its own experts, and
+the text had errors ("Here are the seven planets"). When each draft token
+keeps its own 4 best experts, about 75% of its experts stay. The rate is
+23% more than exact MTP and 44% more than the plain decode. The exact model
+selects 98.2% of the tokens itself, near the 98.6% of the int8 prompt pass
+of the E4B. The text of the three prompts was correct.
+
+The accepted draft tokens also keep their keys and values in the cache,
+so a change stays in the context. The test does not turn the reuse on for
+the server. For that, the verify step must turn it on and the prompt pass
+must turn it off. A prompt of fewer than PREFILL_MIN tokens runs as groups
+of up to 16 tokens, and those use the same router.
+
 ### A difference from one run to the next
 
 Two runs of the same decode steps of the 26B gave results that differed by

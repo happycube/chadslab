@@ -879,7 +879,8 @@ def k_router(c, x, layer):
                  proj, np.ascontiguousarray(w["router.per_expert_scale"], dtype=np.float32),
                  x.shape[1], proj.shape[0], top_k, float(c.eps),
                  float(cfg.hidden_size ** -0.5), val, idx, t,
-                 c.buffer((t, x.shape[1])), c.buffer((t, proj.shape[0])))
+                 c.buffer((t, x.shape[1])), c.buffer((t, proj.shape[0])),
+                 c.router_slots(layer) if hasattr(c, "router_slots") else 0)
         return val, idx
     val = c.buffer(top_k)
     idx = np.zeros(top_k, dtype=np.int32)

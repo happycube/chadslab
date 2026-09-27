@@ -699,6 +699,16 @@ class SplitCompiler(PoolCompiler):
             return self.attn_rows_small(*vals)
         return super().kernel(head, vals, out)
 
+    def router_slots(self, layer):
+        """The slot of each expert of a layer on the GPU, -1 for a cold one.
+        The router of a group reads it for the test of gg_set_reuse."""
+        n = self.cfg.num_experts
+        slots = np.full(n, -1, dtype=np.int32)
+        hot = self.hot.get(layer, [])
+        slots[hot] = np.arange(len(hot), dtype=np.int32)
+        self.__dict__.setdefault("_router_slots", []).append(slots)
+        return slots
+
     def attn_rows_small(self, layer, q):
         """The attention of a small group, one query at a time with the
         record of a decode step (GP_ATTN_QC). Its kernel splits the keys of
