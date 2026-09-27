@@ -277,6 +277,23 @@ try:
         _lib.gemma_attn_decode_i16_mt.argtypes = [_void_p] * 7 + [_int] * 3 + [
             _void_p, _void_p, _int, _int]
         _lib.gemma_attn_decode_i16_mt.restype = None
+        _lib.gemma_quantize_q16_t.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_quantize_q16_t.restype = None
+        _lib.gemma_int4_q16_tile_run.argtypes = [_void_p, _void_p, _void_p, _void_p,
+                                                 _void_p, _int, _int, _int, _int]
+        _lib.gemma_int4_q16_tile_run.restype = None
+        _lib.gemma_gather_t_moe.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
+        _lib.gemma_gather_t_moe.restype = None
+        _lib.gemma_int4_f32_moe_run.argtypes = [_void_p, _void_p, _void_p, _void_p, _int,
+                                                _int, _int, _void_p, _void_p, _void_p, _int]
+        _lib.gemma_int4_f32_moe_run.restype = None
+        _lib.gemma_quantize_q16_t_moe.argtypes = [_void_p, _void_p, _void_p, _void_p, _int,
+                                                  _int, _int]
+        _lib.gemma_quantize_q16_t_moe.restype = None
+        _lib.gemma_int4_q16_moe_run.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p,
+                                                _int, _int, _int, _void_p, _void_p, _void_p,
+                                                _int]
+        _lib.gemma_int4_q16_moe_run.restype = None
         _lib.gemma_run.argtypes = [_void_p, _int]
         _lib.gemma_run.restype = _int
         _lib.gemma_gp_record_size.argtypes = []
@@ -1302,4 +1319,65 @@ def attn_decode_i16_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
                                   vq.ctypes.data, vs.ctypes.data, scores.ctypes.data,
                                   out.ctypes.data, q_heads, kv_heads, head_dim,
                                   lo.ctypes.data, n.ctypes.data, nmax, t)
+    return out
+
+
+def linear_int4_q16(x, packed, scales, tb=16):
+    """Multiply x by W with int16 activations. W is packed 4-bit data.
+
+    Quantize x to int16 with one scale for each group of 32 values, then run
+    the int16 tile. The token count is padded to a full token block of tb.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    tokens, cols = x.shape
+    rows = packed.shape[0]
+    stride = (tokens + tb - 1) // tb * tb
+    qxt = np.zeros(cols * stride, dtype=np.int16)
+    sx = np.zeros((cols // 32) * stride, dtype=np.float32)
+    _lib.gemma_quantize_q16_t(x.ctypes.data, qxt.ctypes.data, sx.ctypes.data,
+                              tokens, cols, stride)
+    out = np.empty((tokens, rows), dtype=np.float32)
+    _lib.gemma_int4_q16_tile_run(packed.ctypes.data, scales.ctypes.data, qxt.ctypes.data,
+                                 sx.ctypes.data, out.ctypes.data, rows, cols, tokens, stride)
+    return out
+
+
+def gather_t_moe(x, src, stride, n):
+    """Gather n rows of x (by src, or in order) into a (cols, stride) buffer."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    cols = x.shape[1]
+    xt = np.zeros(cols * stride, dtype=np.float32)
+    _lib.gemma_gather_t_moe(x.ctypes.data, None if src is None else src.ctypes.data,
+                            xt.ctypes.data, cols, stride, n)
+    return xt
+
+
+def int4_f32_moe(w, scales, xt, rows, cols, stride, off, ntok, eid):
+    """Run the float tile of every selected expert in one region."""
+    eid = np.ascontiguousarray(eid, dtype=np.int32)
+    out = np.empty((stride, rows), dtype=np.float32)
+    _lib.gemma_int4_f32_moe_run(w.ctypes.data, scales.ctypes.data, xt.ctypes.data,
+                                out.ctypes.data, rows, cols, stride, off.ctypes.data,
+                                ntok.ctypes.data, eid.ctypes.data, int(eid.size))
+    return out
+
+
+def quantize_q16_t_moe(x, src, cols, stride, n):
+    """Quantize n expert rows of x (by src, or in order) to the int16 tile layout."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    qxt = np.zeros(cols * stride, dtype=np.int16)
+    sx = np.zeros((cols // 32) * stride, dtype=np.float32)
+    _lib.gemma_quantize_q16_t_moe(x.ctypes.data, None if src is None else src.ctypes.data,
+                                  qxt.ctypes.data, sx.ctypes.data, cols, stride, n)
+    return qxt, sx
+
+
+def int4_q16_moe(w, scales, qxt, sx, rows, cols, stride, off, ntok, eid):
+    """Run the int16 tile of every selected expert in one region."""
+    eid = np.ascontiguousarray(eid, dtype=np.int32)
+    out = np.empty((stride, rows), dtype=np.float32)
+    _lib.gemma_int4_q16_moe_run(w.ctypes.data, scales.ctypes.data, qxt.ctypes.data,
+                                sx.ctypes.data, out.ctypes.data, rows, cols, stride,
+                                off.ctypes.data, ntok.ctypes.data, eid.ctypes.data,
+                                int(eid.size))
     return out

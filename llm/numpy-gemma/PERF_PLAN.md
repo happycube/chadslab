@@ -466,26 +466,11 @@ The decode of the 26B has the speed of the old int8 copy:
 The server now uses the int16 copy by default (--kv-attn int16). The
 program and the Python path keep the same bits in the new mode.
 
-**To decide: the int8 activations of the prompt pass.** The prompt pass
-changes the activations to int8 before the int4 products (NP_GEMMA_INT4_Q8=1,
-the default). The prompt pass writes the keys and the values of the cache,
-so each later decode step reads that error. The error of the logits against
-the reference, and the time of a prompt of 512 tokens:
-
-    int8 activations          max |d|   mean |d|   top-1   pp512
-    all products (default)    8.19      1.135       78%    6.94 s
-    experts only              6.72      0.730      100%    8.28 s
-    dense and attention only  8.06      1.064       89%    9.32 s
-    none (float)              0.0014    0.00019    100%   11.80 s
-
-llama.cpp uses the same method: Q8_0 activations for Q4_0 weights. On the
-40 most probable next tokens, its log-probabilities differ from the
-reference by 0.71 on average (at most 2.73). This project differs by 0.92
-(at most 4.35) with int8 activations, and by less than 0.0001 with float
-activations.
-
-The error has no single source. Each int8 product differs from the float
-product by 0.45 to 1.0 per cent, for every kind of matrix:
+**The int8 activations of the prompt pass.** By default, the prompt pass
+uses int8 activations for the int4 products (NP_GEMMA_INT4_Q8=1). The
+llama.cpp code uses the same method: Q8_0 activations for Q4_0 weights.
+Each int8 product differs from the float product by 0.45 to 1.0 per cent,
+for every kind of matrix:
 
     product              mean error
     self_attn.o_proj     1.01e-02
@@ -498,16 +483,42 @@ product by 0.45 to 1.0 per cent, for every kind of matrix:
     self_attn.q_proj     6.69e-03
     experts.gate_up      4.50e-03
 
-That is the step of int8 with one scale for each 32 values. Thus a float
-path for one kind of matrix does not fix it. The choices are:
+A small change of the residual can change the experts that the router
+selects for a token. One such change at layer 7 grew to 34 tokens with
+other experts at layer 29. Thus the logits of a few rows are a poor measure
+for this model. A better measure is the perplexity of a text and the share
+of positions with the same most probable token as the float products.
 
-1. Keep int8. The accuracy is close to llama.cpp, and the prompt pass has
-   the speed of llama.cpp.
-2. Use float. The prompt pass is 1.7 times slower.
-3. Use int16 activations, as the cache now does. The AVX-512 VNNI
-   instruction vpdpwssd multiplies int16 values at half the rate of the
-   int8 instruction. The error falls by about 256 times. Measure the speed
-   of the tile with a benchmark of one layer before the full work.
+The table uses 1024 tokens of README.md and of np_gemma/model.py:
+
+    activations                    ppl README   ppl model.py   same token
+    int8 (NP_GEMMA_INT4_Q8=1)      59.28        33.45          84 per cent
+    int16 for every product        54.91        35.30          97 per cent
+    float matrices, int16 experts  55.12        35.84          99.5 per cent
+    float (NP_GEMMA_INT4_Q8=0)     55.08        35.71          100 per cent
+
+The int8 products change the most probable token at about 16 per cent of
+the positions. The perplexity is not worse on both texts, so the change is
+a perturbation more than a loss.
+
+The speed of each form comes from its kernels. A fused float kernel of the
+experts takes 82 ms for one layer of 256 tokens, and the int8 kernel takes
+31 ms. The float tile changes each weight to float32 for each token block,
+so its work limits it. The new int16 tile keeps the integer multiply at
+half the rate of int8, and it takes 39 ms. For the attention and the dense
+matrices, the float GEMM is as fast as the int16 tile. Thus the best
+accurate form uses float matrices and int16 experts.
+
+NP_GEMMA_INT4_Q8 now selects the form:
+
+    mode   form                           ppl README   pp512
+    1      int8 (default)                 59.28        6.06 s
+    16     float matrices, int16 experts  55.12        9.15 s
+    0      float                          55.08       11.59 s
+
+Mode 0 now runs the experts in one region too. The int16 tile of a dense
+matrix (cops.linear_int4_q16) stays in the code for a comparison. No mode
+uses it, because the float GEMM is as fast.
 
 ## Verification
 

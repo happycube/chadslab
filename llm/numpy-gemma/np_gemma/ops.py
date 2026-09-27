@@ -41,7 +41,18 @@ _COPS_READY = _cops is not None and _cops.available()
 _KERNEL_MODE = os.environ.get("NP_GEMMA_KERNEL", "auto").lower()
 _FUSED_QKV = os.environ.get("NP_GEMMA_FUSED_QKV", "1") == "1"
 _INT4_MULTI4 = os.environ.get("NP_GEMMA_INT4_MULTI4", "1") == "1"
-_INT4_Q8 = os.environ.get("NP_GEMMA_INT4_Q8", "1") == "1"
+# The activations of the int4 products of a prompt pass (PERF_PLAN.md,
+# "Accuracy against the reference"):
+#   "1"   int8 for every product. This is the default and the method of
+#         llama.cpp. It changes the most probable token at about 16 per cent
+#         of the positions, against the float products.
+#   "16"  float32 for the attention and the dense matrices, and int16 for the
+#         experts. It changes about 0.5 per cent of the positions, and the
+#         prompt pass takes about 1.37 times the time of "1".
+#   "0"   float32 for every product. The prompt pass takes about 1.8 times the
+#         time of "1".
+_PROMPT_ACT = os.environ.get("NP_GEMMA_INT4_Q8", "1")
+_INT4_Q8 = _PROMPT_ACT == "1"
 _INT4_Q8_GEMV = os.environ.get("NP_GEMMA_INT4_Q8_GEMV", "0") == "1"
 # The int8 tile needs AVX-512. The int8 dot product for one token needs VNNI.
 _INT4_Q8_OK = _INT4_Q8 and _COPS_READY and bool(getattr(_cops, "AVX512", False))
@@ -697,8 +708,8 @@ def linear_int4_numpy(x, packed, scales):
 
 # Use the int4 kernel with int8 activations. The kernel quantizes the
 # activations to int8 with one scale for each group of 32 columns. The dot then
-# uses the integer multiply maddubs. Set NP_GEMMA_INT4_Q8=0 to compare with
-# the float path. The 26B model gives the same token ids on the Paris test.
+# uses the integer multiply maddubs. NP_GEMMA_INT4_Q8 selects the activations
+# of a prompt pass; see _PROMPT_ACT at the top of this module.
 # The smallest token count for the int8 tile. A smaller count wastes the token
 # lanes and pays for the quantization of the activations.
 _INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))
@@ -769,6 +780,96 @@ def linear_int4_q8_wide(x, packed, scales):
 def int4_q8_moe_ready():
     """Return True when the fused int8 mixture-of-experts kernel is ready."""
     return int4_q8_ready()
+
+
+def moe_prompt_ready():
+    """Return True when a fused expert kernel serves the prompt pass."""
+    if _PROMPT_ACT == "1":
+        return _INT4_Q8_OK
+    return _COPS_READY
+
+
+def moe_prompt(h, gu, dn, val, idx, inner):
+    """Run the experts of a prompt pass with the activations of NP_GEMMA_INT4_Q8.
+
+    "1" uses int8, "16" uses int16, and "0" uses float32. Each form runs the
+    experts of the layer in one region.
+    """
+    if _PROMPT_ACT == "1":
+        return moe_int4_q8(h, gu, dn, val, idx, inner)
+    if _PROMPT_ACT == "16":
+        return moe_int4_q16(h, gu, dn, val, idx, inner)
+    return moe_int4_f32(h, gu, dn, val, idx, inner)
+
+
+def moe_int4_f32(h, gu, dn, val, idx, inner):
+    """Run the selected experts for a prompt with float32 activations.
+
+    The steps are the steps of moe_int4_q8, with the float tile in place of
+    the int8 tile. Thus the activations have no quantization error, and one
+    region covers the experts of the layer.
+    """
+    gu_p, gu_s = gu
+    dn_p, dn_s = dn
+    tokens, hidden = h.shape
+    top_k = idx.shape[1]
+    flat_e = np.asarray(idx, dtype=np.int64).reshape(-1)
+    flat_t = np.repeat(np.arange(tokens), top_k)
+    order = np.argsort(flat_e, kind="stable")
+    src = flat_t[order].astype(np.int32)
+    eid, counts = np.unique(flat_e[order], return_counts=True)
+    ntok = counts.astype(np.int32)
+    off = np.zeros(eid.size, dtype=np.int32)
+    if eid.size > 1:
+        np.cumsum(ntok[:-1], out=off[1:])
+    n = tokens * top_k
+    # A tile reads at most one token block past the end of an expert.
+    stride = n + 16
+    xt = _cops.gather_t_moe(h, src, stride, n)
+    act = _cops.int4_f32_moe(gu_p, gu_s, xt, gu_p.shape[1], hidden, stride, off, ntok,
+                             eid)[:n]
+    act2 = _cops.gelu_mul(act, inner)
+    xt2 = _cops.gather_t_moe(act2, None, stride, n)
+    de = _cops.int4_f32_moe(dn_p, dn_s, xt2, dn_p.shape[1], inner, stride, off, ntok,
+                            eid)[:n]
+    w = np.ascontiguousarray(np.asarray(val, dtype=np.float32).reshape(-1)[order])
+    out = np.zeros_like(h)
+    _cops.moe_scatter(out, de, src, w, hidden, n)
+    return out
+
+
+def moe_int4_q16(h, gu, dn, val, idx, inner):
+    """Run the selected experts for a prompt with int16 activations.
+
+    The steps are the steps of moe_int4_q8, with the int16 tile. The error of
+    one product is about 2e-5 of its size, against about 6e-3 for int8.
+    """
+    gu_p, gu_s = gu
+    dn_p, dn_s = dn
+    tokens, hidden = h.shape
+    top_k = idx.shape[1]
+    flat_e = np.asarray(idx, dtype=np.int64).reshape(-1)
+    flat_t = np.repeat(np.arange(tokens), top_k)
+    order = np.argsort(flat_e, kind="stable")
+    src = flat_t[order].astype(np.int32)
+    eid, counts = np.unique(flat_e[order], return_counts=True)
+    ntok = counts.astype(np.int32)
+    off = np.zeros(eid.size, dtype=np.int32)
+    if eid.size > 1:
+        np.cumsum(ntok[:-1], out=off[1:])
+    n = tokens * top_k
+    stride = n + 16
+    qxt, sx = _cops.quantize_q16_t_moe(h, src, hidden, stride, n)
+    act = _cops.int4_q16_moe(gu_p, gu_s, qxt, sx, gu_p.shape[1], hidden, stride, off,
+                             ntok, eid)[:n]
+    act2 = _cops.gelu_mul(act, inner)
+    qxt2, sx2 = _cops.quantize_q16_t_moe(act2, None, inner, stride, n)
+    de = _cops.int4_q16_moe(dn_p, dn_s, qxt2, sx2, dn_p.shape[1], inner, stride, off,
+                            ntok, eid)[:n]
+    w = np.ascontiguousarray(np.asarray(val, dtype=np.float32).reshape(-1)[order])
+    out = np.zeros_like(h)
+    _cops.moe_scatter(out, de, src, w, hidden, n)
+    return out
 
 
 def moe_int4_q8(h, gu, dn, val, idx, inner):

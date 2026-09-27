@@ -555,11 +555,12 @@ class Model:
             return self._moe_one_token(h, w, val, idx)
         if self._dtype == "int4" and ops.mt_ready(h.shape[0]):
             return self._moe_mt(h, w, val, idx)
-        if self._dtype == "int4" and h.shape[0] >= 2 and ops.int4_q8_moe_ready():
-            # One parallel region covers every expert of the layer.
-            return ops.moe_int4_q8(h, w["experts.gate_up_proj"],
-                                   w["experts.down_proj"], val, idx,
-                                   self.cfg.moe_intermediate_size)
+        if self._dtype == "int4" and h.shape[0] >= 2 and ops.moe_prompt_ready():
+            # One parallel region covers every expert of the layer. The
+            # activations are int8, int16, or float32 (NP_GEMMA_INT4_Q8).
+            return ops.moe_prompt(h, w["experts.gate_up_proj"],
+                                  w["experts.down_proj"], val, idx,
+                                  self.cfg.moe_intermediate_size)
         inner = self.cfg.moe_intermediate_size
         out = np.zeros_like(h)
         gu = w["experts.gate_up_proj"]
