@@ -644,3 +644,47 @@ class GGUF:
                 i for i, s in enumerate(tokens) if s in ("<turn|>", "<end_of_turn>")
             ],
         }
+
+
+class GGUFSplit(GGUF):
+    """A model in split GGUF files (name-00001-of-0000N.gguf, as llama.cpp
+    gguf-split writes them). The first file has the metadata; each file has
+    its own tensors. raw() and dequant() read a tensor from its file.
+
+        g = open_gguf("model-00001-of-00004.gguf")
+    """
+
+    def __init__(self, path):
+        m = re.match(r"(.*)-(\d{5})-of-(\d{5})\.gguf$", path)
+        if m is None:
+            raise ValueError("not the name of a split GGUF file: %s" % path)
+        prefix, count = m.group(1), int(m.group(3))
+        self.path = path
+        self.parts = [GGUF("%s-%05d-of-%05d.gguf" % (prefix, i, count))
+                      for i in range(1, count + 1)]
+        self.meta = self.parts[0].meta
+        self.version = self.parts[0].version
+        self.tensors, self._where, self._order = {}, {}, []
+        for p in self.parts:
+            for name in p._order:
+                self.tensors[name] = p.tensors[name]
+                self._where[name] = p
+                self._order.append(name)
+        n = int(self.meta.get("split.tensors.count", len(self.tensors)))
+        if n != len(self.tensors):
+            raise ValueError("the split files have %d tensors, not %d" % (len(self.tensors), n))
+        self._to_gguf = {}
+
+    def raw(self, gname):
+        return self._where[gname].raw(gname)
+
+    def close(self):
+        for p in self.parts:
+            p.close()
+
+
+def open_gguf(path):
+    """A GGUF file, or the first file of a split model (GGUFSplit)."""
+    if re.search(r"-\d{5}-of-\d{5}\.gguf$", path):
+        return GGUFSplit(path)
+    return GGUF(path)
