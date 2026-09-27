@@ -76,6 +76,7 @@ enum {
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
     GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
     GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93, GP_F32_LINEAR = 94, GP_DRAFT_HEAD = 95,
+    GP_ARGMAX = 96,
 };
 
 static cudaStream_t gg_stream;
@@ -2785,6 +2786,41 @@ __global__ void k_draft_best(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* GP_ARGMAX: x, n, out. out[0] gets the index of the largest of the n values
+ * of x. At an equal value, the lower index wins, as np.argmax. One block. */
+__global__ void k_argmax(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    const float *x = DP(const float, 0);
+    int n = DI(1);
+    float v = -INFINITY;
+    int b = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (x[i] > v) {
+            v = x[i];
+            b = i;
+        }
+    }
+    bv[threadIdx.x] = v;
+    bi[threadIdx.x] = b;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) {
+            float ov = bv[threadIdx.x + s2];
+            int oi = bi[threadIdx.x + s2];
+            if (ov > bv[threadIdx.x] || (ov == bv[threadIdx.x] && oi < bi[threadIdx.x])) {
+                bv[threadIdx.x] = ov;
+                bi[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        DP(int, 2)[0] = bi[0];
+    }
+}
+
 /* ---------- the output head ---------- */
 
 /* x (cols), a Q6_K matrix, out (rows). One warp for each row. A Q6_K block
@@ -3254,6 +3290,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_draft_best<<<1, 1024, 0, s>>>(dr, denv);
         break;
     }
+    case GP_ARGMAX:
+        k_argmax<<<1, 1024, 0, s>>>(dr, denv);
+        break;
     case GP_HOT_SPLIT_MT:
         k_hot_split_mt<<<(unsigned)cdiv(hlit(r, 5, &bad), T), T, 0, s>>>(dr, denv);
         break;

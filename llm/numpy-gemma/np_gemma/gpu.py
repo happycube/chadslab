@@ -1430,10 +1430,16 @@ def quantize_q4_0(w):
     return np.ascontiguousarray(ops.pack_int4_blocks(scale, qs)), scale
 
 
-def compile_drafter(a, target_cfg):
+def compile_drafter(a, target_cfg, cache_form="e4b"):
     """Compile one draft step of the assistant a (an Assistant with float32
     weights) for the GPU. The steps are those of Assistant.step and of its
-    centroid head.
+    head: the centroid head (E4B), or the full head and an argmax (26B).
+
+    cache_form is the cache of the target: "e4b", the float cache of the E4B
+    (heads, positions, head_dim), or "qc", the int16 cache of the 26B on the
+    GPU (GPUKV). For "qc" the step binds the addresses of the first key row
+    and the count of the rows (the slots kq.s, ks.s, vq.s, vs.s, n.s and the
+    same with .f), as Assistant._attention finds them.
 
     The input "xin" holds the embedding of the token and the hidden state h,
     with the backbone size each. The step writes the next h into the second
@@ -1462,9 +1468,15 @@ def compile_drafter(a, target_cfg):
         P.k_rope(c, q, None, c.p.slot("cos." + kind), c.p.slot("sin." + kind), i)
         att = c.buffer((1, nq * hd))
         window = plan.sliding_window or 0
-        c.p.emit(P.ATTN_F32H, q, c.p.slot("k." + kind), c.p.slot("v." + kind),
-                 c.p.slot("scores"), att, nq, tplan[plan.is_sliding].num_kv_heads, hd, 1,
-                 c.p.slot("pd"), c.p.slot("hs." + kind), max(0, window - 1), 1)
+        kvh = tplan[plan.is_sliding].num_kv_heads
+        if cache_form == "qc":
+            sl = lambda n: c.p.slot("%s.%s" % (n, kind))  # noqa: E731
+            c.p.emit(P.ATTN_QC, q, sl("kq"), sl("ks"), sl("vq"), sl("vs"), c.p.slot("scores"),
+                     att, nq, kvh, hd, sl("n"))
+        else:
+            c.p.emit(P.ATTN_F32H, q, c.p.slot("k." + kind), c.p.slot("v." + kind),
+                     c.p.slot("scores"), att, nq, kvh, hd, 1,
+                     c.p.slot("pd"), c.p.slot("hs." + kind), max(0, window - 1), 1)
         o = P.k_int4(c, q4(w["self_attn.o_proj"]), att)
         u = P.k_add(c, u, P.k_rms_norm(c, o, w["post_attention_layernorm"]))
         m = P.k_rms_norm(c, u, w["pre_feedforward_layernorm"])
@@ -1475,37 +1487,48 @@ def compile_drafter(a, target_cfg):
         u = P.k_mul(c, u, w["layer_scalar"])
     un = P.k_rms_norm(c, u, a.norm)
     hnext = P.k_int4(c, q4(a.post), un)
-    n_cent, per = a.order.shape
-    cent = np.ascontiguousarray(a.centroids, dtype=np.float32)
-    clog = c.buffer(n_cent)
-    c.p.emit(P.F32_LINEAR, un, cent, clog, n_cent, cfg.hidden_size)
     token = np.zeros(1, dtype=np.int32)
-    c.p.emit(P.DRAFT_HEAD, un, clog, np.ascontiguousarray(a.order, dtype=np.int32),
-             np.ascontiguousarray(a.head_f32, dtype=np.float32), c.buffer(a.top_k * per),
-             np.zeros(a.top_k, dtype=np.int32), token, n_cent, per, a.top_k, cfg.hidden_size)
+    if a.centroids is not None:
+        n_cent, per = a.order.shape
+        cent = np.ascontiguousarray(a.centroids, dtype=np.float32)
+        clog = c.buffer(n_cent)
+        c.p.emit(P.F32_LINEAR, un, cent, clog, n_cent, cfg.hidden_size)
+        c.p.emit(P.DRAFT_HEAD, un, clog, np.ascontiguousarray(a.order, dtype=np.int32),
+                 np.ascontiguousarray(a.head_f32, dtype=np.float32), c.buffer(a.top_k * per),
+                 np.zeros(a.top_k, dtype=np.int32), token, n_cent, per, a.top_k,
+                 cfg.hidden_size)
+    else:
+        # The full head: the int4 product with the table of the drafter, and
+        # the best token. The assistant has no soft cap.
+        logits = P.k_int4(c, q4(a.head), un)
+        c.p.emit(P.ARGMAX, logits, logits.size, token)
     c.p.emit(P.COPY, hnext, xin[:, bk:], bk * 4)
     c.env["token"] = token
     return c.p.finish()
 
 
 class GPUDrafter:
-    """The MTP drafter of the E4B model on the GPU. draft() has the arguments
-    of Assistant.draft, so mtp_stream takes either.
+    """The MTP drafter on the GPU, for the E4B model or the 26B model. draft()
+    has the arguments of Assistant.draft, so mtp_stream takes either.
 
-    The drafter reads the cache of the target on the GPU: the buffers that
-    the shared layers of the E4B model reuse. Thus it needs no copy of the
-    cache to the host. Its weights are its own int4 blocks with float16
-    scales (quantize_q4_0), so its drafts can differ a little from the CPU
-    drafter. The target checks each draft, so the text does not change.
+    The drafter reads the cache of the target on the GPU. For the E4B, those
+    are the buffers that its shared layers reuse. For the 26B, they are the
+    int16 buffers of two layers of GPUKV (assistant.shared_layers). Thus it
+    needs no copy of the cache to the host. Its weights are its own int4
+    blocks with float16 scales (quantize_q4_0), so its drafts can differ a
+    little from the CPU drafter. The target checks each draft, so the text
+    does not change.
     """
+
+    on_gpu = True
 
     def __init__(self, path, target):
         from .assistant import Assistant
         self.a = Assistant(path, dtype="f32")
-        assert self.a.centroids is not None, "the GPU drafter needs the centroid head"
         self.target = target
         self.p_min = 0.0
-        self.prog = compile_drafter(self.a, target.cfg)
+        self.e4b = hasattr(target, "mode")      # E4B has a mode; Model does not
+        self.prog = compile_drafter(self.a, target.cfg, "e4b" if self.e4b else "qc")
         self.g = None
 
     def draft(self, target, token, h, pos, cache, n, eos_ids=()):
@@ -1515,16 +1538,35 @@ class GPUDrafter:
             self.g = GPUProgram(self.prog, mirror=tg.g.mirror)
         a, bk = self.a, self.a.backbone
         kw = {"pd": pos - 1}
+        if not self.e4b:
+            from .assistant import shared_layers
+            layers = dict(zip(("s", "f"), shared_layers(target.cfg)))
         for kind, sliding in (("s", True), ("f", False)):
             plan = next(p for p in a.cfg.plan if p.is_sliding == sliding)
-            store = cache.shared["sliding_attention" if sliding else "full_attention"]
-            kw["k." + kind], kw["v." + kind] = store[0], store[1]
-            kw["hs." + kind] = store[0].shape[1] * store[0].shape[2]
+            if self.e4b:
+                store = cache.shared["sliding_attention" if sliding else "full_attention"]
+                kw["k." + kind], kw["v." + kind] = store[0], store[1]
+                kw["hs." + kind] = store[0].shape[1] * store[0].shape[2]
+            else:
+                # The rows of positions lo to pos - 1 of the target layer, as
+                # Assistant._attention reads them.
+                i = layers[kind]
+                kv = tg.kv
+                base = kv.base[i]
+                lo = max(0, pos - a.cfg.sliding_window + 1 - base) if sliding else 0
+                tp = target.cfg.plan[i]
+                per = tp.num_kv_heads * tp.head_dim
+                b = kv.bufs[i]
+                kw.update({"kq." + kind: b["kq"].ptr + lo * 2 * per,
+                           "ks." + kind: b["ks"].ptr + lo * per // 8,
+                           "vq." + kind: b["vq"].ptr + lo * 2 * per,
+                           "vs." + kind: b["vs"].ptr + lo * per // 8,
+                           "n." + kind: pos - base - lo})
             cos, sin = a._cos_sin(plan, pos)
             kw["cos." + kind] = np.ascontiguousarray(cos, dtype=np.float32)
             kw["sin." + kind] = np.ascontiguousarray(sin, dtype=np.float32)
         kw["scores"] = np.empty(max(p.num_q_heads for p in a.cfg.plan) * (pos + 1), np.float32)
-        self.g.bind(kw, tg.cache)
+        self.g.bind(kw, tg.cache if self.e4b else None)
         xin = self.g.mirror.buffer_of(self.prog.names["xin"]).ptr
         tokbuf = self.g.mirror.buffer_of(self.prog.names["token"])
         hh = np.ascontiguousarray(h, dtype=np.float32).reshape(-1)

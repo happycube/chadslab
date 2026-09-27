@@ -2013,10 +2013,13 @@ measures them:
 
 The prompt pass on the GPU copies the experts that the GPU does not hold for
 each chunk of 1024 tokens. The option works for scripts/gguf_generate.py
-too. MTP works with --gpu and gives the same tokens. But it is slower than
-the plain decode on the GPU, because its verify group sends more experts to
-the CPU.
-Thus the server turns MTP off with --gpu unless NP_GEMMA_MTP=1.
+too.
+
+MTP works with --gpu and gives the same tokens. With the drafter on
+the GPU (GPUDrafter, scripts/bench_mtp_gpu.py), the 26B gives about 47
+tokens/s with MTP, against 45 for the plain decode. The gain is small,
+because the verify group sends more experts to the CPU. Thus the server
+turns MTP off with --gpu unless NP_GEMMA_MTP=1.
 See SPLIT_PLAN.md.
 
 Then choose the provider and the model in the harness. No credential is

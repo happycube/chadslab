@@ -282,7 +282,8 @@ def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
     """
     pos = len(ids)
     emitted = 0
-    if hasattr(target, "gpu_mirror") and not hasattr(cache, "shared"):
+    if (hasattr(target, "gpu_mirror") and not hasattr(cache, "shared")
+            and not getattr(drafter, "on_gpu", False)):
         # With the cache on the GPU, the drafter needs the new rows of its
         # two layers in the host cache after each step.
         target.gpu_mirror(cache, shared_layers(target.cfg))

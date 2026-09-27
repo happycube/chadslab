@@ -692,12 +692,13 @@ scripts/mma_peak.cu measures the peak rate of mma.sync on this GPU:
     int8      int32     204 TOPS
 
 The products of the prompt pass of the E4B need about 8 TFLOP for 1024
-tokens. The kernel k_gemm_tc took 263 ms (30 TFLOPS). The kernel k_gemm_tc2 copies each step with
-cp.async into two buffers, so the copy of the next step runs during the
-compute. It uses tiles of 128 tokens by 128 rows, and it makes the float16
-values of the weights in registers from the 4-bit numbers. It takes 243 ms:
-33 TFLOPS, about 89% of the peak of float16. Thus a better float16 kernel
-cannot give much more.
+tokens. The kernel k_gemm_tc took 263 ms (30 TFLOPS).
+
+The kernel k_gemm_tc2 copies each step with cp.async into two buffers, so
+the copy of the next step runs during the compute. It uses tiles of 128
+tokens by 128 rows. It makes the float16 values of the weights in registers
+from the 4-bit numbers. It takes 243 ms: 33 TFLOPS, about 89% of the peak of
+float16. Thus a better float16 kernel cannot give much more.
 
 The kernel k_gemm_q8 (NP_GEMMA_GPU_TC=8) quantizes the rows of x to int8.
 Each block of 32 values has a scale, as in the Q8_0 form of ggml. The instruction
@@ -734,8 +735,26 @@ about 0.5 ms, against about 7 ms on the CPU.
     MTP, 3 drafts                     121 tok/s     69%
     llama.cpp (CUDA), plain decode    112 tok/s     -
 
-MTP gives the same tokens as the plain decode. The drafter of the 26B has a
-full head, not a centroid head, so GPUDrafter does not take it yet.
+MTP gives the same tokens as the plain decode.
+
+GPUDrafter also takes the drafter of the 26B. That drafter has a full head,
+not a centroid head. The step computes the int4 product with the full head
+and then finds the best token with GP_ARGMAX. The attention reads the int16
+buffers of GPUKV for the two layers of shared_layers (GP_ATTN_QC). The step
+binds the address of the first row in the window and the count of rows.
+The script scripts/bench_mtp_gpu.py measures it:
+
+    26B, decode of 128 tokens         rate          drafts accepted
+    plain decode on the GPU           45.1 tok/s    -
+    MTP, 1 draft, drafter on the GPU  47.0 tok/s    73%
+    MTP, 2 drafts                     47.4 tok/s    62%
+    MTP, 3 drafts                     42.7 tok/s    50%
+
+MTP gives the same tokens as the plain decode. The gain is small, because
+the verify group sends the cold experts of each token to the CPU. The
+drafter on the GPU removes the cost of the drafts (about 14 ms in a step
+with the CPU drafter). It does not remove the cost of the group. Thus MTP stays
+off by default with NP_GEMMA_GPU=1.
 
 ### A difference from one run to the next
 
