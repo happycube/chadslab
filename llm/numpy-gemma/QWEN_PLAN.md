@@ -210,6 +210,28 @@ from the limit of about 25 tok/s (2.6 GB for each token at 67 GB/s).
 5. Test against transformers: the hidden state of each layer of the
    4-layer model, then the logits and 32 greedy tokens of the full model.
 
+Status of phase 1 (done):
+
+- np_gemma/qwen_tok.py: the same ids as the tokenizers library on 5031
+  texts (the files of this repository, 10 hard samples, 5000 random
+  strings). It needs no regex module (scripts/check_qwen_tok.py).
+- np_gemma/qwen.py: the model in NumPy. On the first 4 layers (3 linear,
+  1 full), the logits agree with transformers to 7e-7 (max rel). This is
+  true for one pass, and for a prompt pass with steps after it
+  (scripts/check_qwen.py with scripts/qwen_reference.py). The whole model gives "The capital of France
+  is Paris." It takes about 4 s for each token.
+
+Two facts that the tests found:
+
+- The MLX files keep the norm weights with the 1 added (mlx-lm adds it at
+  the conversion). transformers keeps w and adds 1. The reference script
+  gives w - 1 to transformers. The test with 4 layers did not find this
+  first, because the model and the reference used the same wrong rule.
+  Only the text of the whole model showed it.
+- A model that transformers makes on the meta device has no inv_freq for
+  RoPE (a buffer that the state dict does not have). The reference script
+  computes it again.
+
 ## Phase 2: the CPU path
 
 The CPU path uses the program interpreter (gemma_run) with new records:
