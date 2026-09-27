@@ -280,9 +280,11 @@ Status (done; scripts/check_qwen4_mtp.py):
   from a copy and the first n inputs of its convolution. A verify group
   and commit give the same bits as steps. The keys of the indexer need no
   change: a block that is not complete gets its key again in the next run.
-- Qwen4CPU.generate_mtp: draft with the MTP layer, verify the group, then
-  the MTP layer on the accepted drafts with the streams of the model.
-  The tokens are those of greedy decode with no drafts.
+- Qwen4CPU.generate_mtp: each round, one group of the MTP layer does two
+  things. It remakes the keys of the accepted drafts with the streams of
+  the model, and it gives the first draft. The next drafts use the streams
+  of the MTP layer. Then one verify group of the model runs. The tokens
+  are those of greedy decode with no drafts.
 
 The rate of the decode (greedy; the plain decode is 6.9 to 7.2 tok/s):
 
@@ -297,14 +299,42 @@ This is a code answer of 98 tokens. The answer "why the sky is blue" with
 9.0 tok/s (3 drafts). The verify group costs more than a step (a group of
 4 tokens reads up to 40 experts in each layer).
 
-Next: the first draft can go in the same group as the MTP layer on the
-accepted drafts (about 6 ms a round).
+With the keys of the accepted drafts and the first draft in one group,
+3 drafts give 13.7 tok/s on the code answer.
+
+A draft head on the first 32k to 131k tokens only is 16 to 32 ms faster
+each round. But it loses more in accepted drafts (code has tokens with
+high numbers), so all the head stays.
 
 ### Phase 4: the rate of the CPU
 
-- The profile of the step (gemma_profile), and a check of the resident set.
-- The experts of 640 values: the tiles and the dynamic schedule of the
-  Qwen3.6 work.
+Status (the profile; gemma_profile, 18 threads):
+
+    the step of one token: 129 ms
+      the dense products (all Q8_0, 3.9 GB)    80 ms   49 GB/s
+      the experts (1.75 GB)                    37 ms   47 GB/s
+      the rest (GDN, norms, the mixers)        12 ms
+    the verify group of 4 tokens: 193 ms (the experts: 85 ms)
+    the MTP layer (one token): 3.2 ms; the head (675 MB, Q8_0): 11 ms
+
+- A read of 4 GB by 18 threads gives 66 GB/s on this machine. The
+  large Q8_0 products give 52 to 58 GB/s alone. Thus the step is at about
+  75% of the rate of the memory, and the floor is about 86 ms.
+- These changes gave less than the noise, and are not kept:
+  - one record for up to 4 products on the same x (one barrier, one
+    loop over their rows): 640 product records became 350;
+  - a prefetch of the row 2 rows ahead;
+  - a dynamic schedule of the rows.
+- The default of one thread for each core (np_gemma/__init__.py) is
+  correct. Two threads on each core (36) are much slower when other
+  programs use the CPU. The threads of the barriers spin, and a stopped
+  thread holds up all of them.
+- The small products are the slowest: hc_*_up (10240 rows of 320 values)
+  gives 37 GB/s, and hc_*_down (320 rows) 44 GB/s. Together they are
+  about 17 ms of the step. A kernel of several rows at a time can help
+  them.
+- The verify group reads the experts of 4 tokens (up to 40 for each
+  layer). That is the most part of the cost of a round.
 
 ### Phase 5: the GPU
 

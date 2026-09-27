@@ -93,9 +93,9 @@ def main():
     m = Qwen4CPU(args.path, mtp=args.mtp)
     ids = tok.encode(args.prompt)
     stop = set(tok.stop_ids)
-    for t in (1, args.draft + 1):
-        m.program(t)
-        m.program(t, "verify")
+    m.program(1)
+    m.program(args.draft + 1, "verify")
+    for t in range(1, args.draft + 2):
         m.program(t, "mtp")
     cache = Qwen4Cache(m.cfg, len(ids) + args.tokens + 8)
     h = m.forward(ids, cache)
@@ -117,9 +117,9 @@ def main():
           "accepted (%.0f%%), %.2f tokens a round" % (
               args.draft, len(out), t_mtp, st["rounds"], st["accepted"], st["drafted"],
               100 * st["accepted"] / max(1, st["drafted"]), len(out) / max(1, st["rounds"])))
-    print("decode: %.2f tok/s; for each round: draft %.0f ms, verify %.0f ms, catch-up %.0f ms"
+    print("decode: %.2f tok/s; for each round: draft %.0f ms, verify %.0f ms"
           % ((len(out) - 1) / st["decode_s"], *(1e3 * st[k] / max(1, st["rounds"])
-                                                for k in ("draft", "verify", "catch_up"))))
+                                                for k in ("draft", "verify"))))
     same = sum(1 for a, b in zip(out, plain) if a == b)
     first = next((i for i, (a, b) in enumerate(zip(out, plain)) if a != b), len(plain))
     print("same tokens as plain decode: %d/%d (first change at %d)" % (same, len(plain), first))

@@ -738,9 +738,11 @@ class Qwen4CPU(Qwen4):
 
     def generate_mtp(self, prompt, n_new, draft=3, max_len=8192, stop=None, stats=None):
         """Greedy generation with the MTP layer as the drafter. Each round:
-        draft tokens with the MTP layer, one verify group of the model, then
-        the MTP layer on the accepted tokens (with the streams of the model)
-        and the next draft in one group. Return the new tokens."""
+        the MTP layer on the rows it has not seen (the accepted tokens with
+        the streams of the model) and the first draft in one group, the
+        next drafts on the streams of the MTP layer, then one verify group
+        of the model. Return the new tokens."""
+        import time
         cfg = self.cfg
         cache = Qwen4Cache(cfg, max_len)
         mcache = Qwen4MTPCache(cfg, max_len)
@@ -748,50 +750,44 @@ class Qwen4CPU(Qwen4):
         n = len(prompt)
         xn, H = self.forward(prompt, cache, 0, streams=True)
         tok = int(np.argmax(self.logits(xn[-1:])[0]))
-        # The MTP layer on the prompt: token j with the streams of j - 1
-        # (zeros for token 0).
-        Hin = np.concatenate([np.zeros((1, H.shape[1]), np.float32), H[:-1]])
-        for c0 in range(0, n, self.CHUNK):
-            c1 = min(n, c0 + self.CHUNK)
-            self.mtp_step(Hin[c0:c1], prompt[c0:c1], mcache, c0)
-        out = [tok]
-        pend_h, pos = H[-1:], n            # the streams at pos - 1; tok is at pos
+        out, pos = [tok], n                # tok is at pos
+        # The rows of the MTP layer before the first draft: token j with the
+        # streams of j - 1 (zeros for token 0), up to (tok, the streams at n - 1).
+        m_ids = prompt + [tok]
+        m_H = np.concatenate([np.zeros((1, H.shape[1]), np.float32), H])
+        m_pos = 0
         rounds = acc_total = 0
-        import time
-        tm = {"draft": 0.0, "verify": 0.0, "catch_up": 0.0}
+        tm = {"draft": 0.0, "verify": 0.0}
         t_start = time.time()
         while len(out) < n_new and (stop is None or tok not in stop):
-            # Draft: the MTP layer at pos with (tok, pend_h), then on its own
-            # streams.
             t0 = time.time()
-            drafts, ids_d, hin, mpos = [], [tok], pend_h, pos
-            for _ in range(draft):
-                xm, hm = self.mtp_step(hin, ids_d, mcache, mpos)
-                d = int(np.argmax(self.logits(xm[-1:])[0]))
-                drafts.append(d)
-                hin, ids_d, mpos = hm[-1:], [d], mpos + 1
-            # Verify tok and the drafts.
+            for c0 in range(0, len(m_ids), self.CHUNK):
+                c1 = min(len(m_ids), c0 + self.CHUNK)
+                xm, hm = self.mtp_step(m_H[c0:c1], m_ids[c0:c1], mcache, m_pos + c0)
+            drafts = []
+            while True:
+                drafts.append(int(np.argmax(self.logits(xm[-1:])[0])))
+                if len(drafts) == draft:
+                    break
+                xm, hm = self.mtp_step(hm[-1:], drafts[-1:], mcache, pos + len(drafts))
             t1 = time.time()
-            group = [tok] + drafts
-            xv, Hv = self.verify(group, cache, pos)
+            # Verify tok and the drafts.
+            xv, Hv = self.verify([tok] + drafts, cache, pos)
             best = np.argmax(self.logits(xv), axis=1)
             a = 0
             while a < draft and best[a] == drafts[a]:
                 a += 1
             self.commit(a + 1)
-            new = drafts[:a] + [int(best[a])]
-            t2 = time.time()
-            # The MTP layer on the accepted drafts, with the streams of the
-            # model (its keys at pos + 1 .. pos + a; the row at pos is right).
-            if a > 0:
-                self.mtp_step(Hv[:a], drafts[:a], mcache, pos + 1)
+            tok = int(best[a])
+            out.extend(drafts[:a] + [tok])
+            # The keys of the MTP layer at pos + 1 .. pos + a came from its own
+            # streams: make them again with the streams of the model.
+            m_ids, m_H, m_pos = drafts[:a] + [tok], Hv[:a + 1], pos + 1
             tm["draft"] += t1 - t0
-            tm["verify"] += t2 - t1
-            tm["catch_up"] += time.time() - t2
-            out.extend(new)
+            tm["verify"] += time.time() - t1
             rounds += 1
             acc_total += a
-            pend_h, tok, pos = Hv[a:a + 1], int(best[a]), pos + a + 1
+            pos += a + 1
         if stats is not None:
             stats.update(rounds=rounds, accepted=acc_total, drafted=rounds * draft,
                          decode_s=time.time() - t_start, **tm)
