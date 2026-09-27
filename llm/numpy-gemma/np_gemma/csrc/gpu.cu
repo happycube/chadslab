@@ -151,6 +151,17 @@ __device__ float block_max(float v)
 
 /* ---------- small operations ---------- */
 
+/* Programmatic dependent launch. In a graph with programmatic edges
+ * (gg_pdl_edges), a kernel can start before the kernel before it ends. Each
+ * kernel waits for the data of the kernels before it (griddepcontrol.wait),
+ * then lets the next kernel start (griddepcontrol.launch_dependents). The
+ * next kernel starts only when every block of this kernel has passed that
+ * point. Outside such a graph the two instructions do nothing. */
+#define PDL_START()                                                           \
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");                      \
+    asm volatile("griddepcontrol.launch_dependents;\n" :::)
+
+
 /* The norm of each row of cols values: out = x s w, where s = 1 / sqrt(mean
  * of x^2 + eps). A null w gives out = x s. One block for each row. The
  * arguments give the operands of x, w, out, cols, and eps. Thus the kernel
@@ -158,6 +169,7 @@ __device__ float block_max(float v)
 __global__ void k_rms_norm(const gp_rec *r, const int64_t *e, int xk, int wk, int ok,
                            int ck, int ek)
 {
+    PDL_START();
     int cols = DI(ck);
     const float *x = DP(const float, xk) + (size_t)blockIdx.x * cols;
     const float *w = DP(const float, wk);
@@ -177,6 +189,7 @@ __global__ void k_rms_norm(const gp_rec *r, const int64_t *e, int xk, int wk, in
 /* a, b, out, n */
 __global__ void k_add(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(3)) {
         DP(float, 2)[i] = DP(const float, 0)[i] + DP(const float, 1)[i];
@@ -186,19 +199,23 @@ __global__ void k_add(const gp_rec *r, const int64_t *e)
 /* x, s (float), out, n */
 __global__ void k_mul_s(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(3)) {
         DP(float, 2)[i] = DP(const float, 0)[i] * df(r, e, 1);
     }
 }
 
-/* GP_ADD_NORM: o, w, x, out, rows, cols, eps, scale. For each row,
+/* GP_ADD_NORM: o, w, x, out, rows, cols, eps, scale, w2, out2. For each row,
  * out = (x + o s w) scale, where s = 1 / sqrt(mean of o^2 + eps). This is
  * GP_RMS_NORM of o, GP_ADD, and GP_MUL_S in one pass, with the same
  * operations in the same order (as k_rms_norm), so the values are the same.
- * out can be x. One block of 256 threads for each row. */
+ * out can be x. With out2, the kernel also writes the norm of out with the
+ * weights w2 there, as GP_RMS_NORM does. One block of 256 threads for each
+ * row. */
 __global__ void k_add_norm(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int cols = DI(5);
     const float *o = DP(const float, 0) + (size_t)blockIdx.x * cols;
     const float *w = DP(const float, 1);
@@ -216,11 +233,27 @@ __global__ void k_add_norm(const gp_rec *r, const int64_t *e)
          * kernels. */
         out[i] = __fmul_rn(__fadd_rn(x[i], __fmul_rn(__fmul_rn(o[i], s), w[i])), scale);
     }
+    float *out2 = DP(float, 9);
+    if (out2 != NULL) {
+        /* Each thread reads back the values that it wrote. */
+        const float *w2 = DP(const float, 8);
+        out2 += (size_t)blockIdx.x * cols;
+        float ss2 = 0.f;
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            ss2 += out[i] * out[i];
+        }
+        ss2 = block_sum(ss2);
+        float s2 = 1.0f / sqrtf(ss2 / (float)cols + eps);
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            out2[i] = out[i] * s2 * w2[i];
+        }
+    }
 }
 
 /* src, dst, bytes */
 __global__ void k_copy(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (size_t)di(r, e, 2)) {
         DP(uint8_t, 1)[i] = DP(const uint8_t, 0)[i];
@@ -230,6 +263,7 @@ __global__ void k_copy(const gp_rec *r, const int64_t *e)
 /* x, out, n. The tanh form of GELU, as ops.gelu_tanh. */
 __global__ void k_gelu(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(2)) {
         float v = DP(const float, 0)[i];
@@ -241,6 +275,7 @@ __global__ void k_gelu(const gp_rec *r, const int64_t *e)
 /* a, b, out, rows, cols, b_stride */
 __global__ void k_mul(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int cols = DI(4);
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(3) * cols) {
@@ -253,6 +288,7 @@ __global__ void k_mul(const gp_rec *r, const int64_t *e)
  * GP_GELU_MUL_INT4. */
 __global__ void k_gelu_mul(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(2)) {
         float v = DP(const float, 0)[i];
@@ -283,6 +319,7 @@ __device__ __forceinline__ float quant32_i16(const float *x, int16_t *q)
 
 __global__ void k_kv_write(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     int n = DI(8);
     if (g >= n / 32) {
@@ -340,6 +377,7 @@ __device__ __forceinline__ float int4_row(const uint8_t *wr, const float *x, int
 
 #define ROWS_PER_BLOCK 8
 
+
 /* One warp for each row of an int4 matrix. The arguments give the operands
  * of x, w, out, rows, and cols: 0, 1, 3, 4, 5 for GP_INT4_LINEAR, and 3, 4,
  * 6, 7, 8 for the matrix of GP_GELU_MUL_INT4. The kernel reads the float16
@@ -353,8 +391,9 @@ __global__ void k_int4_linear(const gp_rec *r, const int64_t *e, int xk, int wk,
     if (row >= rows) {
         return;
     }
-    float v = int4_row(DP(const uint8_t, wk) + (size_t)row * (cols / 32) * 18,
-                       DP(const float, xk), cols);
+    const uint8_t *wr = DP(const uint8_t, wk) + (size_t)row * (cols / 32) * 18;
+    PDL_START();
+    float v = int4_row(wr, DP(const float, xk), cols);
     if (threadIdx.x % 32 == 0) {
         DP(float, ok)[row] = v;
     }
@@ -382,8 +421,9 @@ __global__ void k_int4_multi4(const gp_rec *r, const int64_t *e, int xk, int ck,
     if (m == 4) {
         return;
     }
-    float v = int4_row(DP(const uint8_t, m0 + 4 * m) + (size_t)row * (cols / 32) * 18,
-                       DP(const float, xk), cols);
+    const uint8_t *wr = DP(const uint8_t, m0 + 4 * m) + (size_t)row * (cols / 32) * 18;
+    PDL_START();
+    float v = int4_row(wr, DP(const float, xk), cols);
     if (threadIdx.x % 32 == 0) {
         DP(float, m0 + 2 + 4 * m)[row] = v;
     }
@@ -400,6 +440,7 @@ __global__ void k_bf16_linear(const gp_rec *r, const int64_t *e)
         return;
     }
     const uint4 *w = (const uint4 *)(DP(const uint16_t, 1) + (size_t)row * cols);
+    PDL_START();
     const float *x = DP(const float, 0);
     float sum = 0.f;
     for (int i = lane; i < cols / 8; i += 32) {
@@ -433,6 +474,7 @@ struct qkv_ix {
  * head_dim values. A row of v has no weight. */
 __global__ void k_qkv_norm(const gp_rec *r, const int64_t *e, qkv_ix ix)
 {
+    PDL_START();
     int row = blockIdx.x;
     int qr = DI(ix.qr), kr = DI(ix.kr), hd = DI(ix.hd);
     float *x;
@@ -467,6 +509,7 @@ struct rope_ix {
  * gemma_rope_body. */
 __global__ void k_rope(const gp_rec *r, const int64_t *e, rope_ix ix)
 {
+    PDL_START();
     int row = blockIdx.x;
     int qr = DI(ix.qr), hd = DI(ix.hd), d = hd / 2;
     float *x;
@@ -491,6 +534,7 @@ __global__ void k_rope(const gp_rec *r, const int64_t *e, rope_ix ix)
  * for each head of each token. */
 __global__ void k_kv_write_heads(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int kvh = DI(7), hd = DI(8);
     int j = blockIdx.x / kvh, h = blockIdx.x % kvh;
     size_t src = ((size_t)j * kvh + h) * hd;
@@ -653,6 +697,7 @@ __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j
 /* The block has 256 threads. head_dim must be 256 or 512. */
 __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
 {
+    PDL_START();
     __shared__ float qs[ATTN_REP * 512];
     __shared__ float ps[ATTN_REP * ATTN_TILE];
     __shared__ float red[ATTN_REP * 512];
@@ -842,6 +887,7 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
  * The weight exp(m_c - M) of each chunk goes to shared memory first. */
 __global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part)
 {
+    PDL_START();
     __shared__ float w[ATTN_CHUNKS];
     attn_d a = attn_get(r, e);
     int h = blockIdx.x, hd = a.hd;
@@ -918,6 +964,7 @@ __device__ __forceinline__ void w_block32(const void *w, int row, int cols, int 
 template <int F32W>
 __global__ void k_gemm(const float *x, const void *w, float *out, int t, int rows, int cols)
 {
+    PDL_START();
     __shared__ float xs[32][GM + 1];
     __shared__ float ws[32][GN + 1];
     int n0 = blockIdx.x * GN, j0 = blockIdx.y * GM;
@@ -1160,6 +1207,7 @@ __device__ __forceinline__ void tc_tile(const __half *x, const uint8_t *w, float
 
 __global__ void k_gemm_tc(const __half *x, const uint8_t *w, float *out, int t, int rows, int cols)
 {
+    PDL_START();
     int q0 = blockIdx.y * TMD;
     tc_tile<4>(x, w, out, q0, min(t, q0 + TMD), blockIdx.x * TN, rows, cols, (size_t)rows, NULL);
 }
@@ -1220,6 +1268,7 @@ __device__ __forceinline__ uint32_t nib2(uint32_t n0, uint32_t n1)
 __global__ void __launch_bounds__(256) k_gemm_tc2(const __half *x, const uint8_t *w, float *out,
                                                   int t, int rows, int cols)
 {
+    PDL_START();
     __shared__ __align__(16) __half as_[2][T2M][TK + 8];
     __shared__ __align__(16) uint8_t bs[2][T2N][T2RB];
     /* blockIdx.x is the tile of tokens, so the blocks that read the same rows of
@@ -1358,6 +1407,7 @@ __device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v)
 __global__ void __launch_bounds__(256) k_gemm_bh(const __half *x, const uint16_t *w, float *out,
                                                  int t, int rows, int cols)
 {
+    PDL_START();
     __shared__ __align__(16) __half as_[2][T2M][BHK + 8];
     __shared__ __align__(16) uint16_t bs[2][T2N][BHK + 8];
     /* blockIdx.x is the tile of tokens, so the blocks that read the same rows of
@@ -1478,6 +1528,7 @@ __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, const uint32
  * thread reads 4 values as a float4 and writes 4 bytes. */
 __global__ void k_quant_q8(const float *x, int8_t *q, float *sc, size_t blocks)
 {
+    PDL_START();
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t bi = tid / 8;
     int sub = threadIdx.x % 8;
@@ -1528,6 +1579,7 @@ __global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *
                                                  const uint8_t *w, float *out, int t, int rows,
                                                  int cols)
 {
+    PDL_START();
     /* Q8NS buffers in dynamic shared memory: the copies of Q8NS - 1 steps
      * run during the compute of a step. */
     extern __shared__ __align__(16) uint8_t q8sm[];
@@ -1660,6 +1712,7 @@ __global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *
 /* The float16 copy of n values, for the tensor cores. */
 __global__ void k_to_half(const float *x, __half *y, size_t n)
 {
+    PDL_START();
     size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (i + 3 < n) {
         float4 v = *(const float4 *)(x + i);
@@ -1680,6 +1733,7 @@ __global__ void k_to_half(const float *x, __half *y, size_t n)
 template <int NT>
 __global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int rows, int cols)
 {
+    PDL_START();
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32, sub = lane & 3;
     if (row >= rows) {
@@ -1726,6 +1780,7 @@ __global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int ro
 
 __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, int rows, int cols)
 {
+    PDL_START();
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32, sub = lane & 3;
     if (row >= rows) {
@@ -1775,6 +1830,7 @@ __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, i
 __global__ void k_mt_gemv_bf16(const float *x, const uint16_t *w, float *out, int t, int rows,
                                int cols)
 {
+    PDL_START();
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32;
     if (row >= rows) {
@@ -1820,6 +1876,7 @@ __global__ void k_mt_gemv_bf16(const float *x, const uint16_t *w, float *out, in
 /* g, u, out, rows, inner: out = gelu(g) u for each value. */
 __global__ void k_gelu_mul_rows(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (size_t)DI(3) * DI(4)) {
         float v = DP(const float, 0)[i];
@@ -1850,6 +1907,7 @@ __global__ void k_gelu_mul_rows(const gp_rec *r, const int64_t *e)
 
 __global__ void k_attn_qc_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     __shared__ float ks_[KT][512];
     __shared__ float vs_[KT][512];
     const float *q = DP(const float, 0);
@@ -1984,6 +2042,7 @@ __device__ __forceinline__ float flash_kv(const gp_rec *r, const int64_t *e, int
 template <int F32H>
 __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     __shared__ float qs[FQ][FD + 1];
     __shared__ float kvs[FK][FD + 1];
     __shared__ float ps[FQ][FK + 1];
@@ -2162,6 +2221,7 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
 template <int F32H>
 __global__ void k_flash_tc(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     extern __shared__ __half fsm[];
     int o0 = F32H ? 5 : 7;
     int qh = DI(o0), kvh = DI(o0 + 1), hd = DI(o0 + 2), t = DI(o0 + 3);
@@ -2376,6 +2436,7 @@ template <int HD, int HB, int ST>
 __global__ void __launch_bounds__(32 * HB * (HD / 256))
 k_flash_f32h(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     typedef flash3_dims<HD> D;
     extern __shared__ float fsm3[];
     float *kbuf = fsm3;                                   /* ST x FK3 x KLD */
@@ -2574,6 +2635,7 @@ k_flash_f32h(const gp_rec *r, const int64_t *e)
  * product with proj. Last, the top experts of each token. */
 __global__ void k_router_norm_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int j = blockIdx.x, hidden = DI(4);
     const float *x = DP(const float, 0) + (size_t)j * hidden;
     const float *scale = DP(const float, 1);
@@ -2596,6 +2658,7 @@ __device__ void router_top_warp(const float *logits, const float *per_expert, fl
 /* The logits of a small group: one warp for each expert and token. */
 __global__ void k_router_logits_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int ex = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int j = blockIdx.y, lane = threadIdx.x % 32;
     int hidden = DI(4), experts = DI(5);
@@ -2618,6 +2681,7 @@ __global__ void k_router_logits_mt(const gp_rec *r, const int64_t *e)
 
 __global__ void k_router_top_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int j = blockIdx.x, experts = DI(5), top_k = DI(6);
     router_top_warp(DP(const float, 13) + (size_t)j * experts, DP(const float, 3),
                     DP(float, 9) + (size_t)j * top_k, DP(int, 10) + (size_t)j * top_k,
@@ -2651,6 +2715,7 @@ __global__ void k_router_top_mt(const gp_rec *r, const int64_t *e)
 
 __global__ void k_moe_sort(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     const int *idx = DP(const int, 2);
     int pairs = DI(3) * DI(4), experts = MOE_EXPERTS_MAX;
     int *cnt = DP(int, 11), *off = DP(int, 12), *fill = DP(int, 13);
@@ -2684,6 +2749,7 @@ __global__ void k_moe_sort(const gp_rec *r, const int64_t *e)
 
 __global__ void k_moe_tiles(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     const int *cnt = DP(const int, 11), *off = DP(const int, 12);
     int *tiles = DP(int, 16);
     int n = 0;
@@ -2702,6 +2768,7 @@ __global__ void k_moe_tiles(const gp_rec *r, const int64_t *e)
 __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, int gather,
                            const int64_t *wtab, int rows, int cols, float *out)
 {
+    PDL_START();
     __shared__ float xs[32][GM + 1];
     __shared__ float ws[32][GN + 1];
     const int *tiles = DP(const int, 16);
@@ -2777,6 +2844,7 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
 __global__ void k_moe_gemm_tc(const gp_rec *r, const int64_t *e, const void *a, int gather,
                               const int64_t *wtab, int rows, int cols, float *out)
 {
+    PDL_START();
     const int *tiles = DP(const int, 16);
     const int *off = DP(const int, 12);
     int tile = blockIdx.y;
@@ -2792,6 +2860,7 @@ __global__ void k_moe_gemm_tc(const gp_rec *r, const int64_t *e, const void *a, 
 /* act holds the gate and the up values of each pair: 2 inner values. */
 __global__ void k_moe_gelu(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int inner = DI(10);
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)DI(3) * DI(4) * inner) {
@@ -2806,6 +2875,7 @@ __global__ void k_moe_gelu(const gp_rec *r, const int64_t *e)
 
 __global__ void k_moe_sum(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int dn_rows = DI(9), top_k = DI(4);
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)DI(3) * dn_rows) {
@@ -2836,6 +2906,7 @@ __global__ void k_moe_sum(const gp_rec *r, const int64_t *e)
  * 3. the softmax, and the choice of the top_k experts. */
 __global__ void k_router_norm(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     const float *x = DP(const float, 0);
     const float *scale = DP(const float, 1);
     float *rv = DP(float, 11);
@@ -2854,6 +2925,7 @@ __global__ void k_router_norm(const gp_rec *r, const int64_t *e)
 
 __global__ void k_router_logits(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int ex = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32;
     int hidden = DI(4);
@@ -2942,6 +3014,7 @@ __device__ void router_top_warp(const float *logits, const float *per_expert, fl
 
 __global__ void k_router_top(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     router_top_warp(DP(const float, 12), DP(const float, 3), DP(float, 9), DP(int, 10),
                     DI(5), DI(6));
 }
@@ -2956,6 +3029,7 @@ __global__ void k_router_top(const gp_rec *r, const int64_t *e)
  * these experts (GP_MOE_N of the CPU interpreter). */
 __global__ void k_hot_split(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     const int *idx = DP(const int, 0);
     const float *val = DP(const float, 1);
     const int *map = DP(const int, 2);
@@ -2998,6 +3072,7 @@ __device__ __forceinline__ int hot_slot(const gp_rec *r, const int64_t *e, int j
 
 __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int j = blockIdx.y, slot = hot_slot(r, e, j);
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int rows = DI(11), cols = DI(12);
@@ -3014,6 +3089,7 @@ __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
 
 __global__ void k_hot_gelu(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int j = blockIdx.x;
     if (hot_slot(r, e, j) < 0) {
         return;
@@ -3030,6 +3106,7 @@ __global__ void k_hot_gelu(const gp_rec *r, const int64_t *e)
 
 __global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int j = blockIdx.y, slot = hot_slot(r, e, j);
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int rows = DI(13), inner = DI(14);
@@ -3046,6 +3123,7 @@ __global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
 
 __global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int tok = blockIdx.y;
     int rows = DI(13), top_k = DI(10);
@@ -3070,6 +3148,7 @@ __global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
  * (the CPU part), and GP_HOT_MOE skips the other pairs (the GPU part). */
 __global__ void k_hot_split_mt(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= DI(5)) {
         return;
@@ -3092,6 +3171,7 @@ __global__ void k_hot_split_mt(const gp_rec *r, const int64_t *e)
  * float32 table. Last, they write the best token. */
 __global__ void k_f32_linear(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32, rows = DI(3), cols = DI(4);
     if (row >= rows) {
@@ -3115,6 +3195,7 @@ __global__ void k_f32_linear(const gp_rec *r, const int64_t *e)
  * largest first. One block of 1024 threads; n_cent is at most 2048. */
 __global__ void k_draft_top(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     __shared__ float kv[2048];
     __shared__ int ki[2048];
     const float *clog = DP(const float, 1);
@@ -3157,6 +3238,7 @@ __global__ void k_draft_top(const gp_rec *r, const int64_t *e)
 /* The logit of each candidate token: one warp for each. */
 __global__ void k_draft_sel(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     int i = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int lane = threadIdx.x % 32, per = DI(8), top_k = DI(9), hidden = DI(10);
     if (i >= top_k * per) {
@@ -3180,6 +3262,7 @@ __global__ void k_draft_sel(const gp_rec *r, const int64_t *e)
 /* The best candidate: one block. At an equal logit, the first candidate. */
 __global__ void k_draft_best(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     __shared__ float bv[1024];
     __shared__ int bi[1024];
     int per = DI(8), n = DI(9) * per;
@@ -3216,6 +3299,7 @@ __global__ void k_draft_best(const gp_rec *r, const int64_t *e)
  * of x. At an equal value, the lower index wins, as np.argmax. One block. */
 __global__ void k_argmax(const gp_rec *r, const int64_t *e)
 {
+    PDL_START();
     __shared__ float bv[1024];
     __shared__ int bi[1024];
     const float *x = DP(const float, 0);
@@ -3263,9 +3347,17 @@ __global__ void k_argmax(const gp_rec *r, const int64_t *e)
  * result is cap tanh(out / cap), the soft cap of the logits. */
 #define HEAD_MAX 16
 
+/* NX 0: nx rows, up to HEAD_MAX. NX 1: one row (the decode step); the
+ * compiler then keeps one sum and unrolls the loops. */
+template <int NX>
 __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int rows, int cols,
                            float cap, int nx)
 {
+    constexpr int NS = NX ? NX : HEAD_MAX;
+    if (NX) {
+        nx = NX;
+    }
+    PDL_START();
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int l = threadIdx.x % 32;
     if (row >= rows) {
@@ -3273,10 +3365,11 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
     }
     int nb = cols / 256;
     const uint8_t *wr = w + (size_t)row * nb * 210;
-    float sum[HEAD_MAX];
-    for (int k = 0; k < HEAD_MAX; ++k) {
+    float sum[NS];
+    for (int k = 0; k < NS; ++k) {
         sum[k] = 0.f;
     }
+    #pragma unroll 2
     for (int b = 0; b < nb; ++b) {
         const uint8_t *ql = wr + (size_t)b * 210;
         const uint8_t *qh = ql + 128;
@@ -3297,7 +3390,7 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
             idx[4 * n + 2] = idx[4 * n + 0] + 64;
             idx[4 * n + 3] = idx[4 * n + 0] + 96;
         }
-        for (int k = 0; k < HEAD_MAX; ++k) {
+        for (int k = 0; k < NS; ++k) {
             if (k < nx) {
                 const float *xk = x + (size_t)k * cols;
                 float acc = 0.f;
@@ -3309,7 +3402,7 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
             }
         }
     }
-    for (int k = 0; k < HEAD_MAX; ++k) {
+    for (int k = 0; k < NS; ++k) {
         if (k < nx) {
             float v = sum[k];
             for (int o = 16; o > 0; o >>= 1) {
@@ -3987,6 +4080,56 @@ static int gg_launch_seg(gg_prog *g, const gg_seg *sg)
 
 /* Run the segments and the boundary records in order. With the graph, the
  * first run records the graph of each segment. */
+#define GG_SEG_FIRST 32
+#define GG_SEG_MAX 160
+
+/* NP_GEMMA_GPU_PDL=0 keeps the ordinary edges, for a test. */
+static int gg_pdl_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_GPU_PDL");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* Change each edge from a kernel to a kernel into a programmatic edge. The
+ * kernels start with PDL_START, so each waits for its data. */
+static cudaError_t gg_pdl_edges(cudaGraph_t graph)
+{
+    size_t n = 0;
+    cudaError_t err = cudaGraphGetEdges(graph, NULL, NULL, NULL, &n);
+    if (err != cudaSuccess || n == 0) {
+        return err;
+    }
+    cudaGraphNode_t *from = (cudaGraphNode_t *)malloc(n * sizeof(cudaGraphNode_t));
+    cudaGraphNode_t *to = (cudaGraphNode_t *)malloc(n * sizeof(cudaGraphNode_t));
+    cudaGraphEdgeData *ed = (cudaGraphEdgeData *)malloc(n * sizeof(cudaGraphEdgeData));
+    err = cudaGraphGetEdges(graph, from, to, ed, &n);
+    for (size_t i = 0; i < n && err == cudaSuccess; ++i) {
+        cudaGraphNodeType ta, tb;
+        if (cudaGraphNodeGetType(from[i], &ta) != cudaSuccess ||
+            cudaGraphNodeGetType(to[i], &tb) != cudaSuccess ||
+            ta != cudaGraphNodeTypeKernel || tb != cudaGraphNodeTypeKernel ||
+            ed[i].type != cudaGraphDependencyTypeDefault) {
+            continue;
+        }
+        err = cudaGraphRemoveDependencies(graph, &from[i], &to[i], &ed[i], 1);
+        if (err == cudaSuccess) {
+            cudaGraphEdgeData e;
+            memset(&e, 0, sizeof(e));
+            e.from_port = cudaGraphKernelNodePortProgrammatic;
+            e.type = cudaGraphDependencyTypeProgrammatic;
+            err = cudaGraphAddDependencies(graph, &from[i], &to[i], &e, 1);
+        }
+    }
+    free(from);
+    free(to);
+    free(ed);
+    return err;
+}
+
 static int gg_exec(gg_prog *g)
 {
     int pc = 0, k = 0;
@@ -4014,6 +4157,9 @@ static int gg_exec(gg_prog *g)
                     return rc;
                 }
                 CK(err);
+                if (gg_pdl_on()) {
+                    CK(gg_pdl_edges(graph));
+                }
                 CK(cudaGraphInstantiate(&sg->exec, graph, 0));
                 CK(cudaGraphDestroy(graph));
             }
@@ -4189,19 +4335,29 @@ void *gg_load(const int64_t *prog, int use_graph)
     memcpy(g->henv, prog + 4, (size_t)g->n_env * sizeof(int64_t));
     /* The segments, and one event for each GP_TO_HOST. */
     g->seg = (gg_seg *)calloc((size_t)g->n_code + 1, sizeof(gg_seg));
-    int in_seg = 0;
+    /* A long run of records becomes several graphs: the first has
+     * GG_SEG_FIRST records, the next ones GG_SEG_MAX. The GPU starts a graph
+     * only when cudaGraphLaunch returns, about 1.5 us for each kernel. With a
+     * small first graph, the GPU starts early, and the launches of the next
+     * graphs run while it works. */
+    int in_seg = 0, run = 0;
     for (int pc = 0; pc < g->n_code; ++pc) {
         const gp_rec *r = g->hcode + pc;
         if (is_boundary(r->op)) {
             in_seg = 0;
+            run = 0;
             if (r->op == GP_TO_HOST && r->v[9] + 1 > g->n_ev) {
                 g->n_ev = (int)r->v[9] + 1;
             }
             continue;
         }
+        if (in_seg && pc - g->seg[g->n_seg - 1].start >= (run == 1 ? GG_SEG_FIRST : GG_SEG_MAX)) {
+            in_seg = 0;
+        }
         if (!in_seg) {
             g->seg[g->n_seg].start = pc;
             ++g->n_seg;
+            ++run;
             in_seg = 1;
         }
         g->seg[g->n_seg - 1].end = pc + 1;
@@ -4299,8 +4455,14 @@ int gg_q6k_head(const void *w, const float *x, float *out, int rows, int cols, f
         snprintf(gg_error, sizeof(gg_error), "gg_q6k_head: 1 to %d rows of x", HEAD_MAX);
         return -1;
     }
-    k_q6k_head<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
-        (const uint8_t *)w, x, out, rows, cols, cap, nx);
+    dim3 grid((unsigned)cdiv(rows, ROWS_PER_BLOCK));
+    if (nx == 1) {
+        k_q6k_head<1><<<grid, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
+            (const uint8_t *)w, x, out, rows, cols, cap, nx);
+    } else {
+        k_q6k_head<0><<<grid, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
+            (const uint8_t *)w, x, out, rows, cols, cap, nx);
+    }
     CK(cudaGetLastError());
     return 0;
 }

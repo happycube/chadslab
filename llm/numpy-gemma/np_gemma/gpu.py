@@ -498,9 +498,10 @@ class E4BGPU:
     def __init__(self, model, graph=True):
         self.model = model
         progs = model.__dict__.setdefault("_programs", {})
-        prog = progs.get(1)
+        # The GPU step has the fused operations; the CPU step (key 1) has not.
+        prog = progs.get("gpu1")
         if prog is None:
-            prog = progs[1] = P.compile_e4b_step(model, 1)
+            prog = progs["gpu1"] = P.compile_e4b_step(model, 1, fused=2)
         self.prog = prog
         self.g = GPUProgram(prog, graph=graph)
         self.graph = graph
@@ -618,7 +619,7 @@ class E4BGPU:
             self.head = Buffer(w.nbytes)
             self.head.upload(w)
             self.out = Buffer(4 * vocab * MT_CPU)
-            self.host_logits = np.empty((MT_CPU, vocab), dtype=np.float32)
+            self.host_logits = pinned((MT_CPU, vocab))     # a faster copy from the GPU
         assert 1 <= rows <= min(self.rows, MT_CPU)
         vocab = self.host_logits.shape[1]
         cap = float(cfg.final_logit_softcapping or 0.0)
@@ -1365,7 +1366,7 @@ class ModelGPU:
             self.head = Buffer(w.nbytes)
             self.head.upload(w)
             self.out = Buffer(4 * vocab * MT_CPU)
-            self.host_logits = np.empty((MT_CPU, vocab), dtype=np.float32)
+            self.host_logits = pinned((MT_CPU, vocab))     # a faster copy from the GPU
         assert 1 <= rows <= min(self.rows, MT_CPU)
         vocab = self.host_logits.shape[1]
         cap = float(cfg.final_logit_softcapping or 0.0)

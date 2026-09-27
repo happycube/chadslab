@@ -2795,7 +2795,8 @@ void gemma_q6k_rows(const uint8_t *table, const int64_t *ids, int n, int cols, f
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
     int64_t total = (int64_t)n * (cols >> 8);
-    #pragma omp parallel for schedule(static)
+    /* One token (a decode step) is too little work for the threads. */
+    #pragma omp parallel for schedule(static) if (n > 4)
     for (int64_t i = 0; i < total; ++i) {
         int64_t r = i / (cols >> 8), b = i % (cols >> 8);
         q6k_decode_block(table + (size_t)ids[r] * row_bytes + (size_t)b * 210u,

@@ -306,6 +306,9 @@ def _py_step(op, a, e):
         s = 1.0 / np.sqrt(np.mean(o * o, axis=1, keepdims=True) + np.float32(F(6)))
         y = (x + o * s.astype(np.float32) * _arr(V(1), cols)) * np.float32(F(7))
         _arr(V(3), rows * cols)[:] = y.reshape(-1)
+        if V(9):
+            s2 = 1.0 / np.sqrt(np.mean(y * y, axis=1, keepdims=True) + np.float32(F(6)))
+            _arr(V(9), rows * cols)[:] = (y * s2.astype(np.float32) * _arr(V(8), cols)).reshape(-1)
     elif op == ADD:
         n = V(3)
         np.add(_arr(V(0), n), _arr(V(1), n), out=_arr(V(2), n))
@@ -662,8 +665,18 @@ def k_add_norm(c, x, o, w, s=1.0, out=None):
     the same."""
     out = c.buffer(x.shape) if out is None else out
     c.p.emit(ADD_NORM, o, w, x, out, x.shape[0], x.shape[1], float(c.eps),
-             float(np.asarray(s).reshape(-1)[0]))
+             float(np.asarray(s).reshape(-1)[0]), 0, 0)
     return out
+
+
+def k_add_norm2(c, x, o, w, w2, s=1.0):
+    """(add_norm2 x o w w2 [s]): x = (x + rms_norm(o) w) s in place, as
+    add_norm. Return rms_norm(x) w2, the input of the next matrix, from the
+    same kernel. The values are those of add_norm and rms_norm."""
+    out2 = c.buffer(x.shape)
+    c.p.emit(ADD_NORM, o, w, x, x, x.shape[0], x.shape[1], float(c.eps),
+             float(np.asarray(s).reshape(-1)[0]), w2, out2)
+    return out2
 
 
 def k_gelu_mul(c, g, u, out=None):
@@ -1010,6 +1023,7 @@ KERNELS = {
     "gelu": k_gelu,
     "gelu_mul": k_gelu_mul,
     "add_norm": k_add_norm,
+    "add_norm2": k_add_norm2,
     "mul_v": k_mul_v,
     "mul_pli": k_mul_pli,
     "linear": k_linear,
@@ -1260,7 +1274,13 @@ def e4b_layer_form(model, i, fused=False):
     source layer.
 
     fused uses add_norm and gelu_mul, which do two or three operations in
-    one pass and give the same values. The GPU group uses it.
+    one pass and give the same values. The GPU group uses it. fused 2 also
+    computes each norm of x in the kernel that changes x (add_norm2): the
+    norm before the feed-forward part, and the input norm of the next layer
+    (or the final norm into xn). Layer 0 then starts with its own norm, and
+    the other layers take h from the layer before. The GPU decode step uses
+    it; the buffer h goes from one layer to the next, so it needs a compiler
+    that does not reuse the buffers of a layer.
     """
     plan = model.cfg.plan[i]
     kind = "s" if plan.is_sliding else "f"
@@ -1290,21 +1310,35 @@ def e4b_layer_form(model, i, fused=False):
                  T("self_attn.k_norm.weight"), i),
                 ("rope", "q", "k", "cos." + kind, "sin." + kind, i),
                 ("kv_write_heads", i, "k", "v"))
+    if fused == 2:
+        last = i == model.cfg.num_hidden_layers - 1
+        nxt = ("t", E4B_PREFIX + "norm.weight") if last else \
+            ("t", E4B_PREFIX + "layers.%d.input_layernorm.weight" % (i + 1))
+        head = (("let", "h", ("rms_norm", "x", T("input_layernorm.weight"))),) if i == 0 else ()
+        mid = (("let", "hf", ("add_norm2", "x", "o", T("post_attention_layernorm.weight"),
+                              T("pre_feedforward_layernorm.weight"))),)
+        ffn_in = "hf"
+        tail = (("let", "xn" if last else "h",
+                 ("add_norm2", "x", "pp", T("post_per_layer_input_norm.weight"), nxt,
+                  T("layer_scalar"))),)
+    else:
+        head = (("let", "h", ("rms_norm", "x", T("input_layernorm.weight"))),)
+        mid = add_norm("o", "post_attention_layernorm.weight")
+        ffn_in = ("rms_norm", "x", T("pre_feedforward_layernorm.weight"))
+        tail = add_norm("pp", "post_per_layer_input_norm.weight", "layer_scalar")
     return ("layer", i,
-            ("let", "h", ("rms_norm", "x", T("input_layernorm.weight"))),
+            *head,
             *attn,
             ("let", "a", ("attn_e4b", i, "q")),
             ("let", "o", ("linear", M("self_attn.o_proj"), "a")),
-            *add_norm("o", "post_attention_layernorm.weight"),
-            ("let", ("g", "u"), ("int4_multi4",
-                                 ("rms_norm", "x", T("pre_feedforward_layernorm.weight")),
-                                 M("mlp.gate_proj"), M("mlp.up_proj"))),
+            *mid,
+            ("let", ("g", "u"), ("int4_multi4", ffn_in, M("mlp.gate_proj"), M("mlp.up_proj"))),
             ("let", "d", ("linear", M("mlp.down_proj"),
                           ("gelu_mul", "g", "u") if fused else ("mul_v", ("gelu", "g"), "u"))),
             *add_norm("d", "post_feedforward_layernorm.weight"),
             ("let", "pg", ("gelu", ("linear", M("per_layer_input_gate"), "x"))),
             ("let", "pp", ("linear", M("per_layer_projection"), ("mul_pli", "pg", "pl", i))),
-            *add_norm("pp", "post_per_layer_input_norm.weight", "layer_scalar"))
+            *tail)
 
 
 def e4b_step_form(model, fused=False):
@@ -1323,19 +1357,21 @@ def e4b_step_form(model, fused=False):
                            ("t", E4B_PREFIX + "per_layer_projection_norm.weight"))),
             ("let", "pl", ("mul", ("add", "pn", "tok"), cfg.per_layer_input_scale)),
             *[e4b_layer_form(model, i, fused) for i in range(cfg.num_hidden_layers)],
-            ("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))))
+            *(() if fused == 2 else
+              (("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))),)))
 
 
-def compile_e4b_step(model, t=1):
+def compile_e4b_step(model, t=1, fused=False):
     """Compile a whole E4B step of t tokens. "x" and "tok" are the inputs;
-    "xn" is the hidden state after the final norm."""
+    "xn" is the hidden state after the final norm. fused selects the fused
+    operations of e4b_layer_form (the GPU)."""
     cfg = model.cfg
     c = Compiler(model)
     c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
     c.p.slot("pos")
-    c.compile(e4b_step_form(model))
+    c.compile(e4b_step_form(model, fused))
     c.p.tokens = t
     return c.p.finish()
 
