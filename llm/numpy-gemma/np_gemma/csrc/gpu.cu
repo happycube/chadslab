@@ -42,6 +42,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,9 +70,12 @@ enum {
     GP_GELU_MUL_INT4 = 35, GP_BF16_LINEAR = 39,
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_QC = 50, GP_ATTN_F32 = 51,
     GP_QKV_NORM = 54, GP_ROPE = 55, GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
-    GP_ROUTER = 64,
+    GP_INT4_LINEAR_MT = 36, GP_INT4_MULTI4_MT = 37, GP_GELU_MUL_ROWS = 38,
+    GP_ATTN_QC_MT = 52,
+    GP_ROUTER = 64, GP_ROUTER_MT = 66,
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
-    GP_HOT_MOE = 88,
+    GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
+    GP_FETCH_DONE = 92,
 };
 
 static cudaStream_t gg_stream;
@@ -835,6 +839,639 @@ __global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part
     }
 }
 
+/* ---------- token groups: the prompt pass and the MTP group ----------
+ * SPLIT_PLAN.md, phase 5. The program of a group of t tokens has the same
+ * operations as the program of one token, in their group form. */
+
+/* A matrix of int4 blocks or of float32 values times the rows of x. The
+ * result is out[j][n] = sum_k x[j][k] W[n][k], for j < t and n < rows. The
+ * array x has t rows of cols values, and out has t rows of rows values.
+ *
+ * For a small group (t <= 16), k_mt_gemv: one warp for each row of W. The
+ * warp reads each block of the row one time and uses it for every token.
+ *
+ * For a large group, k_gemm: a tile of GM tokens by GN rows for each block.
+ * The block reads a step of 32 columns of x and of W to shared memory. Then
+ * each thread computes 4 by 4 values of the tile. */
+#define GM 64
+#define GN 64
+
+template <int F32W>
+__device__ __forceinline__ void w_block32(const void *w, int row, int cols, int g, float *out32)
+{
+    if (F32W) {
+        const float *p = (const float *)w + (size_t)row * cols + (size_t)g * 32;
+        for (int k = 0; k < 32; ++k) {
+            out32[k] = p[k];
+        }
+    } else {
+        const uint8_t *blk = (const uint8_t *)w + ((size_t)row * (cols / 32) + g) * 18;
+        float d = __half2float(__ushort_as_half((uint16_t)(blk[0] | (blk[1] << 8))));
+        for (int k = 0; k < 16; ++k) {
+            int b = blk[2 + k];
+            out32[k] = (float)((b & 15) - 8) * d;
+            out32[k + 16] = (float)((b >> 4) - 8) * d;
+        }
+    }
+}
+
+template <int F32W>
+__global__ void k_gemm(const float *x, const void *w, float *out, int t, int rows, int cols)
+{
+    __shared__ float xs[32][GM + 1];
+    __shared__ float ws[32][GN + 1];
+    int n0 = blockIdx.x * GN, j0 = blockIdx.y * GM;
+    int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    float acc[4][4] = {{0.f}};
+    int groups = cols / 32;
+    for (int g = 0; g < groups; ++g) {
+        /* x: GM tokens by 32 columns; each thread loads 8 values. */
+        for (int q = threadIdx.x; q < GM * 32; q += blockDim.x) {
+            int jj = q / 32, k = q % 32;
+            int j = j0 + jj;
+            xs[k][jj] = j < t ? x[(size_t)j * cols + (size_t)g * 32 + k] : 0.f;
+        }
+        /* W: GN rows by 32 columns; one thread for each row. */
+        if (threadIdx.x < GN) {
+            int n = n0 + threadIdx.x;
+            float v[32];
+            if (n < rows) {
+                w_block32<F32W>(w, n, cols, g, v);
+            } else {
+                for (int k = 0; k < 32; ++k) {
+                    v[k] = 0.f;
+                }
+            }
+            for (int k = 0; k < 32; ++k) {
+                ws[k][threadIdx.x] = v[k];
+            }
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int k = 0; k < 32; ++k) {
+            float a[4], b[4];
+            for (int u = 0; u < 4; ++u) {
+                a[u] = xs[k][ty * 4 + u];
+                b[u] = ws[k][tx * 4 + u];
+            }
+            for (int u = 0; u < 4; ++u) {
+                for (int v = 0; v < 4; ++v) {
+                    acc[u][v] += a[u] * b[v];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int u = 0; u < 4; ++u) {
+        int j = j0 + ty * 4 + u;
+        if (j >= t) {
+            continue;
+        }
+        for (int v = 0; v < 4; ++v) {
+            int n = n0 + tx * 4 + v;
+            if (n < rows) {
+                out[(size_t)j * rows + n] = acc[u][v];
+            }
+        }
+    }
+}
+
+#define MT_MAX 16
+
+__global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, int rows, int cols)
+{
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32, sub = lane & 3;
+    if (row >= rows) {
+        return;
+    }
+    int blocks = cols / 32;
+    const uint8_t *wr = w + (size_t)row * blocks * 18;
+    float sum[MT_MAX];
+    for (int j = 0; j < MT_MAX; ++j) {
+        sum[j] = 0.f;
+    }
+    for (int b = lane >> 2; b < blocks; b += 8) {
+        const uint8_t *blk = wr + (size_t)b * 18;
+        float d = __half2float(__ushort_as_half(*(const uint16_t *)blk));
+        const uint16_t *qp = (const uint16_t *)(blk + 2 + 4 * sub);
+        uint32_t q = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+        float wl[4], wh[4];
+        for (int u = 0; u < 4; ++u) {
+            wl[u] = (float)((int)((q >> (8 * u)) & 15) - 8) * d;
+            wh[u] = (float)((int)((q >> (8 * u + 4)) & 15) - 8) * d;
+        }
+        for (int j = 0; j < MT_MAX; ++j) {
+            if (j < t) {
+                const float *xb = x + (size_t)j * cols + b * 32;
+                float4 xl = *(const float4 *)(xb + 4 * sub);
+                float4 xh = *(const float4 *)(xb + 16 + 4 * sub);
+                sum[j] += wl[0] * xl.x + wl[1] * xl.y + wl[2] * xl.z + wl[3] * xl.w
+                        + wh[0] * xh.x + wh[1] * xh.y + wh[2] * xh.z + wh[3] * xh.w;
+            }
+        }
+    }
+    for (int j = 0; j < MT_MAX; ++j) {
+        if (j < t) {
+            float v = sum[j];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, o);
+            }
+            if (lane == 0) {
+                out[(size_t)j * rows + row] = v;
+            }
+        }
+    }
+}
+
+/* g, u, out, rows, inner: out = gelu(g) u for each value. */
+__global__ void k_gelu_mul_rows(const gp_rec *r, const int64_t *e)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t)DI(3) * DI(4)) {
+        float v = DP(const float, 0)[i];
+        DP(float, 2)[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
+                                                   (v + 0.044715f * v * v * v)))
+                          * DP(const float, 1)[i];
+    }
+}
+
+/* The attention of a group of queries over the int16 cache, as FlashAttention
+ * does it. The record GP_ATTN_QC_MT:
+ *
+ *     q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, t, pos,
+ *     base, window, lo, n
+ *
+ * The cache addresses point at buffer row 0, whose position is base. Query j
+ * has the position pos + j. It sees the rows of the positions pos + j -
+ * window + 1 to pos + j, or from position 0 when window is 0.
+ *
+ * Block (h, tile) takes query head h and QT queries. Thread x keeps query
+ * x / 16 and head_dim / 16 of its values, and the same values of the output.
+ * The block reads KT key rows at a time to shared memory. Each thread
+ * computes its part of the dot of its query with each key. The 16 threads of
+ * a query add the parts with shuffles. Then each thread updates its output
+ * with the online softmax. */
+#define QT 16
+#define KT 8
+
+__global__ void k_attn_qc_mt(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float ks_[KT][512];
+    __shared__ float vs_[KT][512];
+    const float *q = DP(const float, 0);
+    const int16_t *kq = DP(const int16_t, 1);
+    const float *ksc = DP(const float, 2);
+    const int16_t *vq = DP(const int16_t, 3);
+    const float *vsc = DP(const float, 4);
+    float *out = DP(float, 6);
+    int qh = DI(7), kvh = DI(8), hd = DI(9), t = DI(10), window = DI(13);
+    int64_t pos = di(r, e, 11), base = di(r, e, 12);
+    int h = blockIdx.x, kv = h / (qh / kvh);
+    int j0 = blockIdx.y * QT;
+    int qi = threadIdx.x / 16, part = threadIdx.x % 16;
+    int j = j0 + qi;
+    int per = hd / 16;                      /* 16 or 32 values */
+    int d0 = part * per;
+    bool live = j < t;
+    int64_t p = pos + j;
+    float qv[32], acc[32];
+    for (int u = 0; u < 32; ++u) {
+        qv[u] = (u < per && live) ? q[((size_t)j * qh + h) * hd + d0 + u] : 0.f;
+        acc[u] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    int jl = min(t, j0 + QT) - 1;
+    int64_t first = window > 0 ? pos + j0 - window + 1 : 0;
+    if (first < base) {
+        first = base;
+    }
+    int64_t last = pos + jl;
+    size_t row = (size_t)kvh * hd;
+    for (int64_t k0 = first; k0 <= last; k0 += KT) {
+        int kn = (int)min((int64_t)KT, last - k0 + 1);
+        for (int x = threadIdx.x; x < KT * hd; x += blockDim.x) {
+            int kk = x / hd, i = x % hd;
+            if (kk < kn) {
+                size_t o = (size_t)(k0 - base + kk) * row + (size_t)kv * hd + i;
+                ks_[kk][i] = (float)kq[o] * ksc[o / 32];
+                vs_[kk][i] = (float)vq[o] * vsc[o / 32];
+            }
+        }
+        __syncthreads();
+        float sc[KT];
+        for (int kk = 0; kk < KT; ++kk) {
+            float sdot = 0.f;
+            if (kk < kn) {
+                for (int u = 0; u < 32; ++u) {
+                    if (u < per) {
+                        sdot += qv[u] * ks_[kk][d0 + u];
+                    }
+                }
+            }
+            for (int o = 8; o > 0; o >>= 1) {
+                sdot += __shfl_xor_sync(0xffffffff, sdot, o);
+            }
+            int64_t kp = k0 + kk;
+            bool ok = kk < kn && kp <= p && (window == 0 || p - kp < window);
+            sc[kk] = ok ? sdot : -INFINITY;
+        }
+        float mt = m;
+        for (int kk = 0; kk < KT; ++kk) {
+            mt = fmaxf(mt, sc[kk]);
+        }
+        if (mt > -INFINITY) {
+            float scale = m == -INFINITY ? 0.f : expf(m - mt);
+            l *= scale;
+            for (int u = 0; u < 32; ++u) {
+                acc[u] *= scale;
+            }
+            for (int kk = 0; kk < KT; ++kk) {
+                if (sc[kk] == -INFINITY) {
+                    continue;
+                }
+                float pk = expf(sc[kk] - mt);
+                l += pk;
+                for (int u = 0; u < 32; ++u) {
+                    if (u < per) {
+                        acc[u] += pk * vs_[kk][d0 + u];
+                    }
+                }
+            }
+            m = mt;
+        }
+        __syncthreads();
+    }
+    if (live) {
+        float inv = l > 0.f ? 1.0f / l : 0.f;
+        for (int u = 0; u < per; ++u) {
+            out[((size_t)j * qh + h) * hd + d0 + u] = acc[u] * inv;
+        }
+    }
+}
+
+/* A faster form of k_attn_qc_mt for a large group. It uses tiles of FQ
+ * queries by FK keys, as FlashAttention-2 does, but without tensor cores.
+ *
+ * Block (h, tile) takes query head h and FQ queries. Thread x belongs to
+ * query x / 8 and to slice x % 8. For each tile of FK keys:
+ *
+ * 1. The scores: the block reads the queries and the keys to shared memory,
+ *    64 values of each at a time. Thread (q, s) computes the scores of query
+ *    q with keys s, s + 8, s + 16, and s + 24.
+ * 2. The 8 threads of a query find the maximum and the sum of the tile with
+ *    shuffles. They update the running maximum m and sum l.
+ * 3. The values: the block reads the value rows to shared memory, 64 values
+ *    at a time. Thread (q, s) keeps the output values s, s + 8, s + 16, ...
+ *    of query q.
+ *
+ * The block has 256 threads. head_dim is 256 or 512. */
+#define FQ 32
+#define FK 32
+#define FD 64
+
+__global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float qs[FQ][FD + 1];
+    __shared__ float kvs[FK][FD + 1];
+    __shared__ float ps[FQ][FK + 1];
+    const float *q = DP(const float, 0);
+    const int16_t *kq = DP(const int16_t, 1);
+    const float *ksc = DP(const float, 2);
+    const int16_t *vq = DP(const int16_t, 3);
+    const float *vsc = DP(const float, 4);
+    float *out = DP(float, 6);
+    int qh = DI(7), kvh = DI(8), hd = DI(9), t = DI(10), window = DI(13);
+    int64_t pos = di(r, e, 11), base = di(r, e, 12);
+    int h = blockIdx.x, kv = h / (qh / kvh);
+    int j0 = blockIdx.y * FQ;
+    int qi = threadIdx.x / 8, sl = threadIdx.x % 8;
+    int j = j0 + qi;
+    int64_t p = pos + j;
+    int jl = min(t, j0 + FQ) - 1;
+    int64_t first = window > 0 ? pos + j0 - window + 1 : 0;
+    if (first < base) {
+        first = base;
+    }
+    int64_t last = pos + jl;
+    size_t row = (size_t)kvh * hd;
+    float o[64];
+    for (int u = 0; u < 64; ++u) {
+        o[u] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    for (int64_t k0 = first; k0 <= last; k0 += FK) {
+        int kn = (int)min((int64_t)FK, last - k0 + 1);
+        float sc[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int d0 = 0; d0 < hd; d0 += FD) {
+            for (int x = threadIdx.x; x < FQ * FD; x += blockDim.x) {
+                int a = x / FD, d = x % FD;
+                int jj = j0 + a;
+                qs[a][d] = jj < t ? q[((size_t)jj * qh + h) * hd + d0 + d] : 0.f;
+                size_t o2 = (size_t)(k0 - base + a) * row + (size_t)kv * hd + d0 + d;
+                kvs[a][d] = a < kn ? (float)kq[o2] * ksc[o2 / 32] : 0.f;
+            }
+            __syncthreads();
+            #pragma unroll 8
+            for (int d = 0; d < FD; ++d) {
+                float qv = qs[qi][d];
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    sc[v] += qv * kvs[sl + 8 * v][d];
+                }
+            }
+            __syncthreads();
+        }
+        float mt = m;
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            int kk = sl + 8 * v;
+            int64_t kp = k0 + kk;
+            bool ok = kk < kn && j < t && kp <= p && (window == 0 || p - kp < window);
+            sc[v] = ok ? sc[v] : -INFINITY;
+            mt = fmaxf(mt, sc[v]);
+        }
+        for (int off = 4; off > 0; off >>= 1) {
+            mt = fmaxf(mt, __shfl_xor_sync(0xffffffff, mt, off));
+        }
+        float scale = (m == -INFINITY || mt == -INFINITY) ? (m == -INFINITY ? 0.f : 1.f)
+                                                          : expf(m - mt);
+        float ls = 0.f;
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            float pk = sc[v] == -INFINITY ? 0.f : expf(sc[v] - mt);
+            ps[qi][sl + 8 * v] = pk;
+            ls += pk;
+        }
+        for (int off = 4; off > 0; off >>= 1) {
+            ls += __shfl_xor_sync(0xffffffff, ls, off);
+        }
+        if (mt != -INFINITY) {
+            l = l * scale + ls;
+            for (int u = 0; u < 64; ++u) {
+                o[u] *= scale;
+            }
+            m = mt;
+        }
+        __syncthreads();
+        /* The loop has a fixed count, so the index of o is a constant and o
+         * stays in registers. */
+        #pragma unroll
+        for (int c = 0; c < 512 / FD; ++c) {
+            int d0 = c * FD;
+            if (d0 >= hd) {
+                break;
+            }
+            for (int x = threadIdx.x; x < FK * FD; x += blockDim.x) {
+                int a = x / FD, d = x % FD;
+                size_t o2 = (size_t)(k0 - base + a) * row + (size_t)kv * hd + d0 + d;
+                kvs[a][d] = a < kn ? (float)vq[o2] * vsc[o2 / 32] : 0.f;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int w = 0; w < FD / 8; ++w) {
+                int d = sl + 8 * w;
+                float acc = 0.f;
+                #pragma unroll 8
+                for (int kk = 0; kk < FK; ++kk) {
+                    acc += ps[qi][kk] * kvs[kk][d];
+                }
+                o[c * (FD / 8) + w] += acc;
+            }
+            __syncthreads();
+        }
+    }
+    if (j < t) {
+        float inv = l > 0.f ? 1.0f / l : 0.f;
+        #pragma unroll
+        for (int c = 0; c < 512 / FD; ++c) {
+            if (c * FD >= hd) {
+                break;
+            }
+            #pragma unroll
+            for (int w = 0; w < FD / 8; ++w) {
+                out[((size_t)j * qh + h) * hd + c * FD + sl + 8 * w] = o[c * (FD / 8) + w] * inv;
+            }
+        }
+    }
+}
+
+/* GP_ROUTER_MT: x, scale, proj, per_expert, hidden, experts, top_k, eps,
+ * hscale, val, idx, t, r, logits. The kernels do the steps of GP_ROUTER for
+ * each token. First the norm of the rows into r. Then the logits, as a
+ * product with proj. Last, the top experts of each token. */
+__global__ void k_router_norm_mt(const gp_rec *r, const int64_t *e)
+{
+    int j = blockIdx.x, hidden = DI(4);
+    const float *x = DP(const float, 0) + (size_t)j * hidden;
+    const float *scale = DP(const float, 1);
+    float *rv = DP(float, 12) + (size_t)j * hidden;
+    float ss = 0.f;
+    for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
+        ss += x[k] * x[k];
+    }
+    ss = block_sum(ss);
+    float inv = 1.0f / sqrtf(ss / (float)hidden + df(r, e, 7));
+    float hs = df(r, e, 8);
+    for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
+        rv[k] = x[k] * inv * scale[k] * hs;
+    }
+}
+
+__device__ void router_top_warp(const float *logits, const float *per_expert, float *val,
+                                int *idx, int experts, int top_k);
+
+__global__ void k_router_top_mt(const gp_rec *r, const int64_t *e)
+{
+    int j = blockIdx.x, experts = DI(5), top_k = DI(6);
+    router_top_warp(DP(const float, 13) + (size_t)j * experts, DP(const float, 3),
+                    DP(float, 9) + (size_t)j * top_k, DP(int, 10) + (size_t)j * top_k,
+                    experts, top_k);
+}
+
+/* ---------- the experts of a large group on the GPU ----------
+ * The operands of GP_MOE_GPU:
+ *
+ *     h, val, idx, t, top_k, 0, 0, gu_rows, cols, dn_rows, inner, cnt, off,
+ *     fill, pair_tok, pair_of, tiles, act, act2, de, out, gu_tab, dn_tab
+ *
+ * The tables gu_tab and dn_tab give the device address of the int4 blocks
+ * of each expert. A hot expert is on the GPU. A cold expert is in the
+ * buffer that GP_FETCH fills. The steps:
+ *
+ * 1. k_moe_sort: count the pairs (token, slot) of each expert. Put the pairs
+ *    in the order of the experts. The array pair_tok gets the token of each
+ *    pair. The array pair_of gets the pair of each (token, slot).
+ * 2. k_moe_tiles: make the list of the tiles: GM pairs of one expert each.
+ * 3. k_moe_gemm (gate and up), k_moe_gelu, k_moe_gemm (down): the products
+ *    of the tiles. A tile reads the weights of its expert one time for its
+ *    GM pairs.
+ * 4. k_moe_sum: out[j] = the sum over the slots of val[j][s] times the
+ *    output of the pair of (j, s).
+ *
+ * The arrays cnt, off, and fill have one int for each expert, and off has
+ * one more. The array tiles holds the tile count, then (expert, first pair)
+ * for each tile. */
+#define MOE_EXPERTS_MAX 256
+
+__global__ void k_moe_sort(const gp_rec *r, const int64_t *e)
+{
+    const int *idx = DP(const int, 2);
+    int pairs = DI(3) * DI(4), experts = MOE_EXPERTS_MAX;
+    int *cnt = DP(int, 11), *off = DP(int, 12), *fill = DP(int, 13);
+    int *pair_tok = DP(int, 14), *pair_of = DP(int, 15);
+    int top_k = DI(4);
+    for (int x = threadIdx.x; x < experts; x += blockDim.x) {
+        cnt[x] = 0;
+        fill[x] = 0;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        atomicAdd(&cnt[idx[p]], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int a = 0;
+        for (int x = 0; x < experts; ++x) {
+            off[x] = a;
+            a += cnt[x];
+        }
+        off[experts] = a;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        int ex = idx[p];
+        int q = off[ex] + atomicAdd(&fill[ex], 1);
+        pair_tok[q] = p / top_k;
+        pair_of[p] = q;
+    }
+}
+
+__global__ void k_moe_tiles(const gp_rec *r, const int64_t *e)
+{
+    const int *cnt = DP(const int, 11), *off = DP(const int, 12);
+    int *tiles = DP(int, 16);
+    int n = 0;
+    for (int x = 0; x < MOE_EXPERTS_MAX; ++x) {
+        for (int p0 = 0; p0 < cnt[x]; p0 += GM) {
+            tiles[1 + 2 * n] = x;
+            tiles[2 + 2 * n] = off[x] + p0;
+            ++n;
+        }
+    }
+    tiles[0] = n;
+}
+
+/* A tile of up to GM pairs of one expert, and GN rows of its matrix. With
+ * gather, row q of A is row pair_tok[q] of a; else it is row q. */
+__global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, int gather,
+                           const int64_t *wtab, int rows, int cols, float *out)
+{
+    __shared__ float xs[32][GM + 1];
+    __shared__ float ws[32][GN + 1];
+    const int *tiles = DP(const int, 16);
+    const int *off = DP(const int, 12);
+    const int *pair_tok = DP(const int, 14);
+    int tile = blockIdx.y;
+    if (tile >= tiles[0]) {
+        return;
+    }
+    int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile];
+    int qend = off[ex + 1];
+    int n0 = blockIdx.x * GN;
+    int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    const uint8_t *we = (const uint8_t *)(intptr_t)wtab[ex];
+    float acc[4][4] = {{0.f}};
+    int groups = cols / 32;
+    for (int g = 0; g < groups; ++g) {
+        for (int x = threadIdx.x; x < GM * 32; x += blockDim.x) {
+            int qq = x / 32, k = x % 32;
+            int q = q0 + qq;
+            float v = 0.f;
+            if (q < qend) {
+                int src = gather ? pair_tok[q] : q;
+                v = a[(size_t)src * cols + (size_t)g * 32 + k];
+            }
+            xs[k][qq] = v;
+        }
+        if (threadIdx.x < GN) {
+            int n = n0 + threadIdx.x;
+            float v[32];
+            if (n < rows) {
+                w_block32<0>(we, n, cols, g, v);
+            } else {
+                for (int k = 0; k < 32; ++k) {
+                    v[k] = 0.f;
+                }
+            }
+            for (int k = 0; k < 32; ++k) {
+                ws[k][threadIdx.x] = v[k];
+            }
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int k = 0; k < 32; ++k) {
+            float av[4], bv[4];
+            for (int u = 0; u < 4; ++u) {
+                av[u] = xs[k][ty * 4 + u];
+                bv[u] = ws[k][tx * 4 + u];
+            }
+            for (int u = 0; u < 4; ++u) {
+                for (int v = 0; v < 4; ++v) {
+                    acc[u][v] += av[u] * bv[v];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int u = 0; u < 4; ++u) {
+        int q = q0 + ty * 4 + u;
+        if (q >= qend) {
+            continue;
+        }
+        for (int v = 0; v < 4; ++v) {
+            int n = n0 + tx * 4 + v;
+            if (n < rows) {
+                out[(size_t)q * rows + n] = acc[u][v];
+            }
+        }
+    }
+}
+
+/* act holds the gate and the up values of each pair: 2 inner values. */
+__global__ void k_moe_gelu(const gp_rec *r, const int64_t *e)
+{
+    int inner = DI(10);
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)DI(3) * DI(4) * inner) {
+        return;
+    }
+    size_t q = i / inner, c = i % inner;
+    const float *g = DP(const float, 17) + q * 2 * inner;
+    float v = g[c];
+    DP(float, 18)[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
+                                                (v + 0.044715f * v * v * v))) * g[inner + c];
+}
+
+__global__ void k_moe_sum(const gp_rec *r, const int64_t *e)
+{
+    int dn_rows = DI(9), top_k = DI(4);
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)DI(3) * dn_rows) {
+        return;
+    }
+    size_t j = i / dn_rows, c = i % dn_rows;
+    const float *val = DP(const float, 1);
+    const int *pair_of = DP(const int, 15);
+    const float *de = DP(const float, 19);
+    float acc = 0.f;
+    for (int s2 = 0; s2 < top_k; ++s2) {
+        int q = pair_of[j * top_k + s2];
+        acc += val[j * top_k + s2] * de[(size_t)q * dn_rows + c];
+    }
+    DP(float, 20)[i] = acc;
+}
+
 /* ---------- the router ----------
  * The operands of GP_ROUTER:
  *
@@ -890,13 +1527,9 @@ __global__ void k_router_logits(const gp_rec *r, const int64_t *e)
  * keeps the logits of experts lane, lane + 32, and so on. At an equal
  * probability, the expert with the lower index wins, as in
  * gemma_router_body. At most 256 experts. */
-__global__ void k_router_top(const gp_rec *r, const int64_t *e)
+__device__ void router_top_warp(const float *logits, const float *per_expert, float *val,
+                                int *idx, int experts, int top_k)
 {
-    const float *logits = DP(const float, 12);
-    const float *per_expert = DP(const float, 3);
-    float *val = DP(float, 9);
-    int *idx = DP(int, 10);
-    int experts = DI(5), top_k = DI(6);
     int lane = threadIdx.x;
     float p[8];
     float m = -INFINITY;
@@ -954,6 +1587,12 @@ __global__ void k_router_top(const gp_rec *r, const int64_t *e)
             val[j] = val[j] * invv * per_expert[idx[j]];
         }
     }
+}
+
+__global__ void k_router_top(const gp_rec *r, const int64_t *e)
+{
+    router_top_warp(DP(const float, 12), DP(const float, 3), DP(float, 9), DP(int, 10),
+                    DI(5), DI(6));
 }
 
 /* ---------- the hot experts ----------
@@ -1154,7 +1793,87 @@ typedef struct {
 
 static int is_boundary(int op)
 {
-    return op == GP_TO_HOST || op == GP_CPU_JOIN || op == GP_TO_DEV;
+    return op == GP_TO_HOST || op == GP_CPU_JOIN || op == GP_TO_DEV || op == GP_FETCH ||
+           op == GP_FETCH_WAIT || op == GP_FETCH_DONE;
+}
+
+/* ---------- the copy of the weights of the experts ----------
+ * The operands of GP_FETCH are ranges, count, fetch f, and buffer b. ranges is a host array of
+ * count triples (host address, device address, bytes). A worker thread
+ * copies the ranges to the GPU on a stream of its own, and records the event
+ * ready[f]. The host memory is not pinned: it is the map of the model file.
+ * Thus the copy call waits until the data is in the buffers of the driver. The worker thread does that
+ * wait, and the runner goes on with the launches. Before the copy, the
+ * worker waits for the event free[b]: the last use of buffer b is done.
+ *
+ * GP_FETCH_WAIT f: the stream of the program waits for ready[f].
+ * GP_FETCH_DONE b: the stream of the program records free[b]. */
+#define GG_FETCH_MAX 256
+
+typedef struct {
+    const int64_t *ranges;
+    int count;
+    int f, b;
+} gg_job;
+
+static pthread_mutex_t gg_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gg_cv = PTHREAD_COND_INITIALIZER;
+static gg_job gg_jobs[GG_FETCH_MAX];
+static int gg_job_head, gg_job_tail;
+static int gg_recorded[GG_FETCH_MAX];
+static int gg_fetch_error;
+static cudaEvent_t gg_ready[GG_FETCH_MAX], gg_freeev[2];
+static cudaStream_t gg_copy;
+static int gg_worker_on;
+
+static void *gg_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&gg_mu);
+        while (gg_job_head == gg_job_tail) {
+            pthread_cond_wait(&gg_cv, &gg_mu);
+        }
+        gg_job j = gg_jobs[gg_job_head % GG_FETCH_MAX];
+        pthread_mutex_unlock(&gg_mu);
+        int bad = cudaEventSynchronize(gg_freeev[j.b]) != cudaSuccess;
+        for (int k = 0; k < j.count && !bad; ++k) {
+            const int64_t *q = j.ranges + 3 * k;
+            bad = cudaMemcpyAsync((void *)(intptr_t)q[1], (const void *)(intptr_t)q[0],
+                                  (size_t)q[2], cudaMemcpyHostToDevice, gg_copy) != cudaSuccess;
+        }
+        bad = bad || cudaEventRecord(gg_ready[j.f], gg_copy) != cudaSuccess;
+        pthread_mutex_lock(&gg_mu);
+        gg_fetch_error |= bad;
+        gg_recorded[j.f] = 1;
+        ++gg_job_head;
+        pthread_cond_broadcast(&gg_cv);
+        pthread_mutex_unlock(&gg_mu);
+    }
+    return NULL;
+}
+
+static int gg_fetch_init(void)
+{
+    if (gg_worker_on) {
+        return 0;
+    }
+    CK(cudaStreamCreateWithFlags(&gg_copy, cudaStreamNonBlocking));
+    for (int k = 0; k < GG_FETCH_MAX; ++k) {
+        CK(cudaEventCreateWithFlags(&gg_ready[k], cudaEventDisableTiming));
+    }
+    for (int k = 0; k < 2; ++k) {
+        CK(cudaEventCreateWithFlags(&gg_freeev[k], cudaEventDisableTiming));
+        CK(cudaEventRecord(gg_freeev[k], gg_stream));
+    }
+    pthread_t th;
+    if (pthread_create(&th, NULL, gg_worker, NULL) != 0) {
+        snprintf(gg_error, sizeof(gg_error), "no worker thread for the copies");
+        return -1;
+    }
+    pthread_detach(th);
+    gg_worker_on = 1;
+    return 0;
 }
 
 static int64_t hi(const gp_rec *r, const int64_t *e, int k)
@@ -1204,6 +1923,34 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
     k_attn_join<<<dim3((unsigned)qh, (unsigned)cdiv(hd, 128)), 128, 0, gg_stream>>>(
         dr, denv, g->part);
     return 0;
+}
+
+/* The largest group for k_mt_gemv. A larger group uses k_gemm. A test can
+ * lower it with gg_set_gemv_max to check k_gemm with a small group. */
+static int gg_gemv_max = MT_MAX;
+
+/* The product of an int4 matrix and a group of rows. The operands give x,
+ * w, out, rows, cols, and t. The pointers must be literals, because the
+ * kernel takes them as arguments: the compiler of a group passes arrays,
+ * not slots. */
+static void gemm_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, int xk,
+                        int wk, int ok, int rk, int ck, int tk, int *bad)
+{
+    if (r->tag[xk] == GP_T_SLOT || r->tag[wk] == GP_T_SLOT || r->tag[ok] == GP_T_SLOT) {
+        *bad = 1;
+        return;
+    }
+    const float *x = (const float *)(intptr_t)r->v[xk];
+    const void *w = (const void *)(intptr_t)r->v[wk];
+    float *out = (float *)(intptr_t)r->v[ok];
+    int rows = (int)hlit(r, rk, bad), cols = (int)hlit(r, ck, bad), t = (int)hlit(r, tk, bad);
+    if (t <= gg_gemv_max) {
+        k_mt_gemv<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
+            x, (const uint8_t *)w, out, t, rows, cols);
+    } else {
+        k_gemm<0><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(
+            x, w, out, t, rows, cols);
+    }
 }
 
 /* Launch the kernels of one record. Return 0, or -1 for an operation that
@@ -1313,6 +2060,65 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_hot_sum<<<(unsigned)cdiv(hlit(r, 13, &bad), T), T, 0, s>>>(dr, denv);
         break;
     }
+    case GP_INT4_LINEAR_MT:
+        /* x, w, s, out, rows, cols, t */
+        gemm_launch(r, dr, denv, 0, 1, 3, 4, 5, 6, &bad);
+        break;
+    case GP_INT4_MULTI4_MT:
+        /* x, cols, t, then (w, s, out, rows) for up to four matrices */
+        for (int m = 0; m < 4; ++m) {
+            if (r->v[3 + 4 * m] != 0) {
+                gemm_launch(r, dr, denv, 0, 3 + 4 * m, 5 + 4 * m, 6 + 4 * m, 1, 2, &bad);
+            }
+        }
+        break;
+    case GP_GELU_MUL_ROWS:
+        k_gelu_mul_rows<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad), T), T, 0, s>>>(
+            dr, denv);
+        break;
+    case GP_ATTN_QC_MT:
+        if (hlit(r, 9, &bad) > 512 || hlit(r, 9, &bad) % 16 != 0) {
+            bad = 1;
+        }
+        if (hlit(r, 10, &bad) > MT_MAX && hlit(r, 9, &bad) % FD == 0) {
+            k_flash_qc_mt<<<dim3((unsigned)hlit(r, 7, &bad),
+                                 (unsigned)cdiv(hlit(r, 10, &bad), FQ)), 256, 0, s>>>(dr, denv);
+        } else {
+            k_attn_qc_mt<<<dim3((unsigned)hlit(r, 7, &bad),
+                                (unsigned)cdiv(hlit(r, 10, &bad), QT)), QT * 16, 0, s>>>(dr, denv);
+        }
+        break;
+    case GP_ROUTER_MT: {
+        int64_t t = hlit(r, 11, &bad), ex = hlit(r, 5, &bad);
+        k_router_norm_mt<<<(unsigned)t, T, 0, s>>>(dr, denv);
+        k_gemm<1><<<dim3((unsigned)cdiv(ex, GN), (unsigned)cdiv(t, GM)), 256, 0, s>>>(
+            (const float *)(intptr_t)r->v[12], (const void *)(intptr_t)r->v[2],
+            (float *)(intptr_t)r->v[13], (int)t, (int)ex, (int)hlit(r, 4, &bad));
+        k_router_top_mt<<<(unsigned)t, 32, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_MOE_GPU: {
+        /* The pointers of the weights and of the scratch are literals. */
+        int64_t t = hlit(r, 3, &bad), k = hlit(r, 4, &bad), pairs = t * k;
+        int gu_rows = (int)hlit(r, 7, &bad), cols = (int)hlit(r, 8, &bad);
+        int dn_rows = (int)hlit(r, 9, &bad), inner = (int)hlit(r, 10, &bad);
+        unsigned max_tiles = (unsigned)(cdiv(pairs, GM) + 128);
+        const int64_t *gu = (const int64_t *)(intptr_t)hlit(r, 21, &bad);
+        const int64_t *dn = (const int64_t *)(intptr_t)hlit(r, 22, &bad);
+        const float *h = (const float *)(intptr_t)hlit(r, 0, &bad);
+        float *act = (float *)(intptr_t)hlit(r, 17, &bad);
+        float *act2 = (float *)(intptr_t)hlit(r, 18, &bad);
+        float *de = (float *)(intptr_t)hlit(r, 19, &bad);
+        k_moe_sort<<<1, 1024, 0, s>>>(dr, denv);
+        k_moe_tiles<<<1, 1, 0, s>>>(dr, denv);
+        k_moe_gemm<<<dim3((unsigned)cdiv(gu_rows, GN), max_tiles), 256, 0, s>>>(
+            dr, denv, h, 1, gu, gu_rows, cols, act);
+        k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+        k_moe_gemm<<<dim3((unsigned)cdiv(dn_rows, GN), max_tiles), 256, 0, s>>>(
+            dr, denv, act2, 0, dn, dn_rows, inner, de);
+        k_moe_sum<<<(unsigned)cdiv(t * dn_rows, T), T, 0, s>>>(dr, denv);
+        break;
+    }
     case GP_ROUTER:
         k_router_norm<<<1, T, 0, s>>>(dr, denv);
         k_router_logits<<<(unsigned)cdiv(hlit(r, 5, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
@@ -1340,6 +2146,41 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
 static int gg_boundary(gg_prog *g, const gp_rec *r)
 {
     switch (r->op) {
+    case GP_FETCH: {
+        if (gg_fetch_init() != 0) {
+            return -1;
+        }
+        gg_job j;
+        j.ranges = (const int64_t *)(intptr_t)r->v[0];
+        j.count = (int)r->v[1];
+        j.f = (int)r->v[2];
+        j.b = (int)r->v[3];
+        pthread_mutex_lock(&gg_mu);
+        gg_recorded[j.f] = 0;
+        gg_jobs[gg_job_tail % GG_FETCH_MAX] = j;
+        ++gg_job_tail;
+        pthread_cond_broadcast(&gg_cv);
+        pthread_mutex_unlock(&gg_mu);
+        return 0;
+    }
+    case GP_FETCH_WAIT: {
+        int f = (int)r->v[0];
+        pthread_mutex_lock(&gg_mu);
+        while (!gg_recorded[f]) {
+            pthread_cond_wait(&gg_cv, &gg_mu);
+        }
+        int bad = gg_fetch_error;
+        pthread_mutex_unlock(&gg_mu);
+        if (bad) {
+            snprintf(gg_error, sizeof(gg_error), "a copy of the weights of the experts failed");
+            return -1;
+        }
+        CK(cudaStreamWaitEvent(gg_stream, gg_ready[f], 0));
+        return 0;
+    }
+    case GP_FETCH_DONE:
+        CK(cudaEventRecord(gg_freeev[r->v[0]], gg_stream));
+        return 0;
     case GP_TO_HOST:
         for (int k = 0; k < 3; ++k) {
             if (r->v[3 * k] != 0) {
@@ -1463,6 +2304,11 @@ int gg_init(int device)
 void gg_set_cpu_runner(void *fn)
 {
     gg_cpu_run = (gg_cpu_runner)fn;
+}
+
+void gg_set_gemv_max(int t)
+{
+    gg_gemv_max = t < MT_MAX ? t : MT_MAX;
 }
 
 int gg_mem_info(size_t *free_b, size_t *total_b)

@@ -76,6 +76,7 @@ ROUTER, MOE, ROUTER_MT, MOE_MT, MOE_N = 64, 65, 66, 67, 68
 XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 # The records that move work between the GPU and the CPU (np_gemma/gpu.py).
 TO_HOST, CPU_JOIN, TO_DEV, HOT_SPLIT, HOT_MOE = 84, 85, 86, 87, 88
+MOE_GPU, FETCH, FETCH_WAIT, FETCH_DONE = 89, 90, 91, 92
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -89,7 +90,8 @@ OP_NAMES = {v: k for k, v in dict(
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
     ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART,
     ATTN_QC_H=ATTN_QC_H, ATTN_F32_H=ATTN_F32_H, TO_HOST=TO_HOST, CPU_JOIN=CPU_JOIN,
-    TO_DEV=TO_DEV, MOE_N=MOE_N, HOT_SPLIT=HOT_SPLIT, HOT_MOE=HOT_MOE).items()}
+    TO_DEV=TO_DEV, MOE_N=MOE_N, HOT_SPLIT=HOT_SPLIT, HOT_MOE=HOT_MOE, MOE_GPU=MOE_GPU,
+    FETCH=FETCH, FETCH_WAIT=FETCH_WAIT, FETCH_DONE=FETCH_DONE).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -659,13 +661,14 @@ def k_copy(c, x, out=None):
     return out
 
 
-def _mats(mats, t=1):
-    """Return the operands of up to four int4 matrices and their outputs."""
+def _mats(c, mats, t=1):
+    """Return the operands of up to four int4 matrices and their outputs. The
+    outputs are new buffers of the compiler c."""
     args, outs = [], []
     for m in range(4):
         if m < len(mats) and mats[m] is not None:
             w, s = mats[m]
-            o = np.zeros((t, w.shape[0]), dtype=np.float32)
+            o = c.buffer((t, w.shape[0]))
             args += [w, s, o, w.shape[0]]
             outs.append(o)
         else:
@@ -679,7 +682,7 @@ def k_int4_multi4(c, x, *mats):
     ops.int4_multi4_mt. Return one (rows of x, rows of m) buffer for each
     matrix."""
     t = x.shape[0]
-    args, outs = _mats(mats, t)
+    args, outs = _mats(c, mats, t)
     if t == 1:
         c.p.emit(INT4_MULTI4, x, x.shape[1], *args)
     else:
@@ -694,7 +697,7 @@ def k_rms_norm_multi4(c, x, wn, *mats):
     Model._decoder_layer does."""
     if x.shape[0] > 1:
         return k_int4_multi4(c, k_rms_norm(c, x, wn), *mats)
-    args, outs = _mats(mats)
+    args, outs = _mats(c, mats)
     scratch = c.buffer(x.shape[1])
     c.p.emit(RMS_NORM_MULTI4, x, np.ascontiguousarray(wn, dtype=np.float32), scratch,
              x.shape[1], float(c.eps), *args)
@@ -830,7 +833,7 @@ def k_router(c, x, layer):
     proj = np.ascontiguousarray(w["router.proj"], dtype=np.float32)
     if t > 1:
         val = c.buffer((t, top_k))
-        idx = np.zeros((t, top_k), dtype=np.int32)
+        idx = c.buffer((t, top_k), np.int32)
         c.p.emit(ROUTER_MT, x, np.ascontiguousarray(w["router.scale"], dtype=np.float32),
                  proj, np.ascontiguousarray(w["router.per_expert_scale"], dtype=np.float32),
                  x.shape[1], proj.shape[0], top_k, float(c.eps),

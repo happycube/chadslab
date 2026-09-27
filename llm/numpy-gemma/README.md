@@ -270,7 +270,9 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_PART_TEAM     0                       The thread count of each part. 0 divides OMP_NUM_THREADS by the count of parts.
     NP_GEMMA_GPU           0                       1 runs a decode step of one token and the output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). The E4B model runs wholly on the GPU. The 26B model keeps its experts on the CPU. It needs nvcc. The first step copies the weights to the GPU. The MTP drafter is then off.
     NP_GEMMA_GPU_HOT       the 26B counts          A file of expert counts (scripts/expert_use.py). With NP_GEMMA_GPU=1, the GPU holds the most used experts of the 26B and runs them. 0 keeps all the experts on the CPU. The default is np_gemma/data/gemma-4-26B-expert-counts.npz.
-    NP_GEMMA_GPU_HOT_GB    free less 4.5 GB        The GPU memory for the hot experts, in GB.
+    NP_GEMMA_GPU_HOT_GB    free less 6 GB          The GPU memory for the hot experts, in GB.
+    NP_GEMMA_GPU_CHUNK     1024                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.9 s for the 26B), so a longer chunk is faster.
+    NP_GEMMA_GPU_PREFILL_MIN 128                   A shorter part of a prompt runs on the GPU in groups of 16 tokens, with the experts on the CPU.
     NP_GEMMA_GPU_KV        int16                   The form of the cache of the 26B on the GPU. int16 keeps the int16 copy of the CPU program: about half of the float form. float keeps float32 rows.
     NP_GEMMA_PART_ATTN     heads                   heads gives each part a range of the attention heads. one runs the attention in part 0 only, the first form.
 
@@ -1993,12 +1995,14 @@ experts on the GPU, up to --gpu-experts-gb. The server copies the weights at
 the start. On jackal, a greedy generation of the 26B gives the same tokens
 as the CPU:
 
-    mode                    decode rate
-    CPU only                about 18 tokens/s
-    --gpu dense             about 40 tokens/s
-    --gpu hot (3.4 GB)      52 to 65 tokens/s
+    mode                    decode rate           prompt pass
+    CPU only                about 18 tokens/s     about 60 tokens/s
+    --gpu dense             about 40 tokens/s     about 440 tokens/s
+    --gpu hot (about 2 GB)  about 45 to 52        about 440 tokens/s
 
-The option works for scripts/gguf_generate.py too. MTP is off with --gpu.
+The prompt pass on the GPU copies the experts that the GPU does not hold for
+each chunk of 1024 tokens. The option works for scripts/gguf_generate.py
+too. MTP is off with --gpu.
 See SPLIT_PLAN.md.
 
 Then choose the provider and the model in the harness. No credential is

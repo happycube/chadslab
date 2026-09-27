@@ -46,7 +46,7 @@ def main():
                          " experts on the GPU. Needs nvcc. MTP is then off.")
     ap.add_argument("--gpu-experts-gb", type=float, default=None,
                     help="With --gpu hot, the GPU memory for the experts. The default is the"
-                         " free memory less 4.5 GB.")
+                         " free memory less 6 GB.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)

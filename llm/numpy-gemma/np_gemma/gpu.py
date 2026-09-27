@@ -57,8 +57,9 @@ _error = None
 # block. The records of the handoff to the CPU hold host addresses: pinned
 # buffers and the address of a CPU program.
 SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
+        P.INT4_LINEAR_MT: (2,), P.INT4_MULTI4_MT: (4, 8, 12, 16),
         P.RMS_NORM_MULTI4: (6, 10, 14, 18), P.GELU_MUL_INT4: (5,),
-        P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,)}
+        P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,)}
 
 
 def _nvcc():
@@ -194,6 +195,7 @@ class Mirror:
         self.starts = []    # sorted host start addresses
         self.arrays = {}    # host start -> array
         self.bufs = {}      # host start -> Buffer
+        self.checked = set()  # the int4 matrices whose scales are checked
 
     def add(self, a):
         start = a.ctypes.data
@@ -233,9 +235,11 @@ class Mirror:
         return sum(b.nbytes for b in self.bufs.values())
 
 
-def _check_scales(prog):
+def _check_scales(prog, done=None):
     """Check that the float16 scale of each int4 block equals the float32
-    scale that the CPU kernels read."""
+    scale that the CPU kernels read. done is a set of the matrices that an
+    earlier check covered."""
+    done = set() if done is None else done
     for op, args in prog.recs:
         # (w, s, rows, cols) of each matrix of the record.
         if op == P.INT4_LINEAR:
@@ -246,12 +250,17 @@ def _check_scales(prog):
             pairs = [(5 + 4 * m, 6 + 4 * m, 8 + 4 * m, 3) for m in range(4)]
         elif op == P.GELU_MUL_INT4:
             pairs = [(4, 5, 7, 8)]
+        elif op == P.INT4_LINEAR_MT:
+            pairs = [(1, 2, 4, 5)]
+        elif op == P.INT4_MULTI4_MT:
+            pairs = [(3 + 4 * m, 4 + 4 * m, 6 + 4 * m, 1) for m in range(4)]
         else:
             continue
         for wk, sk, rk, ck in pairs:
             w, s = args[wk][1], args[sk][1]
-            if not w:
+            if not w or w in done:
                 continue
+            done.add(w)
             rows, cols = args[rk][1], args[ck][1]
             if not rows:
                 continue
@@ -267,13 +276,15 @@ class GPUProgram:
     """A Program on the GPU: its records with device addresses, its data, and
     the device buffers of its parameters."""
 
-    def __init__(self, prog, graph=True):
+    def __init__(self, prog, graph=True, mirror=None):
+        """mirror is the Mirror of an earlier program of the same model. The
+        programs then share the device copies of the weights."""
         self.prog = prog
-        self.mirror = Mirror()
+        self.mirror = mirror if mirror is not None else Mirror()
         for a in prog.keep:
             if isinstance(a, np.ndarray):
                 self.mirror.add(a)
-        _check_scales(prog)
+        _check_scales(prog, self.mirror.checked)
         buf = prog.buf.copy()
         n_env = int(buf[1])
         code = buf[4 + n_env:].view(P.REC)
@@ -485,15 +496,46 @@ class SplitCompiler(P.Compiler):
     GPU while the CPU computes the experts.
     """
 
-    def __init__(self, model, hot=None, kv="int16"):
+    def __init__(self, model, hot=None, kv="int16", pool=False, stage=None):
         super().__init__(model)
         self.kv = kv
+        # With pool, the n-th buffer of a shape in a layer is the same array
+        # in every layer. A layer does not read the buffers of an earlier
+        # layer, and the GPU runs the layers in order, so this is safe. A
+        # group of 1024 tokens then needs about 0.3 GB, not 8 GB.
+        self.pool_on = pool
+        self.pool = {}
+        self.pool_n = {}
+        # The two device buffers for the weights of the experts of a layer
+        # (see moe_group_gpu), or None.
+        self.stage = stage
         # id of an output of the experts -> (CPU program, host output, event,
         # device buffer of the CPU part, device buffer of the GPU part).
         self.pending = {}
         self.n_events = 0
         self.cpu_progs = []
         self.hot = hot or {}   # layer -> the experts that the GPU holds
+        # For a step program: layer -> (hot experts, gate and up blocks, down
+        # blocks). For a group program: the device addresses of those blocks
+        # (see moe_group_gpu).
+        self.hot_stores = {}
+
+    def compile(self, form):
+        if form[0] == "layer":
+            self.pool_n = {}
+        return super().compile(form)
+
+    def buffer(self, shape, dtype=np.float32):
+        if not self.pool_on:
+            return super().buffer(shape, dtype)
+        shape = tuple(np.atleast_1d(shape)) if not isinstance(shape, tuple) else shape
+        k = (shape, np.dtype(dtype).str)
+        n = self.pool_n.get(k, 0)
+        self.pool_n[k] = n + 1
+        b = self.pool.get((k, n))
+        if b is None:
+            b = self.pool[(k, n)] = np.zeros(shape, dtype=dtype)
+        return b
 
     def kernel(self, head, vals, out=None):
         for a in _arrays(vals):
@@ -524,9 +566,98 @@ class SplitCompiler(P.Compiler):
             self.p.emit(P.ADD, gpu_part, part, a, a.size)
 
     def moe(self, h, val, idx, layer):
-        assert h.shape[0] == 1, "the GPU runs a step of one token"
+        if h.shape[0] > 1 and self.stage is not None:
+            return self.moe_group_gpu(h, val, idx, layer)
+        if h.shape[0] > 1:
+            return self.moe_group_cpu(h, val, idx, layer)
         if self.hot.get(layer):
             return self.moe_hot(h, val, idx, layer, self.hot[layer])
+        hp, vp, ip = pinned(h.shape), pinned(val.shape), pinned(idx.shape, np.int32)
+        ev = self.n_events
+        self.n_events += 1
+        self.p.emit(P.TO_HOST, h, hp, h.nbytes, val, vp, val.nbytes, idx, ip, idx.nbytes, ev)
+        cc = P.Compiler(self.model)
+        host_out = P.k_moe(cc, hp, vp, ip, layer)
+        cpu = cc.p.finish()
+        self.cpu_progs.append(cpu)
+        dev_out = self.buffer(h.shape)
+        self.pending[id(dev_out)] = (cpu, host_out, ev, dev_out, None)
+        return dev_out
+
+    def tables(self, layer):
+        """Return the tables of the device addresses of the experts of a
+        layer (gate and up, down), and the list of the copies of the cold
+        experts: (host address, device address, bytes) for each run of
+        adjacent cold experts."""
+        w = self.model._layers[layer]
+        gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+        n = gu.shape[0]
+        egu, edn = gu.nbytes // n, dn.nbytes // n
+        dgu, ddn = self.stage[layer % 2]
+        hot, hgu, hdn = self.hot_stores.get(layer, ([], 0, 0))
+        slot = {x: k for k, x in enumerate(hot)}
+        tgu = np.zeros(n, dtype=np.int64)
+        tdn = np.zeros(n, dtype=np.int64)
+        ranges = []
+        rank = 0
+        for x in range(n):
+            if x in slot:
+                tgu[x] = hgu + slot[x] * egu
+                tdn[x] = hdn + slot[x] * edn
+                continue
+            tgu[x] = dgu.ptr + rank * egu
+            tdn[x] = ddn.ptr + rank * edn
+            if ranges and ranges[-1][3] == x - 1:
+                ranges[-1][2] += egu
+                ranges[-1][6] += edn
+                ranges[-1][3] = x
+            else:
+                # host gate and up, device, bytes, last expert; host down,
+                # device, bytes
+                ranges.append([gu.ctypes.data + x * egu, int(tgu[x]), egu, x,
+                               dn.ctypes.data + x * edn, int(tdn[x]), edn])
+            rank += 1
+        flat = []
+        for r in ranges:
+            flat += [r[0], r[1], r[2]]
+        for r in ranges:
+            flat += [r[4], r[5], r[6]]
+        return tgu, tdn, np.array(flat, dtype=np.int64).reshape(-1, 3)
+
+    def fetch(self, layer):
+        """Emit the copy of the weights of the cold experts of a layer to the
+        device buffer layer % 2."""
+        _tgu, _tdn, ranges = self.tables(layer)
+        self.p.emit(P.FETCH, ranges, len(ranges), layer, layer % 2)
+
+    def moe_group_gpu(self, h, val, idx, layer):
+        """The experts of a large group on the GPU (GP_MOE_GPU). All the
+        experts of the layer come to a device buffer with GP_FETCH. The copy
+        of layer l + 2 starts when the experts of layer l are done with the
+        buffer."""
+        w = self.model._layers[layer]
+        gu_q, dn_q = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+        inner = self.cfg.moe_intermediate_size
+        t, top_k = idx.shape
+        pairs = t * top_k
+        hidden = h.shape[1]
+        tgu, tdn, _ranges = self.tables(layer)
+        i32 = lambda n: self.buffer((n,), np.int32)  # noqa: E731
+        out = self.buffer(h.shape)
+        self.p.emit(P.FETCH_WAIT, layer)
+        self.p.emit(P.MOE_GPU, h, val, idx, t, top_k, 0, 0, gu_q.shape[1], hidden,
+                    dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
+                    i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
+                    self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), out,
+                    tgu, tdn)
+        self.p.emit(P.FETCH_DONE, layer % 2)
+        if layer + 2 < self.cfg.num_hidden_layers:
+            self.fetch(layer + 2)
+        return out
+
+    def moe_group_cpu(self, h, val, idx, layer):
+        """The experts of a group of tokens on the CPU: the MOE_MT record of
+        the CPU interpreter on pinned copies of the input."""
         hp, vp, ip = pinned(h.shape), pinned(val.shape), pinned(idx.shape, np.int32)
         ev = self.n_events
         self.n_events += 1
@@ -558,6 +689,7 @@ class SplitCompiler(P.Compiler):
         slots[hot] = np.arange(len(hot), dtype=np.int32)
         gu_store = np.ascontiguousarray(gu_q[hot])
         dn_store = np.ascontiguousarray(dn_q[hot])
+        self.hot_stores[layer] = (list(hot), gu_store, dn_store)
         for store, scales in ((gu_store, gu_s), (dn_store, dn_s)):
             half = store[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)
             if not np.array_equal(half, scales[hot]):
@@ -627,6 +759,44 @@ def hot_counts(model):
     return counts
 
 
+# The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the
+# weights of the cold experts to the GPU. For the 26B that is up to 11 GB,
+# about 1.9 s over PCIe 3 x8. A long chunk pays for the copy with more tokens.
+CHUNK = int(os.environ.get("NP_GEMMA_GPU_CHUNK", "1024"))
+# The largest group whose experts run on the CPU (GP_MOE_MT of the CPU
+# interpreter takes at most 16 tokens).
+MT_CPU = 16
+# The shortest part of a prompt that runs with the experts on the GPU. The
+# copy of their weights costs about 1.9 s, and the CPU takes about as long for
+# 128 tokens.
+PREFILL_MIN = int(os.environ.get("NP_GEMMA_GPU_PREFILL_MIN", "128"))
+
+
+def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=None):
+    """Compile a step of t tokens for the GPU: a chunk of a prompt, or the
+    group of an MTP verify step. The form is the group form of the layers.
+
+    A group of more than MT_CPU tokens computes the experts on the GPU, with
+    the weights in the two device buffers of stage. A smaller group sends
+    them to the CPU, as a step does."""
+    assert kv == "int16", "a group on the GPU reads the int16 cache"
+    gpu_experts = model.cfg.enable_moe_block and t > MT_CPU and stage is not None
+    c = SplitCompiler(model, hot, kv, pool=True, stage=stage if gpu_experts else None)
+    c.hot_stores = hot_stores or {}
+    c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
+    c.p.slot("pos")
+    if gpu_experts:
+        c.fetch(0)
+        c.fetch(1)
+    c.compile(P.step_form(model, "qc", t))
+    assert not c.pending, "an output of the experts has no reader"
+    c.p.layers = list(range(model.cfg.num_hidden_layers))
+    c.p.attn = "qc"
+    c.p.tokens = t
+    c.p.cpu_progs = c.cpu_progs
+    return c.p.finish()
+
+
 def compile_split_step(model, hot=None, kv="int16"):
     """Compile a step of one token of the 26B model (or of a dense model) for
     the GPU. "x" is the input and "xn" the result. hot gives the experts that
@@ -642,6 +812,7 @@ def compile_split_step(model, hot=None, kv="int16"):
     c.p.attn = "qc" if kv == "int16" else "f32"
     c.p.tokens = 1
     c.p.cpu_progs = c.cpu_progs
+    c.p.hot_stores = c.hot_stores
     return c.p.finish()
 
 
@@ -661,9 +832,10 @@ class GPUKV:
     int16, those rows come back as the int16 values times their scales.
     """
 
-    def __init__(self, cfg, kv="int16"):
+    def __init__(self, cfg, kv="int16", max_chunk=512):
         self.cfg = cfg
         self.form = kv
+        self.max_chunk = max_chunk
         self.window = cfg.sliding_window or 0
         n = cfg.num_hidden_layers
         self.names = ("kq", "ks", "vq", "vs") if kv == "int16" else ("k", "v")
@@ -715,7 +887,8 @@ class GPUKV:
         for i in range(self.cfg.num_hidden_layers):
             rows = cache.end[i] - cache.base[i]
             plan = self.cfg.plan[i]
-            cap = (2 * self.window + 64) if plan.is_sliding else max(max_len, rows + 64)
+            cap = ((2 * self.window + self.max_chunk + 64) if plan.is_sliding
+                   else max(max_len, rows + 64))
             cap = max(cap, rows + 64)
             if not self.bufs[i] or self.cap[i] < cap:
                 self._alloc(i, cap)
@@ -725,8 +898,8 @@ class GPUKV:
                 for name, a in self._host_rows(cache, i, rows).items():
                     self.bufs[i][name].upload(np.ascontiguousarray(a))
 
-    def prepare(self, i, pos):
-        """Make room for the row of position pos in layer i."""
+    def prepare(self, i, pos, t=1):
+        """Make room for the rows of positions pos to pos + t - 1 in layer i."""
         if self.cfg.plan[i].is_sliding:
             w = self.window
             if pos - self.base[i] > 2 * w:
@@ -742,10 +915,10 @@ class GPUKV:
                 # The host now lacks some rows that the GPU dropped. Only the
                 # rows of the window matter to a later step.
                 self.host_end[i] = max(self.host_end[i], keep)
-        need = pos + 1 - self.base[i]
+        need = pos + t - self.base[i]
         if need > self.cap[i]:
             self._alloc(i, max(need + 64, 2 * self.cap[i]), self.end[i] - self.base[i])
-        self.end[i] = max(self.end[i], pos + 1)
+        self.end[i] = max(self.end[i], pos + t)
 
     def detach(self, cache):
         """Write the rows that the GPU made into the host cache."""
@@ -771,6 +944,14 @@ class GPUKV:
                 v = (got["vq"].reshape(-1, 32) * got["vs"][:, None]).reshape(shape)
             cache.write(i, start, k.astype(np.float32), v.astype(np.float32))
             self.host_end[i] = self.end[i]
+
+    def sync(self, cache):
+        """Follow a truncate of the host cache (KVCache.truncate). A row
+        after the end of the host is not a row of the history any more."""
+        for i in range(self.cfg.num_hidden_layers):
+            if cache.end[i] < self.host_end[i]:
+                self.host_end[i] = cache.end[i]
+                self.end[i] = min(self.end[i], cache.end[i])
 
     def params(self):
         kw = {}
@@ -801,23 +982,30 @@ class ModelGPU:
         or else HOT_COUNTS when its shape agrees with the model.
         NP_GEMMA_GPU_HOT=0 turns the hot experts off. NP_GEMMA_GPU_HOT_GB
         gives the budget in GB. The default budget is the free memory of the
-        GPU less 4.5 GB: the rest of the step takes about 3 GB, and the
-        display needs some memory too.
+        GPU less 6 GB: the step, its head, and a cache of 4096 tokens take
+        about 2.7 GB, a prompt pass takes about 1.3 GB more, and the display
+        needs some memory too.
         """
         self.model = model
         if hot is None and model.cfg.enable_moe_block:
             counts = hot_counts(model)
             if counts is not None:
                 gb = os.environ.get("NP_GEMMA_GPU_HOT_GB")
-                budget = float(gb) * 1e9 if gb else max(0.0, mem_info()[0] - 4.5e9)
+                budget = float(gb) * 1e9 if gb else max(0.0, mem_info()[0] - 6.0e9)
                 hot = pick_hot(model, counts, budget)
         self.hot = hot or {}
         kv = kv or os.environ.get("NP_GEMMA_GPU_KV", "int16")
+        self.kv_form = kv
+        self.graph = graph
         self.prog = compile_split_step(model, self.hot, kv)
         self.g = GPUProgram(self.prog, graph=graph)
-        self.kv = GPUKV(model.cfg, kv)
+        self.kv = GPUKV(model.cfg, kv, max_chunk=CHUNK)
+        self.groups = {}      # t -> (Program, GPUProgram) of a group of t tokens
         self.head = None
         self.max_len = 4096
+        # The device address of the hidden state of the last row of the last
+        # step or group, for the output head.
+        self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
 
     def attach(self, cache):
         self.kv.attach(cache, max(self.max_len, cache.max_len))
@@ -825,14 +1013,14 @@ class ModelGPU:
     def detach(self, cache):
         self.kv.detach(cache)
 
-    def step(self, tokens, pos):
+    def _params(self, pos, t):
+        """Prepare the cache for t rows from pos. Return the parameters."""
         model, cfg = self.model, self.model.cfg
-        assert len(tokens) == 1, "the GPU runs a step of one token"
         for i in range(cfg.num_hidden_layers):
-            self.kv.prepare(i, pos)
+            self.kv.prepare(i, pos, t)
         kw = {"pos": pos}
         kw.update(self.kv.params())
-        positions = np.array([pos])
+        positions = np.arange(pos, pos + t)
         for kind, sliding in (("s", True), ("f", False)):
             plan = next((p for p in cfg.plan if p.is_sliding == sliding), None)
             if plan is None:
@@ -840,17 +1028,105 @@ class ModelGPU:
             cos, sin, _ca, _sa = model._rope(plan, positions)
             kw["cos." + kind] = np.ascontiguousarray(cos, dtype=np.float32)
             kw["sin." + kind] = np.ascontiguousarray(sin, dtype=np.float32)
-        need = max(p.num_q_heads * (pos + 1) for p in cfg.plan)
+        # The attention of a group needs no scores buffer on the GPU.
+        need = max(p.num_q_heads * (pos + 1) for p in cfg.plan) if t == 1 else 16
         kw["scores"] = np.empty(need, dtype=np.float32)
-        self.prog.names["x"][:] = model.embed(tokens)
+        return kw
+
+    def step(self, tokens, pos):
+        """Run a step of one token. Return the hidden state after the final
+        norm, shape (1, hidden)."""
+        assert len(tokens) == 1, "step runs one token; group runs more"
+        kw = self._params(pos, 1)
+        self.prog.names["x"][:] = self.model.embed(tokens)
         self.g.upload("x")
         self.g.bind(kw)
         self.g.run()
         self.g.download("xn")
+        self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
         return self.prog.names["xn"].copy()
 
+    def _hot_devices(self):
+        """Return layer -> (hot experts, device address of their gate and up
+        blocks, of their down blocks), from the step program."""
+        out = {}
+        for layer, (hot, gu, dn) in self.prog.hot_stores.items():
+            out[layer] = (hot, self.g.mirror.buffer_of(gu).ptr, self.g.mirror.buffer_of(dn).ptr)
+        return out
+
+    def _stage(self):
+        """Return the two device buffers for the weights of the cold experts
+        of a layer, for a large group. The GPU holds the hot experts already,
+        so a buffer holds only the cold experts of the layer with the most."""
+        if getattr(self, "stage", None) is None:
+            w = self.model._layers[0]
+            gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+            n = gu.shape[0]
+            cold = max(n - len(self.hot.get(i, ())) for i in range(self.model.cfg.num_hidden_layers))
+            self.stage = [(Buffer(cold * gu.nbytes // n), Buffer(cold * dn.nbytes // n))
+                          for _ in range(2)]
+        return self.stage
+
+    def _group(self, t):
+        e = self.groups.get(t)
+        if e is None:
+            stage = self._stage() if (t > MT_CPU and self.model.cfg.enable_moe_block) else None
+            prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
+                                       hot_stores=self._hot_devices() if stage else None)
+            e = self.groups[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
+        return e
+
+    def group(self, tokens, pos, size=None):
+        """Run a group of tokens from position pos. Return the hidden states
+        after the final norm, shape (len(tokens), hidden).
+
+        size pads the group to a program of that many tokens. The padding
+        rows write cache rows after the group. The cache then forgets them:
+        a later step writes those rows again.
+        """
+        t = len(tokens)
+        size = size or t
+        prog, g = self._group(size)
+        kw = self._params(pos, size)
+        x = prog.names["x"]
+        x[:t] = self.model.embed(tokens)
+        x[t:] = 0.0
+        g.upload("x")
+        g.bind(kw)
+        g.run()
+        g.download("xn")
+        for i in range(self.model.cfg.num_hidden_layers):
+            self.kv.end[i] = min(self.kv.end[i], pos + t)
+        hidden = self.model.cfg.hidden_size
+        self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * hidden * 4
+        return prog.names["xn"][:t].copy()
+
+    def prefill(self, ids, pos=0):
+        """Run a prompt from position pos. Return the hidden states after the
+        final norm of every token.
+
+        A part of PREFILL_MIN tokens or more goes in chunks of CHUNK tokens,
+        with the experts on the GPU. A short chunk goes to a program of the
+        next power of two. Each such chunk copies the weights of the experts
+        to the GPU. A shorter part goes in groups of 16 tokens, with the
+        experts on the CPU, which costs less than that copy.
+        """
+        out = []
+        c0 = 0
+        while c0 < len(ids):
+            chunk = ids[c0:c0 + CHUNK]
+            if len(chunk) >= PREFILL_MIN or not self.model.cfg.enable_moe_block:
+                size = max(MT_CPU + 1, 1 << (len(chunk) - 1).bit_length())
+                out.append(self.group(chunk, pos + c0, min(size, CHUNK)))
+            else:
+                chunk = ids[c0:c0 + MT_CPU]
+                out.append(self.group(chunk, pos + c0, MT_CPU))
+            c0 += len(chunk)
+        return np.concatenate(out)
+
     def logits(self):
-        """Return the logits of the last step, with the soft cap."""
+        """Return the logits of the last row of the last step or group, with
+        the soft cap."""
         model, cfg = self.model, self.model.cfg
         if self.head is None:
             if model._embed_q6k is None:
@@ -861,9 +1137,8 @@ class ModelGPU:
             self.head.upload(w)
             self.out = Buffer(4 * rows)
             self.host_logits = np.empty((1, rows), dtype=np.float32)
-        xn = self.g.mirror.buffer_of(self.prog.names["xn"])
         cap = float(cfg.final_logit_softcapping or 0.0)
-        _check(lib().gg_q6k_head(self.head.ptr, xn.ptr, self.out.ptr,
+        _check(lib().gg_q6k_head(self.head.ptr, self.last, self.out.ptr,
                                  self.host_logits.shape[1], cfg.hidden_size, cap))
         self.out.download(self.host_logits)
         return self.host_logits.copy()

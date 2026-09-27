@@ -484,7 +484,8 @@ shorter.
 
 The two programs ran one after the other on jackal, which had other load
 (load average 8 to 10). The tool llama-bench (build-cuda) runs tg128 and
-pp512 with 18 threads and flash attention. scripts/bench_decode.py measures
+pp512 with 18 threads and flash attention. The script scripts/bench_decode.py
+measures
 the decode of this runtime in the same way: 128 tokens from a short context,
 with the output head.
 
@@ -553,6 +554,59 @@ the GPU read the same cache. The times include the output head:
 At a context of 64k, the attention of the step takes about 6.5 ms. The
 experts on the CPU take most of the rest.
 
+## Results of phase 5: the prompt pass on the GPU
+
+The program of a group of t tokens (the group form of the layers) now runs
+on the GPU. New kernels:
+
+- k_mt_gemv: a group of up to 16 tokens, one warp for each row of a matrix;
+- k_gemm: a larger group, tiles of 64 tokens by 64 rows;
+- k_flash_qc_mt: the causal attention of a large group over the int16
+  cache. It uses tiles of 32 queries by 32 keys. A small group uses
+  k_attn_qc_mt;
+- the router of a group: the norm, a product with the matrix of the router,
+  and the top experts of each token;
+- GP_MOE_GPU: the experts of a large group. The pairs (token, slot) go in
+  the order of the experts. Then a tile of 64 pairs of one expert reads the
+  weights of that expert one time.
+
+The weights of the experts stay in host memory. GP_FETCH copies the cold
+experts of a layer to one of two device buffers. A worker thread does the
+copies, so the GPU computes layer l while the link copies layer l + 1. The
+hot experts of the decode step are on the GPU already, and GP_MOE_GPU reads
+them there. A table gives the device address of each expert.
+
+The compiler of a group uses the same buffers for every layer (the n-th
+buffer of a shape in a layer). A program of 1024 tokens then needs 0.52 GB,
+not about 9 GB.
+
+ModelGPU.prefill runs a prompt in chunks of 1024 tokens
+(NP_GEMMA_GPU_CHUNK). A part shorter than 128 tokens
+(NP_GEMMA_GPU_PREFILL_MIN) goes in groups of 16 tokens with the experts on
+the CPU. The copy of the experts takes about 1.9 s, which is more than the
+time of the CPU for such a part. Thus a short turn of a chat stays on the
+GPU, and the cache does not move.
+
+The accuracy: the test compares 256 rows of a prompt of 512 tokens. The
+top token of the GPU pass agrees with the float prompt pass of the CPU (mode
+0) for 100% of the rows. The CPU pass of mode 16 agrees for 97.7%. A two-turn chat and a
+prompt of 1681 tokens give the same tokens as the CPU.
+
+The speed of the prompt pass of the 26B on jackal:
+
+    prompt                 CPU        GPU               llama.cpp (-ncmoe 30 / 22)
+    512 tokens             ~65 tok/s  266 to 317 tok/s  301 / 407 (-ub 512)
+    1024 tokens            ~65 tok/s  about 510 tok/s   545 / 735 (-ub 1024)
+    1681 tokens, chat      60 tok/s   441 tok/s         -
+
+A profile of a chunk of 1024 tokens runs the records one at a time. The
+experts take 651 ms, the other products 457 ms, and the attention 221 ms.
+The copy of the experts takes about 1.9 s in all. The copy runs at the same time
+as the compute, so the copy limits a chunk of 1024 tokens. A longer chunk,
+or fewer bytes of experts to copy, makes the pass faster. The kernels do not
+use the tensor cores yet. llama.cpp uses them, and it holds all the experts
+of some layers on the GPU.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`
@@ -587,7 +641,8 @@ experts on the CPU take most of the rest.
   split, with the experts on the CPU. Then the hot experts on the GPU. Then
   a comparison with llama.cpp for each split. Its layer split is slower, so
   this runtime does not add one.
-- Phase 5: the prompt pass and the MTP group on the GPU. The prompt pass is
+- Phase 5: the prompt pass (done, see the results of phase 5) and the MTP
+  group on the GPU. The prompt pass is
   limited by the work of the multiply, not by memory, so the GPU gains the
   most there.
 

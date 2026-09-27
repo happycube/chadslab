@@ -1000,10 +1000,10 @@ class Model:
         return out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
 
     # ---- output head -------------------------------------------------------
-    def _gpu_step(self, ids, cache, pos):
-        """Run a decode step on the GPU. The first step with a cache copies
-        the cache to the GPU. From then on, the GPU has the new rows, until
-        _gpu_release writes them into the host cache."""
+    def _gpu_attach(self, cache):
+        """Return the GPU runner with this cache on the GPU. The first use of
+        a cache copies it to the GPU. From then on, the GPU has the new rows,
+        until _gpu_release writes them into the host cache."""
         g = self.__dict__.get("_gpu")
         if g is None:
             from . import gpu
@@ -1014,7 +1014,19 @@ class Model:
                 g.detach(self._gpu_cache)
             g.attach(cache)
             self._gpu_cache = cache
-        self._gpu_xn = g.step(ids, pos)
+        else:
+            g.kv.sync(cache)
+        return g
+
+    def _gpu_step(self, ids, cache, pos):
+        """Run a decode step on the GPU."""
+        self._gpu_xn = self._gpu_attach(cache).step(ids, pos)
+        return self._gpu_xn
+
+    def _gpu_prefill(self, ids, cache, start):
+        """Run a prompt on the GPU. Return the hidden states of every
+        token (see ModelGPU.prefill)."""
+        self._gpu_xn = self._gpu_attach(cache).prefill(list(ids), start)
         return self._gpu_xn
 
     def _gpu_release(self, cache):
@@ -1033,7 +1045,9 @@ class Model:
         Apply the softcap when requested.
         """
         xn = self.__dict__.get("_gpu_xn")
-        if xn is not None and apply_softcap and (x is xn or getattr(x, "base", None) is xn):
+        if (xn is not None and apply_softcap and x.shape[0] == 1
+                and (x is xn or getattr(x, "base", None) is xn)
+                and (x is xn or x.ctypes.data == xn[-1:].ctypes.data)):
             # The hidden state of the last GPU step: the GPU runs the head.
             return self._gpu.logits()
         if self._embed_q6k is not None:
@@ -1067,6 +1081,9 @@ class Model:
         of ids[0]. Use it to add tokens to a cache that already has data. The
         hook gives the time of each stage of every block.
         """
+        if (_GPU and hook is None and len(ids) > 1 and isinstance(cache, KVCache)
+                and self._dtype == "int4" and self.keep_weights):
+            return self._gpu_prefill(ids, cache, start)
         chunk = self.prefill_chunk
         x = None
         for off in range(0, len(ids), chunk):
