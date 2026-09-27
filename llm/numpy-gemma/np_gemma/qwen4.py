@@ -29,6 +29,8 @@ The new parts:
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from .gguf import open_gguf
@@ -76,9 +78,12 @@ class Qwen4Cache(QwenCache):
         self.ple_ids = np.full(cfg.ple_ngram - 1, cfg.ple_eos, dtype=np.int64)
         self.ple_conv = {i: np.zeros(((cfg.ple_conv_kernel - 1) * cfg.ple_ngram, hc_dim),
                                      np.float32) for i in cfg.ple_layers}
-        # The raw keys of the indexer of each QSA layer (one for each position).
+        # The raw keys of the indexer of each QSA layer (one for each position),
+        # and the key of each complete block (the C program keeps it).
         self.idx_k = {i: np.zeros((max_len, cfg.indexer_dim), np.float32)
                       for i, t in enumerate(cfg.layer_types) if t == "full_attention"}
+        self.idx_blk = {i: np.zeros((max_len // 4 + 1, cfg.indexer_dim), np.float32)
+                        for i in self.idx_k}
 
 
 def grouped_norm(x, w, hidden, eps):
@@ -329,8 +334,8 @@ def compile_qwen4_step(model, t):
     and names["ple"] (t x hid: the rows of the n-gram table). The output is
     names["xn"], the input of the head. The products are KQ_QUANT and
     KQ_LINEAR (csrc/kquants.c); the gated residual and the n-gram layer are
-    the records of csrc/hyperconn.c. QSA is the full attention (at most
-    2048 + 3 positions: the indexer is not in the program yet)."""
+    the records of csrc/hyperconn.c.
+    The QSA layers have QSA_SELECT (the indexer) and ATTN_QSA (csrc/qsa.c)."""
     from . import cops
     from . import program as P
     cfg = model.cfg
@@ -347,7 +352,13 @@ def compile_qwen4_step(model, t):
     xq, xs, xm = np.zeros((t, wide), np.int8), f32(t, wide // 32), f32(t, wide // 16)
     o1, o2, o3, o4, o5 = f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide)
     att, gate, qout, kbuf = f32(t, nq * hd), f32(t, nq * hd), f32(t, nq * hd), f32(t, nk * hd)
-    lo_n = (np.zeros(t, np.int32), np.zeros(t, np.int32))
+    ratio = lambda i: cfg.compress_ratios[i]  # noqa: E731
+    budget = lambda i: cfg.indexer_top_k // cfg.compress_ratios[i]  # noqa: E731
+    r0 = max(r for r in cfg.compress_ratios if r)
+    maxsel = cfg.indexer_top_k + r0 - 1
+    iq, ik = f32(t, cfg.indexer_heads * cfg.indexer_dim), f32(t, cfg.indexer_dim)
+    sel, cnt = np.zeros((t, maxsel), np.int32), np.zeros(t, np.int32)
+    qscr = prog.slot("qsa_scratch")
     keyn, qn, gated, gn = f32(t, HD), f32(t, HD), f32(t, HD), f32(t, HD)
     mo, logits = f32(t, hid), f32(t, E)
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
@@ -395,12 +406,15 @@ def compile_qwen4_step(model, t):
         rows = [scalar(P.S_ADD, bs, scalar(P.S_MUL, pos, step))
                 for bs, step in zip(base, (2 * per, per // 8, 2 * per, per // 8))]
         prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
-        if t <= 16:
-            for j in range(t):
-                nj = scalar(P.S_ADD, pos, j + 1)
-                prog.emit(P.ATTN_QC, qout[j:j + 1], *base, scores, att[j:j + 1], nq, nk, hd, nj)
-        else:
-            prog.emit(P.ATTN_QC_MT, qout, *base, scores, att, nq, nk, hd, t, pos, 0, 0, *lo_n)
+        # QSA: the indexer selects the keys of each query (csrc/qsa.c).
+        lin(b + "indexer.q_proj.weight", iq)
+        lin(b + "indexer.k_proj.weight", ik)
+        prog.emit(P.QSA_SELECT, iq, ik, prog.slot("idxk.%d" % i), prog.slot("blk.%d" % i),
+                  model.F(b + "indexer.q_norm.weight"), model.F(b + "indexer.k_norm.weight"),
+                  cos, sin, pos, t, cfg.indexer_heads, cfg.indexer_dim, ratio(i), budget(i),
+                  cfg.rotary_dim, float(cfg.rope_theta), eps, sel, cnt, maxsel, qscr,
+                  prog.slot("nbmax"))
+        prog.emit(P.ATTN_QSA, qout, *base, scores, att, nq, nk, hd, t, pos, sel, cnt, maxsel)
         prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
         quant(att, nq * hd)
         lin(b + "attn_output.weight", o5)
@@ -477,7 +491,12 @@ class Qwen4CPU(Qwen4):
         from .qwen import KMat
         m = self._k.get(gname)
         if m is None:
-            m = self._k[gname] = KMat(self.g, gname)
+            m = KMat(self.g, gname)
+            if m.type == 30:
+                # BF16 (the indexer): the products take it as F32.
+                a = self.G(gname)
+                m.data, m.type = np.ascontiguousarray(a, np.float32).view(np.uint8).reshape(-1), 0
+            self._k[gname] = m
         return m
 
     def F(self, gname, shape=None):
@@ -529,14 +548,18 @@ class Qwen4CPU(Qwen4):
         kw.update(cache_params(self, cache))
         for i in cfg.ple_layers:
             kw["pleconv.%d" % i] = cache.ple_conv[i]
+        for i, a in cache.idx_k.items():
+            kw["idxk.%d" % i], kw["blk.%d" % i] = a, cache.idx_blk[i]
+        nbmax = cache.max_len // min(r for r in cfg.compress_ratios if r) + 1
+        need = (os.cpu_count() or 1) * nbmax * 12
+        if getattr(self, "_qscr", None) is None or self._qscr.size < need:
+            self._qscr = np.zeros(need, np.uint8)
+        kw["qsa_scratch"], kw["nbmax"] = self._qscr, nbmax
         prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
 
     def forward(self, ids, cache, start_pos=0, hook=None):
         ids = list(ids)
         cfg = self.cfg
-        if start_pos + len(ids) > 2048 + 3:
-            raise NotImplementedError("the program has no QSA indexer yet: at most 2051 "
-                                      "positions (Qwen4 has it)")
         out = []
         c0 = 0
         while c0 < len(ids):

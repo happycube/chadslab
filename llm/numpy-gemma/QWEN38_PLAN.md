@@ -233,7 +233,15 @@ Status (in progress):
   int8 x is spread over all the products: with one group of products
   exact, it changes little. A router of 512 experts turns small changes
   into another expert more often than the 256 of Qwen3.6.
-- The program has no QSA indexer yet: at most 2051 positions.
+- QSA in the program (csrc/qsa.c): QSA_SELECT keeps the raw keys of the
+  indexer and the key of each complete block (made one time, when the
+  block is complete), and selects the keys of each query. ATTN_QSA is the
+  int16 attention on those keys (attn_i16_head_rows, the head of the 26B
+  with a list of rows). For 2600 random rows, the selection of the C code
+  equals that of Qwen4.qsa_mask for all 549 queries that drop blocks.
+- A prompt of 2941 tokens (QWEN_PLAN.md) and a question on it: a correct
+  answer. The prompt pass: 31 tok/s (with the compile); the decode: 152 ms
+  for each token.
 
 - Use the kernels of kquants.c for these parts:
   - the products (int8 x, a scale for each 32 values);

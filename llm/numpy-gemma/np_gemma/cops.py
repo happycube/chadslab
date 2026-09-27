@@ -31,7 +31,7 @@ _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
 # The files that bf16_linear.c includes; the hash of the library covers them.
 _SOURCES = [_SRC] + [_HERE / "csrc" / n for n in ("moe.c", "mlx_affine.c", "kquants.c", "deltanet.c",
-                                                 "hyperconn.c")]
+                                                 "hyperconn.c", "qsa.c")]
 _LIB_DIR = _HERE / "_libs"
 # The code builds three libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The third adds the VNNI

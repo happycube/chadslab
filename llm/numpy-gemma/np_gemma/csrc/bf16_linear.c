@@ -3847,16 +3847,18 @@ static inline float dot32_f32_i16(const float *a, const int16_t *b)
 #endif
 }
 
-/* One query head over n rows of the int16 cache. qh is float32. */
-static inline void attn_i16_head(const float *qh, const int16_t *kq, const float *ks,
-                                 const int16_t *vq, const float *vs, float *sc,
-                                 float *oh, int kv, int head_dim, size_t kv_stride,
-                                 size_t ks_stride, int n)
+/* One query head over n rows of the int16 cache. qh is float32. rows (or
+ * null for rows 0 to n - 1) gives the rows to read (QSA of qwen4exp). */
+static inline void attn_i16_head_rows(const float *qh, const int16_t *kq, const float *ks,
+                                      const int16_t *vq, const float *vs, float *sc,
+                                      float *oh, int kv, int head_dim, size_t kv_stride,
+                                      size_t ks_stride, int n, const int32_t *rows)
 {
     int g = head_dim / 32;
     for (int j = 0; j < n; ++j) {
-        const int16_t *kp = kq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
-        const float *ksp = ks + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        size_t r = rows ? (size_t)rows[j] : (size_t)j;
+        const int16_t *kp = kq + r * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *ksp = ks + r * ks_stride + (size_t)kv * (size_t)g;
         float s = 0.0f;
         for (int gg = 0; gg < g; ++gg) {
             s += dot32_f32_i16(qh + (size_t)gg * 32, kp + (size_t)gg * 32) * ksp[gg];
@@ -3881,8 +3883,9 @@ static inline void attn_i16_head(const float *qh, const int16_t *kq, const float
     }
     for (int j = 0; j < n; ++j) {
         float p = sc[j] * inv;
-        const int16_t *vp = vq + (size_t)j * kv_stride + (size_t)kv * (size_t)head_dim;
-        const float *vsp = vs + (size_t)j * ks_stride + (size_t)kv * (size_t)g;
+        size_t r = rows ? (size_t)rows[j] : (size_t)j;
+        const int16_t *vp = vq + r * kv_stride + (size_t)kv * (size_t)head_dim;
+        const float *vsp = vs + r * ks_stride + (size_t)kv * (size_t)g;
         for (int gg = 0; gg < g; ++gg) {
             const int16_t *vpp = vp + (size_t)gg * 32;
             float *op = oh + (size_t)gg * 32;
@@ -3908,6 +3911,14 @@ static inline void attn_i16_head(const float *qh, const int16_t *kq, const float
 #endif
         }
     }
+}
+
+static inline void attn_i16_head(const float *qh, const int16_t *kq, const float *ks,
+                                 const int16_t *vq, const float *vs, float *sc,
+                                 float *oh, int kv, int head_dim, size_t kv_stride,
+                                 size_t ks_stride, int n)
+{
+    attn_i16_head_rows(qh, kq, ks, vq, vs, sc, oh, kv, head_dim, kv_stride, ks_stride, n, NULL);
 }
 
 /* The attention of one float32 query over n rows of the int16 cache. q is
@@ -6973,6 +6984,7 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
 #include "kquants.c"
 #include "deltanet.c"
 #include "hyperconn.c"
+#include "qsa.c"
 
 /* ---------- small operations of other models (Qwen3.5) ---------- */
 
@@ -7123,7 +7135,7 @@ enum {
     GP_KQ_MOE = 109,
     /* qwen4exp: the gated residual and the n-gram layer (hyperconn.c) */
     GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
-    GP_PLE_CONV = 119,
+    GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121,
 };
 
 int gemma_gp_record_size(void)
@@ -7511,6 +7523,22 @@ static void gp_step(const gp_rec *r, int64_t *e)
         /* gn, gated, H, state, w, t, channels, kernel, dilation */
         ple_conv_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_P(float, 3),
                       GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7), GP_I(8));
+        break;
+    case GP_QSA_SELECT:
+        /* iq, ik, idxk, blk, qn, kn, cos, sin, pos, t, heads, d, ratio, budget, rot, theta,
+         * eps, sel, cnt, maxsel, scratch, nbmax */
+        qsa_select_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_P(float, 3),
+                        GP_P(const float, 4), GP_P(const float, 5), GP_P(const float, 6),
+                        GP_P(const float, 7), gp_i(r, e, 8), GP_I(9), GP_I(10), GP_I(11), GP_I(12),
+                        GP_I(13), GP_I(14), gp_f(r, e, 15), gp_f(r, e, 16), GP_P(int32_t, 17),
+                        GP_P(int32_t, 18), GP_I(19), GP_P(uint8_t, 20), gp_i(r, e, 21));
+        break;
+    case GP_ATTN_QSA:
+        /* q, kq, ks, vq, vs, scores, out, nq, nk, hd, t, pos, sel, cnt, maxsel */
+        attn_qsa_body(GP_P(const float, 0), GP_P(const int16_t, 1), GP_P(const float, 2),
+                      GP_P(const int16_t, 3), GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                      GP_I(7), GP_I(8), GP_I(9), GP_I(10), gp_i(r, e, 11), GP_P(const int32_t, 12),
+                      GP_P(const int32_t, 13), GP_I(14));
         break;
     case GP_KQ_QUANT:
         /* x, t, cols, xq, xs, xm */
