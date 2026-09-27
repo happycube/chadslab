@@ -43,6 +43,13 @@ def _default_threads():
 # machine.
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", str(min(8, _default_threads())))
 _os.environ.setdefault("OMP_NUM_THREADS", str(_default_threads()))
+# Keep each OpenMP thread on one core. The threads then keep their caches and
+# the pages that they read, and the OS does not move them. The runner of the
+# parts (np_gemma/parts.py) needs it: on jackal, a step of the 26B in 2 parts
+# takes 45.5 ms with it and 52.1 ms without it. A step of one program changes
+# by less than the noise. Set the variables yourself to override the values.
+_os.environ.setdefault("OMP_PLACES", "cores")
+_os.environ.setdefault("OMP_PROC_BIND", "close")
 
 from .config import Config
 from .st import SafeTensors

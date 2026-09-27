@@ -325,12 +325,16 @@ ms before. 3 parts cost about 3.5 ms, against 13.6 ms before.
 The cache is still one buffer for all the heads. On a machine with NUMA,
 each part must hold the cache of its heads in the memory of its node.
 
-It is important to bind the threads to the cores. Without OMP_PROC_BIND,
-a step of the 26B at a context of 200 takes 52 ms with one part. With
-OMP_PROC_BIND=close, it takes 44 ms. The step of the 12B takes 161 ms,
-against 133 ms. For this reason, an early run with free threads showed two
-parts faster than one part. The runner of the parts binds its teams in all
-cases.
+It is important to bind the threads of the parts to the cores. For this
+reason, an early run with free threads showed two parts faster than one
+part. The runner of the parts binds its teams in all cases. The package now
+sets OMP_PLACES=cores and OMP_PROC_BIND=close when they are not set.
+
+A first measurement gave 15 per cent for the binding of one program, but
+that run had OMP_PLACES without OMP_PROC_BIND, and jackal had other load. A
+second run gave a step of 44.6 ms with the binding and 45.9 ms without it at
+a context of 200, and 64.6 ms against 62.7 ms at 1100. A clean A/B test on
+an idle machine is still to do.
 
 The next steps for NUMA:
 
