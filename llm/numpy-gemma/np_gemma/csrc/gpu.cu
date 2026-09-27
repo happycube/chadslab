@@ -2142,6 +2142,244 @@ __global__ void k_flash_tc(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* ---------- the attention of a large group over a float32 cache ----------
+ * k_flash_f32h: FlashAttention-2 for the record GP_ATTN_F32H (the cache of
+ * the E4B model). It gives the result of k_flash_tc<1>, but it is faster:
+ *
+ * 1. Block (kv, tile, z) takes key and value head kv, the 16 queries of the
+ *    tile, and HB query heads of that key head. The query heads share the
+ *    keys and the values in shared memory, so the block reads them one time
+ *    for HB heads.
+ * 2. The keys and the values come to shared memory as float32 with
+ *    cp.async. With ST 2, the copy of the next step of FK3 keys runs during
+ *    the compute of this step.
+ * 3. The fragments become float16 in registers. The rows of K have HD + 8
+ *    values and the rows of V have HD + 4, so the reads of a warp do not
+ *    hit the same bank.
+ * 4. For HD 256, the fragments of the queries stay in registers. For HD 512
+ *    they are in shared memory as float16.
+ *
+ * Warp w takes query head w / NS and the 256 output values (w % NS) * 256.
+ * NS is HD / 256. */
+#define FK3 16
+
+__device__ __forceinline__ void cp_async16_z(void *smem, const void *gmem, int bytes)
+{
+    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(sa), "l"(gmem), "r"(bytes));
+}
+
+__device__ __forceinline__ uint32_t pack_h2(float a, float b)
+{
+    __half2 h = __floats2half2_rn(a, b);
+    return *(uint32_t *)&h;
+}
+
+template <int HD>
+struct flash3_dims {
+    static constexpr int NS = HD / 256;
+    static constexpr int KLD = HD + 8;
+    static constexpr int VLD = HD + 4;
+    static constexpr int QLD = HD + 8;
+};
+
+template <int HD, int HB, int ST>
+__global__ void __launch_bounds__(32 * HB * (HD / 256))
+k_flash_f32h(const gp_rec *r, const int64_t *e)
+{
+    typedef flash3_dims<HD> D;
+    extern __shared__ float fsm3[];
+    float *kbuf = fsm3;                                   /* ST x FK3 x KLD */
+    float *vbuf = kbuf + ST * FK3 * D::KLD;               /* ST x FK3 x VLD */
+    __half *qs = (__half *)(vbuf + ST * FK3 * D::VLD);    /* HB x 16 x QLD (HD 512) */
+    int qh = DI(5), kvh = DI(6), t = DI(8);
+    int window = DI(11);
+    int64_t pos = di(r, e, 9), hs = di(r, e, 10);
+    const float *q = DP(const float, 0);
+    float *out = DP(float, 4);
+    int G = qh / kvh, kv = blockIdx.x, j0 = blockIdx.y * 16;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int hl = warp / D::NS, dsl = warp % D::NS;
+    int h = kv * G + blockIdx.z * HB + hl;
+    int g = lane / 4, c = lane % 4;
+    const float *kf = DP(const float, 1) + (size_t)kv * hs;
+    const float *vf = DP(const float, 2) + (size_t)kv * hs;
+    bool live0 = j0 + g < t, live1 = j0 + g + 8 < t;
+    int64_t p0 = pos + j0 + g, p1 = p0 + 8;
+    int jl = min(t, j0 + 16) - 1;
+    int64_t first = window > 0 ? pos + j0 - window + 1 : 0;
+    if (first < 0) {
+        first = 0;
+    }
+    int64_t last = pos + jl;
+    int nsteps = (int)((last - first) / FK3) + 1;
+
+    auto load = [&](int stage, int64_t k0) {
+        int kn = (int)min((int64_t)FK3, last - k0 + 1);
+        float *kd = kbuf + stage * FK3 * D::KLD, *vd = vbuf + stage * FK3 * D::VLD;
+        for (int x = threadIdx.x; x < FK3 * HD / 4; x += blockDim.x) {
+            int a = x / (HD / 4), d = (x % (HD / 4)) * 4;
+            bool ok = a < kn;
+            size_t o2 = (size_t)(ok ? k0 + a : k0) * HD + d;
+            cp_async16_z(kd + a * D::KLD + d, kf + o2, ok ? 16 : 0);
+            cp_async16_z(vd + a * D::VLD + d, vf + o2, ok ? 16 : 0);
+        }
+        cp_async_commit();
+    };
+    load(0, first);
+
+    /* The queries: rows g and g + 8 are the queries j0 + g and j0 + g + 8. */
+    const float *q0r = q + ((size_t)(j0 + g) * qh + h) * HD;
+    const float *q1r = q + ((size_t)(j0 + g + 8) * qh + h) * HD;
+    uint32_t qa[D::NS == 1 ? HD / 16 : 1][4];
+    if (D::NS == 1) {
+        #pragma unroll
+        for (int kk = 0; kk < HD; kk += 16) {
+            int k2 = D::NS == 1 ? kk / 16 : 0;
+            int d = kk + 2 * c;
+            qa[k2][0] = live0 ? pack_h2(q0r[d], q0r[d + 1]) : 0u;
+            qa[k2][1] = live1 ? pack_h2(q1r[d], q1r[d + 1]) : 0u;
+            qa[k2][2] = live0 ? pack_h2(q0r[d + 8], q0r[d + 9]) : 0u;
+            qa[k2][3] = live1 ? pack_h2(q1r[d + 8], q1r[d + 9]) : 0u;
+        }
+    } else {
+        for (int x = threadIdx.x; x < HB * 16 * HD; x += blockDim.x) {
+            int hh = x / (16 * HD), a = (x / HD) % 16, d = x % HD;
+            int jj = j0 + a;
+            qs[(hh * 16 + a) * D::QLD + d] = __float2half_rn(
+                jj < t ? q[((size_t)jj * qh + kv * G + blockIdx.z * HB + hh) * HD + d] : 0.f);
+        }
+    }
+    const __half *qw = qs + hl * 16 * D::QLD;
+
+    float o[32][4];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    }
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    for (int s = 0; s < nsteps; ++s) {
+        int64_t k0 = first + (int64_t)s * FK3;
+        int kn = (int)min((int64_t)FK3, last - k0 + 1);
+        int st = ST == 2 ? (s & 1) : 0;
+        if (ST == 2 && s + 1 < nsteps) {
+            load(st ^ 1, k0 + FK3);
+            cp_async_wait1();
+        } else {
+            cp_async_wait0();
+        }
+        __syncthreads();
+        const float *kd = kbuf + st * FK3 * D::KLD;
+        const float *vd = vbuf + st * FK3 * D::VLD;
+        /* S: 16 queries by FK3 keys = 2 tiles of 8 keys. */
+        float sc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        #pragma unroll
+        for (int kk = 0; kk < HD; kk += 16) {
+            uint32_t a[4];
+            if (D::NS == 1) {
+                int k2 = D::NS == 1 ? kk / 16 : 0;
+                a[0] = qa[k2][0];
+                a[1] = qa[k2][1];
+                a[2] = qa[k2][2];
+                a[3] = qa[k2][3];
+            } else {
+                a[0] = *(const uint32_t *)&qw[g * D::QLD + kk + 2 * c];
+                a[1] = *(const uint32_t *)&qw[(g + 8) * D::QLD + kk + 2 * c];
+                a[2] = *(const uint32_t *)&qw[g * D::QLD + kk + 2 * c + 8];
+                a[3] = *(const uint32_t *)&qw[(g + 8) * D::QLD + kk + 2 * c + 8];
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const float *kr = kd + (nt * 8 + g) * D::KLD + kk + 2 * c;
+                float2 x0 = *(const float2 *)kr, x1 = *(const float2 *)(kr + 8);
+                uint32_t b[2] = {pack_h2(x0.x, x0.y), pack_h2(x1.x, x1.y)};
+                mma16816(sc[nt], a, b);
+            }
+        }
+        /* The mask and the online softmax, as in k_flash_tc. */
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                int kk = nt * 8 + 2 * c + u;
+                int64_t kp = k0 + kk;
+                bool ok0 = live0 && kk < kn && kp <= p0 && (window == 0 || p0 - kp < window);
+                bool ok1 = live1 && kk < kn && kp <= p1 && (window == 0 || p1 - kp < window);
+                sc[nt][u] = ok0 ? sc[nt][u] : -INFINITY;
+                sc[nt][2 + u] = ok1 ? sc[nt][2 + u] : -INFINITY;
+                mx0 = fmaxf(mx0, sc[nt][u]);
+                mx1 = fmaxf(mx1, sc[nt][2 + u]);
+            }
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, off));
+        }
+        float sc0 = (mx0 == -INFINITY || m0 == -INFINITY) ? (m0 == -INFINITY ? 0.f : 1.f)
+                                                            : expf(m0 - mx0);
+        float sc1 = (mx1 == -INFINITY || m1 == -INFINITY) ? (m1 == -INFINITY ? 0.f : 1.f)
+                                                            : expf(m1 - mx1);
+        float ls0 = 0.f, ls1 = 0.f;
+        uint32_t pa[4];
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            float e0 = sc[nt][0] == -INFINITY ? 0.f : expf(sc[nt][0] - mx0);
+            float e1 = sc[nt][1] == -INFINITY ? 0.f : expf(sc[nt][1] - mx0);
+            float e2 = sc[nt][2] == -INFINITY ? 0.f : expf(sc[nt][2] - mx1);
+            float e3 = sc[nt][3] == -INFINITY ? 0.f : expf(sc[nt][3] - mx1);
+            ls0 += e0 + e1;
+            ls1 += e2 + e3;
+            pa[nt * 2 + 0] = pack_h2(e0, e1);
+            pa[nt * 2 + 1] = pack_h2(e2, e3);
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            ls0 += __shfl_xor_sync(0xffffffff, ls0, off);
+            ls1 += __shfl_xor_sync(0xffffffff, ls1, off);
+        }
+        if (mx0 != -INFINITY) {
+            l0 = l0 * sc0 + ls0;
+            m0 = mx0;
+        }
+        if (mx1 != -INFINITY) {
+            l1 = l1 * sc1 + ls1;
+            m1 = mx1;
+        }
+        float f0 = mx0 == -INFINITY ? 1.f : sc0, f1 = mx1 == -INFINITY ? 1.f : sc1;
+        /* O += P V. A fragment of B: b0 = V[2c, 2c + 1][d], b1 = V[2c + 8, 2c + 9][d]. */
+        #pragma unroll
+        for (int nt = 0; nt < 32; ++nt) {
+            o[nt][0] *= f0;
+            o[nt][1] *= f0;
+            o[nt][2] *= f1;
+            o[nt][3] *= f1;
+            int d = dsl * 256 + nt * 8 + g;
+            const float *vr = vd + (2 * c) * D::VLD + d;
+            uint32_t b[2] = {pack_h2(vr[0], vr[D::VLD]),
+                             pack_h2(vr[8 * D::VLD], vr[9 * D::VLD])};
+            mma16816(o[nt], pa, b);
+        }
+        __syncthreads();
+        if (ST == 1 && s + 1 < nsteps) {
+            load(0, k0 + FK3);
+        }
+    }
+    float inv0 = l0 > 0.f ? 1.0f / l0 : 0.f, inv1 = l1 > 0.f ? 1.0f / l1 : 0.f;
+    #pragma unroll
+    for (int nt = 0; nt < 32; ++nt) {
+        int d = dsl * 256 + nt * 8 + 2 * c;
+        if (live0) {
+            *(float2 *)&out[((size_t)(j0 + g) * qh + h) * HD + d] =
+                make_float2(o[nt][0] * inv0, o[nt][1] * inv0);
+        }
+        if (live1) {
+            *(float2 *)&out[((size_t)(j0 + g + 8) * qh + h) * HD + d] =
+                make_float2(o[nt][2] * inv1, o[nt][3] * inv1);
+        }
+    }
+}
+
 /* GP_ROUTER_MT: x, scale, proj, per_expert, hidden, experts, top_k, eps,
  * hscale, val, idx, t, r, logits. The kernels do the steps of GP_ROUTER for
  * each token. First the norm of the rows into r. Then the logits, as a
@@ -3072,6 +3310,57 @@ static int gg_gemv_max = MT_MAX;
  * k_moe_gemm_tc). 0: the float32 kernels (k_gemm, k_moe_gemm). */
 static int gg_tc = 1;
 
+template <int HD, int HB, int ST>
+static void flash3_run(const gp_rec *dr, const int64_t *denv, int kvh, int t, int G)
+{
+    typedef flash3_dims<HD> D;
+    size_t smem = (size_t)ST * FK3 * (D::KLD + D::VLD) * sizeof(float) +
+                  (D::NS == 1 ? 0 : (size_t)HB * 16 * D::QLD * sizeof(__half));
+    cudaFuncSetAttribute(k_flash_f32h<HD, HB, ST>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    dim3 grid((unsigned)kvh, (unsigned)cdiv(t, 16), (unsigned)(G / HB));
+    k_flash_f32h<HD, HB, ST><<<grid, 32 * HB * D::NS, smem, gg_stream>>>(dr, denv);
+}
+
+/* Launch k_flash_f32h for a GP_ATTN_F32H record. Return -1 when it does not
+ * take the shape. NP_GEMMA_GPU_FLASH=1 selects k_flash_tc<1> for a test. */
+static int flash3_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, int *bad)
+{
+    static int old = -1;
+    if (old < 0) {
+        const char *v = getenv("NP_GEMMA_GPU_FLASH");
+        old = v && v[0] == '1';
+    }
+    if (old) {
+        return -1;
+    }
+    int64_t qh = hlit(r, 5, bad), kvh = hlit(r, 6, bad), hd = hlit(r, 7, bad);
+    int64_t t = hlit(r, 8, bad);
+    if (kvh <= 0 || qh % kvh) {
+        return -1;
+    }
+    int G = (int)(qh / kvh);
+    if (hd == 256) {
+        if (G % 4 == 0) {
+            flash3_run<256, 4, 2>(dr, denv, (int)kvh, (int)t, G);
+        } else if (G % 2 == 0) {
+            flash3_run<256, 2, 2>(dr, denv, (int)kvh, (int)t, G);
+        } else {
+            flash3_run<256, 1, 2>(dr, denv, (int)kvh, (int)t, G);
+        }
+        return 0;
+    }
+    if (hd == 512) {
+        if (G % 2 == 0) {
+            flash3_run<512, 2, 1>(dr, denv, (int)kvh, (int)t, G);
+        } else {
+            flash3_run<512, 1, 1>(dr, denv, (int)kvh, (int)t, G);
+        }
+        return 0;
+    }
+    return -1;
+}
+
 static int flash_tc_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, int f32h,
                            int *bad)
 {
@@ -3251,7 +3540,8 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             if (hlit(r, 7, &bad) % FD != 0 || hlit(r, 7, &bad) > 512) {
                 bad = 1;
             }
-            if (!(gg_tc && g->tc && flash_tc_launch(r, dr, denv, 1, &bad) == 0)) {
+            if (!(gg_tc && g->tc && (flash3_launch(r, dr, denv, &bad) == 0 ||
+                                     flash_tc_launch(r, dr, denv, 1, &bad) == 0))) {
                 k_flash_qc_mt<1><<<dim3((unsigned)hlit(r, 5, &bad),
                                         (unsigned)cdiv(hlit(r, 8, &bad), FQ)), 256, 0, s>>>(
                     dr, denv);

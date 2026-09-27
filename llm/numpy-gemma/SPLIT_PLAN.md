@@ -716,6 +716,49 @@ products. The attention (80 ms) and the small operations (about 45 ms) now
 take as much time as the products. The default stays float16, because it
 stays closer to the float32 result.
 
+### A comparison with llama.cpp in nsys
+
+Nsight Systems recorded the prompt pass of 1024 tokens of the E4B, in
+llama.cpp (llama-bench -p 1024 -fa 1) and in this runtime (int8 products).
+The option --cuda-graph-trace node records each kernel in a CUDA graph. The
+times are for one pass:
+
+    part                          llama.cpp   this runtime   after the fixes
+    products, with the quantize   128 ms      161 ms         156 ms
+    attention                     9 ms        88 ms          16 ms
+    projection of the layer input 1 ms        11 ms          11 ms
+    small operations              30 ms       42 ms          42 ms
+    all the GPU kernels           171 ms      302 ms         224 ms
+    rows of the embeddings        on the GPU  343 ms (CPU)   7 ms (CPU)
+    the pass                      200 ms      600 ms         255 ms
+
+The products were not the cause of the difference. Two things were:
+
+1. E4B.embed_rows decoded the Q6_K rows of the two tables of the embeddings one
+   token at a time in NumPy. The GPU waited for 343 ms. GGUF.take_rows now
+   gathers the rows, and the C function gemma_q6k_rows decodes them in
+   parallel. It takes 7 ms and gives the same values.
+2. The kernel k_flash_tc used 2 warps for each block, and it read 16 keys
+   in each step with no copy ahead. Each query head read the keys again. It
+   wrote the values to shared memory in columns, so the writes hit the same
+   bank. The new kernel k_flash_f32h (GP_ATTN_F32H) gives the same values:
+   - One block takes the 4 query heads of a key head, so it reads the keys
+     and the values one time for 4 heads.
+   - cp.async copies the next step of keys and values during the compute
+     (two buffers for heads of 256 values; one buffer for 512).
+   - The rows in shared memory have a pad, so the reads do not hit the
+     same bank. The fragments become float16 in registers.
+   The attention goes from 88 ms to 16 ms. NP_GEMMA_GPU_FLASH=1 selects the
+   old kernel.
+
+    E4B, 1024 tokens        before       now          llama.cpp
+    float16 products        1527 tok/s   2902 tok/s   -
+    int8 products           1756 tok/s   4093 tok/s   5113 tok/s
+
+The layers with heads of 512 values take 9 of the 16 ms of the attention.
+The next steps are the projection of the layer input in float16 (11 ms to
+about 1 ms), and fused small operations (about 10 ms).
+
 ### The drafter on the GPU
 
 GPUDrafter compiles one draft step of the E4B assistant for the GPU. The
