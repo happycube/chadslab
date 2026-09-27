@@ -260,13 +260,45 @@ Status (in progress):
 
 ### Phase 3: MTP on the CPU
 
-- The drafter: the MTP layer on the hidden state of the 4 streams and the
-  row of the token. It keeps its own cache of keys and values.
-- The verify group and commit of QWEN_PLAN.md phase 3 (the log of the
-  DeltaNet) are ready. Add the state of PLE (the last tokens and the
-  convolution) to the log.
-- Measure the accepted drafts on real answers, and the rate for 1 to 5
-  drafts (llama.cpp: --spec-draft-n-max 5).
+Status (done; scripts/check_qwen4_mtp.py):
+
+- The MTP layer (blk.48, in its own file; GGUFSplit.attach adds its
+  tensors). Qwen4.mtp is the NumPy layer, after graph_mtp of llama.cpp:
+  - the inputs: the streams of the model at position p - 1 (zeros before
+    position 0) and the token at p;
+  - for each stream: enorm of the token row, then hnorm of the stream
+    (the record HC_CAT), then eh_proj (5120 to 2560);
+  - hc_attn and a dense attention (its own int16 cache, Qwen4MTPCache);
+  - the MoE (512 experts, Q8_0), the head mixer nextn.hc_head, and the
+    head of the model;
+  - the streams of the layer are the input of the next draft.
+- compile_qwen4_step(mtp=True) is the layer as a program. A dense layer
+  uses ATTN_QSA with a count of -1 (all the positions). With the streams of
+  4 layers, 91% of its top tokens are those of Qwen4.mtp.
+- compile_qwen4_step(verify=True): the GDN records write a log. Qwen4CPU
+  commit(n) applies it, and makes the state of the n-gram layer again
+  from a copy and the first n inputs of its convolution. A verify group
+  and commit give the same bits as steps. The keys of the indexer need no
+  change: a block that is not complete gets its key again in the next run.
+- Qwen4CPU.generate_mtp: draft with the MTP layer, verify the group, then
+  the MTP layer on the accepted drafts with the streams of the model.
+  The tokens are those of greedy decode with no drafts.
+
+The rate of the decode (greedy; the plain decode is 6.9 to 7.2 tok/s):
+
+    drafts  accepted  tokens a round  tok/s   the time of a round
+    1       98%       2.00            9.9     draft 15 ms, verify 182 ms
+    2       93%       2.88            11.4    draft 29 ms, verify 216 ms
+    3       89%       3.63            13.1    draft 44 ms, verify 223 ms
+    4       80%       4.26            13.0    draft 58 ms, verify 261 ms
+
+This is a code answer of 98 tokens. The answer "why the sky is blue" with
+3 drafts: 67% accepted, 10.8 tok/s. llama.cpp with MTP on the CPU:
+9.0 tok/s (3 drafts). The verify group costs more than a step (a group of
+4 tokens reads up to 40 experts in each layer).
+
+Next: the first draft can go in the same group as the MTP layer on the
+accepted drafts (about 6 ms a round).
 
 ### Phase 4: the rate of the CPU
 

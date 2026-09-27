@@ -86,6 +86,25 @@ class Qwen4Cache(QwenCache):
                         for i in self.idx_k}
 
 
+class Qwen4MTPCache:
+    """The keys and values of the MTP layer (a dense attention layer after
+    the last layer of the model), in the form of QwenCache."""
+
+    def __init__(self, cfg, max_len=4096, kv=None):
+        self.cfg, self.n, self.max_len = cfg, 0, max_len
+        self.kv_form = kv or getattr(cfg, "kv_form", "f32")
+        self.layer = cfg.num_hidden_layers
+        per = cfg.num_kv_heads * cfg.head_dim
+        if self.kv_form == "int16":
+            self.kv = {self.layer: [np.zeros((max_len, per), np.int16),
+                                    np.zeros((max_len, per // 32), np.float32),
+                                    np.zeros((max_len, per), np.int16),
+                                    np.zeros((max_len, per // 32), np.float32)]}
+        else:
+            shape = (cfg.num_kv_heads, max_len, cfg.head_dim)
+            self.kv = {self.layer: [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]}
+
+
 def grouped_norm(x, w, hidden, eps):
     """RMS norm of each group of hidden values of the last axis, times w (the
     weights of the file have the 1 in them)."""
@@ -103,9 +122,12 @@ class Qwen4(QwenGGUF):
         logits = m.logits(h[-1:])
     """
 
-    def __init__(self, path, cfg=None, layers=None):
+    def __init__(self, path, cfg=None, layers=None, mtp=None):
         self.path = path
         self.g = open_gguf(path)
+        if mtp is not None:
+            # The MTP layer (blk.<layers>) is in its own file.
+            self.g.attach(mtp)
         self.cfg = cfg or config_from_gguf(self.g)
         self.n_layers = layers or self.cfg.num_hidden_layers
         self._deq = {}
@@ -228,8 +250,10 @@ class Qwen4(QwenGGUF):
         t, n = h.shape[0], pos + h.shape[0]
         nh, d = cfg.indexer_heads, cfg.indexer_dim
         p = "blk.%d.indexer." % i
+        ratio = cfg.compress_ratios[i] if i < len(cfg.compress_ratios) else 0
+        if ratio == 0:
+            return None                  # a dense layer (the MTP layer)
         cache.idx_k[i][pos:n] = h @ self.G(p + "k_proj.weight").T
-        ratio = cfg.compress_ratios[i]
         budget = cfg.indexer_top_k // ratio
         if n // ratio <= budget:
             return None
@@ -324,10 +348,39 @@ class Qwen4(QwenGGUF):
         self.last_streams = H
         return self.hc_pre(H, "output_hc", inject=False)
 
+    # ---- the MTP layer ----
+
+    def mtp(self, Hs, ids, mcache, pos):
+        """The MTP layer (llama.cpp qwen4exp.cpp, graph_mtp). Row j pairs
+        the streams of the model at position pos + j - 1 (Hs: t x hc x
+        hidden; zeros before position 0) with the token at pos + j. Return
+        the input of the head (the prediction of the token at pos + j + 1);
+        mtp_streams gets the streams of the layer (the Hs of the next draft
+        step)."""
+        cfg = self.cfg
+        L = cfg.num_hidden_layers
+        b = "blk.%d." % L
+        t, hc, hid = Hs.shape
+        eps = cfg.rms_norm_eps
+        e = rms_norm(self.embed(ids), self.G(b + "nextn.enorm.weight"), eps)
+        hn = grouped_norm(Hs.reshape(t, hc * hid), self.G(b + "nextn.hnorm.weight"), hid, eps)
+        # For each stream: the embedding, then the stream (ggml_concat of
+        # enorm and hnorm), then eh_proj.
+        cat = np.concatenate([np.repeat(e[:, None, :], hc, axis=1), hn.reshape(t, hc, hid)],
+                             axis=-1)
+        R = (cat @ self.G(b + "nextn.eh_proj.weight").T).astype(np.float32)
+        x, w = self.hc_pre(R, b + "hc_attn")
+        R = R + self.full_attention(L, x, mcache, pos)[:, None, :] * w[:, :, None]
+        x, w = self.hc_pre(R, b + "hc_ffn")
+        R = (R + self.moe(L, x)[:, None, :] * w[:, :, None]).astype(np.float32)
+        mcache.n = pos + t
+        self.mtp_streams = R
+        return self.hc_pre(R, b + "nextn.hc_head", inject=False)
+
 
 # ---- the CPU path: the step as a program of records (QWEN38_PLAN.md, phase 2) ----
 
-def compile_qwen4_step(model, t):
+def compile_qwen4_step(model, t, verify=False, mtp=False):
     """Compile a step of t tokens of a Qwen4CPU into a program of records.
 
     The inputs are names["H"] (t x hc * hid: the embeddings in each stream)
@@ -335,7 +388,17 @@ def compile_qwen4_step(model, t):
     names["xn"], the input of the head. The products are KQ_QUANT and
     KQ_LINEAR (csrc/kquants.c); the gated residual and the n-gram layer are
     the records of csrc/hyperconn.c.
-    The QSA layers have QSA_SELECT (the indexer) and ATTN_QSA (csrc/qsa.c)."""
+    The QSA layers have QSA_SELECT (the indexer) and ATTN_QSA (csrc/qsa.c).
+
+    verify makes an MTP verify group: the GDN records write a log
+    (names["log.<layer>"]) and do not change the state; Qwen4CPU.commit
+    applies the first n tokens. names["gn.<layer>"] has the inputs of the
+    convolution of each n-gram layer, for the commit of its state.
+
+    mtp compiles the MTP layer (Qwen4.mtp) in place of the model: the
+    inputs are names["e"] (t x hid: the embeddings) and names["h"] (t x
+    hc * hid: the streams of the model); names["H"] gets the streams of the
+    layer, and names["xn"] the input of the head."""
     from . import cops
     from . import program as P
     cfg = model.cfg
@@ -348,22 +411,23 @@ def compile_qwen4_step(model, t):
     f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
     H, ple, xn = f32(t, HD), f32(t, hid), f32(t, hid)
     hn, g, lo, loa, mixed, inj = f32(t, HD), f32(t, HD), f32(t, lr), f32(t, lr), f32(t, hid), f32(t, hc)
-    wide = max(HD, cd, nq * 2 * hd, vd, nq * hd)
+    wide = max(HD, cd, nq * 2 * hd, vd, nq * hd, 2 * HD if mtp else 0)
     xq, xs, xm = np.zeros((t, wide), np.int8), f32(t, wide // 32), f32(t, wide // 16)
     o1, o2, o3, o4, o5 = f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide)
     att, gate, qout, kbuf = f32(t, nq * hd), f32(t, nq * hd), f32(t, nq * hd), f32(t, nk * hd)
-    ratio = lambda i: cfg.compress_ratios[i]  # noqa: E731
+    ratio = lambda i: cfg.compress_ratios[i] if i < len(cfg.compress_ratios) else 0  # noqa: E731
     budget = lambda i: cfg.indexer_top_k // cfg.compress_ratios[i]  # noqa: E731
     r0 = max(r for r in cfg.compress_ratios if r)
     maxsel = cfg.indexer_top_k + r0 - 1
     iq, ik = f32(t, cfg.indexer_heads * cfg.indexer_dim), f32(t, cfg.indexer_dim)
     sel, cnt = np.zeros((t, maxsel), np.int32), np.zeros(t, np.int32)
+    dense = np.full(t, -1, np.int32)      # cnt of a dense layer: all the positions
     qscr = prog.slot("qsa_scratch")
-    keyn, qn, gated, gn = f32(t, HD), f32(t, HD), f32(t, HD), f32(t, HD)
+    keyn, qn, gated = f32(t, HD), f32(t, HD), f32(t, HD)
     mo, logits = f32(t, hid), f32(t, E)
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
     scratch = cops.kq_moe_scratch(t, k, E, hid, inner)
-    gscr = f32(t * cd)
+    gscr = f32(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0))
     prog.names.update(H=H, ple=ple, xn=xn)
     pos, cos, sin, scores = prog.slot("pos"), prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
     cur = {}
@@ -406,6 +470,14 @@ def compile_qwen4_step(model, t):
         rows = [scalar(P.S_ADD, bs, scalar(P.S_MUL, pos, step))
                 for bs, step in zip(base, (2 * per, per // 8, 2 * per, per // 8))]
         prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
+        if ratio(i) == 0:
+            # A dense layer (the MTP layer).
+            prog.emit(P.ATTN_QSA, qout, *base, scores, att, nq, nk, hd, t, pos, sel, dense,
+                      maxsel)
+            prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
+            quant(att, nq * hd)
+            lin(b + "attn_output.weight", o5)
+            return
         # QSA: the indexer selects the keys of each query (csrc/qsa.c).
         lin(b + "indexer.q_proj.weight", iq)
         lin(b + "indexer.k_proj.weight", ik)
@@ -426,16 +498,21 @@ def compile_qwen4_step(model, t):
         lin(b + "ssm_beta.weight", o3)
         lin(b + "ssm_alpha.weight", o4)
         from .qwen import gdn_flags
+        log = None
+        if verify:
+            log = prog.names["log.%d" % i] = np.zeros(cops.gdn_log_floats(
+                t, cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim), np.float32)
         prog.emit(P.GDN, o1, prog.slot("conv.%d" % i), model.F(b + "ssm_conv1d.weight", (cd, cfg.conv_kernel)),
                   cfg.conv_kernel, o2, o4, o3, model.A_log(i), model.F(b + "ssm_dt.bias"),
                   model.F(b + "ssm_norm.weight"), prog.slot("S.%d" % i), att, gscr, t,
-                  cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps, None,
+                  cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps, log,
                   gdn_flags(cfg), prog.slot("nreal"))
         quant(att, vd)
         lin(b + "ssm_out.weight", o5)
 
     def ple_layer(i):
         b = "blk.%d.ple_" % i
+        gn = f32(t, HD)
         quant(ple, hid)
         lin(b + "key.weight", o1)
         lin(b + "value.weight", o2)
@@ -443,17 +520,32 @@ def compile_qwen4_step(model, t):
         prog.emit(P.HC_NORM, H, model.F(b + "norm_query.weight"), qn, t, hc, hid, eps)
         prog.emit(P.PLE_GATE, keyn, qn, o2, gated, t, hc, hid)
         prog.emit(P.HC_NORM, gated, model.F(b + "norm_conv.weight"), gn, t, hc, hid, eps)
+        prog.names["gn.%d" % i] = gn
         prog.emit(P.PLE_CONV, gn, gated, H, prog.slot("pleconv.%d" % i),
                   model.F(b + "conv1d.weight", (HD, cfg.ple_conv_kernel)), t, HD,
                   cfg.ple_conv_kernel, cfg.ple_ngram)
 
-    for i in range(model.n_layers):
+    layers, head = range(model.n_layers), "output_hc"
+    if mtp:
+        L = cfg.num_hidden_layers
+        b = "blk.%d.nextn." % L
+        e, hin, en, cat = f32(t, hid), f32(t, HD), f32(t, hid), f32(t, 2 * HD)
+        prog.names.update(e=e, h=hin)
+        prog.emit(P.RMS_NORM, e, model.F(b + "enorm.weight"), en, t, hid, eps)
+        prog.emit(P.HC_NORM, hin, model.F(b + "hnorm.weight"), hn, t, hc, hid, eps)
+        prog.emit(P.HC_CAT, en, hn, cat, t, hc, hid)
+        # eh_proj on each stream: t * hc rows of 2 hid values.
+        prog.emit(P.KQ_QUANT, cat, t * hc, 2 * hid, xq, xs, xm)
+        m = model.K(b + "eh_proj.weight")
+        prog.emit(P.KQ_LINEAR, xq, xs, xm, cat, m.data, m.type, m.rows, m.cols, t * hc, H)
+        layers, head = [L], b + "hc_head"
+    for i in layers:
         b = "blk.%d." % i
         if i in cfg.ple_layers:
             ple_layer(i)
         hc_pre(b + "hc_attn", mixed)
         quant(mixed, hid)
-        if cfg.layer_types[i] == "full_attention":
+        if i >= len(cfg.layer_types) or cfg.layer_types[i] == "full_attention":
             attention(i)
         else:
             deltanet(i)
@@ -470,7 +562,8 @@ def compile_qwen4_step(model, t):
         prog.emit(P.KQ_MOE, xq, xs, xm, idx, val, t, k, E, mats, slog, hid, inner, scratch, mo)
         prog.keep.append(mats)
         prog.emit(P.HC_ADD, H, mo, inj, t, hc, hid, 1.0 / hc)
-    hc_pre("output_hc", xn, inject=False)
+    hc_pre(head, xn, inject=False)
+    prog.keep.append(dense)
     prog.tokens = t
     return prog.finish()
 
@@ -481,8 +574,8 @@ class Qwen4CPU(Qwen4):
 
     CHUNK = 512
 
-    def __init__(self, path, cfg=None, layers=None):
-        super().__init__(path, cfg, layers)
+    def __init__(self, path, cfg=None, layers=None, mtp=None):
+        super().__init__(path, cfg, layers, mtp)
         self._k = {}
         self._f = {}
         self.programs = {}
@@ -533,10 +626,14 @@ class Qwen4CPU(Qwen4):
         m = self.K("per_layer_token_embd.weight")
         return cops.kq_rows(m.data, m.type, m.cols, rows.reshape(-1)).reshape(len(ids), -1)
 
-    def program(self, t):
-        prog = self.programs.get(t)
+    def program(self, t, kind=None):
+        """The program of t tokens: a step (kind None), an MTP verify group
+        ("verify"), or the MTP layer ("mtp")."""
+        key = t if kind is None else (kind, t)
+        prog = self.programs.get(key)
         if prog is None:
-            prog = self.programs[t] = compile_qwen4_step(self, t)
+            prog = self.programs[key] = compile_qwen4_step(
+                self, t, verify=kind == "verify", mtp=kind == "mtp")
         return prog
 
     def _bind(self, prog, cache, pos, t):
@@ -557,21 +654,145 @@ class Qwen4CPU(Qwen4):
         kw["qsa_scratch"], kw["nbmax"] = self._qscr, nbmax
         prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
 
-    def forward(self, ids, cache, start_pos=0, hook=None):
-        ids = list(ids)
+    def _run(self, prog, ids, cache, pos):
         cfg = self.cfg
-        out = []
+        self._bind(prog, cache, pos, len(ids))
+        x = self.embed(ids)
+        prog.names["H"][:] = np.repeat(x[:, None, :], cfg.hc_count, axis=1).reshape(len(ids), -1)
+        if cfg.ple_layers:
+            prog.names["ple"][:] = self.ple_rows(ids, cache)
+        prog.run()
+
+    def forward(self, ids, cache, start_pos=0, hook=None, streams=False):
+        """Run tokens from start_pos. Return the input of the head (t x
+        hidden); with streams, also the streams after the last layer (t x
+        hc * hidden, the input of the MTP layer)."""
+        ids = list(ids)
+        out, hs = [], []
         c0 = 0
         while c0 < len(ids):
             chunk = ids[c0:c0 + self.CHUNK]
             prog = self.program(len(chunk))
-            self._bind(prog, cache, start_pos + c0, len(chunk))
-            x = self.embed(chunk)
-            prog.names["H"][:] = np.repeat(x[:, None, :], cfg.hc_count, axis=1).reshape(len(chunk), -1)
-            if cfg.ple_layers:
-                prog.names["ple"][:] = self.ple_rows(chunk, cache)
-            prog.run()
+            self._run(prog, chunk, cache, start_pos + c0)
             out.append(prog.names["xn"].copy())
+            if streams:
+                hs.append(prog.names["H"].copy())
             c0 += len(chunk)
         cache.n = start_pos + len(ids)
+        if streams:
+            return np.concatenate(out), np.concatenate(hs)
         return np.concatenate(out)
+
+    # ---- MTP: the verify group and the MTP layer (QWEN38_PLAN.md, phase 3) ----
+
+    def verify(self, ids, cache, start_pos):
+        """Run a group of tokens from start_pos as an MTP verify group.
+        Return the input of the head and the streams of each token. The
+        keys (and the keys of the indexer) are written for all the tokens;
+        the state of the linear layers and of the n-gram layer does not
+        change until commit(n)."""
+        cfg = self.cfg
+        prog = self.program(len(ids), "verify")
+        snap = (cache.ple_ids.copy(), {i: a.copy() for i, a in cache.ple_conv.items()})
+        self._run(prog, list(ids), cache, start_pos)
+        self._pending = (prog, cache, start_pos, list(ids), snap)
+        return prog.names["xn"].copy(), prog.names["H"].copy()
+
+    def commit(self, n):
+        """Keep the first n tokens of the last verify group."""
+        from . import cops
+        prog, cache, start, ids, (ple_ids, ple_conv) = self._pending
+        cfg = self.cfg
+        for i in range(self.n_layers):
+            if cfg.layer_types[i] != "full_attention":
+                cops.gdn_commit(cache.conv[i], cache.state[i], prog.names["log.%d" % i], n,
+                                cfg.conv_kernel, cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim,
+                                cfg.lin_v_dim)
+        ctx = cfg.ple_ngram - 1
+        cache.ple_ids = np.concatenate([ple_ids, np.asarray(ids[:n], np.int64)])[-ctx:].copy()
+        for i, old in ple_conv.items():
+            hist = old.shape[0]
+            cache.ple_conv[i][:] = np.concatenate([old, prog.names["gn.%d" % i][:n]])[-hist:]
+        cache.n = start + n
+        self._pending = None
+
+    def mtp_step(self, Hs, ids, mcache, pos):
+        """The MTP layer as a program (Qwen4.mtp). Return the input of the
+        head and the streams of the layer."""
+        from .qwen import scores_buffer
+        cfg = self.cfg
+        t = len(ids)
+        prog = self.program(t, "mtp")
+        L = cfg.num_hidden_layers
+        cos, sin = self.rope(np.arange(pos, pos + t))
+        kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos),
+              "sin": np.ascontiguousarray(sin), "scores": scores_buffer(cfg, pos + t)}
+        for nm, a in zip(("kq", "ks", "vq", "vs"), mcache.kv[L]):
+            kw["%s.%d" % (nm, L)] = a
+        prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
+        prog.names["e"][:] = self.embed(ids)
+        prog.names["h"][:] = Hs.reshape(t, -1)
+        prog.run()
+        mcache.n = pos + t
+        return prog.names["xn"].copy(), prog.names["H"].copy()
+
+    def generate_mtp(self, prompt, n_new, draft=3, max_len=8192, stop=None, stats=None):
+        """Greedy generation with the MTP layer as the drafter. Each round:
+        draft tokens with the MTP layer, one verify group of the model, then
+        the MTP layer on the accepted tokens (with the streams of the model)
+        and the next draft in one group. Return the new tokens."""
+        cfg = self.cfg
+        cache = Qwen4Cache(cfg, max_len)
+        mcache = Qwen4MTPCache(cfg, max_len)
+        prompt = list(prompt)
+        n = len(prompt)
+        xn, H = self.forward(prompt, cache, 0, streams=True)
+        tok = int(np.argmax(self.logits(xn[-1:])[0]))
+        # The MTP layer on the prompt: token j with the streams of j - 1
+        # (zeros for token 0).
+        Hin = np.concatenate([np.zeros((1, H.shape[1]), np.float32), H[:-1]])
+        for c0 in range(0, n, self.CHUNK):
+            c1 = min(n, c0 + self.CHUNK)
+            self.mtp_step(Hin[c0:c1], prompt[c0:c1], mcache, c0)
+        out = [tok]
+        pend_h, pos = H[-1:], n            # the streams at pos - 1; tok is at pos
+        rounds = acc_total = 0
+        import time
+        tm = {"draft": 0.0, "verify": 0.0, "catch_up": 0.0}
+        t_start = time.time()
+        while len(out) < n_new and (stop is None or tok not in stop):
+            # Draft: the MTP layer at pos with (tok, pend_h), then on its own
+            # streams.
+            t0 = time.time()
+            drafts, ids_d, hin, mpos = [], [tok], pend_h, pos
+            for _ in range(draft):
+                xm, hm = self.mtp_step(hin, ids_d, mcache, mpos)
+                d = int(np.argmax(self.logits(xm[-1:])[0]))
+                drafts.append(d)
+                hin, ids_d, mpos = hm[-1:], [d], mpos + 1
+            # Verify tok and the drafts.
+            t1 = time.time()
+            group = [tok] + drafts
+            xv, Hv = self.verify(group, cache, pos)
+            best = np.argmax(self.logits(xv), axis=1)
+            a = 0
+            while a < draft and best[a] == drafts[a]:
+                a += 1
+            self.commit(a + 1)
+            new = drafts[:a] + [int(best[a])]
+            t2 = time.time()
+            # The MTP layer on the accepted drafts, with the streams of the
+            # model (its keys at pos + 1 .. pos + a; the row at pos is right).
+            if a > 0:
+                self.mtp_step(Hv[:a], drafts[:a], mcache, pos + 1)
+            tm["draft"] += t1 - t0
+            tm["verify"] += t2 - t1
+            tm["catch_up"] += time.time() - t2
+            out.extend(new)
+            rounds += 1
+            acc_total += a
+            pend_h, tok, pos = Hv[a:a + 1], int(best[a]), pos + a + 1
+        if stats is not None:
+            stats.update(rounds=rounds, accepted=acc_total, drafted=rounds * draft,
+                         decode_s=time.time() - t_start, **tm)
+        return out[:n_new]

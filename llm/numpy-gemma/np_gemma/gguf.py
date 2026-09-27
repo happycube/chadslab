@@ -703,6 +703,19 @@ class GGUFSplit(GGUF):
     def raw(self, gname):
         return self._where[gname].raw(gname)
 
+    def attach(self, path):
+        """Add the tensors of another file (the MTP layer of a model in its own
+        file). The names of the file must be new."""
+        p = GGUF(path)
+        for name in p._order:
+            if name in self.tensors:
+                raise ValueError("%s has the tensor %s of the model" % (path, name))
+            self.tensors[name] = p.tensors[name]
+            self._where[name] = p
+            self._order.append(name)
+        self.parts.append(p)
+        return p
+
     def close(self):
         for p in self.parts:
             p.close()

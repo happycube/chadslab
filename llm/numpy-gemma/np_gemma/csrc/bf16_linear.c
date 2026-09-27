@@ -7135,7 +7135,7 @@ enum {
     GP_KQ_MOE = 109,
     /* qwen4exp: the gated residual and the n-gram layer (hyperconn.c) */
     GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
-    GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121,
+    GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121, GP_HC_CAT = 122,
 };
 
 int gemma_gp_record_size(void)
@@ -7523,6 +7523,11 @@ static void gp_step(const gp_rec *r, int64_t *e)
         /* gn, gated, H, state, w, t, channels, kernel, dilation */
         ple_conv_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_P(float, 3),
                       GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7), GP_I(8));
+        break;
+    case GP_HC_CAT:
+        /* e, hn, out, t, hc, hid */
+        hc_cat_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_I(3), GP_I(4),
+                    GP_I(5));
         break;
     case GP_QSA_SELECT:
         /* iq, ik, idxk, blk, qn, kn, cos, sin, pos, t, heads, d, ratio, budget, rot, theta,

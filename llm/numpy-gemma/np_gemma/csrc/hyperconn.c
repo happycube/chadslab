@@ -157,3 +157,17 @@ static void ple_conv_body(const float *gn, const float *gated, float *H, float *
         }
     }
 }
+
+/* HC_CAT: e (t x hid), hn (t x hc * hid), out (t x hc x 2 hid), t, hc, hid.
+ * For each stream: the row of e, then the stream (the input of eh_proj of
+ * the MTP layer: embedding first, as the converter joins fc_embedding and
+ * fc_hidden). */
+static void hc_cat_body(const float *e, const float *hn, float *out, int t, int hc, int hid)
+{
+    #pragma omp for schedule(static)
+    for (int rg = 0; rg < t * hc; ++rg) {
+        float *o = out + (size_t)rg * 2 * hid;
+        memcpy(o, e + (size_t)(rg / hc) * hid, (size_t)hid * 4);
+        memcpy(o + hid, hn + (size_t)rg * hid, (size_t)hid * 4);
+    }
+}
