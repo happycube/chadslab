@@ -164,6 +164,17 @@ Q5_K, and the inverse order at load, for the GGUF file. Use llama.cpp on the
 GGUF as the reference for the speed, and as a second reference for the
 values.
 
+The rate of llama.cpp (build-cuda) on the GGUF file, with the other load
+of this machine (llama-bench, -fa 1):
+
+    setup                                    prompt           decode
+    dense part on the GPU, experts on the    224 tok/s (512)  39.5 tok/s
+    CPU (-ngl 99 -ncmoe 40)
+    no layers on the GPU (-ngl 0)            60 tok/s (128)   10.1 tok/s
+
+These are the values to beat. The decode of 10.1 tok/s on the CPU is far
+from the limit of about 25 tok/s (2.6 GB for each token at 67 GB/s).
+
 ## The references
 
 - transformers 5.17 (the venv of gemma4-12b-qat-pytorch) has
