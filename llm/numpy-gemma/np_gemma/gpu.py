@@ -1409,3 +1409,134 @@ def describe(g):
                                        sum(len(v) for v in g.hot.values()),
                                        (g.head.nbytes if g.head else 0) / 1e9,
                                        free / 1e9, total / 1e9))
+
+
+# ---- the MTP drafter on the GPU (SPLIT_PLAN.md, phase 5) --------------------
+
+def quantize_q4_0(w):
+    """Quantize a float32 matrix to int4 blocks with float16 scales. Return
+    (blocks, scales), as ops.quantize_int4 does. The float32 scales equal the
+    float16 scales of the blocks, which the GPU kernels read."""
+    from . import ops
+    w = np.asarray(w, dtype=np.float32)
+    rows, cols = w.shape
+    wg = w.reshape(rows, cols // 32, 32)
+    scale = (np.max(np.abs(wg), axis=2) / 8.0).astype(np.float16).astype(np.float32)
+    scale = np.where(scale == 0.0, np.float32(np.float16(1e-7)), scale)
+    q = np.rint(wg / scale[:, :, None]).clip(-8.0, 7.0).astype(np.int16)
+    qb = (q + 8).astype(np.uint8).reshape(rows, cols // 32, 2, 16)
+    qs = (qb[:, :, 0, :] | (qb[:, :, 1, :] << 4)).astype(np.uint8)
+    return np.ascontiguousarray(ops.pack_int4_blocks(scale, qs)), scale
+
+
+def compile_drafter(a, target_cfg):
+    """Compile one draft step of the assistant a (an Assistant with float32
+    weights) for the GPU. The steps are those of Assistant.step and of its
+    centroid head.
+
+    The input "xin" holds the embedding of the token and the hidden state h,
+    with the backbone size each. The step writes the next h into the second
+    half of xin, so the next draft step finds it there. "token" gets the
+    draft token. The attention of a layer reads the cache of the target:
+    the query at pos sees the rows before pos. The record GP_ATTN_F32H sees
+    the rows to its pos operand, so the step gives it pos - 1 (the slot
+    "pd"), and a window one smaller.
+    """
+    cfg = a.cfg
+    bk = a.backbone
+    c = P.Compiler(a)
+    xin = np.zeros((1, 2 * bk), dtype=np.float32)
+    c.env["xin"] = xin
+    q4 = lambda w: quantize_q4_0(w)  # noqa: E731
+    u = P.k_int4(c, q4(a.pre), xin)
+    tplan = {True: next(p for p in target_cfg.plan if p.is_sliding),
+             False: next(p for p in target_cfg.plan if not p.is_sliding)}
+    for i, w in enumerate(a.layers):
+        plan = cfg.plan[i]
+        kind = "s" if plan.is_sliding else "f"
+        hd, nq = plan.head_dim, plan.num_q_heads
+        h = P.k_rms_norm(c, u, w["input_layernorm"])
+        q = P.k_int4(c, q4(w["self_attn.q_proj"]), h)
+        q = P.k_rms_norm_rows(c, q, hd, w["self_attn.q_norm"])
+        P.k_rope(c, q, None, c.p.slot("cos." + kind), c.p.slot("sin." + kind), i)
+        att = c.buffer((1, nq * hd))
+        window = plan.sliding_window or 0
+        c.p.emit(P.ATTN_F32H, q, c.p.slot("k." + kind), c.p.slot("v." + kind),
+                 c.p.slot("scores"), att, nq, tplan[plan.is_sliding].num_kv_heads, hd, 1,
+                 c.p.slot("pd"), c.p.slot("hs." + kind), max(0, window - 1), 1)
+        o = P.k_int4(c, q4(w["self_attn.o_proj"]), att)
+        u = P.k_add(c, u, P.k_rms_norm(c, o, w["post_attention_layernorm"]))
+        m = P.k_rms_norm(c, u, w["pre_feedforward_layernorm"])
+        g = P.k_int4(c, q4(w["mlp.gate_proj"]), m)
+        up = P.k_int4(c, q4(w["mlp.up_proj"]), m)
+        mm = P.k_int4(c, q4(w["mlp.down_proj"]), P.k_mul_v(c, P.k_gelu(c, g), up))
+        u = P.k_add(c, u, P.k_rms_norm(c, mm, w["post_feedforward_layernorm"]))
+        u = P.k_mul(c, u, w["layer_scalar"])
+    un = P.k_rms_norm(c, u, a.norm)
+    hnext = P.k_int4(c, q4(a.post), un)
+    n_cent, per = a.order.shape
+    cent = np.ascontiguousarray(a.centroids, dtype=np.float32)
+    clog = c.buffer(n_cent)
+    c.p.emit(P.F32_LINEAR, un, cent, clog, n_cent, cfg.hidden_size)
+    token = np.zeros(1, dtype=np.int32)
+    c.p.emit(P.DRAFT_HEAD, un, clog, np.ascontiguousarray(a.order, dtype=np.int32),
+             np.ascontiguousarray(a.head_f32, dtype=np.float32), c.buffer(a.top_k * per),
+             np.zeros(a.top_k, dtype=np.int32), token, n_cent, per, a.top_k, cfg.hidden_size)
+    c.p.emit(P.COPY, hnext, xin[:, bk:], bk * 4)
+    c.env["token"] = token
+    return c.p.finish()
+
+
+class GPUDrafter:
+    """The MTP drafter of the E4B model on the GPU. draft() has the arguments
+    of Assistant.draft, so mtp_stream takes either.
+
+    The drafter reads the cache of the target on the GPU: the buffers that
+    the shared layers of the E4B model reuse. Thus it needs no copy of the
+    cache to the host. Its weights are its own int4 blocks with float16
+    scales (quantize_q4_0), so its drafts can differ a little from the CPU
+    drafter. The target checks each draft, so the text does not change.
+    """
+
+    def __init__(self, path, target):
+        from .assistant import Assistant
+        self.a = Assistant(path, dtype="f32")
+        assert self.a.centroids is not None, "the GPU drafter needs the centroid head"
+        self.target = target
+        self.p_min = 0.0
+        self.prog = compile_drafter(self.a, target.cfg)
+        self.g = None
+
+    def draft(self, target, token, h, pos, cache, n, eos_ids=()):
+        target._gpu_attach(cache)
+        tg = target._gpu
+        if self.g is None:
+            self.g = GPUProgram(self.prog, mirror=tg.g.mirror)
+        a, bk = self.a, self.a.backbone
+        kw = {"pd": pos - 1}
+        for kind, sliding in (("s", True), ("f", False)):
+            plan = next(p for p in a.cfg.plan if p.is_sliding == sliding)
+            store = cache.shared["sliding_attention" if sliding else "full_attention"]
+            kw["k." + kind], kw["v." + kind] = store[0], store[1]
+            kw["hs." + kind] = store[0].shape[1] * store[0].shape[2]
+            cos, sin = a._cos_sin(plan, pos)
+            kw["cos." + kind] = np.ascontiguousarray(cos, dtype=np.float32)
+            kw["sin." + kind] = np.ascontiguousarray(sin, dtype=np.float32)
+        kw["scores"] = np.empty(max(p.num_q_heads for p in a.cfg.plan) * (pos + 1), np.float32)
+        self.g.bind(kw, tg.cache)
+        xin = self.g.mirror.buffer_of(self.prog.names["xin"]).ptr
+        tokbuf = self.g.mirror.buffer_of(self.prog.names["token"])
+        hh = np.ascontiguousarray(h, dtype=np.float32).reshape(-1)
+        _check(lib().gg_h2d(xin + bk * 4, hh.ctypes.data, bk * 4))
+        out = []
+        got = np.zeros(1, dtype=np.int32)
+        for _ in range(n):
+            emb = np.ascontiguousarray(target.embed([token]), dtype=np.float32).reshape(-1)
+            _check(lib().gg_h2d(xin, emb.ctypes.data, bk * 4))
+            self.g.run()
+            tokbuf.download(got)
+            token = int(got[0])
+            out.append(token)
+            if token in eos_ids:
+                break
+        return out

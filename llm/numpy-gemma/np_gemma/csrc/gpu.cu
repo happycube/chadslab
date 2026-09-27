@@ -75,7 +75,7 @@ enum {
     GP_ROUTER = 64, GP_ROUTER_MT = 66,
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
     GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
-    GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93,
+    GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93, GP_F32_LINEAR = 94, GP_DRAFT_HEAD = 95,
 };
 
 static cudaStream_t gg_stream;
@@ -778,16 +778,23 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
         }
         __syncthreads();
     }
-    #pragma unroll
-    for (int h = 0; h < ATTN_REP; ++h) {
-        if (h < rep) {
+    /* The groups add their sums one after the other, in the order of the
+     * group. An atomic add gives the order of arrival, and the router of the
+     * 26B turns such a difference in the last bit into another expert. */
+    for (int gi = 0; gi < groups; ++gi) {
+        if (grp == gi) {
             #pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                atomicAdd(&red[h * hd + 8 * d + u], acc[h][u]);
+            for (int h = 0; h < ATTN_REP; ++h) {
+                if (h < rep) {
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        red[h * hd + 8 * d + u] += acc[h][u];
+                    }
+                }
             }
         }
+        __syncthreads();
     }
-    __syncthreads();
     for (int x = threadIdx.x; x < rep * hd; x += blockDim.x) {
         int h = x / hd, i = x % hd;
         part[((size_t)(kv * rep + h) * ATTN_CHUNKS + c) * (hd + 2) + i] = red[x];
@@ -954,11 +961,11 @@ __global__ void k_gemm(const float *x, const void *w, float *out, int t, int row
  * The rows of x become float16 values. That rounds each value to 11
  * significant bits.
  *
- * A block of 128 threads (4 warps) takes a tile of TM tokens by TN rows and
- * steps over the columns 64 at a time (2 int4 blocks). Warp w takes 32
- * tokens by 32 rows of the tile: 2 by 4 tiles of the instruction. With
- * gather, token q of the tile is row pair_tok[q] of x (the experts of a
- * large group, see k_moe_gemm).
+ * A block takes a tile of tokens by TN rows. It steps over the columns 64
+ * at a time (2 int4 blocks). Warp w takes 32 tokens by 32 rows of the tile:
+ * 2 by 4 tiles of the instruction. A dense product uses tiles of 128 tokens
+ * (8 warps). The experts use tiles of 64 pairs (4 warps). With gather,
+ * token q of the tile is row pair_tok[q] of x (see k_moe_gemm).
  *
  * The fragments of mma.sync m16n8k16 (g = lane / 4, c = lane % 4):
  *
@@ -980,11 +987,12 @@ __device__ __forceinline__ void mma16816(float *c, const uint32_t *a, const uint
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-/* One tile of WM * 32 tokens by TN rows, with WM * 2 warps. x holds float16
- * values (see k_to_half), cols in each row. w points at the int4 blocks of
- * row 0 of the matrix; rows are the rows of the matrix. The tokens of the
- * tile are q0 to q1 - 1: of x, or of pair_tok with gather. out has ostride
- * values in each row, and the tile writes rows n0 to n0 + TN - 1.
+/* One tile of WM * 32 tokens by TN rows, with WM * 2 warps. The array x holds
+ * float16 values (see k_to_half), cols in each row. The pointer w points at
+ * the int4 blocks of row 0 of the matrix, which has rows rows. The tile
+ * takes the tokens q0 to q1 - 1: rows of x, or rows pair_tok[q] with gather.
+ * The array out has ostride values in each row. The tile writes rows n0 to
+ * n0 + TN - 1.
  *
  * Each thread of the block dequantizes parts of 8 bytes of the int4 blocks,
  * so every thread shares that work. */
@@ -1145,6 +1153,56 @@ __global__ void k_to_half(const float *x, __half *y, size_t n)
 }
 
 #define MT_MAX 16
+
+/* k_mt_gemv with the token count NT fixed when the kernel compiles. The
+ * loops over the tokens then unroll, and a lane keeps NT sums. The general
+ * form keeps 16 sums and ran at about half the rate of one token. */
+template <int NT>
+__global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int rows, int cols)
+{
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32, sub = lane & 3;
+    if (row >= rows) {
+        return;
+    }
+    int blocks = cols / 32;
+    const uint8_t *wr = w + (size_t)row * blocks * 18;
+    float sum[NT];
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        sum[j] = 0.f;
+    }
+    for (int b = lane >> 2; b < blocks; b += 8) {
+        const uint8_t *blk = wr + (size_t)b * 18;
+        float d = __half2float(__ushort_as_half(*(const uint16_t *)blk));
+        const uint16_t *qp = (const uint16_t *)(blk + 2 + 4 * sub);
+        uint32_t q = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+        float wl[4], wh[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            wl[u] = (float)((int)((q >> (8 * u)) & 15) - 8) * d;
+            wh[u] = (float)((int)((q >> (8 * u + 4)) & 15) - 8) * d;
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const float *xb = x + (size_t)j * cols + b * 32;
+            float4 xl = *(const float4 *)(xb + 4 * sub);
+            float4 xh = *(const float4 *)(xb + 16 + 4 * sub);
+            sum[j] += wl[0] * xl.x + wl[1] * xl.y + wl[2] * xl.z + wl[3] * xl.w
+                    + wh[0] * xh.x + wh[1] * xh.y + wh[2] * xh.z + wh[3] * xh.w;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        float v = sum[j];
+        for (int o = 16; o > 0; o >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+            out[(size_t)j * rows + row] = v;
+        }
+    }
+}
 
 __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, int rows, int cols)
 {
@@ -1576,8 +1634,8 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
  *    to shared memory with the keys as columns (Vt), so a fragment of B is
  *    two adjacent values.
  *
- * The record is GP_ATTN_QC_MT (F32H 0) or GP_ATTN_F32H (F32H 1), as for
- * k_flash_qc_mt. head_dim is 256 or 512. */
+ * The record is GP_ATTN_QC_MT (F32H 0) or GP_ATTN_F32H (F32H 1). The kernel
+ * k_flash_qc_mt takes the same records. head_dim is 256 or 512. */
 #define FQ2 32
 #define FK2 16
 
@@ -2264,6 +2322,138 @@ __global__ void k_hot_split_mt(const gp_rec *r, const int64_t *e)
     DP(float, 4)[p] = cold ? DP(const float, 1)[p] : 0.f;
 }
 
+/* ---------- the MTP drafter (np_gemma/gpu.py, GPUDrafter) ----------
+ * GP_F32_LINEAR: x, w, out, rows, cols. A float32 matrix on one row: one
+ * warp for each row.
+ *
+ * GP_DRAFT_HEAD: u, clog, order, head, sel, top, token, n_cent, per, top_k,
+ * hidden. The centroid head of the drafter, as Assistant.logits does it.
+ * The array clog holds the logits of the centroids. The kernels select the
+ * top_k centroids. Then they compute the logits of the tokens of those
+ * centroids: order holds per tokens for each centroid, and head is the
+ * float32 table. Last, they write the best token. */
+__global__ void k_f32_linear(const gp_rec *r, const int64_t *e)
+{
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32, rows = DI(3), cols = DI(4);
+    if (row >= rows) {
+        return;
+    }
+    const float *w = DP(const float, 1) + (size_t)row * cols;
+    const float *x = DP(const float, 0);
+    float s2 = 0.f;
+    for (int k = lane; k < cols; k += 32) {
+        s2 += w[k] * x[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    if (lane == 0) {
+        DP(float, 2)[row] = s2;
+    }
+}
+
+/* The top_k centroids: a bitonic sort of (logit, index) in shared memory,
+ * largest first. One block of 1024 threads; n_cent is at most 2048. */
+__global__ void k_draft_top(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float kv[2048];
+    __shared__ int ki[2048];
+    const float *clog = DP(const float, 1);
+    int n = DI(7), top_k = DI(9);
+    int size = 1;
+    while (size < n) {
+        size <<= 1;
+    }
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        kv[i] = i < n ? clog[i] : -INFINITY;
+        ki[i] = i;
+    }
+    __syncthreads();
+    for (int k = 2; k <= size; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < size; i += blockDim.x) {
+                int l = i ^ j;
+                if (l > i) {
+                    bool desc = (i & k) == 0;
+                    bool swap = desc ? (kv[i] < kv[l] || (kv[i] == kv[l] && ki[i] > ki[l]))
+                                     : (kv[i] > kv[l] || (kv[i] == kv[l] && ki[i] < ki[l]));
+                    if (swap) {
+                        float tv = kv[i];
+                        kv[i] = kv[l];
+                        kv[l] = tv;
+                        int ti = ki[i];
+                        ki[i] = ki[l];
+                        ki[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = threadIdx.x; i < top_k; i += blockDim.x) {
+        DP(int, 5)[i] = ki[i];
+    }
+}
+
+/* The logit of each candidate token: one warp for each. */
+__global__ void k_draft_sel(const gp_rec *r, const int64_t *e)
+{
+    int i = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32, per = DI(8), top_k = DI(9), hidden = DI(10);
+    if (i >= top_k * per) {
+        return;
+    }
+    int tok = DP(const int, 2)[(size_t)DP(const int, 5)[i / per] * per + i % per];
+    const float *hrow = DP(const float, 3) + (size_t)tok * hidden;
+    const float *u = DP(const float, 0);
+    float s2 = 0.f;
+    for (int k = lane; k < hidden; k += 32) {
+        s2 += hrow[k] * u[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    if (lane == 0) {
+        DP(float, 4)[i] = s2;
+    }
+}
+
+/* The best candidate: one block. At an equal logit, the first candidate. */
+__global__ void k_draft_best(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    int per = DI(8), n = DI(9) * per;
+    const float *sel = DP(const float, 4);
+    float v = -INFINITY;
+    int b = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (sel[i] > v) {
+            v = sel[i];
+            b = i;
+        }
+    }
+    bv[threadIdx.x] = v;
+    bi[threadIdx.x] = b;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) {
+            float ov = bv[threadIdx.x + s2];
+            int oi = bi[threadIdx.x + s2];
+            if (ov > bv[threadIdx.x] || (ov == bv[threadIdx.x] && oi < bi[threadIdx.x])) {
+                bv[threadIdx.x] = ov;
+                bi[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        int i = bi[0];
+        DP(int, 6)[0] = DP(const int, 2)[(size_t)DP(const int, 5)[i / per] * per + i % per];
+    }
+}
+
 /* ---------- the output head ---------- */
 
 /* x (cols), a Q6_K matrix, out (rows). One warp for each row. A Q6_K block
@@ -2553,8 +2743,16 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
     float *out = (float *)(intptr_t)r->v[ok];
     int rows = (int)hlit(r, rk, bad), cols = (int)hlit(r, ck, bad), t = (int)hlit(r, tk, bad);
     if (t <= gg_gemv_max) {
-        k_mt_gemv<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
-            x, (const uint8_t *)w, out, t, rows, cols);
+        unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK), blk = 32 * ROWS_PER_BLOCK;
+        const uint8_t *wb = (const uint8_t *)w;
+        switch (t) {
+#define GG_NT(n) case n: k_mt_gemv_n<n><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break;
+        GG_NT(1) GG_NT(2) GG_NT(3) GG_NT(4) GG_NT(5) GG_NT(6) GG_NT(7) GG_NT(8)
+        GG_NT(9) GG_NT(10) GG_NT(11) GG_NT(12) GG_NT(13) GG_NT(14) GG_NT(15) GG_NT(16)
+#undef GG_NT
+        default:
+            k_mt_gemv<<<grid, blk, 0, gg_stream>>>(x, wb, out, t, rows, cols);
+        }
     } else if (gg_tc && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
         size_t n = (size_t)t * cols;
         k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, gg_stream>>>(x, g->xh, n);
@@ -2695,6 +2893,20 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), ROWS_PER_BLOCK), k), W, 0, s>>>(
             dr, denv);
         k_hot_sum<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), T), t), T, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_F32_LINEAR:
+        k_f32_linear<<<(unsigned)cdiv(hlit(r, 3, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        break;
+    case GP_DRAFT_HEAD: {
+        /* The logits of the centroids come from a GP_F32_LINEAR before it. */
+        if (hlit(r, 7, &bad) > 2048) {
+            bad = 1;
+        }
+        k_draft_top<<<1, 1024, 0, s>>>(dr, denv);
+        k_draft_sel<<<(unsigned)cdiv(hlit(r, 8, &bad) * hlit(r, 9, &bad), ROWS_PER_BLOCK), W, 0,
+                      s>>>(dr, denv);
+        k_draft_best<<<1, 1024, 0, s>>>(dr, denv);
         break;
     }
     case GP_HOT_SPLIT_MT:

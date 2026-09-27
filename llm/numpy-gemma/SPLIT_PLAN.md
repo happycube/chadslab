@@ -644,6 +644,76 @@ the cold experts of a step to the CPU. A drafter on the GPU saves about 13
 ms, which gives about the rate of the plain decode. Thus MTP is off by
 default with NP_GEMMA_GPU=1. NP_GEMMA_MTP=1 turns it on.
 
+## The E4B on the GPU: tensor cores and the drafter
+
+scripts/bench_e4b_gpu.py measures the E4B model, which fits wholly on the
+GPU. Thus no expert goes to the CPU, and the numbers show the kernels.
+
+### The prompt pass
+
+The E4B now runs its groups of tokens and its prompt pass on the GPU. New
+kernels: the bfloat16 products of a group, and FlashAttention for the float
+cache of the E4B (heads, positions, head_dim).
+
+k_gemm_tc computes the int4 products of a large group on the tensor cores,
+with mma.sync m16n8k16. The int4 values are exact in float16, and the kernel
+applies the scale of each block in float32. The rows of x become float16 one
+time for each product (k_to_half). A block of 8 warps takes 128 tokens by 64
+rows. The kernel k_flash_tc computes the attention of a large group on the tensor cores,
+as FlashAttention-2 does it.
+
+    E4B, prompt pass   CPU        GPU float32   GPU tensor cores   llama.cpp (CUDA)
+    512 tokens         75 tok/s   628 tok/s     1417 tok/s         4735 tok/s
+    1024 tokens        79 tok/s   616 tok/s     1509 tok/s         5029 tok/s
+
+Against the float32 kernels of the GPU, 99.9% of the top tokens of a prompt
+of 1024 tokens agree (median relative difference 9e-4). The kernels of
+llama.cpp are still three times faster.
+
+The 26B keeps the float32 kernels for its prompt pass. Some activations of
+its global layers are larger than the range of float16. Thus the products
+give infinities, and 93% or fewer of the top tokens agree with the CPU. The copy
+of the experts limits that pass anyway. Each program has its own switch
+(GPUProgram tc). NP_GEMMA_GPU_TC=0 turns the tensor cores off for all.
+
+A small group (at most 16 tokens, such as an MTP verify group) keeps the
+float32 kernels and the decode attention of each query. Thus a verify group
+agrees with the decode steps (6e-6). k_mt_gemv now fixes the token count
+when it compiles (1 to 16). The general form ran at half the rate of one
+token. A group of 3 tokens of the E4B went from 22.9 ms to 15.2 ms.
+
+### The drafter on the GPU
+
+GPUDrafter compiles one draft step of the E4B assistant for the GPU. The
+step has the four layers and the attention over the cache of the target on
+the GPU. Then comes the centroid head: GP_F32_LINEAR, then GP_DRAFT_HEAD. The
+second record sorts the centroids (a bitonic sort) and keeps the top 32. It
+computes the logits of their 4096 tokens and writes the best token.
+
+The drafter reads the cache of the target on the GPU, so it needs no copy
+of the cache. Its weights are int4 blocks with float16 scales. A draft takes
+about 0.5 ms, against about 7 ms on the CPU.
+
+    E4B, decode of 128 tokens         rate          drafts accepted
+    plain decode on the GPU           84 tok/s      -
+    MTP, 1 draft, drafter on the GPU  117 tok/s     81%
+    MTP, 2 drafts                     124 tok/s     76%
+    MTP, 3 drafts                     121 tok/s     69%
+    llama.cpp (CUDA), plain decode    112 tok/s     -
+
+MTP gives the same tokens as the plain decode. The drafter of the 26B has a
+full head, not a centroid head, so GPUDrafter does not take it yet.
+
+### A difference from one run to the next
+
+Two runs of the same decode steps of the 26B gave results that differed by
+up to 14%. The attention of a decode step added the sums of its groups of
+threads with an atomic add, in the order of arrival. The last bit of the
+result then changed from run to run, and the router of the 26B sometimes
+selected a different expert. The groups now add their sums in a fixed
+order, and three runs give the same bits. The earlier notes of a difference
+of 14% for a group of 40 tokens came from this cause too.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`

@@ -271,6 +271,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_GPU           0                       1 runs the decode steps, the prompt pass, and the output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). The E4B model runs wholly on the GPU (decode only). The 26B model keeps its cold experts on the CPU. It needs nvcc. The first step copies the weights to the GPU.
     NP_GEMMA_GPU_HOT       the 26B counts          A file of expert counts (scripts/expert_use.py). With NP_GEMMA_GPU=1, the GPU holds the most used experts of the 26B and runs them. 0 keeps all the experts on the CPU. The default is np_gemma/data/gemma-4-26B-expert-counts.npz.
     NP_GEMMA_GPU_HOT_GB    free less 6 GB          The GPU memory for the hot experts, in GB.
+    NP_GEMMA_GPU_TC        1                       1 runs the int4 products and the attention of a large group (a prompt pass) on the tensor cores, with float16 inputs. 0 keeps float32 kernels. The 26B uses float32 kernels unless NP_GEMMA_GPU_TC_MOE=1.
     NP_GEMMA_GPU_CHUNK     1024                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.9 s for the 26B), so a longer chunk is faster.
     NP_GEMMA_GPU_PREFILL_MIN 128                   A shorter part of a prompt runs on the GPU in groups of 16 tokens, with the experts on the CPU.
     NP_GEMMA_GPU_KV        int16                   The form of the cache of the 26B on the GPU. int16 keeps the int16 copy of the CPU program: about half of the float form. float keeps float32 rows.
@@ -1999,6 +2000,16 @@ as the CPU:
     CPU only                about 18 tokens/s     about 60 tokens/s
     --gpu dense             about 40 tokens/s     about 440 tokens/s
     --gpu hot (about 2 GB)  about 45 to 52        about 440 tokens/s
+
+With NP_GEMMA_GPU=1, the E4B model runs wholly on the GPU. The decode, the
+prompt pass (tensor cores), and MTP with the drafter on the GPU
+(np_gemma.gpu.GPUDrafter) run there. The script scripts/bench_e4b_gpu.py
+measures them:
+
+    E4B on the RTX 5060 Ti    this runtime     llama.cpp (CUDA)
+    prompt, 1024 tokens       1509 tok/s       5029 tok/s
+    decode                    84 tok/s         112 tok/s
+    decode with MTP           124 tok/s        -
 
 The prompt pass on the GPU copies the experts that the GPU does not hold for
 each chunk of 1024 tokens. The option works for scripts/gguf_generate.py
