@@ -192,8 +192,14 @@ Status (in progress):
   MTP with the dense part on the GPU did not fit next to the other work of
   the GPU (8 GB). The drafter needs a compute buffer of 1.7 GB and a cache
   of the linear states for each draft.
-- Next: the QSA indexer (for more than 2048 tokens), the resident set of
-  the memory map, and a check against transformers.
+- The QSA indexer (Qwen4.qsa_mask) and the attention with its key mask
+  are in qwen4.py. The script check_qwen4_indexer.py gives 2600 random rows
+  to both; the kept keys equal those of transformers (549 queries drop
+  blocks). The function relu gives
+  many scores of 0. At the cut, torch.topk keeps an arbitrary subset of
+  equal scores, and this runtime keeps the most recent blocks (24 queries
+  differ only there).
+- Next: the resident set of the memory map during a decode, then phase 2.
 
 - QwenConfig for qwen4exp, and the names of the GGUF tensors. Check the
   order of the value heads of the DeltaNet (tiled, as Qwen3.6?).

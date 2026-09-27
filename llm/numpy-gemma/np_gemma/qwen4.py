@@ -21,10 +21,9 @@ The new parts:
 - the n-gram table (PLE) at one layer. Hashes of the last 2 and 3 tokens
   read 16 rows of 160 values. A gate for each stream and a dilated
   convolution add them to the streams;
-- QSA attention: for a context of at most 2048 + 3 tokens the indexer keeps
-  all the keys, and QSA is the full attention. This file has the full
-  attention only (the indexer comes later; forward() refuses a longer
-  context);
+- QSA attention. An indexer scores blocks of 4 keys and keeps the best 512
+  blocks (2048 tokens) and the tail for each query (Qwen4.qsa_mask). For a
+  context of at most 2048 + 3 tokens it keeps all the keys;
 - no final norm: a last mixer (hc_pre with no inject) makes the input of
   the head.
 """
@@ -33,11 +32,8 @@ from __future__ import annotations
 import numpy as np
 
 from .gguf import open_gguf
-from .qwen import QwenCache, QwenConfig, QwenGGUF, sigmoid, silu
+from .qwen import QwenCache, QwenConfig, QwenGGUF, kv_rows, kv_store, rms_norm, sigmoid, silu
 
-# The keys the indexer can pass (QWEN38_PLAN.md): with more positions the
-# indexer drops blocks, and this file has no indexer yet.
-FULL_LIMIT = 2048 + 3
 
 
 def config_from_gguf(g):
@@ -80,6 +76,9 @@ class Qwen4Cache(QwenCache):
         self.ple_ids = np.full(cfg.ple_ngram - 1, cfg.ple_eos, dtype=np.int64)
         self.ple_conv = {i: np.zeros(((cfg.ple_conv_kernel - 1) * cfg.ple_ngram, hc_dim),
                                      np.float32) for i in cfg.ple_layers}
+        # The raw keys of the indexer of each QSA layer (one for each position).
+        self.idx_k = {i: np.zeros((max_len, cfg.indexer_dim), np.float32)
+                      for i, t in enumerate(cfg.layer_types) if t == "full_attention"}
 
 
 def grouped_norm(x, w, hidden, eps):
@@ -198,6 +197,97 @@ class Qwen4(QwenGGUF):
         out = gated.reshape(t, hc * hid) + silu(conv)
         return (H + out.reshape(t, hc, hid)).astype(np.float32)
 
+    # ---- QSA attention ----
+
+    def _rot(self, x, cos, sin):
+        """RoPE on the first rotary_dim values of the last axis (x: t x ... x
+        d; cos, sin: t x rotary_dim)."""
+        d = self.cfg.rotary_dim
+        half = d // 2
+        extra = (slice(None),) + (None,) * (x.ndim - 2)
+        c, s = cos[extra], sin[extra]
+        xr = x[..., :d]
+        rh = np.concatenate([-xr[..., half:], xr[..., :half]], axis=-1)
+        return np.concatenate([xr * c + rh * s, x[..., d:]], axis=-1)
+
+    def qsa_mask(self, i, h, cache, pos):
+        """The keys that each query of the QSA layer i reads: a bool array
+        (t x (pos + t)), or None for all the keys before it (a context of at
+        most budget blocks). The indexer (transformers Qwen4ExpTextQSAIndexer)
+        keeps the raw key of each token. A block of `ratio` tokens gets the
+        mean of its keys, the norm, and RoPE at its first position. A query
+        scores each complete block with the sum over its heads of relu(q . k),
+        and keeps the best budget blocks and the tail. qsa_scores gets the
+        scores of the queries that drop blocks."""
+        cfg = self.cfg
+        t, n = h.shape[0], pos + h.shape[0]
+        nh, d = cfg.indexer_heads, cfg.indexer_dim
+        p = "blk.%d.indexer." % i
+        cache.idx_k[i][pos:n] = h @ self.G(p + "k_proj.weight").T
+        ratio = cfg.compress_ratios[i]
+        budget = cfg.indexer_top_k // ratio
+        if n // ratio <= budget:
+            return None
+        cos, sin = self.rope(np.arange(0, n))
+        q = (h @ self.G(p + "q_proj.weight").T).reshape(t, nh, d)
+        q = self._rot(rms_norm(q, self.G(p + "q_norm.weight"), cfg.rms_norm_eps),
+                      cos[pos:n], sin[pos:n])
+        nb_all = n // ratio
+        pooled = cache.idx_k[i][:nb_all * ratio].reshape(nb_all, ratio, d).mean(axis=1)
+        starts = np.arange(nb_all) * ratio
+        kb = self._rot(rms_norm(pooled, self.G(p + "k_norm.weight"), cfg.rms_norm_eps),
+                       cos[starts], sin[starts])
+        mask = np.arange(n)[None, :] <= (pos + np.arange(t))[:, None]
+        self.qsa_scores = {}
+        for j in range(t):
+            pj = pos + j
+            nb = (pj + 1) // ratio
+            if nb <= budget:
+                continue
+            score = np.maximum(q[j] @ kb[:nb].T, 0.0).sum(axis=0) / np.sqrt(d)
+            self.qsa_scores[pj] = score
+            # relu gives many scores of 0, so equal scores are common. Keep the
+            # most recent of equal blocks (torch.topk has no fixed order).
+            top = np.lexsort((-np.arange(nb), -score))[:budget]
+            keep = np.zeros(n, bool)
+            keep[(top[:, None] * ratio + np.arange(ratio)[None, :]).reshape(-1)] = True
+            keep[nb * ratio:pj + 1] = True
+            mask[j] = keep
+        return mask
+
+    def full_attention(self, i, h, cache, pos):
+        """The gated attention of Qwen3.5 with the key mask of QSA."""
+        cfg = self.cfg
+        p = "layers.%d.self_attn." % i
+        t = h.shape[0]
+        nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+        sel = self.qsa_mask(i, h, cache, pos)
+        qg = (h @ self.W(p + "q_proj").T).reshape(t, nq, 2 * hd)
+        q, gate = qg[..., :hd], qg[..., hd:].reshape(t, nq * hd)
+        k = (h @ self.W(p + "k_proj").T).reshape(t, nk, hd)
+        v = (h @ self.W(p + "v_proj").T).reshape(t, nk, hd)
+        q = rms_norm(q, self.t(p + "q_norm.weight"), cfg.rms_norm_eps)
+        k = rms_norm(k, self.t(p + "k_norm.weight"), cfg.rms_norm_eps)
+        cos, sin = self.rope(np.arange(pos, pos + t))
+        q, k = self._rot(q, cos, sin), self._rot(k, cos, sin)
+        kv_store(cache, i, k, v, pos)
+        n = pos + t
+        K, V = kv_rows(cache, i, n)
+        rep = nq // nk
+        if sel is None:
+            sel = np.arange(n)[None, :] <= (pos + np.arange(t))[:, None]
+        out = np.empty((t, nq, hd), np.float32)
+        for hq in range(nq):
+            kh = hq // rep
+            s_ = (q[:, hq] @ K[kh].T) * hd ** -0.5                  # (t, n)
+            s_[~sel] = -np.inf
+            s_ -= s_.max(axis=-1, keepdims=True)
+            w = np.exp(s_)
+            w /= w.sum(axis=-1, keepdims=True)
+            out[:, hq] = w @ V[kh]
+        o = out.reshape(t, nq * hd) * sigmoid(gate)
+        return o @ self.W(p + "o_proj").T
+
     # ---- the model ----
 
     def layer(self, i, H, ids, cache, pos):
@@ -218,9 +308,6 @@ class Qwen4(QwenGGUF):
         """Run tokens from start_pos. Return the input of the head (t x
         hidden). hook(name, value) gets the streams after each layer."""
         ids = list(ids)
-        if start_pos + len(ids) > FULL_LIMIT:
-            raise NotImplementedError("the QSA indexer is not in this file yet: at most %d "
-                                      "positions" % FULL_LIMIT)
         cfg = self.cfg
         x = self.embed(ids)
         H = np.repeat(x[:, None, :], cfg.hc_count, axis=1).astype(np.float32)
