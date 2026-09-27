@@ -296,6 +296,8 @@ try:
         _lib.gemma_int4_q16_moe_run.restype = None
         _lib.gemma_run.argtypes = [_void_p, _int]
         _lib.gemma_run.restype = _int
+        _lib.gemma_run_parts.argtypes = [_void_p, _int, _int, _void_p]
+        _lib.gemma_run_parts.restype = _int
         _lib.gemma_gp_record_size.argtypes = []
         _lib.gemma_gp_record_size.restype = _int
         _lib.gemma_router_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
@@ -1261,6 +1263,14 @@ def linear_bf16_gemv(x, w_u16):
 def gp_run(buf, limit=-1):
     """Run a program of np_gemma.program. buf is its int64 array."""
     return _lib.gemma_run(buf.ctypes.data, ctypes.c_int(limit))
+
+
+def gp_run_parts(addrs, team, bar):
+    """Run the programs of the parts of a step at the same time. addrs is an
+    int64 array of the address of each program. bar is the int64 barrier
+    array of the programs."""
+    return _lib.gemma_run_parts(addrs.ctypes.data, ctypes.c_int(addrs.size),
+                                ctypes.c_int(team), bar.ctypes.data)
 
 
 def gp_record_size():

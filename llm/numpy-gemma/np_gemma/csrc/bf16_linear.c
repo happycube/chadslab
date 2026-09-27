@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <omp.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -6908,6 +6909,7 @@ enum {
     GP_ATTN_QC_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
+    GP_XBAR = 80, GP_MOE_PART = 81,
 };
 
 int gemma_gp_record_size(void)
@@ -7092,6 +7094,126 @@ static void gp_moe_group(const gp_rec *r, const int64_t *e)
             int t = f / top_k;
             gp_add_scaled(out + (size_t)t * (size_t)dn_rows,
                           de + (size_t)p * (size_t)dn_rows, val[f], dn_rows);
+        }
+    }
+}
+
+/* ---------- programs in parts ----------
+ * SPLIT_PLAN.md, phase 1. A step can run as several programs, one for each
+ * part of the machine. A part is, for example, one NUMA node. The function
+ * gemma_run_parts runs each part in its own team of threads. A part computes
+ * a range of the rows of the large operations, so each output value still
+ * comes from one thread.
+ *
+ * A barrier across the parts (GP_XBAR) comes before an operation that reads
+ * the output of a different part. The barrier is an int64 array of the
+ * caller. The
+ * value b[0] counts the parts that arrived. The value b[8] is the generation.
+ * It is on a different cache line.
+ *
+ * The last part to arrive sets the count to 0 and increments the
+ * generation. The other parts wait until the generation changes.
+ *
+ * The OpenMP barrier at the start makes sure that each thread of the team
+ * finished its writes. The atomic operations then make those writes visible
+ * to the other parts. */
+static void gp_xbar(int64_t *b, int n)
+{
+    #pragma omp barrier
+    #pragma omp single
+    {
+        int64_t gen = __atomic_load_n(&b[8], __ATOMIC_ACQUIRE);
+        if (__atomic_add_fetch(&b[0], 1, __ATOMIC_ACQ_REL) == n) {
+            __atomic_store_n(&b[0], 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&b[8], gen + 1, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&b[8], __ATOMIC_ACQUIRE) == gen) {
+#if GEMMA_X86
+                _mm_pause();
+#endif
+            }
+        }
+    }
+}
+
+/* The experts of one token, for the rows of one part. The part holds a copy
+ * of some rows of each expert:
+ *
+ * - ni gate rows from inner row a0, and the ni up rows that go with them;
+ * - nd down rows from output row c0.
+ *
+ * The steps:
+ *
+ * 1. Sort the selected experts, as gp_moe_one does.
+ * 2. Run the gate and the up rows of the part and the GELU. Copy the result
+ *    to columns a0 to a0 + ni of the shared activation (top_k, inner).
+ * 3. Wait at the barrier until all parts wrote their columns.
+ * 4. Run the down rows of the part on the whole activation.
+ * 5. Add the outputs of the experts for rows c0 to c0 + nd of the output.
+ *    Use the order of the expert index, as gp_moe_one does.
+ *
+ * Each value comes from the same instructions as in gp_moe_one, so the bits
+ * are the same. This needs a0 and ni to be multiples of 16. The GELU uses 16
+ * values in a vector and the rest one at a time. */
+static void gp_moe_part(const gp_rec *r, const int64_t *e)
+{
+    const float *h = GP_P(const float, 0);
+    const float *val = GP_P(const float, 1);
+    const int32_t *idx = GP_P(const int32_t, 2);
+    int top_k = GP_I(3);
+    const uint8_t *gu_w = GP_P(const uint8_t, 4);
+    const float *gu_s = GP_P(const float, 5);
+    const uint8_t *dn_w = GP_P(const uint8_t, 6);
+    const float *dn_s = GP_P(const float, 7);
+    int gu_rows = GP_I(8);      /* 2 ni */
+    int cols = GP_I(9);
+    int nd = GP_I(10);
+    int ni = GP_I(11);
+    int32_t *ids = GP_P(int32_t, 12);
+    float *act = GP_P(float, 13);     /* (top_k, 2 ni), private */
+    float *act2p = GP_P(float, 14);   /* (top_k, ni), private */
+    float *act2 = GP_P(float, 15);    /* (top_k, inner), shared */
+    int a0 = GP_I(16);
+    int inner = GP_I(17);
+    float *de = GP_P(float, 18);      /* (top_k, nd), private */
+    float *out = GP_P(float, 19);     /* (hidden), shared */
+    int c0 = GP_I(20);
+    int64_t *bar = GP_P(int64_t, 21);
+    int nparts = GP_I(22);
+    #pragma omp single
+    {
+        for (int j = 0; j < top_k; ++j) {
+            ids[j] = idx[j];
+        }
+        for (int j = 1; j < top_k; ++j) {
+            int32_t x = ids[j];
+            int k = j - 1;
+            while (k >= 0 && ids[k] > x) {
+                ids[k + 1] = ids[k];
+                --k;
+            }
+            ids[k + 1] = x;
+        }
+    }
+    gemma_moe_gemv_gelu_body(gu_w, gu_s, h, ids, top_k, act, act2p, gu_rows, cols, 0, ni);
+    #pragma omp single
+    for (int j = 0; j < top_k; ++j) {
+        memcpy(act2 + (size_t)j * (size_t)inner + a0, act2p + (size_t)j * (size_t)ni,
+               (size_t)ni * sizeof(float));
+    }
+    gp_xbar(bar, nparts);
+    gemma_int4_moe_gemv_body(dn_w, dn_s, act2, ids, top_k, de, nd, inner, inner);
+    #pragma omp single
+    {
+        for (int c = 0; c < nd; ++c) {
+            out[c0 + c] = 0.0f;
+        }
+        for (int j = 0; j < top_k; ++j) {
+            int s = 0;
+            while (idx[s] != ids[j]) {
+                ++s;
+            }
+            gp_add_scaled(out + c0, de + (size_t)j * (size_t)nd, val[s], nd);
         }
     }
 }
@@ -7440,16 +7562,22 @@ static void gp_step(const gp_rec *r, int64_t *e)
     case GP_MOE_MT:
         gp_moe_group(r, e);
         break;
+    /* ---- programs in parts ---- */
+    case GP_XBAR:
+        /* bar, parts */
+        gp_xbar(GP_P(int64_t, 0), GP_I(1));
+        break;
+    case GP_MOE_PART:
+        gp_moe_part(r, e);
+        break;
     default:
         break;
     }
 }
 
-int gemma_run(const int64_t *prog, int limit)
+/* Run the records of one program. The caller opens the parallel region. */
+static void gp_exec(const int64_t *prog, int limit)
 {
-    if (prog[0] != GP_MAGIC) {
-        return -1;
-    }
     const int n_env = (int)prog[1];
     int n_code = (int)prog[2];
     const int64_t *env0 = prog + 4;
@@ -7457,14 +7585,53 @@ int gemma_run(const int64_t *prog, int limit)
     if (limit >= 0 && limit < n_code) {
         n_code = limit;
     }
+    int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
+    memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
+    for (int pc = 0; pc < n_code; ++pc) {
+        gp_step(code + pc, e);
+    }
+    free(e);
+}
+
+int gemma_run(const int64_t *prog, int limit)
+{
+    if (prog[0] != GP_MAGIC) {
+        return -1;
+    }
     #pragma omp parallel
-    {
-        int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
-        memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
-        for (int pc = 0; pc < n_code; ++pc) {
-            gp_step(code + pc, e);
+    gp_exec(prog, limit);
+    return 0;
+}
+
+/* Run nparts programs at the same time. Each program runs in a team of team
+ * threads. The array progs holds the address of each program. The outer
+ * region has one thread for each part, spread over the places of OMP_PLACES.
+ * Each of those threads opens a team on the places near it.
+ *
+ * A team of 0 divides the threads of OMP_NUM_THREADS by the parts. The array
+ * bar is the barrier of the programs (see gp_xbar). This function sets it to
+ * 0 first. */
+int gemma_run_parts(const int64_t *const *progs, int nparts, int team, int64_t *bar)
+{
+    for (int p = 0; p < nparts; ++p) {
+        if (progs[p][0] != GP_MAGIC) {
+            return -1;
         }
-        free(e);
+    }
+    if (team <= 0) {
+        team = omp_get_max_threads() / nparts;
+        if (team < 1) {
+            team = 1;
+        }
+    }
+    bar[0] = 0;
+    bar[8] = 0;
+    omp_set_max_active_levels(2);
+    #pragma omp parallel num_threads(nparts) proc_bind(spread)
+    {
+        const int64_t *prog = progs[omp_get_thread_num()];
+        #pragma omp parallel num_threads(team) proc_bind(close)
+        gp_exec(prog, -1);
     }
     return 0;
 }

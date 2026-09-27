@@ -256,6 +256,62 @@ waits for an event of the GPU. The GPU part waits for a flag that the CPU
 writes, with a stream wait on a value in host memory. Thus a step stays one
 call from Python.
 
+## Results of phase 1
+
+The module np_gemma/parts.py compiles a step of one token into one program
+for each part. The function gemma_run_parts in the C file runs the parts in
+nested teams. The script scripts/check_parts.py compares each step with the
+program of one part.
+
+The compiler keeps the set of the shared buffers that the parts wrote since
+the last barrier. It puts a barrier only before an operation that reads one
+of them. A layer of the 26B then has five barriers, and the expert operation
+has one more inside. The router needs no barrier, because it reads only the
+hidden state of its own part.
+
+The bits are the same in every case of the check:
+
+    model   parts   cache    contexts      steps
+    26B     2, 3    int16    200, 1100     12
+    26B     2       float    200, 1100     12
+    12B     2       int16    200, 1100     12
+
+The next table gives the time of a step without the output head, on
+jackal. The threads are bound (OMP_PLACES=cores, OMP_PROC_BIND=close). Each
+value is the median of 12 steps.
+
+    model   context   one part   2 parts   3 parts
+    26B     200       43.7 ms    45.7 ms   48.4 ms
+    26B     1100      55.5 ms    59.6 ms   70.0 ms
+    12B     200       132.7 ms   135.8 ms  -
+    12B     1100      148.5 ms   153.2 ms  -
+
+jackal has one NUMA node. Thus the parts cannot be faster than one team
+here. The cost of the parts has two causes:
+
+- the barriers across the parts: 180 in a step of the 26B;
+- the attention, which runs only in part 0, on half of the cores. This cost
+  increases with the context.
+
+To make the attention split, each part must hold the keys and the values of
+some heads. Do this before the test on a machine with two sockets.
+
+It is important to bind the threads to the cores. Without OMP_PROC_BIND,
+a step of the 26B at a context of 200 takes 52 ms with one part. With
+OMP_PROC_BIND=close, it takes 44 ms. The step of the 12B takes 161 ms,
+against 133 ms. For this reason, an early run with free threads showed two
+parts faster than one part. The runner of the parts binds its teams in all
+cases.
+
+The next steps for NUMA:
+
+- the attention split by heads, with a cache for each part;
+- a copy of the weights of each part in the memory of its node, made by the
+  threads of that node;
+- the steps of a token group, which need a row stride of the output in the
+  group kernels;
+- the output head split by rows.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`
@@ -277,7 +333,7 @@ call from Python.
   machine with two sockets for the NUMA work (open).
 - Phase 1: places and parts in the compiler, and a runtime of several parts
   on the CPU. Emulate two nodes on jackal. Test: the same bits as one part,
-  for a step of one token.
+  for a step of one token (done, see the results of phase 1).
 - Phase 2: NUMA for real. Node-local weights, threads that stay on their
   node, and the barrier across the nodes. Measure the decode on a machine with two
   sockets, against one team.

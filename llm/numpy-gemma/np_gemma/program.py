@@ -47,6 +47,7 @@ scripts/check_program.py.
 from __future__ import annotations
 
 import ctypes
+import os
 
 import numpy as np
 
@@ -71,6 +72,8 @@ INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, BF16_LINEAR = 36, 37, 38, 39
 QKV_NORM_ROPE, KV_WRITE, ATTN_QC, ATTN_F32 = 48, 49, 50, 51
 ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
 ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
+# The operations of a program in parts (np_gemma/parts.py, SPLIT_PLAN.md).
+XBAR, MOE_PART = 80, 81
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -82,7 +85,7 @@ OP_NAMES = {v: k for k, v in dict(
     GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_QC_MT=ATTN_QC_MT, ATTN_F32_MT=ATTN_F32_MT,
     ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
-    ATTN_F32H=ATTN_F32H).items()}
+    ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -571,13 +574,17 @@ class Compiler:
             return np.ascontiguousarray(self.model.T(args[0]), dtype=np.float32)
         if head in SCALAR:
             return self.scalar(head, [self.value(a) for a in args])
-        fn = KERNELS[head]
-        return fn(self, *[self.value(a) for a in args])
+        return self.kernel(head, [self.value(a) for a in args])
 
     def expr_into(self, form, out):
         """Compile a kernel expression that writes an existing buffer."""
-        fn = KERNELS[form[0]]
-        return fn(self, *[self.value(a) for a in form[1:]], out=out)
+        return self.kernel(form[0], [self.value(a) for a in form[1:]], out)
+
+    def kernel(self, head, vals, out=None):
+        """Compile one kernel operation of KERNELS on the values of its
+        operands. The compiler of a part (np_gemma/parts.py) changes this."""
+        fn = KERNELS[head]
+        return fn(self, *vals) if out is None else fn(self, *vals, out=out)
 
     def scalar(self, head, vals):
         """Compile a scalar operation. Return an int or a slot.
@@ -936,7 +943,6 @@ def k_kv_write_heads(c, layer, k, v):
 def k_attn_e4b(c, layer, q):
     """(attn_e4b layer q): the attention of the queries over the E4B cache. A
     shared layer reads the buffers of its source layer. As E4B.attention."""
-    import os
     plan = c.cfg.plan[layer]
     hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
     t = q.size // (qh * hd)
@@ -1133,6 +1139,10 @@ def decode_step(model, cache, tokens, pos):
     """
     tokens = [int(x) for x in tokens]
     attn = ready(model, cache)
+    n_parts = int(os.environ.get("NP_GEMMA_PARTS", "1"))
+    if n_parts > 1 and len(tokens) == 1:
+        from . import parts
+        return parts.decode_step(model, cache, tokens, pos, attn, n_parts)
     progs = model.__dict__.setdefault("_programs", {})
     key = (attn, len(tokens))
     prog = progs.get(key)
@@ -1151,6 +1161,14 @@ def bind_step(prog, model, cache, pos):
     a buffer. The program then writes the new rows in C. In the mode "qc",
     the int16 copy of the cache must be on for every layer of the program.
     """
+    kw = step_params(prog, model, cache, pos)
+    prog.bind(**kw)
+    return kw
+
+
+def step_params(prog, model, cache, pos):
+    """Prepare the cache for the tokens of a step. Return the parameters of
+    the program as a dict. See bind_step."""
     kw = {"pos": pos}
     keep = []
     qc = getattr(prog, "attn", "qc") == "qc"
@@ -1182,8 +1200,8 @@ def bind_step(prog, model, cache, pos):
         sc = np.zeros(max(need, 2 * (sc.size if sc is not None else 0)), dtype=np.float32)
         prog.scores = sc
     kw["scores"] = sc
-    prog.bind(**kw)
     prog.keep_bound = keep
+    return kw
 
 
 # ---- the E4B model ------------------------------------------------------------

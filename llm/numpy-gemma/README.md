@@ -239,6 +239,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     OPENBLAS_NUM_THREADS   1                       One BLAS thread for the attention. Many threads fight the int8 kernel. Set it to 1 for the E4B int4 mode as well: that mode is about eight times slower with a BLAS pool.
     OMP_NUM_THREADS        physical cores          The thread count of the int4 kernel. Set it to override the default.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
+    OMP_PROC_BIND          system                  close, with OMP_PLACES=cores, keeps each thread on one core. On jackal a decode step of the 26B is then about 15 per cent faster, and one of the 12B about 18 per cent.
     NP_GEMMA_ATTN          1                       1 uses the fused attention over an int16 copy of the cache, with a float query. 0 uses the float cache. The two give about the same result. The server uses 1 (--kv-attn int16).
     NP_GEMMA_FUSED_QKV     1                       1 gives the query, the key, and the value their norm in one call, and the query and the key their rope in one call. 0 gives each tensor its own call.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
@@ -264,6 +265,8 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_MT            1                       1 uses the small-group kernels for 2 to 16 tokens, the MTP verify step. 0 uses the prompt kernels.
     NP_GEMMA_MTP           1                       0 turns the MTP drafter off. See MTP_PLAN.md.
     NP_GEMMA_MTP_PMIN      0                       The drafter stops when its best token has a lower probability than this value. 0 turns the test off.
+    NP_GEMMA_PARTS         1                       2 or more runs a decode step of one token as that many programs, each in its own team of threads (np_gemma/parts.py, SPLIT_PLAN.md). This is for a machine with NUMA. The result has the same bits.
+    NP_GEMMA_PART_TEAM     0                       The thread count of each part. 0 divides OMP_NUM_THREADS by the count of parts.
 
 ## Weight modes
 
