@@ -21,6 +21,10 @@ static inline float gdn_silu(float v)
  * v_dim), a and b (t x v_heads). S (v_heads x k_dim x v_dim) is the state.
  * out (t x v_heads * v_dim) gets rms_norm(o) * norm_w * silu(z).
  *
+ * The value head hv reads the key head hv / (v_heads / k_heads) (the order of
+ * transformers and MLX), or hv % k_heads with tiled (the order of the GGUF
+ * files of llama.cpp).
+ *
  * gdn_body runs inside a parallel region: first the convolution of all the
  * channels (tokens in order), then each value head on its own thread.
  *
@@ -41,7 +45,7 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
                      const float *z, const float *a, const float *b, const float *A_log,
                      const float *dt_bias, const float *norm_w, float *S, float *out,
                      float *scratch, int t, int k_heads, int v_heads, int k_dim, int v_dim,
-                     float eps, float *log)
+                     float eps, float *log, int tiled)
 {
     int kd = k_heads * k_dim, vd = v_heads * v_dim, cd = 2 * kd + vd;
     int rep = v_heads / k_heads;
@@ -81,7 +85,7 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
         }
         #pragma omp for schedule(static)
         for (int hv = 0; hv < v_heads; ++hv) {
-            int hk = hv / rep;
+            int hk = tiled ? hv % k_heads : hv / rep;
             float *Sh = S + (size_t)hv * k_dim * v_dim;
             if (log != NULL) {
                 /* A verify group: a copy of the state of the head. */
@@ -159,11 +163,12 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
 void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
               const float *z, const float *a, const float *b, const float *A_log,
               const float *dt_bias, const float *norm_w, float *S, float *out, float *scratch,
-              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps, float *log)
+              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps, float *log,
+              int tiled)
 {
     #pragma omp parallel
     gdn_body(qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, t,
-             k_heads, v_heads, k_dim, v_dim, eps, log);
+             k_heads, v_heads, k_dim, v_dim, eps, log, tiled);
 }
 
 /* Apply the first n tokens of a log (gdn_body with a log of t tokens) to

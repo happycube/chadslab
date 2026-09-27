@@ -558,42 +558,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
     float *as = (float *)ma_take(&p, (size_t)P * ngi * 4);
     float *am = (float *)ma_take(&p, (size_t)P * ngi * 4);
     float *de = (float *)ma_take(&p, (size_t)P * hidden * 4);
-    #pragma omp single
-    {
-        /* A counting sort of the pairs by expert. */
-        for (int e = 0; e <= ne; ++e) {
-            cnt[e] = 0;
-        }
-        for (int q = 0; q < t * k; ++q) {
-            cnt[ids[q]]++;
-        }
-        if (shared) {
-            cnt[experts] = t;
-        }
-        int a = 0, nu = 0;
-        for (int e = 0; e < ne; ++e) {
-            start[e] = a;
-            a += cnt[e];
-            if (cnt[e] > 0) {
-                used[nu++] = e;
-            }
-            cnt[e] = 0;
-        }
-        for (int q = 0; q < t * k; ++q) {
-            int e = ids[q];
-            int pos = start[e] + cnt[e]++;
-            pair_tok[pos] = q / k;
-            pair_of[q] = pos;
-        }
-        if (shared) {
-            for (int j = 0; j < t; ++j) {
-                int pos = start[experts] + cnt[experts]++;
-                pair_tok[pos] = j;
-                pair_of[t * k + j] = pos;
-            }
-        }
-        *nused_p = nu;
-    }
+    moe_sort_pairs(ids, t, k, experts, shared, cnt, start, used, pair_tok, pair_of, nused_p);
     int nu = *nused_p;
     /* The input rows of the pairs, in the sorted order. */
     #pragma omp for schedule(static)
@@ -638,26 +603,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
         ma_rows_any(m, r, inner, aq + (size_t)s0 * inner, as + (size_t)s0 * ngi,
                     am + (size_t)s0 * ngi, n, de + (size_t)s0 * hidden + r, (size_t)hidden);
     }
-    /* The weighted sum for each token, in blocks of 64 columns, so one
-     * token uses all the threads. */
-    int nb = hidden / 64;
-    #pragma omp for schedule(static)
-    for (int x = 0; x < t * nb; ++x) {
-        int j = x / nb, c0 = (x % nb) * 64;
-        float *o = out + (size_t)j * hidden;
-        float sw = shared ? 1.f / (1.f + expf(-shared_logit[j])) : 0.f;
-        const float *sd = shared ? de + (size_t)pair_of[t * k + j] * hidden : NULL;
-        for (int c = c0; c < c0 + 64; ++c) {
-            o[c] = shared ? sw * sd[c] : 0.f;
-        }
-        for (int sl = 0; sl < k; ++sl) {
-            const float *d = de + (size_t)pair_of[j * k + sl] * hidden;
-            float w = val[j * k + sl];
-            for (int c = c0; c < c0 + 64; ++c) {
-                o[c] += w * d[c];
-            }
-        }
-    }
+    moe_combine(de, pair_of, val, shared_logit, shared, t, k, hidden, out);
 }
 
 void ma_moe(const int8_t *hq4, const int8_t *hq8, const float *hs, const float *hsum,

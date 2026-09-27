@@ -30,7 +30,7 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
 # The files that bf16_linear.c includes; the hash of the library covers them.
-_SOURCES = [_SRC, _HERE / "csrc" / "mlx_affine.c", _HERE / "csrc" / "deltanet.c"]
+_SOURCES = [_SRC] + [_HERE / "csrc" / n for n in ("moe.c", "mlx_affine.c", "kquants.c", "deltanet.c")]
 _LIB_DIR = _HERE / "_libs"
 # The code builds three libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The third adds the VNNI
@@ -236,8 +236,19 @@ try:
         _lib.ma_moe_scratch.argtypes = [_int] * 5
         _lib.ma_moe_scratch.restype = ctypes.c_size_t
         _lib.gdn_step.argtypes = [_void_p, _void_p, _void_p, _int] + [_void_p] * 9 + \
-            [_int] * 5 + [ctypes.c_float, _void_p]
+            [_int] * 5 + [ctypes.c_float, _void_p, _int]
         _lib.gdn_step.restype = None
+        _lib.kq_quant_x.argtypes = [_void_p, _int, _int, _void_p, _void_p, _void_p]
+        _lib.kq_quant_x.restype = None
+        _lib.kq_linear.argtypes = [_void_p, _int, _int, _int] + [_void_p] * 4 + [_int, _void_p]
+        _lib.kq_linear.restype = None
+        _lib.kq_rows.argtypes = [_void_p, _int, _int, _void_p, _int, _void_p]
+        _lib.kq_rows.restype = None
+        _lib.kq_moe.argtypes = [_void_p] * 5 + [_int, _int, _int, _void_p, _void_p, _int, _int,
+                                                 _void_p, _void_p]
+        _lib.kq_moe.restype = None
+        _lib.kq_moe_scratch.argtypes = [_int] * 5
+        _lib.kq_moe_scratch.restype = ctypes.c_size_t
         _lib.gdn_commit.argtypes = [_void_p, _void_p, _void_p] + [_int] * 6
         _lib.gdn_commit.restype = None
         _lib.gdn_log_floats.argtypes = [_int] * 5
@@ -665,14 +676,16 @@ def ma_moe(hq4, hq8, hs, hsum, ids, val, experts, mats, shared_logit, hidden, in
 
 
 def gdn_step(qkv, conv, conv_w, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, k_heads,
-             v_heads, k_dim, v_dim, eps):
+             v_heads, k_dim, v_dim, eps, tiled=False):
     """The Gated DeltaNet for the rows of qkv, in order (csrc/deltanet.c).
-    conv and S are the state; the call changes them."""
+    conv and S are the state; the call changes them. tiled: the order of
+    the value heads of the GGUF files."""
     t = qkv.shape[0]
     _lib.gdn_step(qkv.ctypes.data, conv.ctypes.data, conv_w.ctypes.data, conv_w.shape[1],
                   z.ctypes.data, a.ctypes.data, b.ctypes.data, A_log.ctypes.data,
                   dt_bias.ctypes.data, norm_w.ctypes.data, S.ctypes.data, out.ctypes.data,
-                  scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps), None)
+                  scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps), None,
+                  int(tiled))
 
 
 def gdn_log_floats(t, k_heads, v_heads, k_dim, v_dim):
@@ -684,6 +697,52 @@ def gdn_commit(conv, S, log, n, kernel, k_heads, v_heads, k_dim, v_dim):
     """Apply the first n tokens of the log of a verify group to conv and S."""
     _lib.gdn_commit(conv.ctypes.data, S.ctypes.data, log.ctypes.data, n, kernel, k_heads,
                     v_heads, k_dim, v_dim)
+
+
+def kq_quant_x(x, xq, xs, xm):
+    """Quantize the rows of x (float32, contiguous) for the GGUF products:
+    xq (int8, the shape of x), xs (one value for each 32), xm (one value for
+    each 16). See csrc/kquants.c."""
+    t, cols = x.shape
+    _lib.kq_quant_x(x.ctypes.data, t, cols, xq.ctypes.data, xs.ctypes.data, xm.ctypes.data)
+
+
+def kq_linear(w, type_, rows, cols, xq, xs, xm, x, t, out):
+    """out (t x rows) = x W^T for a GGUF matrix w (the raw blocks) of ggml
+    type type_ (0, 8, 12, 13, 14)."""
+    _lib.kq_linear(w.ctypes.data, type_, rows, cols, xq.ctypes.data, xs.ctypes.data,
+                   xm.ctypes.data, x.ctypes.data, t, out.ctypes.data)
+
+
+def kq_rows(w, type_, cols, ids):
+    """The float32 rows ids of a GGUF matrix (the embeddings)."""
+    ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
+    out = np.empty((ids.size, cols), dtype=np.float32)
+    _lib.kq_rows(w.ctypes.data, type_, cols, ids.ctypes.data, ids.size, out.ctypes.data)
+    return out
+
+
+def kq_moe_mats(gate, up, down, shared):
+    """The descriptor of the matrices of kq_moe: 6 x (data, type) as int64
+    (0 for no shared expert). Each matrix is a (data, type) pair."""
+    rows = []
+    for m in (gate, up, down) + (tuple(shared) if shared is not None else (None, None, None)):
+        rows += [0, 0] if m is None else [m[0].ctypes.data, m[1]]
+    return np.array(rows, dtype=np.int64)
+
+
+def kq_moe_scratch(t, k, experts, hidden, inner):
+    return np.empty(_lib.kq_moe_scratch(t, k, experts, hidden, inner), dtype=np.uint8)
+
+
+def kq_moe(hq, hs, hm, ids, val, experts, mats, shared_logit, hidden, inner, scratch, out):
+    """The experts of t tokens with GGUF weights (csrc/kquants.c,
+    kq_moe_body). ids and val are (t, k); mats comes from kq_moe_mats."""
+    t, k = ids.shape
+    _lib.kq_moe(hq.ctypes.data, hs.ctypes.data, hm.ctypes.data, ids.ctypes.data,
+                val.ctypes.data, t, k, experts, mats.ctypes.data,
+                None if shared_logit is None else shared_logit.ctypes.data, hidden, inner,
+                scratch.ctypes.data, out.ctypes.data)
 
 
 def q6k_rows(table, ids, cols):

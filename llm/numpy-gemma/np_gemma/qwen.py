@@ -411,6 +411,10 @@ class QwenCPU(Qwen):
             a = self._f[name] = a.reshape(shape) if shape is not None else a
         return a
 
+    def QX(self, h):
+        """The quantized rows of h for the products of lin()."""
+        return mlx_affine.QX(h)
+
     def lin(self, name, qx, full=None):
         return mlx_affine.linear(self.M(name, full), qx)
 
@@ -439,7 +443,7 @@ class QwenCPU(Qwen):
         cfg = self.cfg
         p = "layers.%d.linear_attn." % i
         t = h.shape[0]
-        qx = mlx_affine.QX(h)
+        qx = self.QX(h)
         qkv = self.lin(p + "in_proj_qkv", qx)
         z = self.lin(p + "in_proj_z", qx)
         b = self.lin(p + "in_proj_b", qx)
@@ -449,15 +453,15 @@ class QwenCPU(Qwen):
                       z, a, b, self.F(p + "A_log"), self.F(p + "dt_bias"), self.F(p + "norm.weight"),
                       cache.state[i], out, np.empty((t, cfg.conv_dim), np.float32),
                       cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim,
-                      cfg.rms_norm_eps)
-        return self.lin(p + "out_proj", mlx_affine.QX(out))
+                      cfg.rms_norm_eps, cfg.v_tiled)
+        return self.lin(p + "out_proj", self.QX(out))
 
     def full_attention(self, i, h, cache, pos):
         cfg = self.cfg
         p = "layers.%d.self_attn." % i
         t = h.shape[0]
         nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
-        qx = mlx_affine.QX(h)
+        qx = self.QX(h)
         qg = self.lin(p + "q_proj", qx).reshape(t, nq, 2 * hd)
         q, gate = qg[..., :hd], qg[..., hd:].reshape(t, nq * hd)
         k = self.lin(p + "k_proj", qx).reshape(t, nk, hd)
@@ -485,29 +489,66 @@ class QwenCPU(Qwen):
             n = pos + j + 1
             o[j] = ops.attn_decode_f32(q[j], K[:, :n], V[:, :n], pos + j)
         o = o.reshape(t, nq * hd) * sigmoid(gate)
-        return self.lin(p + "o_proj", mlx_affine.QX(o))
+        return self.lin(p + "o_proj", self.QX(o))
 
     def moe(self, i, h):
         cfg = self.cfg
         p = "layers.%d.mlp." % i
         t = h.shape[0]
-        qx = mlx_affine.QX(h)
+        qx = self.QX(h)
         logits = self.lin(p + "gate", qx)
         e = np.exp(logits - logits.max(axis=-1, keepdims=True))
         probs = e / e.sum(axis=-1, keepdims=True)
         top = np.argsort(-probs, axis=-1, kind="stable")[:, :cfg.top_k].astype(np.int32)
         val = np.take_along_axis(probs, top, axis=-1)
         val = (val / val.sum(axis=-1, keepdims=True)).astype(np.float32)
+        slog = np.ascontiguousarray(self.lin(p + "shared_expert_gate", qx)[:, 0])
+        out = np.empty((t, cfg.hidden_size), np.float32)
+        self.experts(p, qx, np.ascontiguousarray(top), np.ascontiguousarray(val), slog, out)
+        return out
+
+    def moe_mats(self, p):
+        """The descriptor of the experts of the MLP p (ma_moe_mats)."""
         g, u, d = (self.M(p + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj"))
         shared = [self.M(p + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
-        mats = cops.ma_moe_mats(g, u, d, shared)
-        slog = np.ascontiguousarray(self.lin(p + "shared_expert_gate", qx)[:, 0])
+        return cops.ma_moe_mats(g, u, d, shared)
+
+    def experts(self, p, qx, top, val, slog, out):
+        cfg = self.cfg
+        t = top.shape[0]
         k, inner, hid = cfg.top_k, cfg.moe_inter, cfg.hidden_size
-        out = np.empty((t, hid), np.float32)
-        cops.ma_moe(qx.get(4), qx.get(8), qx.xs, qx.xsum, np.ascontiguousarray(top),
-                    np.ascontiguousarray(val), cfg.num_experts, mats, slog, hid, inner,
+        cops.ma_moe(qx.get(4), qx.get(8), qx.xs, qx.xsum, top, val, cfg.num_experts,
+                    self.moe_mats(p), slog, hid, inner,
                     cops.ma_moe_scratch(t, k, cfg.num_experts, hid, inner), out)
-        return out
+
+    # ---- the records of the program (compile_qwen_step) ----
+
+    def x_buffers(self, t, wide):
+        """The quantized x of the program: one set for all the products."""
+        return dict(q4=np.zeros((t, wide), np.int8), q8=np.zeros((t, wide), np.int8),
+                    xs=np.zeros((t, wide // 64), np.float32),
+                    xsum=np.zeros((t, wide // 64), np.float32), t=t)
+
+    def emit_quant(self, prog, xb, src, cols):
+        from . import program as P
+        prog.emit(P.MA_QUANT, src, xb["t"], cols, xb["q4"], xb["q8"], xb["xs"], xb["xsum"])
+
+    def emit_lin(self, prog, xb, name, out):
+        from . import program as P
+        m = self.M(name)
+        prog.emit(P.MA_LINEAR, xb["q4"] if m.bits == 4 else xb["q8"], xb["xs"], xb["xsum"], m.q,
+                  m.scales, m.biases, m.bits, m.rows, m.cols, xb["t"], out)
+
+    def moe_scratch(self, t):
+        cfg = self.cfg
+        return cops.ma_moe_scratch(t, cfg.top_k, cfg.num_experts, cfg.hidden_size, cfg.moe_inter)
+
+    def emit_moe(self, prog, xb, p, idx, val, slog, scratch, out):
+        from . import program as P
+        cfg = self.cfg
+        prog.emit(P.MA_MOE, xb["q4"], xb["q8"], xb["xs"], xb["xsum"], idx, val, xb["t"],
+                  cfg.top_k, cfg.num_experts, self.moe_mats(p), slog, cfg.hidden_size,
+                  cfg.moe_inter, scratch, out)
 
     def embed(self, ids):
         return self.M("embed_tokens").dequant(rows=np.asarray(ids, dtype=np.int64))
@@ -539,13 +580,12 @@ def compile_qwen_step(model, t, verify=False):
     f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
     x, h, xn = f32(t, hid), f32(t, hid), f32(t, hid)
     wide = max(cd, nq * 2 * hd, vd, nq * hd)
-    xq4, xq8 = np.zeros((t, wide), np.int8), np.zeros((t, wide), np.int8)
-    xs, xsum = f32(t, wide // 64), f32(t, wide // 64)
+    xb = model.x_buffers(t, wide)
     o1, o2, o3, o4 = f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide)
     att, gate, qout = f32(t, nq * hd), f32(t, nq * hd), f32(t, nq * hd)
     mo, logits = f32(t, hid), f32(t, E)
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
-    scratch = cops.ma_moe_scratch(t, k, E, hid, inner)
+    scratch = model.moe_scratch(t)
     gscr = np.zeros(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0),
                     np.float32)
     prog.names.update(x=x, xn=xn)
@@ -554,13 +594,10 @@ def compile_qwen_step(model, t, verify=False):
     hs = prog.slot("hs")
 
     def quant(src, cols):
-        prog.emit(P.MA_QUANT, src, t, cols, xq4, xq8, xs, xsum)
+        model.emit_quant(prog, xb, src, cols)
 
-    def lin(name, out, full=None):
-        m = model.M(name, full)
-        prog.emit(P.MA_LINEAR, xq4 if m.bits == 4 else xq8, xs, xsum, m.q, m.scales, m.biases,
-                  m.bits, m.rows, m.cols, t, out)
-        return m.rows
+    def lin(name, out):
+        model.emit_lin(prog, xb, name, out)
 
     def log_of(i):
         if not verify:
@@ -599,7 +636,7 @@ def compile_qwen_step(model, t, verify=False):
                       att, o3, model.F(a + "A_log"), model.F(a + "dt_bias"),
                       model.F(a + "norm.weight"), prog.slot("S.%d" % i), gate, gscr, t,
                       cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps,
-                      log_of(i))
+                      log_of(i), int(cfg.v_tiled))
             quant(gate, vd)
             lin(a + "out_proj", o4)
         # o4 (t x hidden) has the output of the attention; x += o4.
@@ -610,11 +647,7 @@ def compile_qwen_step(model, t, verify=False):
         lin(m + "gate", logits)
         prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
         lin(m + "shared_expert_gate", slog)
-        g, u, d = (model.M(m + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj"))
-        shared = [model.M(m + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
-        mats = cops.ma_moe_mats(g, u, d, shared)
-        prog.emit(P.MA_MOE, xq4, xq8, xs, xsum, idx, val, t, k, E, mats, slog, hid, inner,
-                  scratch, mo)
+        model.emit_moe(prog, xb, m, idx, val, slog, scratch, mo)
         prog.emit(P.ADD, x, mo, x, t * hid)
     prog.emit(P.RMS_NORM, x, model.F("norm.weight"), xn, t, hid, eps)
     prog.tokens = t
@@ -638,8 +671,8 @@ def bind_qwen_step(prog, model, cache, pos):
     prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
 
 
-class QwenProgram(QwenCPU):
-    """QwenCPU with the step as one program (compile_qwen_step). A prompt
+class _QwenRuns:
+    """The runs of a model with the step as one program (compile_qwen_step). A prompt
     runs in chunks of at most CHUNK tokens; each token count has its own
     program.
 
@@ -700,6 +733,11 @@ class QwenProgram(QwenCPU):
             c0 += len(chunk)
         cache.n = start_pos + len(ids)
         return np.concatenate(out)
+
+
+
+class QwenProgram(_QwenRuns, QwenCPU):
+    """QwenCPU (the MLX files) with the step as one program."""
 
 
 class QwenSession:
@@ -852,3 +890,108 @@ class QwenGGUF(Qwen):
             r = np.arange(r0, min(rows, r0 + chunk))
             out[:, r] = h @ self.g.dequant("output.weight", rows=r).T
         return out
+
+
+class KMat:
+    """One GGUF matrix (or a stack: the experts) as its raw blocks: data
+    (uint8, a view into the memory map), the ggml type, rows and cols of
+    one matrix."""
+
+    def __init__(self, g, gname):
+        blocks, dims, self.type = g.raw(gname)
+        self.data = np.ascontiguousarray(blocks).view(np.uint8).reshape(-1)
+        self.cols = int(dims[0])
+        self.rows = int(dims[1]) if len(dims) > 1 else 1
+
+    def c(self):
+        return (self.data, self.type)
+
+
+class KX:
+    """Rows of x, quantized for the GGUF products (csrc/kquants.c): int8
+    for each value, a scale for each 32, a sum for each 16. The F32
+    matrices use x itself."""
+
+    def __init__(self, x):
+        self.x = np.ascontiguousarray(x, dtype=np.float32)
+        self.t, cols = self.x.shape
+        self.xq = np.empty((self.t, cols), np.int8)
+        self.xs = np.empty((self.t, cols // 32), np.float32)
+        self.xm = np.empty((self.t, cols // 16), np.float32)
+        cops.kq_quant_x(self.x, self.xq, self.xs, self.xm)
+
+
+class QwenGGUFCPU(QwenCPU):
+    """QwenCPU on a GGUF file (QwenGGUF): the products run on the blocks of
+    the file with the kernels of csrc/kquants.c. The router and the other
+    F32 matrices use x without quantization."""
+
+    t = QwenGGUF.t
+
+    def __init__(self, path, cfg=None, layers=None):
+        QwenGGUF.__init__(self, path, cfg, layers)
+        self._m = {}
+        self._f = {}
+
+    def M(self, name, full=None):
+        m = self._m.get(name)
+        if m is None:
+            m = self._m[name] = KMat(self.g, gguf_name(name))
+        return m
+
+    def QX(self, h):
+        return KX(h)
+
+    def lin(self, name, qx, full=None):
+        m = self.M(name)
+        out = np.empty((qx.t, m.rows), np.float32)
+        cops.kq_linear(m.data, m.type, m.rows, m.cols, qx.xq, qx.xs, qx.xm, qx.x, qx.t, out)
+        return out
+
+    def moe_mats(self, p):
+        g, u, d = (self.M(p + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj"))
+        shared = [self.M(p + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        return cops.kq_moe_mats(g, u, d, shared)
+
+    def moe_scratch(self, t):
+        cfg = self.cfg
+        return cops.kq_moe_scratch(t, cfg.top_k, cfg.num_experts, cfg.hidden_size, cfg.moe_inter)
+
+    def experts(self, p, qx, top, val, slog, out):
+        cfg = self.cfg
+        cops.kq_moe(qx.xq, qx.xs, qx.xm, top, val, cfg.num_experts, self.moe_mats(p), slog,
+                    cfg.hidden_size, cfg.moe_inter, self.moe_scratch(top.shape[0]), out)
+
+    def embed(self, ids):
+        m = self.M("embed_tokens")
+        return cops.kq_rows(m.data, m.type, m.cols, ids)
+
+    def logits(self, h, chunk=None):
+        return self.lin("lm_head", KX(h))
+
+    def x_buffers(self, t, wide):
+        return dict(xq=np.zeros((t, wide), np.int8), xs=np.zeros((t, wide // 32), np.float32),
+                    xm=np.zeros((t, wide // 16), np.float32), t=t, src=None)
+
+    def emit_quant(self, prog, xb, src, cols):
+        from . import program as P
+        prog.emit(P.KQ_QUANT, src, xb["t"], cols, xb["xq"], xb["xs"], xb["xm"])
+        # The F32 products that follow read the float rows.
+        xb["src"] = src
+
+    def emit_lin(self, prog, xb, name, out):
+        from . import program as P
+        m = self.M(name)
+        prog.emit(P.KQ_LINEAR, xb["xq"], xb["xs"], xb["xm"], xb["src"], m.data, m.type, m.rows,
+                  m.cols, xb["t"], out)
+
+    def emit_moe(self, prog, xb, p, idx, val, slog, scratch, out):
+        from . import program as P
+        cfg = self.cfg
+        prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
+                  cfg.num_experts, self.moe_mats(p), slog, cfg.hidden_size, cfg.moe_inter,
+                  scratch, out)
+
+
+class QwenGGUFProgram(_QwenRuns, QwenGGUFCPU):
+    """QwenGGUFCPU with the step as one program."""

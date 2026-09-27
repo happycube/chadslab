@@ -6966,7 +6966,9 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
  * mlx_affine.c: the MLX affine weight format (mlx-community, OptiQ).
  * deltanet.c: the Gated DeltaNet (Qwen3.5). The program records below
  * call their bodies. */
+#include "moe.c"
 #include "mlx_affine.c"
+#include "kquants.c"
 #include "deltanet.c"
 
 /* ---------- small operations of other models (Qwen3.5) ---------- */
@@ -7107,7 +7109,8 @@ enum {
     /* The MLX affine format, the Gated DeltaNet, and the small operations of
      * Qwen3.5 (QWEN_PLAN.md). */
     GP_MA_QUANT = 100, GP_MA_LINEAR = 101, GP_MA_MOE = 102, GP_ROUTER_TOPK = 103,
-    GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106,
+    GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106, GP_KQ_QUANT = 107, GP_KQ_LINEAR = 108,
+    GP_KQ_MOE = 109,
 };
 
 int gemma_gp_record_size(void)
@@ -7459,12 +7462,32 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_GDN:
         /* qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch,
-         * t, k_heads, v_heads, k_dim, v_dim, eps, log (null, or an MTP verify group) */
+         * t, k_heads, v_heads, k_dim, v_dim, eps, log (null, or an MTP verify group),
+         * tiled (the order of the value heads) */
         gdn_body(GP_P(const float, 0), GP_P(float, 1), GP_P(const float, 2), GP_I(3),
                  GP_P(const float, 4), GP_P(const float, 5), GP_P(const float, 6),
                  GP_P(const float, 7), GP_P(const float, 8), GP_P(const float, 9), GP_P(float, 10),
                  GP_P(float, 11), GP_P(float, 12), GP_I(13), GP_I(14), GP_I(15), GP_I(16),
-                 GP_I(17), gp_f(r, e, 18), GP_P(float, 19));
+                 GP_I(17), gp_f(r, e, 18), GP_P(float, 19), GP_I(20));
+        break;
+    case GP_KQ_QUANT:
+        /* x, t, cols, xq, xs, xm */
+        kq_quant_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3), GP_P(float, 4),
+                      GP_P(float, 5));
+        break;
+    case GP_KQ_LINEAR:
+        /* xq, xs, xm, x, w, type, rows, cols, t, out */
+        kq_linear_body(GP_P(const uint8_t, 4), GP_I(5), GP_I(6), GP_I(7), GP_P(const int8_t, 0),
+                       GP_P(const float, 1), GP_P(const float, 2), GP_P(const float, 3), GP_I(8),
+                       GP_P(float, 9));
+        break;
+    case GP_KQ_MOE:
+        /* hq, hs, hm, ids, val, t, k, experts, mats, shared_logit, hidden, inner, scratch,
+         * out */
+        kq_moe_body(GP_P(const int8_t, 0), GP_P(const float, 1), GP_P(const float, 2),
+                    GP_P(const int32_t, 3), GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7),
+                    GP_P(const int64_t, 8), GP_P(const float, 9), GP_I(10), GP_I(11),
+                    GP_P(uint8_t, 12), GP_P(float, 13));
         break;
     case GP_ATTN_PREP:
         /* qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps, scale,
