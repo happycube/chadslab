@@ -1044,6 +1044,33 @@ expert only if that score is lower. Also, the limit of 8 copies for each
 step is almost always full. Thus the rule changes which experts come to
 the GPU more than their count. The default is 2.
 
+A third test: the scores start from the routers of the prompt pass. Each
+group counts the selections of its routers on the GPU (GP_COUNT, after each
+router). After the group, HotCache.seed adds the counts to the scores. The
+tokens count as the last steps. Then up to 128 slots change:
+
+    26B, 1.5 GB hot         first 64 tokens         all 255 tokens
+                            no seed    seed         no seed    seed
+    CPU cache answer        -          51.4         -          53.0
+    story                   49.6       52.5         57.0       57.5
+    Rust                    53.6       54.6         59.8       60.2
+    README, 1500 tokens     50.8       47.9         53.5       52.6
+
+A short prompt gives a small gain at the start. A long prompt gives a loss.
+Its text is not the text of the answer (a summary of the README). Also, 128
+slots are empty until their copies arrive, during the first steps. Thus the
+seed from a prompt is off by default (NP_GEMMA_GPU_HOT_SEED=0).
+
+The counts of the groups stay for MTP. MTP runs verify groups, not decode
+steps, so observe() never runs, and before this the slots did not change.
+Now each verify group changes up to 8 slots:
+
+    26B, 1.5 GB hot, story, a new HotCache   MTP, 2 drafts
+    fixed set                                41.0 tok/s
+    HotCache, with the counts of the groups  54.3 tok/s
+
+The tokens and the accepted drafts are the same.
+
 ### A difference from one run to the next
 
 Two runs of the same decode steps of the 26B gave results that differed by

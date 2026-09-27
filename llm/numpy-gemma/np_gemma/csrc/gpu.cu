@@ -76,7 +76,7 @@ enum {
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
     GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
     GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93, GP_F32_LINEAR = 94, GP_DRAFT_HEAD = 95,
-    GP_ARGMAX = 96, GP_ADD_NORM = 97,
+    GP_ARGMAX = 96, GP_ADD_NORM = 97, GP_COUNT = 98,
 };
 
 static cudaStream_t gg_stream;
@@ -247,6 +247,20 @@ __global__ void k_add_norm(const gp_rec *r, const int64_t *e)
         for (int i = threadIdx.x; i < cols; i += blockDim.x) {
             out2[i] = out[i] * s2 * w2[i];
         }
+    }
+}
+
+/* GP_COUNT: idx, counts, top_k, t, experts. counts[x] += the count of x in the first
+ * t rows of idx (top_k values each): the selections of the router of a
+ * group, for the cache of hot experts (HotCache.seed). */
+__global__ void k_count(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    const int *idx = DP(const int, 0);
+    int *counts = DP(int, 1);
+    int n = DI(2) * DI(3);
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < n; p += gridDim.x * blockDim.x) {
+        atomicAdd(&counts[idx[p]], 1);
     }
 }
 
@@ -4039,6 +4053,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     }
     case GP_ARGMAX:
         k_argmax<<<1, 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_COUNT:
+        k_count<<<4, T, 0, s>>>(dr, denv);
         break;
     case GP_ADD_NORM:
         k_add_norm<<<(unsigned)hlit(r, 4, &bad), T, 0, s>>>(dr, denv);

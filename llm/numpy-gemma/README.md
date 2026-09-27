@@ -275,6 +275,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_GPU_HOT_DECAY 0.97                    The decay of the scores of HotCache for each step.
     NP_GEMMA_GPU_HOT_INS   8                       The most experts that HotCache copies to the GPU in each step.
     NP_GEMMA_GPU_HOT_ADMIT 2                       HotCache copies a cold expert to the GPU only from this use on; the first uses run on the CPU.
+    NP_GEMMA_GPU_HOT_SEED  0                       The experts that HotCache can change after a prompt pass, from the routers of the prompt. 0 changes none (a test gave no gain).
     NP_GEMMA_GPU_TC        1                       1 runs the int4 products and the attention of a large group (a prompt pass) on the tensor cores, with float16 inputs. 8 gives int8 inputs to the products (the Q8_0 form): about 45% faster for the E4B, and 98.6% of the top tokens agree with float32, against 99.9%. 0 keeps float32 kernels. The 26B uses float32 kernels unless NP_GEMMA_GPU_TC_MOE=1.
     NP_GEMMA_GPU_PDL       1                       0 turns off programmatic dependent launch in the CUDA graphs, for a test. See SPLIT_PLAN.md.
     NP_GEMMA_GPU_FLASH     0                       1 selects the old attention kernel of a prompt pass (k_flash_tc), for a test.

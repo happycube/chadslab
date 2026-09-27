@@ -77,7 +77,7 @@ XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 # The records that move work between the GPU and the CPU (np_gemma/gpu.py).
 TO_HOST, CPU_JOIN, TO_DEV, HOT_SPLIT, HOT_MOE = 84, 85, 86, 87, 88
 MOE_GPU, FETCH, FETCH_WAIT, FETCH_DONE, HOT_SPLIT_MT = 89, 90, 91, 92, 93
-F32_LINEAR, DRAFT_HEAD, ARGMAX, ADD_NORM = 94, 95, 96, 97
+F32_LINEAR, DRAFT_HEAD, ARGMAX, ADD_NORM, COUNT = 94, 95, 96, 97, 98
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -94,7 +94,7 @@ OP_NAMES = {v: k for k, v in dict(
     TO_DEV=TO_DEV, MOE_N=MOE_N, HOT_SPLIT=HOT_SPLIT, HOT_MOE=HOT_MOE, MOE_GPU=MOE_GPU,
     FETCH=FETCH, FETCH_WAIT=FETCH_WAIT, FETCH_DONE=FETCH_DONE,
     HOT_SPLIT_MT=HOT_SPLIT_MT, F32_LINEAR=F32_LINEAR, DRAFT_HEAD=DRAFT_HEAD,
-    ARGMAX=ARGMAX, ADD_NORM=ADD_NORM).items()}
+    ARGMAX=ARGMAX, ADD_NORM=ADD_NORM, COUNT=COUNT).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -299,6 +299,9 @@ def _py_step(op, a, e):
         e[a[0][1]] = min(V(1), V(2))
     elif op == RMS_NORM:
         L.gemma_rms_norm(V(0), V(1) or None, V(2), V(3), V(4), F(5))
+    elif op == COUNT:
+        n = V(2) * V(3)
+        np.add.at(_arr(V(1), V(4), ctypes.c_int32), _arr(V(0), n, ctypes.c_int32), 1)
     elif op == ADD_NORM:
         rows, cols = V(4), V(5)
         o = _arr(V(0), rows * cols).reshape(rows, cols)

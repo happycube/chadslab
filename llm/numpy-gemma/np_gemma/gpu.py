@@ -694,11 +694,20 @@ class SplitCompiler(PoolCompiler):
         self.hot_ip = {}
         # layer -> (tgu, tdn, ranges) of a large group (see tables).
         self.tables_of = {}
+        # (layers, experts) int32, or None: a group counts the selections of
+        # its routers there (GP_COUNT, HotCache.seed).
+        self.counts = None
 
     def kernel(self, head, vals, out=None):
         for a in _arrays(vals):
             if id(a) in self.pending:
                 self.join(a)
+        if head == "router" and self.counts is not None and vals[0].shape[0] > 1:
+            val, idx = super().kernel(head, vals, out)
+            layer = vals[1]
+            self.p.emit(P.COUNT, idx, self.counts[layer], idx.shape[1], self.p.slot("nreal"),
+                        self.counts.shape[1])
+            return val, idx
         if head == "moe":
             assert out is None
             return self.moe(*vals)
@@ -1020,7 +1029,7 @@ PREFILL_MIN = int(os.environ.get("NP_GEMMA_GPU_PREFILL_MIN", "128"))
 
 
 def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=None,
-                        hot_host=None):
+                        hot_host=None, counts=None):
     """Compile a step of t tokens for the GPU: a chunk of a prompt, or the
     group of an MTP verify step. The form is the group form of the layers.
 
@@ -1032,6 +1041,7 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     c = SplitCompiler(model, hot, kv, pool=True, stage=stage if gpu_experts else None)
     c.hot_stores = hot_stores or {}
     c.hot_host = hot_host or {}
+    c.counts = counts
     c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
     if gpu_experts:
@@ -1339,7 +1349,8 @@ class ModelGPU:
             stage = self._stage() if (t > MT_CPU and self.model.cfg.enable_moe_block) else None
             prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
                                        hot_stores=self._hot_devices() if stage else None,
-                                       hot_host=self.prog.hot_stores)
+                                       hot_host=self.prog.hot_stores,
+                                       counts=self.hot_cache.counts if self.hot_cache else None)
             # The tensor cores round the input of a product to float16. The
             # router of the experts then selects another expert more often:
             # 93% of the top tokens agree with the CPU, against 98% with the
@@ -1369,6 +1380,7 @@ class ModelGPU:
             if size > MT_CPU:
                 self.hot_cache.refresh(prog, g)
         kw = self._params(pos, size)
+        kw["nreal"] = t
         x = prog.names["x"]
         x[:t] = self.model.embed(tokens)
         x[t:] = 0.0
@@ -1376,6 +1388,8 @@ class ModelGPU:
         g.bind(kw)
         g.run()
         g.download("xn")
+        if self.hot_cache is not None:
+            self.hot_cache.seed(g, t, prompt=getattr(self, "in_prompt", False))
         for i in range(self.model.cfg.num_hidden_layers):
             self.kv.end[i] = min(self.kv.end[i], pos + t)
         hidden = self.model.cfg.hidden_size
@@ -1394,6 +1408,13 @@ class ModelGPU:
         to the GPU. A shorter part goes in groups of 16 tokens, with the
         experts on the CPU, which costs less than that copy.
         """
+        self.in_prompt = True       # for HotCache.seed
+        try:
+            return self._prefill(ids, pos)
+        finally:
+            self.in_prompt = False
+
+    def _prefill(self, ids, pos):
         out = []
         c0 = 0
         while c0 < len(ids):
@@ -1491,6 +1512,13 @@ class HotCache:
         self.held = np.stack([e["slots"] >= 0 for e in self.layers]) if m else self.score > 0
         self.incoming = np.zeros_like(self.held)
         self.uses = np.zeros(self.score.shape, dtype=np.int32)   # uses while cold
+        # The selections of the routers of a group (GP_COUNT), for all the
+        # layers; seed() reads the rows of the layers with slots.
+        self.counts = np.zeros((cfg.num_hidden_layers, cfg.num_experts), dtype=np.int32)
+        self.count_rows = [e["layer"] for e in self.layers]
+        # The experts that a prompt pass can change; 0 (the default) only
+        # reads the counts. A test gave no gain (SPLIT_PLAN.md).
+        self.seed_ins = int(os.environ.get("NP_GEMMA_GPU_HOT_SEED", "0"))
         self.rows = np.arange(m)[:, None]
         self.pending = []       # (job id, [(row, expert, slot)], ranges)
         self.due = False        # a step is done, and observe has not run
@@ -1552,11 +1580,49 @@ class HotCache:
         cand &= ~self.held & ~self.incoming & (score > low[:, None]) & (self.uses >= self.admit)
         if not cand.any():
             return
+        self._replace(cand, self.max_ins)
+
+    def seed(self, g, t, prompt):
+        """After a group of t tokens (a part of a prompt, or an MTP verify
+        group): add the selections of its routers to the scores, as if its
+        tokens were the last t steps, then change the slots. After a part of
+        a prompt, up to seed_ins experts change (not max_ins), and one use is
+        enough, so the slots fit the prompt before the decode; the copies go
+        on during the decode. With NP_GEMMA_GPU_HOT_SEED=0 (the default) a
+        prompt changes nothing. An MTP verify group always counts: MTP runs
+        no decode steps, so without it the slots would not change."""
+        if not self.layers:
+            return
+        dev = g.mirror.buffer_of(self.counts).ptr
+        _check(lib().gg_d2h(self.counts.ctypes.data, dev, self.counts.nbytes))
+        c = self.counts[self.count_rows].astype(np.float32)
+        self.counts[:] = 0
+        _check(lib().gg_h2d(dev, self.counts.ctypes.data, self.counts.nbytes))
+        if prompt and self.seed_ins == 0:
+            return
+        # Each of the t tokens gets the mean weight that the steps would give.
+        f = self.decay ** t
+        w = (1.0 - f) / ((1.0 - self.decay) * t)
+        self.score *= f
+        self.score += w * c
+        self.uses += c.astype(np.int32)
+        self.uses[self.held] = 0
+        low = np.where(self.held, self.score, np.inf).min(axis=1)
+        cand = (c > 0) & ~self.held & ~self.incoming & (self.score > low[:, None]) & \
+            (self.uses >= (1 if prompt else self.admit))
+        if cand.any():
+            self._replace(cand, self.seed_ins if prompt else self.max_ins)
+
+    def _replace(self, cand, limit):
+        """Move up to limit experts of the mask cand (rows, experts) to the
+        slots of the lowest held experts, best gain first."""
+        score = self.score
+        low = np.where(self.held, score, np.inf).min(axis=1)
         ri, xi = np.nonzero(cand)
         order = np.argsort(low[ri] - score[ri, xi], kind="stable")
         items, rows, changed = [], [], set()
-        for o in order[:4 * self.max_ins]:
-            if len(items) >= self.max_ins:
+        for o in order[:4 * limit]:
+            if len(items) >= limit:
                 break
             r, x = int(ri[o]), int(xi[o])
             held = np.where(self.held[r], score[r], np.inf)
