@@ -49,12 +49,12 @@ from .qwen import compile_qwen_step
 
 Q8_0, Q8_R = 8, 100     # the ggml type; its rows for the GPU (csrc/gpu.cu)
 MT = 16                 # the largest small group (MT_MAX of csrc/gpu.cu)
-# The shortest part of a prompt that runs as a large group. Its copies of the
-# experts take about 2.8 s (20 GB at 7 GB/s); the split takes about as long
-# for this many tokens.
-FETCH_MIN = int(os.environ.get("NP_GEMMA_GPU_FETCH_MIN", "384"))
-SPLIT_SIZES = (16, 64, 128)       # the split groups of a prompt
-FETCH_SIZES = (512, 1024)         # the large groups
+# The shortest part of a prompt that runs as a large group. A group of 1024
+# rows takes about 2.6 s (mostly the copies of the experts, 7.5 GB/s); split
+# groups of 256 rows take about as long for 700 tokens (QWEN_PLAN.md).
+FETCH_MIN = int(os.environ.get("NP_GEMMA_GPU_FETCH_MIN", "700"))
+SPLIT_SIZES = (16, 64, 128, 256)  # the split groups of a prompt
+FETCH_SIZES = (1024,)             # the large groups
 
 
 class _Emit:

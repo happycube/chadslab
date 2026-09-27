@@ -17,7 +17,8 @@
  *                  each 16 values), d. w = d * sc * (q - 32).
  *
  * The products quantize x to int8 in its natural order, with one scale xs
- * for each 32 values and the sum xm of the int8 values of each 16 values
+ * for each 32 values and xm, xs times the sum of the int8 values of each 16
+ * values
  * (kq_quant_x). The same x serves all the formats. For each part of a
  * block:
  *
@@ -83,8 +84,10 @@ static void kq_quant_part(const float *xr, int g, int8_t *qr, float *xs, float *
             s1 += qv;
         }
     }
-    xm[2 * g] = (float)s0;
-    xm[2 * g + 1] = (float)s1;
+    /* The sums times the scale: the terms of the mins (Q4_K, Q5_K) and of
+     * the offset 32 (Q6_K) are then products with the scales of the row. */
+    xm[2 * g] = xs[g] * (float)s0;
+    xm[2 * g + 1] = xs[g] * (float)s1;
 }
 
 /* Quantize t rows of x (cols % 32 == 0), inside a parallel region: xq (t x
@@ -207,11 +210,17 @@ static void kq_row_scales(const uint8_t *w, int type, int cols, float *ds, float
         size_t bs = type == KQ_Q5_K ? 176 : 144;
         for (int b = 0; b < cols / 256; ++b) {
             const uint8_t *blk = w + (size_t)b * bs;
-            int32_t sm[16];
-            for (int j = 0; j < 8; ++j) {
-                kq_scale_min(blk + 4, j, &sm[j], &sm[8 + j]);
-            }
-            __m512 v = _mm512_cvtepi32_ps(_mm512_loadu_si512((const void *)sm));
+            /* The 6-bit scales and mins with 32-bit masks (as ggml): the
+             * bytes of u are the 8 scales, then the 8 mins. */
+            uint32_t u[4];
+            memcpy(u, blk + 4, 12);
+            const uint32_t k1 = 0x3f3f3f3f, k2 = 0x0f0f0f0f, k3 = 0x03030303;
+            u[3] = ((u[2] >> 4) & k2) | (((u[1] >> 6) & k3) << 4);
+            uint32_t mins = u[1] & k1;
+            u[1] = (u[2] & k2) | (((u[0] >> 6) & k3) << 4);
+            u[2] = mins;
+            u[0] &= k1;
+            __m512 v = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)u)));
             __m512 dd = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(kq_h(blk)),
                                              _mm512_set1_ps(kq_h(blk + 2)));
             v = _mm512_mul_ps(dd, v);
@@ -224,21 +233,21 @@ static void kq_row_scales(const uint8_t *w, int type, int cols, float *ds, float
 
 /* The scales of one row on one token: S gets the scale of each part (ds *
  * xs, in the order of the parts), and the return value is the term that
- * the product subtracts at the end (the mins of Q4_K and Q5_K, 32 times the
- * sums of Q6_K). kq_dot1 and the tiles both use it, so they give the same
- * bits. */
+ * the product subtracts at the end: the mins of Q4_K and Q5_K (dm times
+ * xm), 32 times the sums of Q6_K (ds times xm). kq_dot1 and the tiles both
+ * use it, so they give the same bits. */
 static float kq_prep(int type, int cols, const float *ds, const float *dm, const float *xs,
                      const float *xm, float *S)
 {
+    /* two lanes for each value of 8 (a scale of each 32 for 2 sums of 16) */
+    const __m512i twice = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
     if (type == KQ_Q6_K) {
-        /* one scale of x for each 2 parts of 16 */
-        const __m512i half = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
         __m512 macc = _mm512_setzero_ps();
         for (int b = 0; b < cols / 256; ++b) {
-            __m512 xv = _mm512_permutexvar_ps(half, _mm512_maskz_loadu_ps(0xff, xs + 8 * b));
-            __m512 sv = _mm512_mul_ps(_mm512_loadu_ps(ds + 16 * b), xv);
-            _mm512_storeu_ps(S + 16 * b, sv);
-            macc = _mm512_fmadd_ps(sv, _mm512_loadu_ps(xm + 16 * b), macc);
+            __m512 dv = _mm512_loadu_ps(ds + 16 * b);
+            __m512 xv = _mm512_permutexvar_ps(twice, _mm512_maskz_loadu_ps(0xff, xs + 8 * b));
+            _mm512_storeu_ps(S + 16 * b, _mm512_mul_ps(dv, xv));
+            macc = _mm512_fmadd_ps(dv, _mm512_loadu_ps(xm + 16 * b), macc);
         }
         return 32.f * _mm512_reduce_add_ps(macc);
     }
@@ -251,19 +260,11 @@ static float kq_prep(int type, int cols, const float *ds, const float *dm, const
     if (type == KQ_Q8_0) {
         return 0.f;
     }
-    /* the mins: dm * xs * (the sum of the 32 values of x of the part) */
-    const __m512i ev = _mm512_set_epi32(30, 28, 26, 24, 22, 20, 18, 16, 14, 12, 10, 8, 6, 4, 2, 0);
-    const __m512i od = _mm512_add_epi32(ev, _mm512_set1_epi32(1));
     __m512 macc = _mm512_setzero_ps();
-    for (int j = 0; j < np; j += 16) {
-        __mmask16 m = np - j >= 16 ? (__mmask16)0xffff : (__mmask16)((1u << (np - j)) - 1);
-        __mmask16 m0 = np - j >= 8 ? (__mmask16)0xffff : (__mmask16)((1u << (2 * (np - j))) - 1);
-        __mmask16 m1 = np - j >= 16 ? (__mmask16)0xffff
-                     : (np - j > 8 ? (__mmask16)((1u << (2 * (np - j) - 16)) - 1) : 0);
-        __m512 a = _mm512_maskz_loadu_ps(m0, xm + 2 * j), c = _mm512_maskz_loadu_ps(m1, xm + 2 * j + 16);
-        __m512 sum = _mm512_add_ps(_mm512_permutex2var_ps(a, ev, c), _mm512_permutex2var_ps(a, od, c));
-        __m512 f = _mm512_mul_ps(_mm512_maskz_loadu_ps(m, dm + j), _mm512_maskz_loadu_ps(m, xs + j));
-        macc = _mm512_fmadd_ps(f, sum, macc);
+    for (int j = 0; j < np; j += 8) {
+        __mmask16 m = np - j >= 8 ? (__mmask16)0xffff : (__mmask16)((1u << (2 * (np - j))) - 1);
+        __m512 dv = _mm512_permutexvar_ps(twice, _mm512_maskz_loadu_ps(np - j >= 8 ? (__mmask16)0xff : (__mmask16)((1u << (np - j)) - 1), dm + j));
+        macc = _mm512_fmadd_ps(dv, _mm512_maskz_loadu_ps(m, xm + 2 * j), macc);
     }
     return _mm512_reduce_add_ps(macc);
 }
@@ -497,6 +498,22 @@ static inline int kq_tiles(int type, int cols)
 }
 #endif
 
+#if defined(__AVX512VNNI__)
+/* One row on one token, with the scales of the row (kq_row_scales). */
+static float kq_dot_scaled(const uint8_t *w, int type, int cols, const float *ds,
+                           const float *dm, const int8_t *xq, const float *xs, const float *xm)
+{
+    float S[KQ_S];
+    float corr = kq_prep(type, cols, ds, dm, xs, xm, S);
+    switch (type) {
+    case KQ_Q8_0: return kq_dot_q8_0(w, cols, xq, S) - corr;
+    case KQ_Q4_K: return kq_dot_q45k(w, cols, 0, xq, S) - corr;
+    case KQ_Q5_K: return kq_dot_q45k(w, cols, 1, xq, S) - corr;
+    }
+    return kq_dot_q6k(w, cols, xq, S) - corr;
+}
+#endif
+
 /* One row of type type on one token: xq, xs, xm (quantized), or x for F32. */
 static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
                      const float *xm, const float *x)
@@ -506,15 +523,9 @@ static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, con
         return kq_dot_f32((const float *)w, cols, x);
     }
     if (kq_tiles(type, cols)) {
-        float ds[KQ_S], dm[KQ_S], S[KQ_S];
+        float ds[KQ_S], dm[KQ_S];
         kq_row_scales(w, type, cols, ds, dm);
-        float corr = kq_prep(type, cols, ds, dm, xs, xm, S);
-        switch (type) {
-        case KQ_Q8_0: return kq_dot_q8_0(w, cols, xq, S) - corr;
-        case KQ_Q4_K: return kq_dot_q45k(w, cols, 0, xq, S) - corr;
-        case KQ_Q5_K: return kq_dot_q45k(w, cols, 1, xq, S) - corr;
-        case KQ_Q6_K: return kq_dot_q6k(w, cols, xq, S) - corr;
-        }
+        return kq_dot_scaled(w, type, cols, ds, dm, xq, xs, xm);
     }
 #endif
     (void)xm;
@@ -541,6 +552,19 @@ static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, con
 static void kq_row(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
                    const float *xm, const float *x, int n, float *out, size_t ostride)
 {
+#if defined(__AVX512VNNI__)
+    if (n > 1 && type != KQ_F32 && kq_tiles(type, cols)) {
+        /* The scales of the row one time for all the tokens. */
+        float ds[KQ_S], dm[KQ_S];
+        kq_row_scales(w, type, cols, ds, dm);
+        for (int j = 0; j < n; ++j) {
+            out[(size_t)j * ostride] = kq_dot_scaled(
+                w, type, cols, ds, dm, xq + (size_t)j * cols, xs + (size_t)j * (cols / 32),
+                xm + (size_t)j * (cols / 16));
+        }
+        return;
+    }
+#endif
     for (int j = 0; j < n; ++j) {
         out[(size_t)j * ostride] = kq_dot1(w, type, cols, xq + (size_t)j * cols,
                                            xs + (size_t)j * (cols / 32),
@@ -703,8 +727,14 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         memcpy(xs + (size_t)q * nph, hs + (size_t)j * nph, (size_t)nph * 4);
         memcpy(xm + (size_t)q * 2 * nph, hm + (size_t)j * 2 * nph, (size_t)nph * 8);
     }
+    /* A group: the experts have different counts of tokens, so the tasks
+     * go to the threads as they finish. With a static split, the threads
+     * were idle about 28% of the time. A decode step: the same work in each
+     * task, a static split. Each thread sets the schedule of its own
+     * loops. */
+    omp_set_schedule(t > 1 ? omp_sched_dynamic : omp_sched_static, t > 1 ? 8 : 0);
     /* Gate and up: 2 * inner rows of each used expert, in tasks of 4 rows. */
-    #pragma omp for schedule(static)
+    #pragma omp for schedule(runtime)
     for (int x = 0; x < nu * 2 * inner / 4; ++x) {
         int e = used[x / (2 * inner / 4)], rr = (x % (2 * inner / 4)) * 4, isup = rr >= inner;
         int r = rr % inner;
@@ -730,7 +760,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         }
     }
     /* Down: hidden rows of each used expert, in tasks of 4 rows. */
-    #pragma omp for schedule(static)
+    #pragma omp for schedule(runtime)
     for (int x = 0; x < nu * hidden / 4; ++x) {
         int e = used[x / (hidden / 4)], r = (x % (hidden / 4)) * 4;
         kq_mat m = e < experts ? D : SD;

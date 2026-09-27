@@ -475,6 +475,40 @@ A large group waits for the copies of the experts: about 2.2 s for each
 group at 7.5 GB/s. A group of 2048 rows did not fit next to the other work
 of the GPU. llama.cpp gives 224 tok/s for 512 tokens.
 
+The CPU products of a group (the experts of a split group, and the CPU
+prompt pass) became faster. A profile (perf) of KQ_MOE for 128 tokens
+showed the cause: the math took about a third of the time.
+
+- The threads waited 28% of the time (libgomp). Each expert has its own
+  count of tokens, so a static split of the tasks was not balanced. A group
+  now takes the tasks as the threads finish (schedule dynamic, 8). A step
+  keeps the static split. The MLX experts have the same change.
+- kq_row_scales (25%) unpacked the 6-bit scales one part at a time. The
+  path for fewer than 4 tokens did it again for each token. Now it uses
+  32-bit masks (as ggml), and a row does it one time for all its tokens.
+- xm (the sums of each 16 values of x) now has the scale of x in it. Then
+  the mins of Q4_K and Q5_K are a product of xm and the scales of the row.
+  The offset 32 of Q6_K is too. kq_prep does less work.
+
+The x of the products stays int8 with a scale for each 32 values. A new
+layout of the weights was not necessary.
+
+The prompt pass now (the other load of the machine):
+
+    tokens   GPU          CPU          llama.cpp CUDA   llama.cpp CPU
+                                       (-nopo 1 / def)  (VNNI)
+    100      193 tok/s    90 tok/s     173 / 63         91 tok/s
+    300      253 tok/s    94 tok/s     195 / 148        87 tok/s
+    600      265 tok/s    104 tok/s    - / 164          75 tok/s
+    1000     389 tok/s    117 tok/s    -                -
+    1500     349 tok/s    105 tok/s    201 / 220        87 tok/s
+
+The split groups of 256 rows give about 265 to 285 tok/s. A large group of
+1024 rows takes about 2.6 s, so it is better from about 700 tokens
+(FETCH_MIN). A large group of 512 rows is never better. The decode of
+llama.cpp (tg128): 38.7 tok/s with CUDA and no experts on the GPU, and
+11.9 tok/s on the CPU.
+
 The budget of hot experts (scripts/bench_qwen_hot.py, 256 tokens of
 decode, a prompt of 1500 tokens):
 

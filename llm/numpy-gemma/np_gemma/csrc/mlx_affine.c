@@ -570,9 +570,15 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
         memcpy(xs + (size_t)q * ngh, hs + (size_t)j * ngh, (size_t)ngh * 4);
         memcpy(xm + (size_t)q * ngh, hsum + (size_t)j * ngh, (size_t)ngh * 4);
     }
+    /* A group: the experts have different counts of tokens, so the tasks
+     * go to the threads as they finish. With a static split, the threads
+     * were idle about 28% of the time. A decode step: the same work in each
+     * task, a static split. Each thread sets the schedule of its own
+     * loops. */
+    omp_set_schedule(t > 1 ? omp_sched_dynamic : omp_sched_static, t > 1 ? 8 : 0);
     /* Gate and up: 2 * inner rows of each used expert, on its pairs, in
      * tasks of 4 rows. */
-    #pragma omp for schedule(static)
+    #pragma omp for schedule(runtime)
     for (int x = 0; x < nu * 2 * inner / 4; ++x) {
         int e = used[x / (2 * inner / 4)], rr = (x % (2 * inner / 4)) * 4, isup = rr >= inner;
         int r = rr % inner;
@@ -595,7 +601,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
                       am + (size_t)q * ngi);
     }
     /* Down: hidden rows of each used expert, in tasks of 4 rows. */
-    #pragma omp for schedule(static)
+    #pragma omp for schedule(runtime)
     for (int x = 0; x < nu * hidden / 4; ++x) {
         int e = used[x / (hidden / 4)], r = (x % (hidden / 4)) * 4;
         ma_mat m = e < experts ? ma_expert(D, e, hidden, inner) : SD;
