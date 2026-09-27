@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--contexts", type=int, nargs="+", default=[200, 1100])
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--kv", choices=("int16", "float"), default="int16",
+                    help="The form of the cache on the GPU.")
     ap.add_argument("--hot", default=None,
                     help="A file of scripts/expert_use.py. The GPU then holds the most used experts.")
     ap.add_argument("--hot-gb", type=float, default=4.0, help="The memory of the hot experts.")
@@ -52,7 +54,7 @@ def main():
     if args.hot:
         f = np.load(args.hot)
         hot = gpu.pick_hot(model, sum(f[k] for k in f.files), args.hot_gb * 1e9)
-    dev = gpu.ModelGPU(model, graph=not args.no_graph, hot=hot)
+    dev = gpu.ModelGPU(model, graph=not args.no_graph, hot=hot, kv=args.kv)
     print("GPU program: %.1f s to build and copy, %d hot experts" % (
         time.perf_counter() - t0, sum(len(v) for v in dev.hot.values())))
     ok = True

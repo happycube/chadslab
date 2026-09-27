@@ -485,8 +485,9 @@ class SplitCompiler(P.Compiler):
     GPU while the CPU computes the experts.
     """
 
-    def __init__(self, model, hot=None):
+    def __init__(self, model, hot=None, kv="int16"):
         super().__init__(model)
+        self.kv = kv
         # id of an output of the experts -> (CPU program, host output, event,
         # device buffer of the CPU part, device buffer of the GPU part).
         self.pending = {}
@@ -501,7 +502,19 @@ class SplitCompiler(P.Compiler):
         if head == "moe":
             assert out is None
             return self.moe(*vals)
+        if head == "kv_write" and self.kv == "int16":
+            return self.kv_write16(*vals)
         return super().kernel(head, vals, out)
+
+    def kv_write16(self, layer, k, v, row, qc=1):
+        """As k_kv_write, for a cache with the int16 copy only. The float
+        addresses are null, so the kernel does not store float rows."""
+        plan = self.cfg.plan[layer]
+        per = plan.num_kv_heads * plan.head_dim
+        sl = lambda name: self.p.slot("%s.%d" % (name, layer))  # noqa: E731
+        q = [P._addr(self, sl("kq"), row, 2 * per), P._addr(self, sl("ks"), row, per // 8),
+             P._addr(self, sl("vq"), row, 2 * per), P._addr(self, sl("vs"), row, per // 8)]
+        self.p.emit(P.KV_WRITE, k, v, 0, 0, *q, k.size)
 
     def join(self, a):
         cpu, host, ev, part, gpu_part = self.pending.pop(id(a))
@@ -614,60 +627,89 @@ def hot_counts(model):
     return counts
 
 
-def compile_split_step(model, hot=None):
+def compile_split_step(model, hot=None, kv="int16"):
     """Compile a step of one token of the 26B model (or of a dense model) for
-    the GPU, with the float cache. "x" is the input and "xn" the result. hot
-    gives the experts that the GPU holds (see pick_hot)."""
-    c = SplitCompiler(model, hot)
+    the GPU. "x" is the input and "xn" the result. hot gives the experts that
+    the GPU holds (see pick_hot). kv is the form of the cache on the GPU:
+    "int16" (the form of the CPU program, a scale for each group of 32
+    values) or "float"."""
+    c = SplitCompiler(model, hot, kv)
     c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
-    c.compile(P.step_form(model, "f32", 1))
+    c.compile(P.step_form(model, "qc" if kv == "int16" else "f32", 1))
     assert not c.pending, "an output of the experts has no reader"
     c.p.layers = list(range(model.cfg.num_hidden_layers))
-    c.p.attn = "f32"
+    c.p.attn = "qc" if kv == "int16" else "f32"
     c.p.tokens = 1
     c.p.cpu_progs = c.cpu_progs
     return c.p.finish()
 
 
 class GPUKV:
-    """The float cache of the 26B model on the GPU.
+    """The cache of the 26B model on the GPU.
 
-    Each layer has a key and a value buffer of (rows, kv_heads, head_dim)
-    values. Row 0 has the position base, as in KVCache. A sliding layer drops
-    its oldest rows when the buffer holds more than two windows, as
-    KVCache.prepare does, with a copy on the GPU. attach() copies the rows of
-    a KVCache to the GPU. detach() writes the rows that only the GPU has into
-    the KVCache with KVCache.write, which also makes their int16 copy.
+    Each layer has buffers of (rows, kv_heads, head_dim) values. Row 0 has the
+    position base, as in KVCache. The form "int16" keeps the int16 copy of
+    KVCache only: kq and vq, and ks and vs, one float32 scale for each group
+    of 32 values. That is about half of the float form. The form "float"
+    keeps k and v.
+
+    A layer with a window drops its oldest rows when the buffer holds more
+    than two windows, as KVCache.prepare does, with a copy on the GPU.
+    attach() copies the rows of a KVCache to the GPU. detach() writes the rows
+    that only the GPU has into the KVCache with KVCache.write. With the form
+    int16, those rows come back as the int16 values times their scales.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, kv="int16"):
         self.cfg = cfg
+        self.form = kv
         self.window = cfg.sliding_window or 0
         n = cfg.num_hidden_layers
-        self.k = [None] * n
-        self.v = [None] * n
+        self.names = ("kq", "ks", "vq", "vs") if kv == "int16" else ("k", "v")
+        self.bufs = [dict() for _ in range(n)]
         self.cap = [0] * n
         self.base = [0] * n
         self.end = [0] * n
         self.host_end = [0] * n
 
-    def _row(self, i):
+    def _row(self, i, name):
+        """Return the bytes of one row of the buffer name of layer i."""
         plan = self.cfg.plan[i]
-        return plan.num_kv_heads * plan.head_dim * 4
+        per = plan.num_kv_heads * plan.head_dim
+        return {"k": 4 * per, "v": 4 * per, "kq": 2 * per, "vq": 2 * per,
+                "ks": per // 8, "vs": per // 8}[name]
+
+    def nbytes(self):
+        return sum(b.nbytes for d in self.bufs for b in d.values())
 
     def _alloc(self, i, cap, keep_rows=0):
-        """Give layer i a buffer of cap rows. Keep the first keep_rows rows."""
-        rb = self._row(i)
-        k, v = Buffer(cap * rb), Buffer(cap * rb)
-        if keep_rows:
-            _check(lib().gg_d2d(k.ptr, self.k[i].ptr, keep_rows * rb))
-            _check(lib().gg_d2d(v.ptr, self.v[i].ptr, keep_rows * rb))
-        if self.k[i] is not None:
+        """Give layer i buffers of cap rows. Keep the first keep_rows rows."""
+        new = {}
+        for name in self.names:
+            rb = self._row(i, name)
+            new[name] = Buffer(cap * rb)
+            if keep_rows:
+                _check(lib().gg_d2d(new[name].ptr, self.bufs[i][name].ptr, keep_rows * rb))
+        if self.bufs[i]:
             lib().gg_sync()
-            self.k[i].free()
-            self.v[i].free()
-        self.k[i], self.v[i], self.cap[i] = k, v, cap
+            for b in self.bufs[i].values():
+                b.free()
+        self.bufs[i], self.cap[i] = new, cap
+
+    def _host_rows(self, cache, i, rows):
+        """Return the host rows of layer i in the form of the GPU."""
+        if self.form == "float":
+            return {"k": cache.k[i][:rows], "v": cache.v[i][:rows]}
+        if cache._qc_on[i]:
+            return {"kq": cache.kq[i][:rows], "ks": cache.ks[i][:rows],
+                    "vq": cache.vq[i][:rows], "vs": cache.vs[i][:rows]}
+        from . import ops
+        out = {}
+        for name, a in (("k", cache.k[i][:rows]), ("v", cache.v[i][:rows])):
+            q, sc = ops.quantize_i16(a.reshape(rows, -1, 32))
+            out[name + "q"], out[name + "s"] = q, sc
+        return out
 
     def attach(self, cache, max_len):
         for i in range(self.cfg.num_hidden_layers):
@@ -675,17 +717,16 @@ class GPUKV:
             plan = self.cfg.plan[i]
             cap = (2 * self.window + 64) if plan.is_sliding else max(max_len, rows + 64)
             cap = max(cap, rows + 64)
-            if self.k[i] is None or self.cap[i] < cap:
+            if not self.bufs[i] or self.cap[i] < cap:
                 self._alloc(i, cap)
             self.base[i], self.end[i] = cache.base[i], cache.end[i]
             self.host_end[i] = cache.end[i]
             if rows > 0:
-                Buffer.upload(self.k[i], np.ascontiguousarray(cache.k[i][:rows]))
-                Buffer.upload(self.v[i], np.ascontiguousarray(cache.v[i][:rows]))
+                for name, a in self._host_rows(cache, i, rows).items():
+                    self.bufs[i][name].upload(np.ascontiguousarray(a))
 
     def prepare(self, i, pos):
         """Make room for the row of position pos in layer i."""
-        rb = self._row(i)
         if self.cfg.plan[i].is_sliding:
             w = self.window
             if pos - self.base[i] > 2 * w:
@@ -693,8 +734,10 @@ class GPUKV:
                 off = keep - self.base[i]
                 rows = self.end[i] - keep
                 if rows > 0:
-                    _check(lib().gg_d2d(self.k[i].ptr, self.k[i].ptr + off * rb, rows * rb))
-                    _check(lib().gg_d2d(self.v[i].ptr, self.v[i].ptr + off * rb, rows * rb))
+                    for name in self.names:
+                        rb = self._row(i, name)
+                        b = self.bufs[i][name]
+                        _check(lib().gg_d2d(b.ptr, b.ptr + off * rb, rows * rb))
                 self.base[i] = keep
                 # The host now lacks some rows that the GPU dropped. Only the
                 # rows of the window matter to a later step.
@@ -713,19 +756,28 @@ class GPUKV:
                 continue
             plan = self.cfg.plan[i]
             shape = (n, plan.num_kv_heads, plan.head_dim)
-            k, v = np.empty(shape, np.float32), np.empty(shape, np.float32)
-            off = (start - self.base[i]) * self._row(i)
-            _check(lib().gg_d2h(k.ctypes.data, self.k[i].ptr + off, k.nbytes))
-            _check(lib().gg_d2h(v.ctypes.data, self.v[i].ptr + off, v.nbytes))
-            cache.write(i, start, k, v)
+            got = {}
+            for name in self.names:
+                rb = self._row(i, name)
+                dt = {"kq": np.int16, "vq": np.int16}.get(name, np.float32)
+                a = np.empty(n * rb // np.dtype(dt).itemsize, dtype=dt)
+                _check(lib().gg_d2h(a.ctypes.data,
+                                    self.bufs[i][name].ptr + (start - self.base[i]) * rb, a.nbytes))
+                got[name] = a
+            if self.form == "float":
+                k, v = got["k"].reshape(shape), got["v"].reshape(shape)
+            else:
+                k = (got["kq"].reshape(-1, 32) * got["ks"][:, None]).reshape(shape)
+                v = (got["vq"].reshape(-1, 32) * got["vs"][:, None]).reshape(shape)
+            cache.write(i, start, k.astype(np.float32), v.astype(np.float32))
             self.host_end[i] = self.end[i]
 
     def params(self):
         kw = {}
         for i in range(self.cfg.num_hidden_layers):
             kw["base.%d" % i] = self.base[i]
-            kw["k.%d" % i] = self.k[i].ptr
-            kw["v.%d" % i] = self.v[i].ptr
+            for name in self.names:
+                kw["%s.%d" % (name, i)] = self.bufs[i][name].ptr
         return kw
 
 
@@ -741,7 +793,7 @@ class ModelGPU:
         g.detach(cache)                  # the host cache has the new rows
     """
 
-    def __init__(self, model, graph=True, hot=None):
+    def __init__(self, model, graph=True, hot=None, kv=None):
         """hot is a dict layer -> experts (see pick_hot), or None.
 
         Without hot, a model with experts gets the most used experts of a
@@ -760,9 +812,10 @@ class ModelGPU:
                 budget = float(gb) * 1e9 if gb else max(0.0, mem_info()[0] - 4.5e9)
                 hot = pick_hot(model, counts, budget)
         self.hot = hot or {}
-        self.prog = compile_split_step(model, self.hot)
+        kv = kv or os.environ.get("NP_GEMMA_GPU_KV", "int16")
+        self.prog = compile_split_step(model, self.hot, kv)
         self.g = GPUProgram(self.prog, graph=graph)
-        self.kv = GPUKV(model.cfg)
+        self.kv = GPUKV(model.cfg, kv)
         self.head = None
         self.max_len = 4096
 

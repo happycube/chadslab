@@ -67,7 +67,7 @@ enum {
     GP_MUL = 21,
     GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
     GP_GELU_MUL_INT4 = 35, GP_BF16_LINEAR = 39,
-    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_F32 = 51,
+    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_QC = 50, GP_ATTN_F32 = 51,
     GP_QKV_NORM = 54, GP_ROPE = 55, GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64,
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
@@ -232,14 +232,42 @@ __global__ void k_gelu_mul(const gp_rec *r, const int64_t *e)
 }
 
 /* k, v, kd, vd, kqd, ksd, vqd, vsd, n: store n values of the key and of the
- * value at kd and vd. The GPU keeps a float cache only, so the addresses of
- * the int16 copy are null. */
+ * value. A null kd skips the float cache, and a null kqd skips the int16
+ * cache. One thread for each group of 32 values. The int16 form is the form
+ * of gemma_quant_group32_i16: a scale of max |x| / 32767 for each group, and
+ * each value x / scale rounded to the nearest integer. */
+__device__ __forceinline__ float quant32_i16(const float *x, int16_t *q)
+{
+    float amax = 0.f;
+    for (int k = 0; k < 32; ++k) {
+        amax = fmaxf(amax, fabsf(x[k]));
+    }
+    float sc = amax > 0.f ? amax / 32767.0f : 1e-12f;
+    for (int k = 0; k < 32; ++k) {
+        int v = __float2int_rn(x[k] / sc);
+        q[k] = (int16_t)max(-32767, min(32767, v));
+    }
+    return sc;
+}
+
 __global__ void k_kv_write(const gp_rec *r, const int64_t *e)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < DI(8)) {
-        DP(float, 2)[i] = DP(const float, 0)[i];
-        DP(float, 3)[i] = DP(const float, 1)[i];
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = DI(8);
+    if (g >= n / 32) {
+        return;
+    }
+    const float *k = DP(const float, 0) + (size_t)g * 32;
+    const float *v = DP(const float, 1) + (size_t)g * 32;
+    if (DP(float, 2)) {
+        for (int i = 0; i < 32; ++i) {
+            DP(float, 2)[(size_t)g * 32 + i] = k[i];
+            DP(float, 3)[(size_t)g * 32 + i] = v[i];
+        }
+    }
+    if (DP(int16_t, 4)) {
+        DP(float, 5)[g] = quant32_i16(k, DP(int16_t, 4) + (size_t)g * 32);
+        DP(float, 7)[g] = quant32_i16(v, DP(int16_t, 6) + (size_t)g * 32);
     }
 }
 
@@ -302,7 +330,9 @@ __global__ void k_int4_linear(const gp_rec *r, const int64_t *e, int xk, int wk,
 }
 
 /* Up to four int4 matrices on the same x. The operand xk is x and ck is
- * cols. Then come (w, s, out, rows) for each matrix, from operand m0. A null
+ * cols.
+ *
+ * Then come (w, s, out, rows) for each matrix, from operand m0. A null
  * w skips a matrix. The rows of the four matrices follow each other. The
  * values are 0, 1, 2 for GP_INT4_MULTI4 and 2, 3, 5 for GP_RMS_NORM_MULTI4.
  * The x of GP_RMS_NORM_MULTI4 is the scratch of its norm. */
@@ -440,34 +470,50 @@ __global__ void k_kv_write_heads(const gp_rec *r, const int64_t *e)
     }
 }
 
-/* The attention in two kernels, with the method of FlashDecoding. A decode step has
- * few query heads (8 for the E4B model), so one block for each head leaves
- * most of the GPU idle. Here the keys of each head go to ATTN_CHUNKS blocks.
+/* The attention in two kernels, with the method of FlashDecoding. A decode
+ * step has few heads, so one block for each head leaves most of the GPU idle.
+ * Here the keys of each key and value head go to chunks of len keys. The
+ * value len is n / ATTN_CHUNKS, but at least ATTN_MIN_KEYS. Thus a short context gets
+ * a few small chunks, and a long context gets ATTN_CHUNKS chunks.
  *
- * The kernel k_attn_part: block (h, c) takes chunk c of the keys of query
- * head h. It computes these values and writes them to the scratch of the
- * program, hd + 2 values for each (h, c):
+ * The launch
+ * has ATTN_CHUNKS blocks for each head. A block past the last chunk does
+ * nothing.
  *
- * - m, the maximum of the scores of its keys;
- * - l, the sum of exp(score - m);
- * - the sum of exp(score - m) times the value rows.
+ * The kernel k_attn_part: block (kv, c) takes chunk c of the keys of key and
+ * value head kv. It does this for all the query heads of that head (rep
+ * heads), so it reads each key and value row one time. For each query head h and chunk c,
+ * it writes hd + 2 values to the scratch of the program:
+ *
+ * - the sum of exp(score - m) times the value rows;
+ * - m, the maximum of the scores of the chunk;
+ * - l, the sum of exp(score - m).
  *
  * The kernel k_attn_join: block h adds the parts of head h. Part c gets the
  * weight exp(m_c - M), where M is the largest m_c. The kernel then divides by
- * the sum of the weighted l_c.
- *
- * The record: q, k, v, scores, out, q_heads, kv_heads, head_dim, tokens (1),
- * pos, head_stride, window, slide. The keys of the step are rows lo to pos
- * of the cache. The scale is 1, as in gemma_attn_decode_f32_body. */
-#define ATTN_CHUNKS 32
+ * the sum of the weighted l_c. */
+#define ATTN_CHUNKS 256
+#define ATTN_MIN_KEYS 32
+#define ATTN_TILE 128
+#define ATTN_REP 8
+#define ATTN_KEYS 4
 
-/* The operands of one attention, for either layout of the cache. */
+/* The keys of a chunk, and the count of chunks, for n keys. */
+__device__ __forceinline__ int attn_len(int n)
+{
+    return max(ATTN_MIN_KEYS, (n + ATTN_CHUNKS - 1) / ATTN_CHUNKS);
+}
+
+/* The operands of one attention, for the three layouts of the cache. */
 struct attn_d {
-    const float *q, *k, *v;
+    const float *q;
+    const float *k, *v;          /* the float cache */
+    const int16_t *kq, *vq;      /* the int16 cache */
+    const float *ks, *vs;        /* its scale for each group of 32 values */
     float *sc, *out;
-    int qh, kvh, hd, n, window;
-    int64_t kp0, p;          /* the position of key row 0, and of the query */
-    size_t hstride, rstride; /* the distance of two heads and of two rows */
+    int qh, kvh, hd, n, window, i16;
+    int64_t kp0, p;              /* the position of key row 0, and of the query */
+    size_t hstride, rstride;     /* the distance of two heads and of two rows */
 };
 
 /* GP_ATTN_F32H reads the E4B cache, which has the shape (heads, positions,
@@ -479,24 +525,52 @@ struct attn_d {
  * The pointers k and v point at position 0. With slide, the keys start at
  * the first position of the window.
  *
- * GP_ATTN_F32 reads the cache of the 26B model, which has the shape (rows,
- * kv_heads, head_dim). Its operands:
+ * GP_ATTN_F32 reads the float cache of the 26B model, which has the shape
+ * (rows, kv_heads, head_dim). Its operands:
  *
  *     q, k, v, scores, out, q_heads, kv_heads, head_dim, n, pos, base, window
  *
- * The pointers k and v point at the first key row. Its position is base. */
+ * The pointers k and v point at the first key row. Its position is base.
+ *
+ * GP_ATTN_QC reads the int16 cache of the 26B model, with the same shape.
+ * Its operands:
+ *
+ *     q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, n
+ *
+ * The pointers point at the first key row. Every one of the n rows is in
+ * the window of the query. */
 __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
 {
     attn_d a;
+    memset(&a, 0, sizeof(a));
     a.q = DP(const float, 0);
+    if (r->op == GP_ATTN_QC) {
+        a.i16 = 1;
+        a.kq = DP(const int16_t, 1);
+        a.ks = DP(const float, 2);
+        a.vq = DP(const int16_t, 3);
+        a.vs = DP(const float, 4);
+        a.sc = DP(float, 5);
+        a.out = DP(float, 6);
+        a.qh = DI(7);
+        a.kvh = DI(8);
+        a.hd = DI(9);
+        a.n = DI(10);
+        a.window = 0;
+        a.kp0 = 0;
+        a.p = a.n;
+        a.hstride = (size_t)a.hd;
+        a.rstride = (size_t)a.kvh * a.hd;
+        return a;
+    }
     a.sc = DP(float, 3);
     a.out = DP(float, 4);
     a.qh = DI(5);
     a.kvh = DI(6);
     a.hd = DI(7);
     a.p = di(r, e, 9);
+    a.window = DI(11);
     if (r->op == GP_ATTN_F32H) {
-        a.window = DI(11);
         int64_t lo = (DI(12) && a.window > 0) ? a.p - a.window + 1 : 0;
         if (lo < 0) {
             lo = 0;
@@ -508,7 +582,6 @@ __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
         a.k = DP(const float, 1) + (size_t)lo * a.hd;
         a.v = DP(const float, 2) + (size_t)lo * a.hd;
     } else {
-        a.window = DI(11);
         a.kp0 = di(r, e, 10);
         a.n = DI(8);
         a.hstride = (size_t)a.hd;
@@ -519,86 +592,246 @@ __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
     return a;
 }
 
-__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
+/* Read 8 values as floats: values i to i + 7 of row j of head kv. With key
+ * 1 they come from the key cache, and with key 0 from the value cache. The
+ * index i is a multiple of 8. Thus one load of 16 bytes (int16) or two loads
+ * of 16 bytes (float) read them. Wide loads keep more bytes in flight. A
+ * load of one value for each lane reached only about 58 GB/s. */
+__device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j, int i,
+                                         float *out)
 {
-    attn_d a = attn_get(r, e);
-    int h = blockIdx.x, c = blockIdx.y;
-    int n = a.n, hd = a.hd;
-    int len = (n + ATTN_CHUNKS - 1) / ATTN_CHUNKS;
-    int j0 = c * len, j1 = min(n, j0 + len);
-    int kv = h / (a.qh / a.kvh);
-    const float *q = a.q + (size_t)h * hd;
-    const float *k = a.k + kv * a.hstride;
-    const float *v = a.v + kv * a.hstride;
-    float *sc = a.sc + (size_t)h * n;
-    float *o = part + ((size_t)h * ATTN_CHUNKS + c) * (hd + 2);
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
-    for (int j = j0 + warp; j < j1; j += nw) {
-        int64_t kp = a.kp0 + j;
-        float s = 0.f;
-        for (int i = lane; i < hd; i += 32) {
-            s += q[i] * k[(size_t)j * a.rstride + i];
+    size_t o = (size_t)j * a.rstride + (size_t)kv * a.hstride + i;
+    if (a.i16) {
+        const int16_t *q = key ? a.kq : a.vq;
+        float sc = (key ? a.ks : a.vs)[o / 32];
+        uint4 u = *(const uint4 *)(q + o);
+        uint32_t w[4] = {u.x, u.y, u.z, u.w};
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            out[2 * t] = (float)(int16_t)(w[t] & 0xffff) * sc;
+            out[2 * t + 1] = (float)(int16_t)(w[t] >> 16) * sc;
         }
-        for (int off = 16; off > 0; off >>= 1) {
-            s += __shfl_xor_sync(0xffffffff, s, off);
-        }
-        if (lane == 0) {
-            sc[j] = (kp > a.p || (a.window > 0 && a.p - kp >= a.window)) ? -INFINITY : s;
-        }
-    }
-    __syncthreads();
-    float m = -INFINITY;
-    for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
-        m = fmaxf(m, sc[j]);
-    }
-    m = block_max(m);
-    float l = 0.f;
-    for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
-        float x = m == -INFINITY ? 0.f : expf(sc[j] - m);
-        sc[j] = x;
-        l += x;
-    }
-    l = block_sum(l);
-    __syncthreads();
-    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-        float acc = 0.f;
-        for (int j = j0; j < j1; ++j) {
-            acc += sc[j] * v[(size_t)j * a.rstride + i];
-        }
-        o[i] = acc;
-    }
-    if (threadIdx.x == 0) {
-        o[hd] = m;
-        o[hd + 1] = l;
+    } else {
+        const float *p = (key ? a.k : a.v) + o;
+        float4 x = *(const float4 *)p, y = *(const float4 *)(p + 4);
+        out[0] = x.x; out[1] = x.y; out[2] = x.z; out[3] = x.w;
+        out[4] = y.x; out[5] = y.y; out[6] = y.z; out[7] = y.w;
     }
 }
 
-__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part)
+/* The block has 256 threads. head_dim must be 256 or 512. */
+__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
 {
-    int h = blockIdx.x, hd = DI(7);
-    const float *ph = part + (size_t)h * ATTN_CHUNKS * (hd + 2);
-    float M = -INFINITY;
-    for (int c = 0; c < ATTN_CHUNKS; ++c) {
-        M = fmaxf(M, ph[(size_t)c * (hd + 2) + hd]);
+    __shared__ float qs[ATTN_REP * 512];
+    __shared__ float ps[ATTN_REP * ATTN_TILE];
+    __shared__ float red[ATTN_REP * 512];
+    attn_d a = attn_get(r, e);
+    int kv = blockIdx.x, c = blockIdx.y;
+    int n = a.n, hd = a.hd, rep = a.qh / a.kvh;
+    int len = attn_len(n);
+    int j0 = c * len, j1 = min(n, j0 + len);
+    if (j0 >= n) {
+        return;
     }
-    float wsum = 0.f;
-    for (int c = 0; c < ATTN_CHUNKS; ++c) {
-        float mc = ph[(size_t)c * (hd + 2) + hd];
-        if (mc != -INFINITY) {
-            wsum += expf(mc - M) * ph[(size_t)c * (hd + 2) + hd + 1];
-        }
+    for (int i = threadIdx.x; i < rep * hd; i += blockDim.x) {
+        qs[i] = a.q[(size_t)kv * rep * hd + i];
+        red[i] = 0.f;
     }
-    float inv = wsum > 0.f ? 1.0f / wsum : 0.f;
-    float *out = DP(float, 4) + (size_t)h * hd;
-    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-        float acc = 0.f;
-        for (int c = 0; c < ATTN_CHUNKS; ++c) {
-            float mc = ph[(size_t)c * (hd + 2) + hd];
-            if (mc != -INFINITY) {
-                acc += expf(mc - M) * ph[(size_t)c * (hd + 2) + i];
+    __syncthreads();
+    /* The scores: each warp takes ATTN_KEYS keys at a time. Lane l reads
+     * values 8 l to 8 l + 7 of each part of 256 values of each key. The loads
+     * of the keys come first, and the sums of the lanes of the keys follow
+     * each other, so more loads are in flight. */
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
+    for (int jb = j0 + warp * ATTN_KEYS; jb < j1; jb += nw * ATTN_KEYS) {
+        float s[ATTN_KEYS][ATTN_REP];
+        #pragma unroll
+        for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+            #pragma unroll
+            for (int h = 0; h < ATTN_REP; ++h) {
+                s[kk][h] = 0.f;
             }
         }
-        out[i] = acc * inv;
+        for (int base = 0; base < hd; base += 256) {
+            int i = base + 8 * lane;
+            float kv8[ATTN_KEYS][8];
+            #pragma unroll
+            for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+                if (jb + kk < j1) {
+                    attn_kv8(a, 1, kv, jb + kk, i, kv8[kk]);
+                } else {
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        kv8[kk][u] = 0.f;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < ATTN_REP; ++h) {
+                if (h < rep) {
+                    const float *qh = qs + h * hd + i;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        float qv = qh[u];
+                        #pragma unroll
+                        for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+                            s[kk][h] += qv * kv8[kk][u];
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < ATTN_REP; ++h) {
+            if (h < rep) {
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    #pragma unroll
+                    for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+                        s[kk][h] += __shfl_xor_sync(0xffffffff, s[kk][h], off);
+                    }
+                }
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int kk = 0; kk < ATTN_KEYS; ++kk) {
+                int j = jb + kk;
+                if (j >= j1) {
+                    break;
+                }
+                int64_t kp = a.kp0 + j;
+                bool masked = kp > a.p || (a.window > 0 && a.p - kp >= a.window);
+                #pragma unroll
+                for (int h = 0; h < ATTN_REP; ++h) {
+                    if (h < rep) {
+                        a.sc[(size_t)(kv * rep + h) * n + j] = masked ? -INFINITY : s[kk][h];
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    float m[ATTN_REP], l[ATTN_REP];
+    #pragma unroll
+    for (int h = 0; h < ATTN_REP; ++h) {
+        m[h] = -INFINITY;
+        l[h] = 0.f;
+        if (h >= rep) {
+            continue;
+        }
+        float *sc = a.sc + (size_t)(kv * rep + h) * n;
+        float mh = -INFINITY;
+        for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
+            mh = fmaxf(mh, sc[j]);
+        }
+        mh = block_max(mh);
+        float lh = 0.f;
+        for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
+            float x = mh == -INFINITY ? 0.f : expf(sc[j] - mh);
+            sc[j] = x;
+            lh += x;
+        }
+        l[h] = block_sum(lh);
+        m[h] = mh;
+    }
+    __syncthreads();
+    /* The value rows. Thread t keeps values 8 d to 8 d + 7 of every query
+     * head, where d = t mod (hd / 8). The threads with the same d form
+     * groups, and group g takes the keys g, g + groups, and so on, of each
+     * tile. At the end, the groups add their sums in shared memory. */
+    int nd = hd / 8, groups = blockDim.x / nd;
+    int d = threadIdx.x % nd, grp = threadIdx.x / nd;
+    float acc[ATTN_REP][8];
+    #pragma unroll
+    for (int h = 0; h < ATTN_REP; ++h) {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            acc[h][u] = 0.f;
+        }
+    }
+    for (int t0 = j0; t0 < j1; t0 += ATTN_TILE) {
+        int tn = min(ATTN_TILE, j1 - t0);
+        for (int x = threadIdx.x; x < rep * tn; x += blockDim.x) {
+            int h = x / tn, jj = x % tn;
+            ps[h * ATTN_TILE + jj] = a.sc[(size_t)(kv * rep + h) * n + t0 + jj];
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (int jj = grp; jj < tn; jj += groups) {
+            float vv[8];
+            attn_kv8(a, 0, kv, t0 + jj, 8 * d, vv);
+            #pragma unroll
+            for (int h = 0; h < ATTN_REP; ++h) {
+                if (h < rep) {
+                    float p = ps[h * ATTN_TILE + jj];
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        acc[h][u] += p * vv[u];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int h = 0; h < ATTN_REP; ++h) {
+        if (h < rep) {
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                atomicAdd(&red[h * hd + 8 * d + u], acc[h][u]);
+            }
+        }
+    }
+    __syncthreads();
+    for (int x = threadIdx.x; x < rep * hd; x += blockDim.x) {
+        int h = x / hd, i = x % hd;
+        part[((size_t)(kv * rep + h) * ATTN_CHUNKS + c) * (hd + 2) + i] = red[x];
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int h = 0; h < ATTN_REP; ++h) {
+            if (h < rep) {
+                float *o = part + ((size_t)(kv * rep + h) * ATTN_CHUNKS + c) * (hd + 2);
+                o[hd] = m[h];
+                o[hd + 1] = l[h];
+            }
+        }
+    }
+}
+
+/* Block (h, x) joins the values x * 128 to x * 128 + 127 of query head h.
+ * The weight exp(m_c - M) of each chunk goes to shared memory first. */
+__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part)
+{
+    __shared__ float w[ATTN_CHUNKS];
+    attn_d a = attn_get(r, e);
+    int h = blockIdx.x, hd = a.hd;
+    int len = attn_len(a.n);
+    int nc = (a.n + len - 1) / len;
+    const float *ph = part + (size_t)h * ATTN_CHUNKS * (hd + 2);
+    float M = -INFINITY;
+    for (int c = threadIdx.x; c < nc; c += blockDim.x) {
+        M = fmaxf(M, ph[(size_t)c * (hd + 2) + hd]);
+    }
+    M = block_max(M);
+    float wl = 0.f;
+    for (int c = threadIdx.x; c < nc; c += blockDim.x) {
+        float mc = ph[(size_t)c * (hd + 2) + hd];
+        float wc = mc == -INFINITY ? 0.f : expf(mc - M);
+        w[c] = wc;
+        wl += wc * ph[(size_t)c * (hd + 2) + hd + 1];
+    }
+    float wsum = block_sum(wl);
+    float inv = wsum > 0.f ? 1.0f / wsum : 0.f;
+    __syncthreads();
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i < hd) {
+        float acc = 0.f;
+        for (int c = 0; c < nc; ++c) {
+            acc += w[c] * ph[(size_t)c * (hd + 2) + i];
+        }
+        a.out[(size_t)h * hd + i] = acc * inv;
     }
 }
 
@@ -727,9 +960,9 @@ __global__ void k_router_top(const gp_rec *r, const int64_t *e)
  * The GPU holds some experts of each layer (SPLIT_PLAN.md, the hot experts).
  * The array map of a layer gives the slot of each expert on the GPU, or -1.
  *
- * GP_HOT_SPLIT: idx, val, map, cold_idx, cold_val, top_k. Write the
- * selected experts that the GPU does not hold, and their weights, to
- * cold_idx and cold_val. cold_idx[top_k] gets their count. The CPU computes
+ * GP_HOT_SPLIT: idx, val, map, cold_idx, cold_val, top_k. Some selected
+ * experts are not on the GPU. Write them to cold_idx, and their weights to
+ * cold_val. cold_idx[top_k] gets their count. The CPU computes
  * these experts (GP_MOE_N of the CPU interpreter). */
 __global__ void k_hot_split(const gp_rec *r, const int64_t *e)
 {
@@ -915,8 +1148,9 @@ typedef struct {
     cudaEvent_t *ev;     /* the events of the GP_TO_HOST records */
 } gg_prog;
 
-/* The size of the scratch of the attention: 32 heads of 1024 values. */
-#define GG_PART_FLOATS ((size_t)32 * ATTN_CHUNKS * (1024 + 2))
+/* The size of the scratch of the attention: 16 query heads of 512 values,
+ * or the same count of values in another form. */
+#define GG_PART_FLOATS ((size_t)16 * ATTN_CHUNKS * (512 + 2))
 
 static int is_boundary(int op)
 {
@@ -959,13 +1193,16 @@ static int64_t multi4_rows(const gp_rec *r, int m0, int *bad)
 static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                        const int64_t *denv, int *bad)
 {
-    unsigned qh = (unsigned)hlit(r, 5, bad);
-    if ((size_t)qh * ATTN_CHUNKS * (size_t)(hlit(r, 7, bad) + 2) > GG_PART_FLOATS) {
+    int o = r->op == GP_ATTN_QC ? 7 : 5;     /* the operand of q_heads */
+    int64_t qh = hlit(r, o, bad), kvh = hlit(r, o + 1, bad), hd = hlit(r, o + 2, bad);
+    if ((size_t)qh * ATTN_CHUNKS * (size_t)(hd + 2) > GG_PART_FLOATS ||
+        qh % kvh != 0 || qh / kvh > ATTN_REP || (hd != 256 && hd != 512)) {
         *bad = 1;
         return 0;
     }
-    k_attn_part<<<dim3(qh, ATTN_CHUNKS), 128, 0, gg_stream>>>(dr, denv, g->part);
-    k_attn_join<<<qh, 128, 0, gg_stream>>>(dr, denv, g->part);
+    k_attn_part<<<dim3((unsigned)kvh, ATTN_CHUNKS), 256, 0, gg_stream>>>(dr, denv, g->part);
+    k_attn_join<<<dim3((unsigned)qh, (unsigned)cdiv(hd, 128)), 128, 0, gg_stream>>>(
+        dr, denv, g->part);
     return 0;
 }
 
@@ -1047,10 +1284,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_KV_WRITE:
-        if (r->v[4] != 0) {
-            bad = 1;    /* the GPU keeps no int16 copy of the cache */
-        }
-        k_kv_write<<<(unsigned)cdiv(hlit(r, 8, &bad), T), T, 0, s>>>(dr, denv);
+        k_kv_write<<<(unsigned)cdiv(hlit(r, 8, &bad) / 32, 64), 64, 0, s>>>(dr, denv);
         break;
     case GP_KV_WRITE_HEADS:
         k_kv_write_heads<<<(unsigned)(hlit(r, 6, &bad) * hlit(r, 7, &bad)), 128, 0, s>>>(
@@ -1063,6 +1297,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         attn_launch(g, r, dr, denv, &bad);
         break;
     case GP_ATTN_F32:
+    case GP_ATTN_QC:
         attn_launch(g, r, dr, denv, &bad);
         break;
     case GP_HOT_SPLIT:

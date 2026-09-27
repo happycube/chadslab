@@ -480,6 +480,54 @@ of the experts takes about 0.27 ms for each layer, 8 ms in all. It is on the
 critical path. More hot experts, or a faster CPU part, make the step
 shorter.
 
+## The cache on the GPU in int16
+
+The GPU keeps the cache of the 26B in the int16 form of the CPU program
+(NP_GEMMA_GPU_KV=int16, the default). Each group of 32 values has a float32
+scale of max |x| / 32767. The kernel of the cache write quantizes a row as
+gemma_quant_group32_i16 does. The GPU keeps no float rows. detach() gives
+the host the int16 values times their scales.
+
+The size of the cache for 262144 tokens (256k):
+
+    layers               float     int16
+    5 global             10.7 GB   5.7 GB
+    25 with a window     0.85 GB   0.46 GB
+
+The global layers use the key as the value, but the cache still keeps both.
+One copy can halve the global part again.
+
+### The attention kernel at a long context
+
+The first attention kernel took 4.9 ms for each global layer at a context of
+64k: about 58 GB/s. Three changes made it 1.0 ms (about 285 GB/s):
+
+1. A block takes a chunk of keys of one key and value head, for all its
+   query heads. A global layer of the 26B has 8 query heads for each key
+   and value head. Thus the block reads each row one time, not 8 times.
+2. Each lane reads 16 bytes (8 values) with one load, not one value.
+3. A warp takes 4 keys at a time. The loads of the 4 keys come first, and
+   the sums of the lanes of the 4 keys follow each other.
+
+A chunk has n / 256 keys, but at least 32. The join of the chunks computes
+the weight of each chunk one time, in shared memory.
+
+### The test at 64k tokens
+
+scripts/check_gpu_long.py builds a cache of 65536 positions. It runs a real
+prompt pass of 2048 tokens and copies those rows up to 65536 positions. A
+real prompt pass of 64k tokens takes too long on the CPU. The CPU program and
+the GPU read the same cache. The times include the output head:
+
+    run                                  step       cache     GPU memory   same top token
+    CPU program                          260 ms     -         -            -
+    GPU, float cache                     33.5 ms    3.97 GB   5.90 GB      8 of 8
+    GPU, int16 cache                     31.5 ms    2.11 GB   4.12 GB      8 of 8
+    GPU, int16 cache, 3 GB hot experts   22.9 ms    2.11 GB   7.21 GB      8 of 8
+
+At a context of 64k, the attention of the step takes about 6.5 ms. The
+experts on the CPU take most of the rest.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`
