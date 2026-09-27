@@ -250,7 +250,10 @@ class Assistant:
 
 
 def mtp_enabled():
-    """Return False when NP_GEMMA_MTP=0 turns the drafter off."""
+    """Return False when NP_GEMMA_MTP=0 turns the drafter off. The drafter
+    reads the cache in host memory, so NP_GEMMA_GPU=1 turns it off too."""
+    if os.environ.get("NP_GEMMA_GPU", "0") == "1":
+        return False
     return os.environ.get("NP_GEMMA_MTP", "1") != "0"
 
 

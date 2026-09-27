@@ -267,6 +267,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_MTP_PMIN      0                       The drafter stops when its best token has a lower probability than this value. 0 turns the test off.
     NP_GEMMA_PARTS         1                       2 or more runs a decode step of one token as that many programs, each in its own team of threads (np_gemma/parts.py, SPLIT_PLAN.md). This is for a machine with NUMA. The result has the same bits.
     NP_GEMMA_PART_TEAM     0                       The thread count of each part. 0 divides OMP_NUM_THREADS by the count of parts.
+    NP_GEMMA_GPU           0                       1 runs a decode step of one token of the E4B model and its output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). It needs nvcc. The first step copies the weights to the GPU. The MTP drafter is then off.
     NP_GEMMA_PART_ATTN     heads                   heads gives each part a range of the attention heads. one runs the attention in part 0 only, the first form.
 
 ## Weight modes

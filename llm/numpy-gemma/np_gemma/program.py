@@ -1302,6 +1302,12 @@ def e4b_ready(model, cache):
 
 def e4b_bind_step(prog, model, cache, pos):
     """Prepare the E4B cache for the tokens of a step and bind the parameters."""
+    prog.bind(**e4b_step_params(prog, model, cache, pos))
+
+
+def e4b_step_params(prog, model, cache, pos):
+    """Prepare the E4B cache for the tokens of a step. Return the parameters
+    of the program as a dict."""
     t = prog.tokens
     cache._reserve(pos + t)
     kw = {"pos": pos}
@@ -1326,8 +1332,8 @@ def e4b_bind_step(prog, model, cache, pos):
         sc = np.zeros(max(need, 2 * (sc.size if sc is not None else 0)), dtype=np.float32)
         prog.scores = sc
     kw["scores"] = sc
-    prog.bind(**kw)
     prog.keep_bound = keep
+    return kw
 
 
 def decode_step_e4b(model, cache, tokens, pos):

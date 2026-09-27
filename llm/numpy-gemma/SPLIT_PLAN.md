@@ -341,6 +341,58 @@ The next steps for NUMA:
   group kernels;
 - the output head split by rows.
 
+## Results of phase 3: the E4B on the GPU
+
+The file np_gemma/csrc/gpu.cu has a kernel for each operation of the decode
+step of the E4B model. The module np_gemma/gpu.py builds it with nvcc, copies the data of the
+program to the GPU, and changes the addresses of the records. Each kernel
+reads its operands from its record and from the environment in device
+memory. Thus the first run records the step in a CUDA graph, and each later
+run starts the graph with one call. Only the environment changes.
+
+The design choices:
+
+- The int4 kernels read the float16 scale of each block, not the float32
+  copy. This removes 22% of the bytes. The loader checks that the two scales
+  are equal.
+- The attention of a head goes to 32 blocks, each for a part of the keys.
+  A second kernel joins the parts. This is the method of FlashDecoding. One block for
+  each head used only 8 blocks, and it took 5 ms at a context of 1100.
+- The output head (Q6_K) and the soft cap run on the GPU too. On the CPU,
+  the head took 10 to 12 ms for each token.
+- The GPU copy of the cache is the true copy while the GPU runs the steps.
+  A CPU pass on the same cache first copies it back to the host.
+
+The check (scripts/check_gpu.py) runs the CPU program and the GPU on the
+same true tokens:
+
+    context   steps   hidden state, max rel. diff.   same top token   CPU      GPU
+    200       32      9.3e-06                         32 of 32         62.9 ms  11.7 ms
+    1100      32      1.9e-06                         32 of 32         73.5 ms  12.1 ms
+
+The times include the output head. A greedy generation of 128 tokens with
+E4B.forward and E4B.logits gives the same tokens on the CPU and on the GPU.
+The decode rate is 84.5 tokens/s on the GPU, against 15.3 on the CPU and
+16.2 for llama.cpp on the CPU. The first GPU step takes 2.7 s: it copies the
+weights (3.2 GB with the head and the buffers) to the GPU.
+
+The next table shows where the time goes, at a context of 200. The profile
+records an event for each record. The events add about 2.7 ms to the small
+operations.
+
+    operation              count   time      rate
+    int4 gate and up       42      3.2 ms    389 GB/s
+    int4 down              42      1.7 ms    359 GB/s
+    other int4 matrices    ...     1.8 ms    57 to 333 GB/s
+    norms, adds, and other small operations   about 3 ms in the profile
+    output head (not in the graph)            1.9 ms
+
+The graph alone takes 8.8 ms, and it reads 2.29 GB. At 414 GB/s that is 5.5
+ms. The small matrices of the per-layer inputs (256 by 2560) and the small
+operations (about 700 kernels) take most of the rest. Fusing them is the
+next work for the E4B. NP_GEMMA_GPU=1 turns the GPU on for E4B.forward. The
+MTP drafter reads the cache in host memory, so NP_GEMMA_GPU=1 turns MTP off.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`
@@ -369,7 +421,8 @@ The next steps for NUMA:
 - Phase 3: the GPU backend for the decode step. The kernels of the int4
   GEMV, the Q6_K head, the norms, the rope, the int16 attention, the router,
   and the experts. First run the whole E4B on the GPU, because it fits and
-  needs no split. Test it against the CPU and the reference.
+  needs no split. Test it against the CPU and the reference. (The E4B is
+  done, see the results of phase 3.)
 - Phase 4: the CPU and GPU split of the 26B. First the operation split, with
   the experts on the CPU. Then the hot experts on the GPU. Then the layer
   split, to compare. Measure the
