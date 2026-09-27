@@ -121,6 +121,8 @@ def lib():
     L.gg_set_cpu_runner.argtypes = [vp]
     L.gg_set_tc.argtypes = [i]
     L.gg_host_alloc.argtypes = [sz]
+    L.gg_cache_copy.argtypes = [vp, i]
+    L.gg_cache_query.argtypes = [i, i]
     L.gg_host_alloc.restype = vp
     L.gg_d2d.argtypes = [vp, vp, sz]
     # The products of a large group: NP_GEMMA_GPU_TC=1 (the default) runs
@@ -679,12 +681,19 @@ class SplitCompiler(PoolCompiler):
         self.cpu_progs = []
         self.hot = hot or {}   # layer -> the experts that the GPU holds
         # For a step program: layer -> (hot experts, gate and up blocks, down
-        # blocks). For a group program: the device addresses of those blocks
-        # (see moe_group_gpu).
+        # blocks, slots). slots gives the slot of each expert in the blocks,
+        # or -1; HotCache changes it. For a group program: (slots, device
+        # address of the gate and up blocks, of the down blocks), see
+        # moe_group_gpu.
         self.hot_stores = {}
-        # layer -> (hot experts, gate and up blocks, down blocks) of the step
-        # program, for a small group (see moe_hot_group).
+        # layer -> the entry of hot_stores of the step program, for a small
+        # group (see moe_hot_group).
         self.hot_host = {}
+        # layer -> the pinned array that GP_HOT_SPLIT fills: the cold
+        # experts, their count, and the selection of the step (HotCache).
+        self.hot_ip = {}
+        # layer -> (tgu, tdn, ranges) of a large group (see tables).
+        self.tables_of = {}
 
     def kernel(self, head, vals, out=None):
         for a in _arrays(vals):
@@ -702,6 +711,8 @@ class SplitCompiler(PoolCompiler):
     def router_slots(self, layer):
         """The slot of each expert of a layer on the GPU, -1 for a cold one.
         The router of a group reads it for the test of gg_set_reuse."""
+        if layer in self.hot_host:
+            return self.hot_host[layer][3]
         n = self.cfg.num_experts
         slots = np.full(n, -1, dtype=np.int32)
         hot = self.hot.get(layer, [])
@@ -773,41 +784,17 @@ class SplitCompiler(PoolCompiler):
         """Return the tables of the device addresses of the experts of a
         layer (gate and up, down), and the list of the copies of the cold
         experts: (host address, device address, bytes) for each run of
-        adjacent cold experts."""
-        w = self.model._layers[layer]
-        gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
-        n = gu.shape[0]
-        egu, edn = gu.nbytes // n, dn.nbytes // n
-        dgu, ddn = self.stage[layer % 2]
-        hot, hgu, hdn = self.hot_stores.get(layer, ([], 0, 0))
-        slot = {x: k for k, x in enumerate(hot)}
-        tgu = np.zeros(n, dtype=np.int64)
-        tdn = np.zeros(n, dtype=np.int64)
-        ranges = []
-        rank = 0
-        for x in range(n):
-            if x in slot:
-                tgu[x] = hgu + slot[x] * egu
-                tdn[x] = hdn + slot[x] * edn
-                continue
-            tgu[x] = dgu.ptr + rank * egu
-            tdn[x] = ddn.ptr + rank * edn
-            if ranges and ranges[-1][3] == x - 1:
-                ranges[-1][2] += egu
-                ranges[-1][6] += edn
-                ranges[-1][3] = x
-            else:
-                # host gate and up, device, bytes, last expert; host down,
-                # device, bytes
-                ranges.append([gu.ctypes.data + x * egu, int(tgu[x]), egu, x,
-                               dn.ctypes.data + x * edn, int(tdn[x]), edn])
-            rank += 1
-        flat = []
-        for r in ranges:
-            flat += [r[0], r[1], r[2]]
-        for r in ranges:
-            flat += [r[4], r[5], r[6]]
-        return tgu, tdn, np.array(flat, dtype=np.int64).reshape(-1, 3)
+        adjacent cold experts. The arrays are made one time for each layer;
+        fill_tables fills them again when the hot experts change."""
+        if layer not in self.tables_of:
+            n = self.model._layers[layer]["experts.gate_up_proj"][0].shape[0]
+            tgu = np.zeros(n, dtype=np.int64)
+            tdn = np.zeros(n, dtype=np.int64)
+            ranges = np.zeros((2 * n, 3), dtype=np.int64)
+            self.tables_of[layer] = (tgu, tdn, ranges)
+            fill_tables(self.model, layer, self.hot_stores.get(layer), self.stage, tgu, tdn,
+                        ranges)
+        return self.tables_of[layer]
 
     def fetch(self, layer):
         """Emit the copy of the weights of the cold experts of a layer to the
@@ -847,15 +834,12 @@ class SplitCompiler(PoolCompiler):
         the CPU computes the other pairs with GP_MOE_MT. The output is the
         sum of the two parts. The hot experts are the arrays of the step
         program, so the GPU holds them one time."""
-        hot, gu_store, dn_store = self.hot_host[layer]
+        _hot, gu_store, dn_store, slots = self.hot_host[layer]
         w = self.model._layers[layer]
-        n = w["experts.gate_up_proj"][0].shape[0]
         dn_rows = w["experts.down_proj"][0].shape[1]
         inner = self.cfg.moe_intermediate_size
         t, top_k = idx.shape
         hidden = h.shape[1]
-        slots = np.full(n, -1, dtype=np.int32)
-        slots[hot] = np.arange(len(hot), dtype=np.int32)
         cold = self.buffer((t, top_k), np.int32)
         cold_val = self.buffer((t, top_k))
         self.p.emit(P.HOT_SPLIT_MT, idx, val, slots, cold, cold_val, t * top_k)
@@ -911,15 +895,17 @@ class SplitCompiler(PoolCompiler):
         slots[hot] = np.arange(len(hot), dtype=np.int32)
         gu_store = np.ascontiguousarray(gu_q[hot])
         dn_store = np.ascontiguousarray(dn_q[hot])
-        self.hot_stores[layer] = (list(hot), gu_store, dn_store)
+        self.hot_stores[layer] = (list(hot), gu_store, dn_store, slots)
         for store, scales in ((gu_store, gu_s), (dn_store, dn_s)):
             half = store[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)
             if not np.array_equal(half, scales[hot]):
                 raise ValueError("an expert has float32 scales that are not its float16 scales")
-        cold = np.zeros(top_k + 1, dtype=np.int32)
+        # The cold experts, their count, and the selection of the step.
+        cold = np.zeros(2 * top_k + 1, dtype=np.int32)
         cold_val = self.buffer(top_k)
-        self.p.emit(P.HOT_SPLIT, idx, val, slots, cold, cold_val, top_k)
-        hp, vp, ip = pinned(h.shape), pinned((top_k,)), pinned((top_k + 1,), np.int32)
+        self.p.emit(P.HOT_SPLIT, idx, val, slots, cold, cold_val, top_k, 1)
+        hp, vp, ip = pinned(h.shape), pinned((top_k,)), pinned((2 * top_k + 1,), np.int32)
+        self.hot_ip[layer] = ip
         ev = self.n_events
         self.n_events += 1
         self.p.emit(P.TO_HOST, h, hp, h.nbytes, cold_val, vp, vp.nbytes, cold, ip, ip.nbytes, ev)
@@ -939,6 +925,45 @@ class SplitCompiler(PoolCompiler):
         out = self.buffer(h.shape)
         self.pending[id(out)] = (cpu, host_out, ev, self.buffer(h.shape), gpu_part)
         return out
+
+
+def fill_tables(model, layer, hot, stage, tgu, tdn, ranges):
+    """Fill the tables of a large group for one layer (SplitCompiler.tables).
+
+    hot is (slots, device address of the hot gate and up blocks, of the hot
+    down blocks), or None. stage is the two device buffers of the cold
+    experts. tgu and tdn get the device address of each expert. ranges gets
+    the copies of the cold experts to buffer layer % 2: the runs of the gate
+    and up blocks, then those of the down blocks. The count of ranges is
+    fixed (twice the experts), so a program keeps it; the other rows copy
+    nothing."""
+    w = model._layers[layer]
+    gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+    n = gu.shape[0]
+    egu, edn = gu.nbytes // n, dn.nbytes // n
+    dgu, ddn = stage[layer % 2]
+    slots, hgu, hdn = hot if hot is not None else (np.full(n, -1), 0, 0)
+    runs = []
+    rank = 0
+    for x in range(n):
+        if slots[x] >= 0:
+            tgu[x] = hgu + int(slots[x]) * egu
+            tdn[x] = hdn + int(slots[x]) * edn
+            continue
+        tgu[x] = dgu.ptr + rank * egu
+        tdn[x] = ddn.ptr + rank * edn
+        if runs and runs[-1][3] == x - 1:
+            runs[-1][2] += egu
+            runs[-1][6] += edn
+            runs[-1][3] = x
+        else:
+            runs.append([gu.ctypes.data + x * egu, int(tgu[x]), egu, x,
+                         dn.ctypes.data + x * edn, int(tdn[x]), edn])
+        rank += 1
+    ranges[:] = 0
+    for k, r in enumerate(runs):
+        ranges[k] = r[0:3]
+        ranges[len(runs) + k] = r[4:7]
 
 
 def pick_hot(model, counts, budget):
@@ -1018,6 +1043,7 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     c.p.attn = "qc"
     c.p.tokens = t
     c.p.cpu_progs = c.cpu_progs
+    c.p.tables_of = c.tables_of
     return c.p.finish()
 
 
@@ -1037,6 +1063,7 @@ def compile_split_step(model, hot=None, kv="int16"):
     c.p.tokens = 1
     c.p.cpu_progs = c.cpu_progs
     c.p.hot_stores = c.hot_stores
+    c.p.hot_ip = c.hot_ip
     return c.p.finish()
 
 
@@ -1232,6 +1259,11 @@ class ModelGPU:
         # The device address of the hidden state of the last row of the last
         # step or group, for the output head.
         self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
+        # The hot experts follow the text (HotCache). NP_GEMMA_GPU_HOT_DYN=0
+        # keeps the first set.
+        self.hot_cache = None
+        if self.prog.hot_stores and os.environ.get("NP_GEMMA_GPU_HOT_DYN", "1") != "0":
+            self.hot_cache = HotCache(self)
 
     def attach(self, cache):
         self.kv.attach(cache, max(self.max_len, cache.max_len))
@@ -1264,22 +1296,28 @@ class ModelGPU:
         """Run a step of one token. Return the hidden state after the final
         norm, shape (1, hidden)."""
         assert len(tokens) == 1, "step runs one token; group runs more"
+        if self.hot_cache is not None:
+            self.hot_cache.prepare()
         kw = self._params(pos, 1)
         self.prog.names["x"][:] = self.model.embed(tokens)
         self.g.upload("x")
         self.g.bind(kw)
         self.g.run()
         self.g.download("xn")
+        if self.hot_cache is not None:
+            # logits() runs it while the GPU runs the head, or else the next
+            # prepare().
+            self.hot_cache.due = True
         self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
         self.rows = 1
         return self.prog.names["xn"].copy()
 
     def _hot_devices(self):
-        """Return layer -> (hot experts, device address of their gate and up
-        blocks, of their down blocks), from the step program."""
+        """Return layer -> (slots, device address of the gate and up blocks
+        of the hot experts, of their down blocks), from the step program."""
         out = {}
-        for layer, (hot, gu, dn) in self.prog.hot_stores.items():
-            out[layer] = (hot, self.g.mirror.buffer_of(gu).ptr, self.g.mirror.buffer_of(dn).ptr)
+        for layer, (_hot, gu, dn, slots) in self.prog.hot_stores.items():
+            out[layer] = (slots, self.g.mirror.buffer_of(gu).ptr, self.g.mirror.buffer_of(dn).ptr)
         return out
 
     def _stage(self):
@@ -1324,6 +1362,12 @@ class ModelGPU:
         t = len(tokens)
         size = size or t
         prog, g = self._group(size)
+        if self.hot_cache is not None:
+            # A large group copies the cold experts to buffers of a fixed
+            # size, so it needs every slot full: wait for the copies.
+            self.hot_cache.prepare(wait=size > MT_CPU)
+            if size > MT_CPU:
+                self.hot_cache.refresh(prog, g)
         kw = self._params(pos, size)
         x = prog.names["x"]
         x[:t] = self.model.embed(tokens)
@@ -1383,8 +1427,166 @@ class ModelGPU:
         step = cfg.hidden_size * 4
         _check(lib().gg_q6k_head(self.head.ptr, self.last - (rows - 1) * step, self.out.ptr,
                                  vocab, cfg.hidden_size, cap, rows))
+        if self.hot_cache is not None and self.hot_cache.due:
+            self.hot_cache.observe()
         _check(lib().gg_d2h(self.host_logits.ctypes.data, self.out.ptr, rows * vocab * 4))
         return self.host_logits[:rows].copy()
+
+
+# The size of a piece of a copy of the cache. The copies of each layer of a
+# step are small and on the path of the step; a piece holds the link for
+# PIECE / 6.9 GB/s, about 0.15 ms. (Pieces of 128 KB and of the whole
+# expert gave the same rate; 32 KB was slower.)
+PIECE = 1 << 20
+
+
+def _pieces(src, dst, n):
+    """Return the rows (src, dst, bytes) of a copy of n bytes in PIECE parts."""
+    return [(src + o, dst + o, min(PIECE, n - o)) for o in range(0, n, PIECE)]
+
+
+class HotCache:
+    """The hot experts of a ModelGPU follow the text.
+
+    The GPU holds a fixed count of experts in each layer, in slots (see
+    SplitCompiler.moe_hot). After each decode step, the host reads the
+    selection of each layer (GP_HOT_SPLIT writes it to the pinned array of
+    the step) and keeps a score of each expert: score = decay * score + 1 for
+    a selection. When a selected expert that the GPU does not hold has a
+    higher score than the lowest expert in the slots, it takes that slot:
+
+    1. The slot table marks the old expert cold at once. The GPU is idle
+       between steps, so no kernel reads the slot after that.
+    2. A worker thread copies the new expert to the slot (gg_cache_copy).
+    3. When the copy is done, a later step marks the new expert hot.
+
+    At most max_ins experts change in each step. NP_GEMMA_GPU_HOT_DECAY and
+    NP_GEMMA_GPU_HOT_INS change decay and max_ins. See SPLIT_PLAN.md.
+    """
+
+    def __init__(self, dev, decay=None, max_ins=None):
+        self.dev = dev
+        model = dev.model
+        cfg = model.cfg
+        self.decay = float(decay or os.environ.get("NP_GEMMA_GPU_HOT_DECAY", "0.97"))
+        self.max_ins = int(max_ins or os.environ.get("NP_GEMMA_GPU_HOT_INS", "8"))
+        self.top_k = cfg.top_k_experts
+        self.layers = []        # one entry for each layer with hot experts
+        for layer, (_hot, gu_store, dn_store, slots) in sorted(dev.prog.hot_stores.items()):
+            w = model._layers[layer]
+            gq, dq = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+            n = gq.shape[0]
+            self.layers.append(dict(
+                layer=layer, slots=slots, dslots=dev.g.mirror.buffer_of(slots).ptr,
+                gu=dev.g.mirror.buffer_of(gu_store).ptr, dn=dev.g.mirror.buffer_of(dn_store).ptr,
+                egu=gq.nbytes // n, edn=dq.nbytes // n, gsrc=gq.ctypes.data, dsrc=dq.ctypes.data,
+                ip=dev.prog.hot_ip[layer]))
+        m = len(self.layers)
+        # One row for each entry of layers: the score of each expert, the
+        # experts in the slots, and the experts of the pending copies.
+        self.score = np.zeros((m, cfg.num_experts), dtype=np.float32)
+        self.held = np.stack([e["slots"] >= 0 for e in self.layers]) if m else self.score > 0
+        self.incoming = np.zeros_like(self.held)
+        self.rows = np.arange(m)[:, None]
+        self.pending = []       # (job id, [(row, expert, slot)], ranges)
+        self.due = False        # a step is done, and observe has not run
+        self.version = 0        # changes when a slot table changes
+        # Counts for a test: the copies, the steps, and the cold experts of
+        # the steps (the mean over the layers is cold / steps / layers).
+        self.copies = 0
+        self.steps = 0
+        self.cold = 0
+
+    def _upload(self, rows):
+        for r in rows:
+            e = self.layers[r]
+            _check(lib().gg_h2d(e["dslots"], e["slots"].ctypes.data, e["slots"].nbytes))
+        if rows:
+            self.version += 1
+
+    def prepare(self, wait=False):
+        """Before a step or a group: mark the experts of the finished copies
+        hot. wait waits for all the copies."""
+        if self.due:
+            self.observe()
+        if not self.pending:
+            return
+        done, still = set(), []
+        for job, items, ranges in self.pending:
+            r = lib().gg_cache_query(job, 1 if wait else 0)
+            if r < 0:
+                raise RuntimeError(lib().gg_last_error().decode())
+            if r == 0:
+                still.append((job, items, ranges))
+                continue
+            for row, x, slot in items:
+                self.layers[row]["slots"][x] = slot
+                self.held[row, x] = True
+                self.incoming[row, x] = False
+                done.add(row)
+        self.pending = still
+        self._upload(done)
+
+    def observe(self):
+        """After a decode step: score the selection, and start the copies of
+        the experts that take the place of others. The slot tables change on
+        the stream of the programs, after the work that is in it; no kernel
+        of that work reads the slots. The next step comes after them."""
+        self.due = False
+        k = self.top_k
+        sel = np.stack([e["ip"][k + 1:2 * k + 1] for e in self.layers])
+        self.steps += 1
+        self.cold += int(sum(int(e["ip"][k]) for e in self.layers))
+        score = self.score
+        score *= self.decay
+        score[self.rows, sel] += 1.0          # the experts of a row differ
+        low = np.where(self.held, score, np.inf).min(axis=1)
+        cand = np.zeros_like(self.held)
+        cand[self.rows, sel] = True
+        cand &= ~self.held & ~self.incoming & (score > low[:, None])
+        if not cand.any():
+            return
+        ri, xi = np.nonzero(cand)
+        order = np.argsort(low[ri] - score[ri, xi], kind="stable")
+        items, rows, changed = [], [], set()
+        for o in order[:4 * self.max_ins]:
+            if len(items) >= self.max_ins:
+                break
+            r, x = int(ri[o]), int(xi[o])
+            held = np.where(self.held[r], score[r], np.inf)
+            victim = int(held.argmin())
+            if score[r, x] <= held[victim]:
+                continue
+            e = self.layers[r]
+            slot = int(e["slots"][victim])
+            e["slots"][victim] = -1
+            self.held[r, victim] = False
+            self.incoming[r, x] = True
+            changed.add(r)
+            items.append((r, x, slot))
+            rows += _pieces(e["gsrc"] + x * e["egu"], e["gu"] + slot * e["egu"], e["egu"])
+            rows += _pieces(e["dsrc"] + x * e["edn"], e["dn"] + slot * e["edn"], e["edn"])
+        if not items:
+            return
+        # The old experts are cold on the GPU before the copies start.
+        self._upload(changed)
+        ranges = np.array(rows, dtype=np.int64)
+        job = lib().gg_cache_copy(ranges.ctypes.data, len(rows))
+        if job < 0:
+            raise RuntimeError(lib().gg_last_error().decode())
+        self.pending.append((job, items, ranges))
+        self.copies += len(items)
+
+    def refresh(self, prog, g):
+        """Fill the tables of a large group again if the slots changed."""
+        if getattr(prog, "hot_version", None) == self.version:
+            return
+        hot = self.dev._hot_devices()
+        for layer, (tgu, tdn, ranges) in prog.tables_of.items():
+            fill_tables(self.dev.model, layer, hot.get(layer), self.dev.stage, tgu, tdn, ranges)
+            for a in (tgu, tdn):
+                _check(lib().gg_h2d(g.mirror.buffer_of(a).ptr, a.ctypes.data, a.nbytes))
+        prog.hot_version = self.version
 
 
 def offload(model, experts_gb=0.0):

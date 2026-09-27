@@ -3054,7 +3054,9 @@ __global__ void k_router_top(const gp_rec *r, const int64_t *e)
  * GP_HOT_SPLIT: idx, val, map, cold_idx, cold_val, top_k. Some selected
  * experts are not on the GPU. Write them to cold_idx, and their weights to
  * cold_val. cold_idx[top_k] gets their count. The CPU computes
- * these experts (GP_MOE_N of the CPU interpreter). */
+ * these experts (GP_MOE_N of the CPU interpreter). With 2 top_k + 1 values,
+ * cold_idx[top_k + 1 + j] also gets idx[j]: the host reads the selection of
+ * the step for the cache of hot experts (ModelGPU, HotCache). */
 __global__ void k_hot_split(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -3072,6 +3074,11 @@ __global__ void k_hot_split(const gp_rec *r, const int64_t *e)
         }
     }
     cold[top_k] = n;
+    if (DI(6)) {
+        for (int j = 0; j < top_k; ++j) {
+            cold[top_k + 1 + j] = idx[j];
+        }
+    }
 }
 
 /* The operands of GP_HOT_MOE:
@@ -3525,6 +3532,9 @@ static void *gg_worker(void *arg)
         int bad = cudaEventSynchronize(gg_freeev[j.b]) != cudaSuccess;
         for (int k = 0; k < j.count && !bad; ++k) {
             const int64_t *q = j.ranges + 3 * k;
+            if (q[2] == 0) {
+                continue;       /* a row of a fixed-size list that copies nothing */
+            }
             bad = cudaMemcpyAsync((void *)(intptr_t)q[1], (const void *)(intptr_t)q[0],
                                   (size_t)q[2], cudaMemcpyHostToDevice, gg_copy) != cudaSuccess;
         }
@@ -3537,6 +3547,116 @@ static void *gg_worker(void *arg)
         pthread_mutex_unlock(&gg_mu);
     }
     return NULL;
+}
+
+/* ---------- the copies of the cache of hot experts ----------
+ * gg_cache_copy queues a list of ranges (host address, device address,
+ * bytes). A worker thread of its own copies them on a stream of its own,
+ * then records an event. The host memory is the map of the model file, so a
+ * copy call waits for the data; the worker does that wait, not the runner.
+ * gg_cache_query gives 1 when the copies of a job are done. The caller keeps
+ * the ranges until then. */
+#define GG_CACHE_JOBS 64
+
+typedef struct {
+    const int64_t *ranges;
+    int count, id;
+} gg_cjob;
+
+static pthread_mutex_t gg_cmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gg_ccv = PTHREAD_COND_INITIALIZER;
+static gg_cjob gg_cjobs[GG_CACHE_JOBS];
+static int gg_cjob_head, gg_cjob_tail, gg_cjob_next;
+static int gg_cissued[GG_CACHE_JOBS], gg_cid[GG_CACHE_JOBS], gg_cerror;
+static cudaEvent_t gg_cev[GG_CACHE_JOBS];
+static cudaStream_t gg_cstream;
+static int gg_cworker_on;
+
+static void *gg_cworker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&gg_cmu);
+        while (gg_cjob_head == gg_cjob_tail) {
+            pthread_cond_wait(&gg_ccv, &gg_cmu);
+        }
+        gg_cjob j = gg_cjobs[gg_cjob_head % GG_CACHE_JOBS];
+        pthread_mutex_unlock(&gg_cmu);
+        int bad = 0;
+        for (int k = 0; k < j.count && !bad; ++k) {
+            const int64_t *q = j.ranges + 3 * k;
+            bad = cudaMemcpyAsync((void *)(intptr_t)q[1], (const void *)(intptr_t)q[0],
+                                  (size_t)q[2], cudaMemcpyHostToDevice, gg_cstream) != cudaSuccess;
+        }
+        int slot = j.id % GG_CACHE_JOBS;
+        bad = bad || cudaEventRecord(gg_cev[slot], gg_cstream) != cudaSuccess;
+        pthread_mutex_lock(&gg_cmu);
+        gg_cerror |= bad;
+        gg_cissued[slot] = 1;
+        ++gg_cjob_head;
+        pthread_cond_broadcast(&gg_ccv);
+        pthread_mutex_unlock(&gg_cmu);
+    }
+    return NULL;
+}
+
+/* Queue a job. Return its id (0 or more), or -1. */
+extern "C" int gg_cache_copy(const int64_t *ranges, int count)
+{
+    if (!gg_cworker_on) {
+        CK(cudaStreamCreateWithFlags(&gg_cstream, cudaStreamNonBlocking));
+        for (int k = 0; k < GG_CACHE_JOBS; ++k) {
+            CK(cudaEventCreateWithFlags(&gg_cev[k], cudaEventDisableTiming));
+        }
+        pthread_t th;
+        if (pthread_create(&th, NULL, gg_cworker, NULL) != 0) {
+            snprintf(gg_error, sizeof(gg_error), "no worker thread for the cache copies");
+            return -1;
+        }
+        pthread_detach(th);
+        gg_cworker_on = 1;
+    }
+    pthread_mutex_lock(&gg_cmu);
+    if (gg_cjob_tail - gg_cjob_head >= GG_CACHE_JOBS) {
+        pthread_mutex_unlock(&gg_cmu);
+        snprintf(gg_error, sizeof(gg_error), "too many cache copies in the queue");
+        return -1;
+    }
+    int id = gg_cjob_next++;
+    gg_cjob j = {ranges, count, id};
+    gg_cissued[id % GG_CACHE_JOBS] = 0;
+    gg_cid[id % GG_CACHE_JOBS] = id;
+    gg_cjobs[gg_cjob_tail % GG_CACHE_JOBS] = j;
+    ++gg_cjob_tail;
+    pthread_cond_broadcast(&gg_ccv);
+    pthread_mutex_unlock(&gg_cmu);
+    return id;
+}
+
+/* 1: the copies of job id are on the GPU. 0: not yet. -1: an error. With
+ * wait, wait for the job. */
+extern "C" int gg_cache_query(int id, int wait)
+{
+    int slot = id % GG_CACHE_JOBS;
+    pthread_mutex_lock(&gg_cmu);
+    while (wait && !gg_cissued[slot]) {
+        pthread_cond_wait(&gg_ccv, &gg_cmu);
+    }
+    int issued = gg_cissued[slot] && gg_cid[slot] == id, bad = gg_cerror;
+    pthread_mutex_unlock(&gg_cmu);
+    if (bad) {
+        snprintf(gg_error, sizeof(gg_error), "a cache copy failed");
+        return -1;
+    }
+    if (!issued) {
+        return 0;
+    }
+    cudaError_t q = wait ? cudaEventSynchronize(gg_cev[slot]) : cudaEventQuery(gg_cev[slot]);
+    if (q == cudaErrorNotReady) {
+        return 0;
+    }
+    CK(q);
+    return 1;
 }
 
 static int gg_fetch_init(void)

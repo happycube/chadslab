@@ -971,6 +971,61 @@ the server. For that, the verify step must turn it on and the prompt pass
 must turn it off. A prompt of fewer than PREFILL_MIN tokens runs as groups
 of up to 16 tokens, and those use the same router.
 
+### The hot experts follow the text (HotCache)
+
+The fixed set of hot experts comes from the counts of four texts. The test used
+six chat answers of 256 tokens. With 1.5 GB of hot experts (448
+experts), 6.5 of the 8 experts of each layer and step ran on the CPU. The best fixed set for
+each answer, known after the fact, left 3.25. A simulation on the
+selections of those answers compared ways to change the set as the text
+goes:
+
+    1.5 GB (448 experts)            cold experts, each layer   copies, each token
+    fixed set (before)              6.52                       0
+    best fixed set, after the fact  3.25                       0
+    set from the prompt             4.90                       0
+    LRU                             3.41                       112
+    LFU, decay 0.97, one pool       3.24                       14
+    LFU, decay 0.97, each layer     3.32                       12
+    the same, at most 8 copies      3.40                       8
+
+HotCache (np_gemma/gpu.py) is the last one. Each layer keeps its count of
+slots. GP_HOT_SPLIT also writes the selection of the step to the pinned
+array of the host. After a step, the host adds 1 to the score of each
+selected expert, after it multiplies all the scores by the decay. A selected cold
+expert can have a higher score than the lowest expert in the slots of its
+layer. Then it takes that slot:
+
+1. The slot table marks the old expert cold, on the stream of the programs.
+2. A worker thread copies the new expert to the slot on a stream of its
+   own (gg_cache_copy).
+3. When the copy is done, a later step marks the new expert hot.
+
+A large group (a prompt pass) waits for the copies, then fills its tables
+of the addresses of the experts again (fill_tables). The list of copies of
+the cold experts has a fixed size, so the program keeps it.
+
+    26B, 1.5 GB hot, 255 tokens     fixed set    HotCache     best, after the fact
+    CPU cache answer                48.3 tok/s   57.6 tok/s   66.3 tok/s
+    story                           41.7 tok/s   59.0 tok/s   70.1 tok/s
+    Rust                            51.3 tok/s   60.9 tok/s   68.5 tok/s
+
+The tokens are the same as with the fixed set. The rows of a large group
+are the same bits. MTP with 2 drafts gives 68.5 tok/s against 58.3 for the
+plain decode, with the tokens of the plain decode.
+
+Some tests that did not help:
+
+- Pinned memory for the experts (12.8 GB, 6.6 s to copy): the same rate.
+  The file map cannot be pinned (cudaHostRegister: operation not
+  supported), and the link gives only 6.9 GB/s pinned against 5.4 GB/s.
+- Copies in pieces of 128 KB or 32 KB: the same or slower.
+
+The cost was the host part of HotCache. At first it took 1.4 ms in each
+step. With NumPy on all the layers at one time it takes 0.5 ms. It now runs
+while the GPU runs the head of the step, so it adds almost nothing. If the
+set does not change after 64 tokens, the rate is 63.7 tok/s.
+
 ### A difference from one run to the next
 
 Two runs of the same decode steps of the 26B gave results that differed by
