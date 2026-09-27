@@ -7084,8 +7084,14 @@ static void gp_moe_group(const gp_rec *r, const int64_t *e)
             }
             order[k + 1] = x;
         }
+        /* A pair with a negative expert index is not for the CPU: the GPU
+         * computes it (np_gemma/gpu.py). The sort puts such pairs first. */
+        int s0 = 0;
+        while (s0 < pairs && idx[order[s0]] < 0) {
+            ++s0;
+        }
         int jobs = 0;
-        for (int p = 0; p < pairs; ++p) {
+        for (int p = s0; p < pairs; ++p) {
             int32_t ex = idx[order[p]];
             if (jobs == 0 || ids[jobs - 1] != ex) {
                 ids[jobs] = ex;
@@ -7115,6 +7121,9 @@ static void gp_moe_group(const gp_rec *r, const int64_t *e)
          * token therefore come in that order too. */
         for (int p = 0; p < pairs; ++p) {
             int f = order[p];
+            if (idx[f] < 0) {
+                continue;
+            }
             int t = f / top_k;
             gp_add_scaled(out + (size_t)t * (size_t)dn_rows,
                           de + (size_t)p * (size_t)dn_rows, val[f], dn_rows);

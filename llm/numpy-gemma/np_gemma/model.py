@@ -697,9 +697,12 @@ class Model:
         """
         cfg = self.cfg
         t = len(input_ids)
-        if (_GPU and t == 1 and hook is None and max_layers is None
+        if (_GPU and t <= 16 and hook is None and max_layers is None
                 and isinstance(cache, KVCache) and self._dtype == "int4" and self.keep_weights):
-            return self._gpu_step(input_ids, cache, int(start_pos))
+            # One decode step, or the verify group of an MTP step.
+            if t == 1:
+                return self._gpu_step(input_ids, cache, int(start_pos))
+            return self._gpu_group(input_ids, cache, int(start_pos))
         self._gpu_release(cache)
         if (_PROGRAM and (t == 1 or ops.mt_ready(t)) and hook is None
                 and max_layers is None and isinstance(cache, KVCache)
@@ -1021,13 +1024,38 @@ class Model:
     def _gpu_step(self, ids, cache, pos):
         """Run a decode step on the GPU."""
         self._gpu_xn = self._gpu_attach(cache).step(ids, pos)
+        self._gpu_mirror_rows(cache)
+        return self._gpu_xn
+
+    def _gpu_group(self, ids, cache, pos):
+        """Run a group of up to 16 tokens on the GPU, such as the verify
+        group of an MTP step."""
+        self._gpu_xn = self._gpu_attach(cache).group(list(ids), pos)
+        self._gpu_mirror_rows(cache)
         return self._gpu_xn
 
     def _gpu_prefill(self, ids, cache, start):
         """Run a prompt on the GPU. Return the hidden states of every
         token (see ModelGPU.prefill)."""
         self._gpu_xn = self._gpu_attach(cache).prefill(list(ids), start)
+        self._gpu_mirror_rows(cache)
         return self._gpu_xn
+
+    def gpu_mirror(self, cache, layers):
+        """Keep the rows of some layers of the host cache up to date while
+        the GPU has the cache. The MTP drafter reads the cache of two layers
+        on the CPU (assistant.shared_layers). The GPU then writes the new
+        rows of those layers into the host cache after each step. None
+        stops it."""
+        self._gpu_mirror = layers
+        self._gpu_mirror_rows(cache)
+
+    def _gpu_mirror_rows(self, cache):
+        layers = self.__dict__.get("_gpu_mirror")
+        g = self.__dict__.get("_gpu")
+        if layers and g is not None and self.__dict__.get("_gpu_cache") is cache:
+            g.kv.sync(cache)
+            g.kv.detach(cache, layers)
 
     def _gpu_release(self, cache):
         """Write the rows of the GPU cache into the host cache before the CPU
@@ -1045,11 +1073,12 @@ class Model:
         Apply the softcap when requested.
         """
         xn = self.__dict__.get("_gpu_xn")
-        if (xn is not None and apply_softcap and x.shape[0] == 1
-                and (x is xn or getattr(x, "base", None) is xn)
-                and (x is xn or x.ctypes.data == xn[-1:].ctypes.data)):
-            # The hidden state of the last GPU step: the GPU runs the head.
-            return self._gpu.logits()
+        if xn is not None and apply_softcap and x.shape[0] <= 16:
+            # The last rows of the last GPU step or group: the GPU runs the
+            # head.
+            if x is xn or (getattr(x, "base", None) is xn
+                           and x.ctypes.data + x.nbytes == xn.ctypes.data + xn.nbytes):
+                return self._gpu.logits(x.shape[0])
         if self._embed_q6k is not None:
             out = ops.linear_q6k(x, self._embed_q6k_bytes, self.cfg.hidden_size)
         elif self._embed_q is not None:

@@ -596,7 +596,7 @@ The speed of the prompt pass of the 26B on jackal:
 
     prompt                 CPU        GPU               llama.cpp (-ncmoe 30 / 22)
     512 tokens             ~65 tok/s  266 to 317 tok/s  301 / 407 (-ub 512)
-    1024 tokens            ~65 tok/s  about 510 tok/s   545 / 735 (-ub 1024)
+    1024 tokens            ~65 tok/s  510 to 593 tok/s  545 / 735 (-ub 1024)
     1681 tokens, chat      60 tok/s   441 tok/s         -
 
 A profile of a chunk of 1024 tokens runs the records one at a time. The
@@ -606,6 +606,43 @@ as the compute, so the copy limits a chunk of 1024 tokens. A longer chunk,
 or fewer bytes of experts to copy, makes the pass faster. The kernels do not
 use the tensor cores yet. llama.cpp uses them, and it holds all the experts
 of some layers on the GPU.
+
+### A fault in the copy of the arrays
+
+The first checks of a group of 40 tokens showed a difference of up to 14%
+from 40 steps of one token. A new record of a small group then gave an
+illegal address.
+
+The cause was the same: Mirror registered a view of an
+array (for example one row of a buffer) as an array of its own. The view of
+row 0 has the start of the buffer, so the buffer got a device copy with the
+size of one row. Mirror now registers the array that owns the memory. A
+group of 40 tokens then agrees with 40 steps to 4e-4.
+
+### MTP with the GPU
+
+The verify group of MTP (2 to 16 tokens) runs on the GPU. The GPU computes
+the hot experts. It sends the other pairs (token, slot) to the CPU. The
+records are GP_HOT_SPLIT_MT, GP_HOT_MOE for a group, and GP_MOE_MT, which
+skips the pairs of -1.
+
+Each query of the group runs the attention of a decode step. The output
+head computes the rows of the group in one pass over the head. The drafter
+runs on the CPU. It reads the cache of two layers, so the GPU writes the new
+rows of those layers into the host cache after each step.
+
+The tokens are the same as the plain decode. The speed is not better:
+
+    part of an MTP step (2 drafts)   time
+    2 drafts on the CPU              14.6 ms
+    verify group of 3 tokens         38.8 ms
+    output head, 3 rows              3.7 ms
+
+A step gives about 2.25 tokens in 57 ms, about 39 tokens/s. The plain
+decode on the GPU gives about 47. The verify group sends about three times
+the cold experts of a step to the CPU. A drafter on the GPU saves about 13
+ms, which gives about the rate of the plain decode. Thus MTP is off by
+default with NP_GEMMA_GPU=1. NP_GEMMA_MTP=1 turns it on.
 
 ## Verification
 
@@ -641,8 +678,8 @@ of some layers on the GPU.
   split, with the experts on the CPU. Then the hot experts on the GPU. Then
   a comparison with llama.cpp for each split. Its layer split is slower, so
   this runtime does not add one.
-- Phase 5: the prompt pass (done, see the results of phase 5) and the MTP
-  group on the GPU. The prompt pass is
+- Phase 5 (done): the prompt pass and the MTP group on the GPU. See the
+  results of phase 5. The prompt pass is
   limited by the work of the multiply, not by memory, so the GPU gains the
   most there.
 

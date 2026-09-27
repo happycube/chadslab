@@ -117,7 +117,7 @@ def lib():
     L.gg_run.argtypes = [vp, vp]
     L.gg_unload.argtypes = [vp]
     L.gg_profile.argtypes = [vp, vp, vp]
-    L.gg_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float]
+    L.gg_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
     L.gg_set_cpu_runner.argtypes = [vp]
     L.gg_host_alloc.argtypes = [sz]
     L.gg_host_alloc.restype = vp
@@ -198,6 +198,11 @@ class Mirror:
         self.checked = set()  # the int4 matrices whose scales are checked
 
     def add(self, a):
+        # A view (such as one row of a buffer) registers the array that owns
+        # its memory. Else the view and its array can have the same start,
+        # and the device copy has the size of the view.
+        while isinstance(a.base, np.ndarray):
+            a = a.base
         start = a.ctypes.data
         if start in self.arrays or a.nbytes == 0:
             return
@@ -455,7 +460,7 @@ class E4BGPU:
         xn = self.g.mirror.buffer_of(self.prog.names["xn"])
         cap = float(cfg.final_logit_softcapping or 0.0)
         _check(lib().gg_q6k_head(self.head.ptr, xn.ptr, self.out.ptr,
-                                 self.host_logits.shape[1], cfg.hidden_size, cap))
+                                 self.host_logits.shape[1], cfg.hidden_size, cap, 1))
         self.out.download(self.host_logits)
         return self.host_logits.copy()
 
@@ -519,6 +524,9 @@ class SplitCompiler(P.Compiler):
         # blocks). For a group program: the device addresses of those blocks
         # (see moe_group_gpu).
         self.hot_stores = {}
+        # layer -> (hot experts, gate and up blocks, down blocks) of the step
+        # program, for a small group (see moe_hot_group).
+        self.hot_host = {}
 
     def compile(self, form):
         if form[0] == "layer":
@@ -546,7 +554,31 @@ class SplitCompiler(P.Compiler):
             return self.moe(*vals)
         if head == "kv_write" and self.kv == "int16":
             return self.kv_write16(*vals)
+        if head == "attn_rows_qc" and vals[1].shape[0] <= MT_CPU:
+            return self.attn_rows_small(*vals)
         return super().kernel(head, vals, out)
+
+    def attn_rows_small(self, layer, q):
+        """The attention of a small group, one query at a time with the
+        record of a decode step (GP_ATTN_QC). Its kernel splits the keys of
+        each head into chunks, and it is faster for a few queries than the
+        group kernel. Query j has the position pos + j."""
+        plan = self.cfg.plan[layer]
+        hd, qh = plan.head_dim, plan.num_q_heads
+        t = q.shape[0]
+        out = self.buffer((t, qh * hd))
+        base = "base.%d" % layer
+        for j in range(t):
+            p = ("+", "pos", j)
+            if plan.is_sliding:
+                lo = ("max", 0, ("-", p, plan.sliding_window - 1, base))
+            else:
+                lo = 0
+            lo_v = self.value(lo)
+            n_v = self.value(("-", ("+", p, 1), base, lo_v))
+            a = P.k_attn_qc(self, layer, q[j:j + 1], lo_v, n_v)
+            self.p.emit(P.COPY, a, out[j:j + 1], a.nbytes)
+        return out
 
     def kv_write16(self, layer, k, v, row, qc=1):
         """As k_kv_write, for a cache with the int16 copy only. The float
@@ -568,6 +600,8 @@ class SplitCompiler(P.Compiler):
     def moe(self, h, val, idx, layer):
         if h.shape[0] > 1 and self.stage is not None:
             return self.moe_group_gpu(h, val, idx, layer)
+        if h.shape[0] > 1 and layer in self.hot_host:
+            return self.moe_hot_group(h, val, idx, layer)
         if h.shape[0] > 1:
             return self.moe_group_cpu(h, val, idx, layer)
         if self.hot.get(layer):
@@ -655,6 +689,43 @@ class SplitCompiler(P.Compiler):
             self.fetch(layer + 2)
         return out
 
+    def moe_hot_group(self, h, val, idx, layer):
+        """The experts of a small group (at most MT_CPU tokens) when the GPU
+        holds some of them. GP_HOT_SPLIT_MT marks each pair (token, slot):
+        the GPU computes the pairs of the hot experts with GP_HOT_MOE, and
+        the CPU computes the other pairs with GP_MOE_MT. The output is the
+        sum of the two parts. The hot experts are the arrays of the step
+        program, so the GPU holds them one time."""
+        hot, gu_store, dn_store = self.hot_host[layer]
+        w = self.model._layers[layer]
+        n = w["experts.gate_up_proj"][0].shape[0]
+        dn_rows = w["experts.down_proj"][0].shape[1]
+        inner = self.cfg.moe_intermediate_size
+        t, top_k = idx.shape
+        hidden = h.shape[1]
+        slots = np.full(n, -1, dtype=np.int32)
+        slots[hot] = np.arange(len(hot), dtype=np.int32)
+        cold = self.buffer((t, top_k), np.int32)
+        cold_val = self.buffer((t, top_k))
+        self.p.emit(P.HOT_SPLIT_MT, idx, val, slots, cold, cold_val, t * top_k)
+        hp, vp, ip = pinned(h.shape), pinned((t, top_k)), pinned((t, top_k), np.int32)
+        ev = self.n_events
+        self.n_events += 1
+        self.p.emit(P.TO_HOST, h, hp, h.nbytes, cold_val, vp, vp.nbytes, cold, ip, ip.nbytes, ev)
+        gpu_part = self.buffer(h.shape)
+        pairs = t * top_k
+        self.p.emit(P.HOT_MOE, h, val, idx, slots, gu_store, dn_store,
+                    self.buffer((pairs, 2 * inner)), self.buffer((pairs, inner)),
+                    self.buffer((pairs, hidden)), gpu_part, top_k, 2 * inner, hidden,
+                    dn_rows, inner, t)
+        cc = P.Compiler(self.model)
+        host_out = P.k_moe(cc, hp, vp, ip, layer)
+        cpu = cc.p.finish()
+        self.cpu_progs.append(cpu)
+        out = self.buffer(h.shape)
+        self.pending[id(out)] = (cpu, host_out, ev, self.buffer(h.shape), gpu_part)
+        return out
+
     def moe_group_cpu(self, h, val, idx, layer):
         """The experts of a group of tokens on the CPU: the MOE_MT record of
         the CPU interpreter on pinned copies of the input."""
@@ -705,7 +776,7 @@ class SplitCompiler(P.Compiler):
         self.p.emit(P.HOT_MOE, h, val, idx, slots, gu_store, dn_store,
                     self.buffer((top_k, 2 * inner)), self.buffer((top_k, inner)),
                     self.buffer((top_k, hidden)), gpu_part, top_k, 2 * inner, hidden,
-                    dn_q.shape[1], inner)
+                    dn_q.shape[1], inner, 1)
         cc = P.Compiler(self.model)
         host_out = np.zeros(h.shape, dtype=np.float32)
         cc.p.emit(P.MOE_N, hp, vp, ip, ip[top_k:], gu_q, gu_s, dn_q, dn_s, gu_q.shape[1],
@@ -772,7 +843,8 @@ MT_CPU = 16
 PREFILL_MIN = int(os.environ.get("NP_GEMMA_GPU_PREFILL_MIN", "128"))
 
 
-def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=None):
+def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=None,
+                        hot_host=None):
     """Compile a step of t tokens for the GPU: a chunk of a prompt, or the
     group of an MTP verify step. The form is the group form of the layers.
 
@@ -783,6 +855,7 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     gpu_experts = model.cfg.enable_moe_block and t > MT_CPU and stage is not None
     c = SplitCompiler(model, hot, kv, pool=True, stage=stage if gpu_experts else None)
     c.hot_stores = hot_stores or {}
+    c.hot_host = hot_host or {}
     c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
     if gpu_experts:
@@ -920,9 +993,10 @@ class GPUKV:
             self._alloc(i, max(need + 64, 2 * self.cap[i]), self.end[i] - self.base[i])
         self.end[i] = max(self.end[i], pos + t)
 
-    def detach(self, cache):
-        """Write the rows that the GPU made into the host cache."""
-        for i in range(self.cfg.num_hidden_layers):
+    def detach(self, cache, layers=None):
+        """Write the rows that the GPU made into the host cache: of every
+        layer, or of the layers in the list layers."""
+        for i in (range(self.cfg.num_hidden_layers) if layers is None else layers):
             start = max(self.host_end[i], cache.end[i], self.base[i])
             n = self.end[i] - start
             if n <= 0:
@@ -1002,6 +1076,7 @@ class ModelGPU:
         self.kv = GPUKV(model.cfg, kv, max_chunk=CHUNK)
         self.groups = {}      # t -> (Program, GPUProgram) of a group of t tokens
         self.head = None
+        self.rows = 1
         self.max_len = 4096
         # The device address of the hidden state of the last row of the last
         # step or group, for the output head.
@@ -1028,8 +1103,9 @@ class ModelGPU:
             cos, sin, _ca, _sa = model._rope(plan, positions)
             kw["cos." + kind] = np.ascontiguousarray(cos, dtype=np.float32)
             kw["sin." + kind] = np.ascontiguousarray(sin, dtype=np.float32)
-        # The attention of a group needs no scores buffer on the GPU.
-        need = max(p.num_q_heads * (pos + 1) for p in cfg.plan) if t == 1 else 16
+        # The attention of a large group needs no scores buffer on the GPU.
+        # A small group runs the attention of a decode step for each query.
+        need = max(p.num_q_heads * (pos + t) for p in cfg.plan) if t <= MT_CPU else 16
         kw["scores"] = np.empty(need, dtype=np.float32)
         return kw
 
@@ -1044,6 +1120,7 @@ class ModelGPU:
         self.g.run()
         self.g.download("xn")
         self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
+        self.rows = 1
         return self.prog.names["xn"].copy()
 
     def _hot_devices(self):
@@ -1072,7 +1149,8 @@ class ModelGPU:
         if e is None:
             stage = self._stage() if (t > MT_CPU and self.model.cfg.enable_moe_block) else None
             prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
-                                       hot_stores=self._hot_devices() if stage else None)
+                                       hot_stores=self._hot_devices() if stage else None,
+                                       hot_host=self.prog.hot_stores)
             e = self.groups[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
         return e
 
@@ -1098,7 +1176,9 @@ class ModelGPU:
         for i in range(self.model.cfg.num_hidden_layers):
             self.kv.end[i] = min(self.kv.end[i], pos + t)
         hidden = self.model.cfg.hidden_size
-        self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * hidden * 4
+        self.first = g.mirror.buffer_of(prog.names["xn"]).ptr
+        self.last = self.first + (t - 1) * hidden * 4
+        self.rows = t
         return prog.names["xn"][:t].copy()
 
     def prefill(self, ids, pos=0):
@@ -1124,24 +1204,28 @@ class ModelGPU:
             c0 += len(chunk)
         return np.concatenate(out)
 
-    def logits(self):
-        """Return the logits of the last row of the last step or group, with
-        the soft cap."""
+    def logits(self, rows=1):
+        """Return the logits of the last rows of the last step or group, with
+        the soft cap, shape (rows, vocabulary). An MTP verify group needs the
+        logits of each of its rows. At most 16 rows."""
         model, cfg = self.model, self.model.cfg
         if self.head is None:
             if model._embed_q6k is None:
                 raise RuntimeError("the GPU head needs a Q6_K head")
             w = np.ascontiguousarray(model._embed_q6k_bytes)
-            rows = w.shape[0]
+            vocab = w.shape[0]
             self.head = Buffer(w.nbytes)
             self.head.upload(w)
-            self.out = Buffer(4 * rows)
-            self.host_logits = np.empty((1, rows), dtype=np.float32)
+            self.out = Buffer(4 * vocab * MT_CPU)
+            self.host_logits = np.empty((MT_CPU, vocab), dtype=np.float32)
+        assert 1 <= rows <= min(self.rows, MT_CPU)
+        vocab = self.host_logits.shape[1]
         cap = float(cfg.final_logit_softcapping or 0.0)
-        _check(lib().gg_q6k_head(self.head.ptr, self.last, self.out.ptr,
-                                 self.host_logits.shape[1], cfg.hidden_size, cap))
-        self.out.download(self.host_logits)
-        return self.host_logits.copy()
+        step = cfg.hidden_size * 4
+        _check(lib().gg_q6k_head(self.head.ptr, self.last - (rows - 1) * step, self.out.ptr,
+                                 vocab, cfg.hidden_size, cap, rows))
+        _check(lib().gg_d2h(self.host_logits.ctypes.data, self.out.ptr, rows * vocab * 4))
+        return self.host_logits[:rows].copy()
 
 
 def offload(model, experts_gb=0.0):

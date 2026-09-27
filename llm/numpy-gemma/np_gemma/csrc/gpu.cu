@@ -75,7 +75,7 @@ enum {
     GP_ROUTER = 64, GP_ROUTER_MT = 66,
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
     GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
-    GP_FETCH_DONE = 92,
+    GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93,
 };
 
 static cudaStream_t gg_stream;
@@ -1281,6 +1281,29 @@ __global__ void k_router_norm_mt(const gp_rec *r, const int64_t *e)
 __device__ void router_top_warp(const float *logits, const float *per_expert, float *val,
                                 int *idx, int experts, int top_k);
 
+/* The logits of a small group: one warp for each expert and token. */
+__global__ void k_router_logits_mt(const gp_rec *r, const int64_t *e)
+{
+    int ex = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int j = blockIdx.y, lane = threadIdx.x % 32;
+    int hidden = DI(4), experts = DI(5);
+    if (ex >= experts) {
+        return;
+    }
+    const float *pe = DP(const float, 2) + (size_t)ex * hidden;
+    const float *rv = DP(const float, 12) + (size_t)j * hidden;
+    float s2 = 0.f;
+    for (int k = lane; k < hidden; k += 32) {
+        s2 += rv[k] * pe[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    if (lane == 0) {
+        DP(float, 13)[(size_t)j * experts + ex] = s2;
+    }
+}
+
 __global__ void k_router_top_mt(const gp_rec *r, const int64_t *e)
 {
     int j = blockIdx.x, experts = DI(5), top_k = DI(6);
@@ -1624,7 +1647,10 @@ __global__ void k_hot_split(const gp_rec *r, const int64_t *e)
 /* The operands of GP_HOT_MOE:
  *
  *     h, val, idx, map, gu, dn, act, act2, de, out, top_k, gu_rows, cols,
- *     dn_rows, inner
+ *     dn_rows, inner, t
+ *
+ * The record serves a group of t tokens too: h is (t, cols), and val and idx
+ * are (t, top_k). Pair j is slot j % top_k of token j / top_k.
  *
  * The record computes the selected experts that the GPU holds. Four kernels
  * do the steps:
@@ -1652,7 +1678,7 @@ __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
     }
     size_t rb = (size_t)(cols / 32) * 18;
     float v = int4_row(DP(const uint8_t, 4) + ((size_t)slot * rows + row) * rb,
-                       DP(const float, 0), cols);
+                       DP(const float, 0) + (size_t)(j / DI(10)) * cols, cols);
     if (threadIdx.x % 32 == 0) {
         DP(float, 6)[(size_t)j * rows + row] = v;
     }
@@ -1693,6 +1719,7 @@ __global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
 __global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int tok = blockIdx.y;
     int rows = DI(13), top_k = DI(10);
     if (c >= rows) {
         return;
@@ -1700,12 +1727,29 @@ __global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
     const float *val = DP(const float, 1);
     const float *de = DP(const float, 8);
     float acc = 0.f;
-    for (int j = 0; j < top_k; ++j) {
+    for (int s2 = 0; s2 < top_k; ++s2) {
+        int j = tok * top_k + s2;
         if (hot_slot(r, e, j) >= 0) {
             acc += val[j] * de[(size_t)j * rows + c];
         }
     }
-    DP(float, 9)[c] = acc;
+    DP(float, 9)[(size_t)tok * rows + c] = acc;
+}
+
+/* GP_HOT_SPLIT_MT: idx, val, map, cold_idx, cold_val, pairs. Some pairs of
+ * a group use an expert that the GPU does not hold. For such a pair, write
+ * the expert and its weight. For the other pairs, write -1 and 0. GP_MOE_MT of the CPU skips the pairs of -1
+ * (the CPU part), and GP_HOT_MOE skips the other pairs (the GPU part). */
+__global__ void k_hot_split_mt(const gp_rec *r, const int64_t *e)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= DI(5)) {
+        return;
+    }
+    int x = DP(const int, 0)[p];
+    bool cold = DP(const int, 2)[x] < 0;
+    DP(int, 3)[p] = cold ? x : -1;
+    DP(float, 4)[p] = cold ? DP(const float, 1)[p] : 0.f;
 }
 
 /* ---------- the output head ---------- */
@@ -1722,8 +1766,10 @@ __global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
  *
  * Lane l computes these eight values of each block. With cap > 0, the
  * result is cap tanh(out / cap), the soft cap of the logits. */
+#define HEAD_MAX 16
+
 __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int rows, int cols,
-                           float cap)
+                           float cap, int nx)
 {
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     int l = threadIdx.x % 32;
@@ -1732,31 +1778,52 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
     }
     int nb = cols / 256;
     const uint8_t *wr = w + (size_t)row * nb * 210;
-    float sum = 0.f;
+    float sum[HEAD_MAX];
+    for (int k = 0; k < HEAD_MAX; ++k) {
+        sum[k] = 0.f;
+    }
     for (int b = 0; b < nb; ++b) {
         const uint8_t *ql = wr + (size_t)b * 210;
         const uint8_t *qh = ql + 128;
         const int8_t *sc = (const int8_t *)(ql + 192);
         float d = __half2float(__ushort_as_half((uint16_t)(ql[208] | (ql[209] << 8))));
-        const float *xb = x + (size_t)b * 256;
-        float acc = 0.f;
+        float wv[8];
+        int idx[8];
         #pragma unroll
         for (int n = 0; n < 2; ++n) {
             int a = ql[64 * n + l], bq = ql[64 * n + l + 32], hq = qh[32 * n + l];
             int is = 8 * n + l / 16;
-            const float *xn = xb + 128 * n + l;
-            acc += (float)sc[is + 0] * (float)(((a & 15) | ((hq & 3) << 4)) - 32) * xn[0];
-            acc += (float)sc[is + 2] * (float)(((bq & 15) | (((hq >> 2) & 3) << 4)) - 32) * xn[32];
-            acc += (float)sc[is + 4] * (float)(((a >> 4) | (((hq >> 4) & 3) << 4)) - 32) * xn[64];
-            acc += (float)sc[is + 6] * (float)(((bq >> 4) | (((hq >> 6) & 3) << 4)) - 32) * xn[96];
+            wv[4 * n + 0] = d * (float)sc[is + 0] * (float)(((a & 15) | ((hq & 3) << 4)) - 32);
+            wv[4 * n + 1] = d * (float)sc[is + 2] * (float)(((bq & 15) | (((hq >> 2) & 3) << 4)) - 32);
+            wv[4 * n + 2] = d * (float)sc[is + 4] * (float)(((a >> 4) | (((hq >> 4) & 3) << 4)) - 32);
+            wv[4 * n + 3] = d * (float)sc[is + 6] * (float)(((bq >> 4) | (((hq >> 6) & 3) << 4)) - 32);
+            idx[4 * n + 0] = b * 256 + 128 * n + l;
+            idx[4 * n + 1] = idx[4 * n + 0] + 32;
+            idx[4 * n + 2] = idx[4 * n + 0] + 64;
+            idx[4 * n + 3] = idx[4 * n + 0] + 96;
         }
-        sum += d * acc;
+        for (int k = 0; k < HEAD_MAX; ++k) {
+            if (k < nx) {
+                const float *xk = x + (size_t)k * cols;
+                float acc = 0.f;
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    acc += wv[u] * xk[idx[u]];
+                }
+                sum[k] += acc;
+            }
+        }
     }
-    for (int o = 16; o > 0; o >>= 1) {
-        sum += __shfl_xor_sync(0xffffffff, sum, o);
-    }
-    if (l == 0) {
-        out[row] = cap > 0.f ? cap * tanhf(sum / cap) : sum;
+    for (int k = 0; k < HEAD_MAX; ++k) {
+        if (k < nx) {
+            float v = sum[k];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, o);
+            }
+            if (l == 0) {
+                out[(size_t)k * rows + row] = cap > 0.f ? cap * tanhf(v / cap) : v;
+            }
+        }
     }
 }
 
@@ -2051,15 +2118,19 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_hot_split<<<1, 1, 0, s>>>(dr, denv);
         break;
     case GP_HOT_MOE: {
-        unsigned k = (unsigned)hlit(r, 10, &bad);
+        unsigned t = (unsigned)hlit(r, 15, &bad);
+        unsigned k = (unsigned)hlit(r, 10, &bad) * t;
         k_hot_gu<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), ROWS_PER_BLOCK), k), W, 0, s>>>(
             dr, denv);
         k_hot_gelu<<<k, T, 0, s>>>(dr, denv);
         k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), ROWS_PER_BLOCK), k), W, 0, s>>>(
             dr, denv);
-        k_hot_sum<<<(unsigned)cdiv(hlit(r, 13, &bad), T), T, 0, s>>>(dr, denv);
+        k_hot_sum<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), T), t), T, 0, s>>>(dr, denv);
         break;
     }
+    case GP_HOT_SPLIT_MT:
+        k_hot_split_mt<<<(unsigned)cdiv(hlit(r, 5, &bad), T), T, 0, s>>>(dr, denv);
+        break;
     case GP_INT4_LINEAR_MT:
         /* x, w, s, out, rows, cols, t */
         gemm_launch(r, dr, denv, 0, 1, 3, 4, 5, 6, &bad);
@@ -2091,9 +2162,14 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_ROUTER_MT: {
         int64_t t = hlit(r, 11, &bad), ex = hlit(r, 5, &bad);
         k_router_norm_mt<<<(unsigned)t, T, 0, s>>>(dr, denv);
-        k_gemm<1><<<dim3((unsigned)cdiv(ex, GN), (unsigned)cdiv(t, GM)), 256, 0, s>>>(
-            (const float *)(intptr_t)r->v[12], (const void *)(intptr_t)r->v[2],
-            (float *)(intptr_t)r->v[13], (int)t, (int)ex, (int)hlit(r, 4, &bad));
+        if (t <= MT_MAX) {
+            k_router_logits_mt<<<dim3((unsigned)cdiv(ex, ROWS_PER_BLOCK), (unsigned)t), W, 0, s>>>(
+                dr, denv);
+        } else {
+            k_gemm<1><<<dim3((unsigned)cdiv(ex, GN), (unsigned)cdiv(t, GM)), 256, 0, s>>>(
+                (const float *)(intptr_t)r->v[12], (const void *)(intptr_t)r->v[2],
+                (float *)(intptr_t)r->v[13], (int)t, (int)ex, (int)hlit(r, 4, &bad));
+        }
         k_router_top_mt<<<(unsigned)t, 32, 0, s>>>(dr, denv);
         break;
     }
@@ -2477,7 +2553,12 @@ int gg_profile(void *handle, const int64_t *env, float *ms)
             rc = gg_launch(g, r, g->dcode + pc, g->denv);
         }
         CK(cudaEventRecord(b, gg_stream));
-        CK(cudaEventSynchronize(b));
+        cudaError_t err = cudaEventSynchronize(b);
+        if (err != cudaSuccess) {
+            snprintf(gg_error, sizeof(gg_error), "record %d (operation %d): %s", pc, r->op,
+                     cudaGetErrorString(err));
+            return -1;
+        }
         CK(cudaEventElapsedTime(&ms[pc], a, b));
     }
     cudaEventDestroy(a);
@@ -2485,13 +2566,19 @@ int gg_profile(void *handle, const int64_t *env, float *ms)
     return rc;
 }
 
-/* The output head: out = the Q6_K matrix w times x, with the soft cap cap
- * (0 for none). All pointers are device addresses. The call does not wait
- * for the GPU. */
-int gg_q6k_head(const void *w, const float *x, float *out, int rows, int cols, float cap)
+/* The output head: out = the Q6_K matrix w times the nx rows of x, with the
+ * soft cap cap (0 for none). nx is at most HEAD_MAX. out has nx rows of rows
+ * values. The kernel reads the head one time for all the rows. All pointers
+ * are device addresses. The call does not wait for the GPU. */
+int gg_q6k_head(const void *w, const float *x, float *out, int rows, int cols, float cap,
+                int nx)
 {
+    if (nx < 1 || nx > HEAD_MAX) {
+        snprintf(gg_error, sizeof(gg_error), "gg_q6k_head: 1 to %d rows of x", HEAD_MAX);
+        return -1;
+    }
     k_q6k_head<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
-        (const uint8_t *)w, x, out, rows, cols, cap);
+        (const uint8_t *)w, x, out, rows, cols, cap, nx);
     CK(cudaGetLastError());
     return 0;
 }

@@ -264,11 +264,11 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_PROGRAM       1                       1 runs a decode step of one token as one program in C (np_gemma/program.py). 0 uses the Python loop over the layers. The two give the same bits.
     NP_GEMMA_F32_ATTN      c                       c uses the C kernel for the attention of one query over the float cache. numpy uses the batched matmul. The program needs c.
     NP_GEMMA_MT            1                       1 uses the small-group kernels for 2 to 16 tokens, the MTP verify step. 0 uses the prompt kernels.
-    NP_GEMMA_MTP           1                       0 turns the MTP drafter off. See MTP_PLAN.md.
+    NP_GEMMA_MTP           1                       0 turns the MTP drafter off. With NP_GEMMA_GPU=1 the default is 0. See MTP_PLAN.md.
     NP_GEMMA_MTP_PMIN      0                       The drafter stops when its best token has a lower probability than this value. 0 turns the test off.
     NP_GEMMA_PARTS         1                       2 or more runs a decode step of one token as that many programs, each in its own team of threads (np_gemma/parts.py, SPLIT_PLAN.md). This is for a machine with NUMA. The result has the same bits.
     NP_GEMMA_PART_TEAM     0                       The thread count of each part. 0 divides OMP_NUM_THREADS by the count of parts.
-    NP_GEMMA_GPU           0                       1 runs a decode step of one token and the output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). The E4B model runs wholly on the GPU. The 26B model keeps its experts on the CPU. It needs nvcc. The first step copies the weights to the GPU. The MTP drafter is then off.
+    NP_GEMMA_GPU           0                       1 runs the decode steps, the prompt pass, and the output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). The E4B model runs wholly on the GPU (decode only). The 26B model keeps its cold experts on the CPU. It needs nvcc. The first step copies the weights to the GPU.
     NP_GEMMA_GPU_HOT       the 26B counts          A file of expert counts (scripts/expert_use.py). With NP_GEMMA_GPU=1, the GPU holds the most used experts of the 26B and runs them. 0 keeps all the experts on the CPU. The default is np_gemma/data/gemma-4-26B-expert-counts.npz.
     NP_GEMMA_GPU_HOT_GB    free less 6 GB          The GPU memory for the hot experts, in GB.
     NP_GEMMA_GPU_CHUNK     1024                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.9 s for the 26B), so a longer chunk is faster.
@@ -2002,7 +2002,10 @@ as the CPU:
 
 The prompt pass on the GPU copies the experts that the GPU does not hold for
 each chunk of 1024 tokens. The option works for scripts/gguf_generate.py
-too. MTP is off with --gpu.
+too. MTP works with --gpu and gives the same tokens. But it is slower than
+the plain decode on the GPU, because its verify group sends more experts to
+the CPU.
+Thus the server turns MTP off with --gpu unless NP_GEMMA_MTP=1.
 See SPLIT_PLAN.md.
 
 Then choose the provider and the model in the harness. No credential is

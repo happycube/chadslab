@@ -250,11 +250,16 @@ class Assistant:
 
 
 def mtp_enabled():
-    """Return False when NP_GEMMA_MTP=0 turns the drafter off. The drafter
-    reads the cache in host memory, so NP_GEMMA_GPU=1 turns it off too."""
-    if os.environ.get("NP_GEMMA_GPU", "0") == "1":
-        return False
-    return os.environ.get("NP_GEMMA_MTP", "1") != "0"
+    """Return False when NP_GEMMA_MTP=0 turns the drafter off.
+
+    With NP_GEMMA_GPU=1 the default is off. The verify group of MTP then
+    sends about three times the cold experts to the CPU, and a step of MTP
+    gives fewer tokens/s than the plain decode on the GPU (SPLIT_PLAN.md).
+    NP_GEMMA_MTP=1 turns it on again."""
+    v = os.environ.get("NP_GEMMA_MTP")
+    if v is None:
+        return os.environ.get("NP_GEMMA_GPU", "0") != "1"
+    return v != "0"
 
 
 def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
@@ -277,6 +282,10 @@ def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
     """
     pos = len(ids)
     emitted = 0
+    if hasattr(target, "gpu_mirror") and not hasattr(cache, "shared"):
+        # With the cache on the GPU, the drafter needs the new rows of its
+        # two layers in the host cache after each step.
+        target.gpu_mirror(cache, shared_layers(target.cfg))
     if stats is not None:
         stats.setdefault("steps", 0)
         stats.setdefault("drafts", 0)
