@@ -2789,6 +2789,20 @@ static inline void q6k_decode_block(const uint8_t *blk, float *y)
     }
 }
 
+/* Decode the rows ids[0..n) of a Q6_K table into out, shape (n, cols). This
+ * is the embedding lookup of a prompt: the rows of the E4B tables are Q6_K. */
+void gemma_q6k_rows(const uint8_t *table, const int64_t *ids, int n, int cols, float *out)
+{
+    size_t row_bytes = (size_t)(cols >> 8) * 210u;
+    int64_t total = (int64_t)n * (cols >> 8);
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < total; ++i) {
+        int64_t r = i / (cols >> 8), b = i % (cols >> 8);
+        q6k_decode_block(table + (size_t)ids[r] * row_bytes + (size_t)b * 210u,
+                         out + (size_t)r * cols + (size_t)b * 256u);
+    }
+}
+
 /* Return the dot product of one Q6_K row and one float32 row. Scalar form. */
 static float dot_q6k_row_scalar(const uint8_t *w, const float *x, int cols)
 {

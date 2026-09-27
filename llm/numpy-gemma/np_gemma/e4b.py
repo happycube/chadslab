@@ -563,6 +563,8 @@ class E4B:
         row, not for the whole table.
         """
         ids = np.asarray(ids).reshape(-1)
+        if self._q4 and hasattr(self.ct, "take_rows"):
+            return self.ct.take_rows(module + ".weight", ids)
         if self._q4:
             return np.stack([self.ct.get_row(module + ".weight", int(t)) for t in ids])
         return np.stack([self.ct.row(module, int(t)) for t in ids])

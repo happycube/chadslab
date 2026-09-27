@@ -395,6 +395,31 @@ class GGUF:
             arr = arr.astype(dtype)
         return arr
 
+    def take_rows(self, hf_name, rows, dtype=np.float32):
+        """Return the rows of a 2-D tensor in the order of the list rows.
+
+        The function gathers the blocks of every row, then dequantizes them in
+        one operation. An embedding lookup of a prompt then does not do one
+        dequant for each token.
+        """
+        dims, t, _o = self.tensors[self._gguf(hf_name)]
+        if len(dims) != 2:
+            raise ValueError("%s is not 2-D" % hf_name)
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols = int(dims[0])
+        bv, _bb = _BLOCK[t]
+        nblk_row = cols // bv
+        table = self._blocks(hf_name, 0, int(dims[1]) * nblk_row)
+        if t == Q6_K and dtype == np.float32:
+            from . import cops
+            if cops.available():
+                return cops.q6k_rows(table.view(np.uint8), rows, cols)
+        raw = table.reshape(-1, nblk_row)[rows].reshape(-1)
+        arr = _dequant(raw, t, rows.size * cols).reshape(rows.size, cols)
+        if dtype is not None and arr.dtype != np.dtype(dtype):
+            arr = arr.astype(dtype)
+        return arr
+
     def get_row(self, hf_name, row, dtype=np.float32):
         return self.get_rows(hf_name, row, row + 1, dtype=dtype)[0]
 

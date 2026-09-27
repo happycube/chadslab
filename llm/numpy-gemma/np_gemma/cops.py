@@ -219,6 +219,8 @@ try:
         _lib.gemma_int4_q8_set_prefetch.restype = None
         _lib.gemma_q6k_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int]
         _lib.gemma_q6k_linear.restype = None
+        _lib.gemma_q6k_rows.argtypes = [_void_p, _void_p, _int, _int, _void_p]
+        _lib.gemma_q6k_rows.restype = None
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                              _int, _void_p, _int, _int, _int]
         _lib.gemma_int4_moe_gemv.restype = None
@@ -581,6 +583,18 @@ def linear_int4(x, packed, scales, group):
     _lib.gemma_int4_linear(packed.ctypes.data, scales.ctypes.data, x.ctypes.data, out.ctypes.data,
                            ctypes.c_int(rows), ctypes.c_int(cols),
                            ctypes.c_int(x.shape[0]), ctypes.c_int(group))
+    return out
+
+
+def q6k_rows(table, ids, cols):
+    """Return the rows ids of a Q6_K table as float32, shape (len(ids), cols).
+
+    table is the raw block data of the whole table (a uint8 array).
+    """
+    ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
+    out = np.empty((ids.size, cols), dtype=np.float32)
+    _lib.gemma_q6k_rows(table.ctypes.data, ids.ctypes.data, ctypes.c_int(ids.size),
+                        ctypes.c_int(cols), out.ctypes.data)
     return out
 
 
