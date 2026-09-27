@@ -234,8 +234,8 @@ __global__ void k_gelu_mul(const gp_rec *r, const int64_t *e)
 /* k, v, kd, vd, kqd, ksd, vqd, vsd, n: store n values of the key and of the
  * value. A null kd skips the float cache, and a null kqd skips the int16
  * cache. One thread for each group of 32 values. The int16 form is the form
- * of gemma_quant_group32_i16: a scale of max |x| / 32767 for each group, and
- * each value x / scale rounded to the nearest integer. */
+ * of gemma_quant_group32_i16. Each group has a scale of max |x| / 32767. Each
+ * value is x / scale, rounded to the nearest integer. */
 __device__ __forceinline__ float quant32_i16(const float *x, int16_t *q)
 {
     float amax = 0.f;
