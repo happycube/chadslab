@@ -516,6 +516,32 @@ NP_GEMMA_INT4_Q8 now selects the form:
     16     float matrices, int16 experts  55.12        9.15 s
     0      float                          55.08       11.59 s
 
+A better int8 does not close the gap. A study on real activations of
+layers 5 and 15 gives the error of one product for each form:
+
+    form                             error of one product
+    int8, symmetric, groups of 32    5.0e-03 to 8.8e-03 (today)
+    int8, groups of 16               4.3e-03 to 6.7e-03
+    int8, asymmetric, groups of 32   4.1e-03 to 6.1e-03
+    int16                            1.9e-05 to 3.8e-05
+
+The error is spread evenly over the groups. A second int8 pass on the worst
+half of the groups only halves it, so no small set of outlier groups is the
+cause. A simulation of the whole prompt pass quantizes the input of each
+product and then uses the float kernels. It uses 1024 tokens of README.md:
+
+    form                             same token as float
+    int8, symmetric, groups of 32    84.0 per cent (the kernel gives 83.6)
+    int8, asymmetric, groups of 32   85.6 per cent
+    int8, asymmetric, groups of 16   85.9 per cent
+
+Thus a change of the int8 form gains about two points. Only a wider form,
+such as int16, gets near the float products.
+
+The perplexity of 1024 tokens is a noisy measure for these small changes.
+The simulated int8 gives 49.4 and the int8 kernel gives 59.3, on the same
+text, against 55.1 for float. Use the share of the same token.
+
 Mode 0 now runs the experts in one region too. The int16 tile of a dense
 matrix (cops.linear_int4_q16) stays in the code for a comparison. No mode
 uses it, because the float GEMM is as fast.
