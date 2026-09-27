@@ -695,6 +695,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
     float *de = (float *)ma_take(&p, (size_t)P * hidden * 4);
     moe_sort_pairs(ids, t, k, experts, shared, cnt, start, used, pair_tok, pair_of, nused_p);
     int nu = *nused_p;
+    P = start[ne];          /* the pairs with an expert */
     #pragma omp for schedule(static)
     for (int q = 0; q < P; ++q) {
         int j = pair_tok[q];
@@ -711,7 +712,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         size_t rb = kq_row_bytes(m.type, hidden);
         const uint8_t *w = m.w + (e < experts ? (size_t)e * inner * rb : 0);
         int s0 = start[e];
-        int n = (e + 1 < ne ? start[e + 1] : P) - s0;
+        int n = start[e + 1] - s0;
         kq_rows4(w + (size_t)r * rb, rb, m.type, hidden, xq + (size_t)s0 * hidden,
                  xs + (size_t)s0 * nph, xm + (size_t)s0 * 2 * nph, NULL, n,
                  act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
@@ -736,7 +737,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         size_t rb = kq_row_bytes(m.type, inner);
         const uint8_t *w = m.w + (e < experts ? (size_t)e * hidden * rb : 0);
         int s0 = start[e];
-        int n = (e + 1 < ne ? start[e + 1] : P) - s0;
+        int n = start[e + 1] - s0;
         kq_rows4(w + (size_t)r * rb, rb, m.type, inner, aq + (size_t)s0 * inner,
                  as + (size_t)s0 * npi, am + (size_t)s0 * 2 * npi, NULL, n,
                  de + (size_t)s0 * hidden + r, (size_t)hidden);

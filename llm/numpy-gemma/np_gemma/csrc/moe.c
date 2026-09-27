@@ -12,7 +12,9 @@
  * P = t * k (+ t) values (pair_tok, pair_of). start[e] is the first pair of
  * expert e; used has the experts with pairs; pair_tok gives the token of
  * each sorted pair; pair_of gives the sorted pair of each slot (j * k + s,
- * then t * k + j for the shared expert). *nused gets the count of used. */
+ * then t * k + j for the shared expert). *nused gets the count of used.
+ * start[ne] gets the count of pairs. A negative id is no expert (an expert
+ * of a GPU step that the GPU computes): its pair_of is -1. */
 static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int shared, int *cnt,
                            int *start, int *used, int *pair_tok, int *pair_of, int *nused)
 {
@@ -23,7 +25,9 @@ static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int sh
             cnt[e] = 0;
         }
         for (int q = 0; q < t * k; ++q) {
-            cnt[ids[q]]++;
+            if (ids[q] >= 0) {
+                cnt[ids[q]]++;
+            }
         }
         if (shared) {
             cnt[experts] = t;
@@ -37,8 +41,13 @@ static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int sh
             }
             cnt[e] = 0;
         }
+        start[ne] = a;
         for (int q = 0; q < t * k; ++q) {
             int e = ids[q];
+            if (e < 0) {
+                pair_of[q] = -1;
+                continue;
+            }
             int pos = start[e] + cnt[e]++;
             pair_tok[pos] = q / k;
             pair_of[q] = pos;
@@ -73,6 +82,9 @@ static void moe_combine(const float *de, const int *pair_of, const float *val,
             o[c] = shared ? sw * sd[c] : 0.f;
         }
         for (int sl = 0; sl < k; ++sl) {
+            if (pair_of[j * k + sl] < 0) {
+                continue;
+            }
             const float *d = de + (size_t)pair_of[j * k + sl] * hidden;
             float w = val[j * k + sl];
             for (int c = c0; c < c0 + 64; ++c) {

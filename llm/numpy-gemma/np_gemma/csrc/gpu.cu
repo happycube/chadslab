@@ -79,7 +79,8 @@ enum {
     GP_ARGMAX = 96, GP_ADD_NORM = 97, GP_COUNT = 98,
     /* Qwen3.5 (QWEN_PLAN.md, phase 4) */
     GP_ROUTER_TOPK = 103, GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106,
-    GP_KQ_QUANT = 107, GP_KQ_LINEAR = 108, GP_KQ_HOT_MOE = 110,
+    GP_KQ_QUANT = 107, GP_KQ_LINEAR = 108, GP_KQ_HOT_MOE = 110, GP_KQ_MULTI = 111,
+    GP_ADD_RMS = 112, GP_KQ_GROUP_MOE = 113,
 };
 
 static cudaStream_t gg_stream;
@@ -3207,6 +3208,12 @@ __global__ void k_hot_split_mt(const gp_rec *r, const int64_t *e)
     }
     int x = DP(const int, 0)[p];
     bool cold = DP(const int, 2)[x] < 0;
+    /* With operands 6 and 7 (nreal, top_k): the pairs of the padding rows
+     * go to neither part. */
+    int k = r->tag[7] == GP_T_NONE ? 0 : DI(7);
+    if (k > 0 && DI(6) > 0 && p >= DI(6) * k) {
+        cold = false;
+    }
     DP(int, 3)[p] = cold ? x : -1;
     DP(float, 4)[p] = cold ? DP(const float, 1)[p] : 0.f;
 }
@@ -3769,12 +3776,24 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
     }
 }
 
-/* GP_GDN (gdn_body of csrc/deltanet.c), without the log of a verify group:
- * qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch,
- * t, k_heads, v_heads, k_dim, v_dim, eps, log, tiled.
+/* GP_GDN (gdn_body of csrc/deltanet.c): qkv, conv, conv_w, kernel, z, a, b,
+ * A_log, dt_bias, norm_w, S, out, scratch, t, k_heads, v_heads, k_dim,
+ * v_dim, eps, log, tiled, nreal.
+ *
+ * Only the first nreal tokens change the state (0: all t); the other rows
+ * pad a group to the size of its program. With a log (an MTP verify group)
+ * conv and S do not change: the log gets, for each token, the input of the
+ * convolution, and for each head k, the delta, and the decay, as on the CPU.
+ * gg_gdn_commit applies the first n tokens.
  *
  * k_gdn_conv: the convolution of each channel, the tokens in order, into the
  * scratch; the last inputs go back to conv. */
+__device__ __forceinline__ int gdn_nreal(const gp_rec *r, const int64_t *e)
+{
+    int t = DI(13), n = r->tag[21] == GP_T_NONE ? 0 : DI(21);
+    return n > 0 && n < t ? n : t;
+}
+
 __global__ void k_gdn_conv(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -3785,13 +3804,18 @@ __global__ void k_gdn_conv(const gp_rec *r, const int64_t *e)
         return;
     }
     const float *qkv = DP(const float, 0);
-    float *conv = DP(float, 1), *cv = DP(float, 12);
+    float *conv = DP(float, 1), *cv = DP(float, 12), *log = DP(float, 19);
     const float *w = DP(const float, 2) + (size_t)c * kernel;
+    size_t lrow = (size_t)cd + (size_t)DI(15) * (DI(16) + DI(17) + 1);
     float hist[8];
     for (int j = 0; j < kernel - 1; ++j) {
         hist[j] = conv[(size_t)j * cd + c];
     }
+    t = gdn_nreal(r, e);
     for (int i = 0; i < t; ++i) {
+        if (log != NULL) {
+            log[(size_t)i * lrow + c] = qkv[(size_t)i * cd + c];
+        }
         float xin = qkv[(size_t)i * cd + c];
         float v = w[kernel - 1] * xin;
         for (int j = 0; j < kernel - 1; ++j) {
@@ -3803,8 +3827,10 @@ __global__ void k_gdn_conv(const gp_rec *r, const int64_t *e)
         }
         hist[kernel - 2] = xin;
     }
-    for (int j = 0; j < kernel - 1; ++j) {
-        conv[(size_t)j * cd + c] = hist[j];
+    if (log == NULL) {
+        for (int j = 0; j < kernel - 1; ++j) {
+            conv[(size_t)j * cd + c] = hist[j];
+        }
     }
 }
 
@@ -3816,8 +3842,10 @@ __global__ void __launch_bounds__(KD) k_gdn_heads(const gp_rec *r, const int64_t
 {
     PDL_START();
     __shared__ float qsh[KD], ksh[KD];
-    int kh = DI(14), vh = DI(15), t = DI(13), tiled = DI(20);
+    int kh = DI(14), vh = DI(15), t = gdn_nreal(r, e), tiled = DI(20);
     int kd = kh * KD, vd = vh * KD, cd = 2 * kd + vd;
+    float *log = DP(float, 19);
+    size_t lrow = (size_t)cd + (size_t)vh * (2 * KD + 1);
     int hv = blockIdx.x, c = threadIdx.x;
     int hk = tiled ? hv % kh : hv / (vh / kh);
     float *Sh = DP(float, 10) + (size_t)hv * KD * KD;
@@ -3840,17 +3868,27 @@ __global__ void __launch_bounds__(KD) k_gdn_heads(const gp_rec *r, const int64_t
         float sp = av > 20.f ? av : log1pf(expf(av));
         float decay = expf(-Aexp * sp);
         float beta = 1.f / (1.f + expf(-DP(const float, 6)[(size_t)i * vh + hv]));
+        /* The updates of S use explicit roundings, as gg_gdn_commit does, so
+         * a commit gives the state of plain steps. */
         float s1 = 0.f;
         #pragma unroll
         for (int d = 0; d < KD; ++d) {
-            S[d] *= decay;
+            S[d] = __fmul_rn(S[d], decay);
             s1 += ksh[d] * S[d];
         }
         float delta = (row[2 * kd + hv * KD + c] - s1) * beta;
+        if (log != NULL) {
+            float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (2 * KD + 1);
+            lg[c] = ksh[c];
+            lg[KD + c] = delta;
+            if (c == 0) {
+                lg[2 * KD] = decay;
+            }
+        }
         float o = 0.f;
         #pragma unroll
         for (int d = 0; d < KD; ++d) {
-            S[d] += ksh[d] * delta;
+            S[d] = __fmaf_rn(ksh[d], delta, S[d]);
             o += qsh[d] * S[d];
         }
         float ss = block_sum(o * o);
@@ -3859,9 +3897,63 @@ __global__ void __launch_bounds__(KD) k_gdn_heads(const gp_rec *r, const int64_t
         DP(float, 11)[oi] = o * inv * DP(const float, 9)[c] * qw_silu(DP(const float, 4)[oi]);
         __syncthreads();
     }
+    if (log == NULL) {
+        #pragma unroll
+        for (int d = 0; d < KD; ++d) {
+            Sh[(size_t)d * KD + c] = S[d];
+        }
+    }
+}
+
+/* gg_gdn_commit: the first n tokens of a log to conv and S. */
+__global__ void k_gdn_commit_conv(float *conv, const float *log, int n, int kernel, int cd,
+                                  size_t lrow)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cd) {
+        return;
+    }
+    float hist[8];
+    for (int j = 0; j < kernel - 1; ++j) {
+        hist[j] = conv[(size_t)j * cd + c];
+    }
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < kernel - 2; ++j) {
+            hist[j] = hist[j + 1];
+        }
+        hist[kernel - 2] = log[(size_t)i * lrow + c];
+    }
+    for (int j = 0; j < kernel - 1; ++j) {
+        conv[(size_t)j * cd + c] = hist[j];
+    }
+}
+
+template <int KD>
+__global__ void __launch_bounds__(KD) k_gdn_commit_heads(float *S, const float *log, int n,
+                                                         int cd, size_t lrow)
+{
+    int hv = blockIdx.x, c = threadIdx.x;
+    float *Sh = S + (size_t)hv * KD * KD;
+    float st[KD];
     #pragma unroll
     for (int d = 0; d < KD; ++d) {
-        Sh[(size_t)d * KD + c] = S[d];
+        st[d] = Sh[(size_t)d * KD + c];
+    }
+    for (int i = 0; i < n; ++i) {
+        const float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (2 * KD + 1);
+        float decay = lg[2 * KD], delta = lg[KD + c];
+        #pragma unroll
+        for (int d = 0; d < KD; ++d) {
+            st[d] = __fmul_rn(st[d], decay);
+        }
+        #pragma unroll
+        for (int d = 0; d < KD; ++d) {
+            st[d] = __fmaf_rn(lg[d], delta, st[d]);
+        }
+    }
+    #pragma unroll
+    for (int d = 0; d < KD; ++d) {
+        Sh[(size_t)d * KD + c] = st[d];
     }
 }
 
@@ -3955,6 +4047,345 @@ __global__ void k_kqh_sum(const gp_rec *r, const int64_t *e)
     float sw = 1.f / (1.f + expf(-DP(const float, 21)[tok]));
     acc += sw * de[(size_t)(tk + tok) * hidden + c];
     DP(float, 10)[(size_t)tok * hidden + c] = acc;
+}
+
+/* GP_ADD_RMS: x, o, w, h, rows, cols, eps. x += o, then h = rms_norm(x) w
+ * (GP_ADD and GP_RMS_NORM of compile_qwen_step in one kernel). One block
+ * for each row. */
+__global__ void k_add_rms(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int cols = DI(5);
+    float *x = DP(float, 0) + (size_t)blockIdx.x * cols;
+    const float *o = DP(const float, 1) + (size_t)blockIdx.x * cols;
+    const float *w = DP(const float, 2);
+    float *h = DP(float, 3) + (size_t)blockIdx.x * cols;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = x[i] + o[i];
+        x[i] = v;
+        ss += v * v;
+    }
+    ss = block_sum(ss);
+    float s = 1.0f / sqrtf(ss / (float)cols + df(r, e, 6));
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        h[i] = x[i] * s * w[i];
+    }
+}
+
+/* GP_KQ_MULTI: x, cols, t, n, then (w, type, rows, out) for n matrices on
+ * the same rows of x: GP_KQ_LINEAR of each, in one launch. */
+__global__ void k_kq_multi(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int n = DI(3), cols = DI(1), t = DI(2), m = 0;
+    while (m < n && row >= DI(6 + 4 * m)) {
+        row -= DI(6 + 4 * m);
+        ++m;
+    }
+    if (m >= n) {
+        return;
+    }
+    int type = DI(5 + 4 * m), rows = DI(6 + 4 * m);
+    const uint8_t *w = DP(const uint8_t, 4 + 4 * m) + (size_t)row * kq_row_bytes(type, cols);
+    for (int j = 0; j < t; ++j) {
+        float v = kq_row(type, w, DP(const float, 0) + (size_t)j * cols, cols);
+        if (threadIdx.x % 32 == 0) {
+            DP(float, 7 + 4 * m)[(size_t)j * rows + row] = v;
+        }
+    }
+}
+
+/* 8 values of a row from column c0 (a multiple of 8), as float32. */
+__device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float *v)
+{
+    if (type == KQ_F32) {
+        float4 a = *(const float4 *)((const float *)w + c0);
+        float4 b = *(const float4 *)((const float *)w + c0 + 4);
+        v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+        v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+    } else if (type == KQ_Q8_R) {
+        float d = __half2float(((const __half *)(w + cols))[c0 / 32]);
+        uint2 q = *(const uint2 *)(w + c0);
+        for (int u = 0; u < 4; ++u) {
+            v[u] = d * (float)(int8_t)((q.x >> (8 * u)) & 255);
+            v[4 + u] = d * (float)(int8_t)((q.y >> (8 * u)) & 255);
+        }
+    } else if (type == KQ_Q8_0) {
+        const uint8_t *blk = w + (size_t)(c0 / 32) * 34;
+        float d = kq_half(blk);
+        for (int u = 0; u < 8; ++u) {
+            v[u] = d * (float)(int8_t)blk[2 + c0 % 32 + u];
+        }
+    } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
+        int five = type == KQ_Q5_K;
+        const uint8_t *blk = w + (size_t)(c0 / 256) * (five ? 176 : 144);
+        int q = c0 % 256, c = q / 64, off = q % 64, hi = off >= 32, l = off % 32;
+        int j = 2 * c + hi, sc, m;
+        kq_scale_min(blk + 4, j, &sc, &m);
+        float d = kq_half(blk) * (float)sc, dm = kq_half(blk + 2) * (float)m;
+        const uint8_t *qs = blk + (five ? 48 : 16) + 32 * c + l;
+        for (int u = 0; u < 8; ++u) {
+            int nib = hi ? qs[u] >> 4 : qs[u] & 15;
+            if (five) {
+                nib |= ((blk[16 + l + u] >> j) & 1) << 4;
+            }
+            v[u] = d * (float)nib - dm;
+        }
+    } else {
+        const uint8_t *blk = w + (size_t)(c0 / 256) * 210;
+        int q = c0 % 256, h = q / 128, rr = q % 128, u4 = rr / 32, l = rr % 32;
+        const uint8_t *ql = blk + 64 * h + ((u4 & 1) ? 32 : 0) + l;
+        const uint8_t *qh = blk + 128 + 32 * h + l;
+        float d = kq_half(blk + 208) * (float)((const int8_t *)(blk + 192))[8 * h + l / 16 + 2 * u4];
+        for (int u = 0; u < 8; ++u) {
+            int lo = u4 >= 2 ? ql[u] >> 4 : ql[u] & 15;
+            v[u] = d * (float)((lo | (((qh[u] >> (2 * u4)) & 3) << 4)) - 32);
+        }
+    }
+}
+
+/* A tile of the product of a group: rows r0 .. r0 + 63 of W (nrows rows,
+ * rb bytes each) on n rows of x (row j at X + xmap[j] * xstride, or
+ * X + j * xstride). O[j * ostride + r] gets row r, token j. 256 threads;
+ * each computes 4 rows by 4 tokens. The weights come to shared memory as
+ * float32, 32 columns at a time. */
+#define KG_B 64
+#define KG_K 32
+__device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0, int cols,
+                        const float *X, size_t xstride, const int *xmap, int n, float *O,
+                        size_t ostride)
+{
+    __shared__ __align__(16) float Ws[KG_K][KG_B + 4];
+    __shared__ __align__(16) float Xs[KG_K][KG_B + 4];
+    int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
+    int lr = tid / 4, lc = (tid % 4) * 8;
+    const uint8_t *wrow = r0 + lr < nrows ? W + (size_t)(r0 + lr) * rb : NULL;
+    const float *xrow = lr < n ? X + (size_t)(xmap ? xmap[lr] : lr) * xstride : NULL;
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j] = 0.f;
+        }
+    }
+    for (int k0 = 0; k0 < cols; k0 += KG_K) {
+        float v[8];
+        if (wrow != NULL) {
+            kq_dequant8(type, wrow, cols, k0 + lc, v);
+        } else {
+            for (int u = 0; u < 8; ++u) {
+                v[u] = 0.f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            Ws[lc + u][lr] = v[u];
+        }
+        if (xrow != NULL) {
+            float4 a = *(const float4 *)(xrow + k0 + lc), b = *(const float4 *)(xrow + k0 + lc + 4);
+            v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+            v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+        } else {
+            for (int u = 0; u < 8; ++u) {
+                v[u] = 0.f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            Xs[lc + u][lr] = v[u];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < KG_K; ++kk) {
+            float4 a = *(const float4 *)&Ws[kk][ty * 4];
+            float4 b = *(const float4 *)&Xs[kk][tx * 4];
+            float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int rr = r0 + ty * 4 + i;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int jj = tx * 4 + j;
+            if (rr < nrows && jj < n) {
+                O[(size_t)jj * ostride + rr] = acc[i][j];
+            }
+        }
+    }
+}
+
+/* GP_KQ_LINEAR of a large group (t > MT_MAX). */
+__global__ void __launch_bounds__(256) k_kq_gemm(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int type = DI(5), rows = DI(6), cols = DI(7), t = DI(8);
+    int j0 = blockIdx.y * KG_B;
+    kq_tile(type, DP(const uint8_t, 4), kq_row_bytes(type, cols), rows, blockIdx.x * KG_B, cols,
+            DP(const float, 3) + (size_t)j0 * cols, (size_t)cols, NULL, min(KG_B, t - j0),
+            DP(float, 9) + (size_t)j0 * rows, (size_t)rows);
+}
+
+/* GP_KQ_GROUP_MOE: the experts of a large group on the GPU.
+ *
+ *     h, val, idx, t, k, E, hidden, inner, tgate, tup, tdown, gtype, dtype,
+ *     sgate, sup, sdown, stype, slog, work, act, act2, de, out, nreal
+ *
+ * tgate, tup, tdown give the device address of each expert (a hot slot, or
+ * the buffer of the copies of GP_FETCH). The shared expert is expert E.
+ * k_qmoe_sort sorts the pairs (token, expert) of the first nreal tokens by
+ * expert, and makes the tiles of at most 64 pairs of one expert. Then the
+ * gate and up rows, silu(gate) up, the down rows, and the sum. */
+struct qmoe_w {
+    int *cnt, *start, *ptok, *pof, *tiles;
+};
+
+__device__ __forceinline__ qmoe_w qmoe_work(const gp_rec *r, const int64_t *e)
+{
+    int E = DI(5), P = DI(3) * DI(4) + DI(3);
+    qmoe_w w;
+    w.cnt = DP(int, 18) + 8;
+    w.start = w.cnt + E + 2;
+    w.ptok = w.start + E + 2;
+    w.pof = w.ptok + P;
+    w.tiles = w.pof + P;
+    return w;
+}
+
+__global__ void k_qmoe_sort(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    if (threadIdx.x != 0) {
+        return;
+    }
+    int t = DI(3), k = DI(4), E = DI(5);
+    int nr = DI(23);
+    nr = nr > 0 && nr < t ? nr : t;
+    const int *idx = DP(const int, 2);
+    int *work = DP(int, 18);
+    qmoe_w w = qmoe_work(r, e);
+    for (int x = 0; x <= E; ++x) {
+        w.cnt[x] = 0;
+    }
+    for (int q = 0; q < nr * k; ++q) {
+        w.cnt[idx[q]]++;
+    }
+    w.cnt[E] = nr;
+    int a = 0, nt = 0;
+    for (int x = 0; x <= E; ++x) {
+        w.start[x] = a;
+        for (int s = 0; s < w.cnt[x]; s += KG_B) {
+            w.tiles[3 * nt] = x;
+            w.tiles[3 * nt + 1] = a + s;
+            w.tiles[3 * nt + 2] = min(KG_B, w.cnt[x] - s);
+            ++nt;
+        }
+        a += w.cnt[x];
+        w.cnt[x] = 0;
+    }
+    w.start[E + 1] = a;
+    for (int q = 0; q < t * k; ++q) {
+        if (q / k >= nr) {
+            w.pof[q] = -1;
+            continue;
+        }
+        int x = idx[q], pos = w.start[x] + w.cnt[x]++;
+        w.ptok[pos] = q / k;
+        w.pof[q] = pos;
+    }
+    for (int j = 0; j < t; ++j) {
+        int pos = -1;
+        if (j < nr) {
+            pos = w.start[E] + w.cnt[E]++;
+            w.ptok[pos] = j;
+        }
+        w.pof[t * k + j] = pos;
+    }
+    work[0] = nt;
+    work[1] = a;
+}
+
+__global__ void __launch_bounds__(256) k_qmoe_gu(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    qmoe_w w = qmoe_work(r, e);
+    int tile = blockIdx.y;
+    if (tile >= DP(const int, 18)[0]) {
+        return;
+    }
+    int x = w.tiles[3 * tile], p0 = w.tiles[3 * tile + 1], n = w.tiles[3 * tile + 2];
+    int E = DI(5), hidden = DI(6), inner = DI(7);
+    int row0 = blockIdx.x * KG_B, up = row0 >= inner;
+    int type = x < E ? DI(11) : DI(16);
+    const uint8_t *W = x < E ? (const uint8_t *)(intptr_t)DP(const int64_t, up ? 9 : 8)[x]
+                             : DP(const uint8_t, up ? 14 : 13);
+    kq_tile(type, W, kq_row_bytes(type, hidden), inner, row0 - (up ? inner : 0), hidden,
+            DP(const float, 0), (size_t)hidden, w.ptok + p0, n,
+            DP(float, 19) + (size_t)p0 * 2 * inner + (up ? inner : 0), (size_t)2 * inner);
+}
+
+__global__ void k_qmoe_act(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int inner = DI(7);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)DP(const int, 18)[1] * inner) {
+        return;
+    }
+    int64_t p = i / inner, c = i % inner;
+    const float *a = DP(const float, 19) + p * 2 * inner;
+    DP(float, 20)[i] = qw_silu(a[c]) * a[inner + c];
+}
+
+__global__ void __launch_bounds__(256) k_qmoe_dn(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    qmoe_w w = qmoe_work(r, e);
+    int tile = blockIdx.y;
+    if (tile >= DP(const int, 18)[0]) {
+        return;
+    }
+    int x = w.tiles[3 * tile], p0 = w.tiles[3 * tile + 1], n = w.tiles[3 * tile + 2];
+    int E = DI(5), hidden = DI(6), inner = DI(7);
+    int type = x < E ? DI(12) : DI(16);
+    const uint8_t *W = x < E ? (const uint8_t *)(intptr_t)DP(const int64_t, 10)[x]
+                             : DP(const uint8_t, 15);
+    kq_tile(type, W, kq_row_bytes(type, inner), hidden, blockIdx.x * KG_B, inner,
+            DP(const float, 20) + (size_t)p0 * inner, (size_t)inner, NULL, n,
+            DP(float, 21) + (size_t)p0 * hidden, (size_t)hidden);
+}
+
+__global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    qmoe_w w = qmoe_work(r, e);
+    int c = blockIdx.x * blockDim.x + threadIdx.x, tok = blockIdx.y;
+    int t = DI(3), k = DI(4), hidden = DI(6);
+    if (c >= hidden) {
+        return;
+    }
+    const float *val = DP(const float, 1), *de = DP(const float, 21);
+    float acc = 0.f;
+    int ps = w.pof[t * k + tok];
+    if (ps >= 0) {
+        acc = de[(size_t)ps * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
+        for (int s2 = 0; s2 < k; ++s2) {
+            int p = w.pof[tok * k + s2];
+            acc += val[tok * k + s2] * de[(size_t)p * hidden + c];
+        }
+    }
+    DP(float, 22)[(size_t)tok * hidden + c] = acc;
 }
 
 /* ---------- the host side ---------- */
@@ -4647,8 +5078,41 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         /* The GPU products read the float rows (operand 3 of GP_KQ_LINEAR). */
         return 0;
     case GP_KQ_LINEAR:
-        k_kq_linear<<<(unsigned)cdiv(hlit(r, 6, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        if (hlit(r, 8, &bad) > MT_MAX) {
+            if (hlit(r, 7, &bad) % KG_K != 0) {
+                bad = 1;
+            }
+            k_kq_gemm<<<dim3((unsigned)cdiv(hlit(r, 6, &bad), KG_B),
+                             (unsigned)cdiv(hlit(r, 8, &bad), KG_B)), 256, 0, s>>>(dr, denv);
+        } else {
+            k_kq_linear<<<(unsigned)cdiv(hlit(r, 6, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        }
         break;
+    case GP_KQ_MULTI: {
+        int64_t rows = 0;
+        for (int m = 0; m < hlit(r, 3, &bad); ++m) {
+            rows += hlit(r, 6 + 4 * m, &bad);
+        }
+        k_kq_multi<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_ADD_RMS:
+        k_add_rms<<<(unsigned)hlit(r, 4, &bad), T, 0, s>>>(dr, denv);
+        break;
+    case GP_KQ_GROUP_MOE: {
+        int64_t t = hlit(r, 3, &bad), k = hlit(r, 4, &bad), E = hlit(r, 5, &bad);
+        int64_t hidden = hlit(r, 6, &bad), inner = hlit(r, 7, &bad);
+        unsigned tiles = (unsigned)(cdiv(t * k + t, KG_B) + E + 1);
+        if (hidden % KG_B != 0 || inner % KG_B != 0) {
+            bad = 1;
+        }
+        k_qmoe_sort<<<1, 32, 0, s>>>(dr, denv);
+        k_qmoe_gu<<<dim3((unsigned)(2 * inner / KG_B), tiles), 256, 0, s>>>(dr, denv);
+        k_qmoe_act<<<(unsigned)cdiv((t * k + t) * inner, T), T, 0, s>>>(dr, denv);
+        k_qmoe_dn<<<dim3((unsigned)(hidden / KG_B), tiles), 256, 0, s>>>(dr, denv);
+        k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
+        break;
+    }
     case GP_SIGMUL:
         k_sigmul<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
         break;
@@ -4668,8 +5132,8 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_GDN: {
-        /* No log (an MTP verify group) on the GPU yet; k_dim = v_dim = 128. */
-        if (r->v[19] != 0 || hlit(r, 16, &bad) != 128 || hlit(r, 17, &bad) != 128 ||
+        /* k_dim = v_dim = 128 */
+        if (hlit(r, 16, &bad) != 128 || hlit(r, 17, &bad) != 128 ||
             hlit(r, 3, &bad) > 9) {
             bad = 1;
         }
@@ -5177,6 +5641,24 @@ int gg_q6k_head(const void *w, const float *x, float *out, int rows, int cols, f
         k_q6k_head<0><<<grid, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
             (const uint8_t *)w, x, out, rows, cols, cap, nx);
     }
+    CK(cudaGetLastError());
+    return 0;
+}
+
+/* Apply the first n tokens of the log of a verify group to conv and S (the
+ * device arrays of one linear layer), as gdn_commit of the CPU. */
+int gg_gdn_commit(float *conv, float *S, const float *log, int n, int kernel, int k_heads,
+                  int v_heads, int k_dim, int v_dim)
+{
+    if (k_dim != 128 || v_dim != 128 || kernel > 9) {
+        snprintf(gg_error, sizeof(gg_error), "gg_gdn_commit: k_dim = v_dim = 128");
+        return -1;
+    }
+    int cd = 2 * k_heads * k_dim + v_heads * v_dim;
+    size_t lrow = (size_t)cd + (size_t)v_heads * (k_dim + v_dim + 1);
+    k_gdn_commit_conv<<<(unsigned)cdiv(cd, 256), 256, 0, gg_stream>>>(conv, log, n, kernel, cd,
+                                                                    lrow);
+    k_gdn_commit_heads<128><<<(unsigned)v_heads, 128, 0, gg_stream>>>(S, log, n, cd, lrow);
     CK(cudaGetLastError());
     return 0;
 }

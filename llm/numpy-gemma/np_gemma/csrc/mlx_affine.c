@@ -560,6 +560,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
     float *de = (float *)ma_take(&p, (size_t)P * hidden * 4);
     moe_sort_pairs(ids, t, k, experts, shared, cnt, start, used, pair_tok, pair_of, nused_p);
     int nu = *nused_p;
+    P = start[ne];          /* the pairs with an expert */
     /* The input rows of the pairs, in the sorted order. */
     #pragma omp for schedule(static)
     for (int q = 0; q < P; ++q) {
@@ -577,7 +578,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
         int r = rr % inner;
         ma_mat m = e < experts ? ma_expert(isup ? U : G, e, inner, hidden) : (isup ? SU : SG);
         int s0 = start[e];
-        int n = (e + 1 < ne ? start[e + 1] : P) - s0;
+        int n = start[e + 1] - s0;
         ma_rows_any(m, r, hidden, (m.bits == 4 ? x4 : x8) + (size_t)s0 * hidden,
                     xs + (size_t)s0 * ngh, xm + (size_t)s0 * ngh, n,
                     act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
@@ -599,7 +600,7 @@ static void ma_moe_body(const int8_t *hq4, const int8_t *hq8, const float *hs, c
         int e = used[x / (hidden / 4)], r = (x % (hidden / 4)) * 4;
         ma_mat m = e < experts ? ma_expert(D, e, hidden, inner) : SD;
         int s0 = start[e];
-        int n = (e + 1 < ne ? start[e + 1] : P) - s0;
+        int n = start[e + 1] - s0;
         ma_rows_any(m, r, inner, aq + (size_t)s0 * inner, as + (size_t)s0 * ngi,
                     am + (size_t)s0 * ngi, n, de + (size_t)s0 * hidden + r, (size_t)hidden);
     }

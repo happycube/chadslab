@@ -123,6 +123,7 @@ def lib():
     L.gg_host_alloc.argtypes = [sz]
     L.gg_cache_copy.argtypes = [vp, i]
     L.gg_cache_query.argtypes = [i, i]
+    L.gg_gdn_commit.argtypes = [vp, vp, vp] + [i] * 6
     L.gg_host_alloc.restype = vp
     L.gg_d2d.argtypes = [vp, vp, sz]
     # The products of a large group: NP_GEMMA_GPU_TC=1 (the default) runs

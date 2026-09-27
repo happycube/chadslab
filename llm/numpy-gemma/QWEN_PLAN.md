@@ -436,14 +436,58 @@ experts run on the GPU at the same time. The dense part takes about 7 ms
 on the GPU; the large products read about 320 GB/s. 18 CPU threads
 (OMP_NUM_THREADS=18) were faster than 36 in one test.
 
-The next steps of phase 4:
+Status of phase 4 (the groups, done):
 
-- the prompt pass on the GPU. The products take groups of tokens, and the
-  DeltaNet runs the tokens in order (later the chunked form). The experts
-  of a large group come to the GPU, as for the 26B;
-- the MTP verify group (the log of GDN on the GPU);
-- fewer small launches (alpha, beta, and the gate of the shared expert in
-  one record).
+- np_gemma/qwen_gpu.py has three kinds of program. The step, and a group
+  with the experts split (hot on the GPU, cold on the CPU). Also a large
+  group: its cold experts come to the GPU (GP_FETCH, two buffers, as for
+  the 26B). GP_KQ_GROUP_MOE sorts the pairs by expert and runs tiles of 64
+  pairs of one expert. A group of more than 16 tokens uses a tiled
+  kernel for the products (k_kq_gemm). It makes float32 values of the
+  blocks in shared memory.
+- A group of at most 16 tokens runs the attention of each query with the
+  kernel of the step. Then a group gives the bits of the steps.
+- GDN has the log of a verify group on the GPU, and gg_gdn_commit applies
+  the first n tokens. The updates of the state use explicit roundings in
+  both kernels. The slot nreal gives the count of the real tokens of a
+  group. The other rows (added to fill the program) do not change the
+  state.
+- scripts/check_qwen_gpu_groups.py (HotCache off): a group of 4 gives the
+  bits of 4 steps. Verify of 4 with commit(2) and 2 steps also gives the
+  bits of 4 steps (the rows and the states). After a prompt pass on the
+  GPU, the top token of the next token is that of the CPU.
+- Fewer launches: GP_KQ_MULTI runs up to 5 products on the same x in one
+  kernel. GP_ADD_RMS is an add and the next norm. GP_KQ_QUANT is not
+  in the GPU programs. The warm decode went from 54-57 to 61 tok/s.
+- The MoE scratch of a program is one set for all the layers. Before, each
+  layer had its own set (2.6 GB for a group of 512 tokens).
+
+The prompt pass (a prompt of this repository, the other load of the
+machine):
+
+    tokens   GPU          CPU        how
+    100      117 tok/s    67 tok/s   a split group of 128 rows
+    300      131 tok/s    79 tok/s   split groups
+    600      184 tok/s    76 tok/s   a large group of 1024 rows
+    1500     292 tok/s    69 tok/s   large groups of 1024 and 512 rows
+
+A large group waits for the copies of the experts: about 2.2 s for each
+group at 7.5 GB/s. A group of 2048 rows did not fit next to the other work
+of the GPU. llama.cpp gives 224 tok/s for 512 tokens.
+
+The budget of hot experts (scripts/bench_qwen_hot.py, 256 tokens of
+decode, a prompt of 1500 tokens):
+
+    budget   slots   decode new   decode warm   cold of 8   prompt
+    0 GB     1       41.9         45.6          7.46        260 tok/s
+    0.5 GB   6       49.0         49.1          6.11        262 tok/s
+    1.0 GB   12      52.8         51.2          5.31        266 tok/s
+    1.5 GB   18      54.3         56.1          4.77        269 tok/s
+    2.0 GB   24      55.9         57.4          4.34        273 tok/s
+
+With no hot experts the decode is 42 to 46 tok/s. Thus the dense part on
+the GPU gives most of the gain over the CPU (17 tok/s). Each 0.5 GB then adds
+about 2 to 4 tok/s.
 
 ## Phase 5: MTP
 

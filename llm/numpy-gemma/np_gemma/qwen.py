@@ -620,8 +620,12 @@ def compile_qwen_step(model, t, verify=False):
                       model.F(a + "k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
                       prog.slot("V.%d" % i), hs, pos, t, nq, nk, hd, cfg.rotary_dim, eps,
                       float(hd ** -0.5), qout, gate)
-            prog.emit(P.ATTN_F32H, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i), scores,
-                      att, nq, nk, hd, t, pos, hs, 0, 0)
+            if hasattr(model, "emit_attn"):
+                model.emit_attn(prog, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i), scores,
+                                att, nq, nk, hd, t, pos, hs)
+            else:
+                prog.emit(P.ATTN_F32H, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i),
+                          scores, att, nq, nk, hd, t, pos, hs, 0, 0)
             prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
             lin(a + "o_proj", o4)
@@ -636,7 +640,7 @@ def compile_qwen_step(model, t, verify=False):
                       att, o3, model.F(a + "A_log"), model.F(a + "dt_bias"),
                       model.F(a + "norm.weight"), prog.slot("S.%d" % i), gate, gscr, t,
                       cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps,
-                      log_of(i), int(cfg.v_tiled))
+                      log_of(i), int(cfg.v_tiled), prog.slot("nreal"))
             quant(gate, vd)
             lin(a + "out_proj", o4)
         # o4 (t x hidden) has the output of the attention; x += o4.
@@ -645,8 +649,8 @@ def compile_qwen_step(model, t, verify=False):
         quant(h, hid)
         m = p + "mlp."
         lin(m + "gate", logits)
-        prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
         lin(m + "shared_expert_gate", slog)
+        prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
         model.emit_moe(prog, xb, m, idx, val, slog, scratch, mo)
         prog.emit(P.ADD, x, mo, x, t * hid)
     prog.emit(P.RMS_NORM, x, model.F("norm.weight"), xn, t, hid, eps)
