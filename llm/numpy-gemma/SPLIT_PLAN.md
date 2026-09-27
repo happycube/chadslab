@@ -816,6 +816,45 @@ help. The card also runs at its power limit (about 170 of 180 W, 2.6 to
 2.85 GHz). The next test is the tile of llama.cpp: w changed to int8 in
 shared memory one time for each block, not in each warp.
 
+### The decode step, against llama.cpp
+
+Nsight Systems recorded 64 decode steps of the E4B in each runtime. It
+recorded each kernel in the CUDA graphs (llama-bench -n 64 -fa 1; this
+runtime with NP_GEMMA_GPU=1). The machine had other load, so llama.cpp gave 94 tok/s.
+The values are for one step:
+
+    part                           llama.cpp    this runtime
+    the step                       10.5 ms      13.7 ms
+    sum of the kernels             10.8 ms      10.8 ms
+    time with a kernel that runs   8.7 ms       10.8 ms
+    GPU waits for cudaGraphLaunch  1.6 ms       1.5 ms
+    GPU waits for the host         0.2 ms       1.0 ms
+
+    kernels                        llama.cpp    this runtime
+    int4 products and output head  8.1 ms       8.0 ms
+    quantization of x (q8_1)       1.0 ms       -
+    norms                          1.0 ms       1.4 ms
+    attention                      0.3 ms       0.6 ms
+    other small operations         0.3 ms       0.8 ms
+
+The kernels take the same time in the two runtimes. The differences are:
+
+1. The kernels of llama.cpp overlap on one stream (about 1100 of them in
+   each step). This is programmatic dependent launch: a kernel starts
+   before the kernel before it ends, and it waits for the data with
+   cudaGridDependencySynchronize. It hides about 2.1 ms in each step.
+   The kernels of this runtime do not overlap.
+2. Between the logits of a step and the start of the next step, the host
+   of this runtime takes 1.0 ms. llama.cpp takes 0.2 ms. The host work is
+   the argmax of the logits in NumPy, the rows of the embeddings, and the
+   tables of RoPE. It also binds the parameters of the step.
+3. cudaGraphLaunch takes about 1.5 ms for a graph of about 1000 kernels in
+   the two runtimes, and the GPU does not start before it ends.
+
+Thus programmatic dependent launch (about 2 ms) and a faster host part
+(about 0.8 ms) give the most. A graph with fewer kernels also makes the
+launch shorter, at about 1.5 us for each kernel.
+
 ### The drafter on the GPU
 
 GPUDrafter compiles one draft step of the E4B assistant for the GPU. The
