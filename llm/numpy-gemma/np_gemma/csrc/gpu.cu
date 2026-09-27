@@ -21,9 +21,23 @@
  * The kernels do not give the bits of the CPU kernels, because they add the
  * values in a different order. scripts/check_gpu.py compares the two.
  *
- * The first version covers the operations of a decode step of one token of
- * the E4B model, and its output head (gg_q6k_head). The launch of any other
- * operation gives an error.
+ * The file covers the operations of a decode step of one token of the E4B
+ * model, and of the 26B model without the experts. The output head is
+ * gg_q6k_head. The launch of any other operation gives an error.
+ *
+ * A step of the 26B keeps its experts on the CPU (SPLIT_PLAN.md, phase 4).
+ * Three records of the program move the work to the CPU and back:
+ *
+ * - GP_TO_HOST copies the input of the experts to pinned host memory and
+ *   records an event.
+ * - GP_CPU_JOIN waits for that event and runs a CPU program (gemma_run of
+ *   the CPU library) that computes the experts.
+ * - GP_TO_DEV copies the output of the experts back to the GPU.
+ *
+ * The runner launches the kernels after a GP_TO_HOST before it runs the
+ * GP_CPU_JOIN. Thus the GPU computes the dense feed-forward part while the
+ * CPU computes the experts. The kernels between two such records are one
+ * segment, and each segment has its own CUDA graph.
  */
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -51,8 +65,12 @@ enum {
     GP_S_MIN = 6,
     GP_RMS_NORM = 16, GP_ADD = 17, GP_MUL_S = 18, GP_COPY = 19, GP_GELU = 20,
     GP_MUL = 21,
-    GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_BF16_LINEAR = 39,
+    GP_INT4_LINEAR = 32, GP_INT4_MULTI4 = 33, GP_RMS_NORM_MULTI4 = 34,
+    GP_GELU_MUL_INT4 = 35, GP_BF16_LINEAR = 39,
+    GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_F32 = 51,
     GP_QKV_NORM = 54, GP_ROPE = 55, GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
+    GP_ROUTER = 64,
+    GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86,
 };
 
 static cudaStream_t gg_stream;
@@ -127,14 +145,18 @@ __device__ float block_max(float v)
 
 /* ---------- small operations ---------- */
 
-/* x, w (0 for none), out, rows, cols, eps. One block for each row. */
-__global__ void k_rms_norm(const gp_rec *r, const int64_t *e)
+/* The norm of each row of cols values: out = x s w, where s = 1 / sqrt(mean
+ * of x^2 + eps). A null w gives out = x s. One block for each row. The
+ * arguments give the operands of x, w, out, cols, and eps. Thus the kernel
+ * serves GP_RMS_NORM and the first step of GP_RMS_NORM_MULTI4. */
+__global__ void k_rms_norm(const gp_rec *r, const int64_t *e, int xk, int wk, int ok,
+                           int ck, int ek)
 {
-    const float *x = DP(const float, 0) + (size_t)blockIdx.x * DI(4);
-    const float *w = DP(const float, 1);
-    float *out = DP(float, 2) + (size_t)blockIdx.x * DI(4);
-    int cols = DI(4);
-    float eps = df(r, e, 5);
+    int cols = DI(ck);
+    const float *x = DP(const float, xk) + (size_t)blockIdx.x * cols;
+    const float *w = DP(const float, wk);
+    float *out = DP(float, ok) + (size_t)blockIdx.x * cols;
+    float eps = df(r, e, ek);
     float ss = 0.f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         ss += x[i] * x[i];
@@ -195,6 +217,31 @@ __global__ void k_mul(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* g, u, inner, scratch: scratch = gelu(g) u, the first step of
+ * GP_GELU_MUL_INT4. */
+__global__ void k_gelu_mul(const gp_rec *r, const int64_t *e)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < DI(2)) {
+        float v = DP(const float, 0)[i];
+        DP(float, 3)[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
+                                                   (v + 0.044715f * v * v * v)))
+                          * DP(const float, 1)[i];
+    }
+}
+
+/* k, v, kd, vd, kqd, ksd, vqd, vsd, n: store n values of the key and of the
+ * value at kd and vd. The GPU keeps a float cache only, so the addresses of
+ * the int16 copy are null. */
+__global__ void k_kv_write(const gp_rec *r, const int64_t *e)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < DI(8)) {
+        DP(float, 2)[i] = DP(const float, 0)[i];
+        DP(float, 3)[i] = DP(const float, 1)[i];
+    }
+}
+
 /* ---------- matrices ---------- */
 
 /* One row of int4 blocks against x. The row has cols / 32 blocks of 18
@@ -233,32 +280,38 @@ __device__ __forceinline__ float int4_row(const uint8_t *wr, const float *x, int
 
 #define ROWS_PER_BLOCK 8
 
-/* x, w, s, out, rows, cols. One warp for each row. The kernel reads the
- * float16 scale of each block, not s. np_gemma/gpu.py checks that the two
- * scales are equal. */
-__global__ void k_int4_linear(const gp_rec *r, const int64_t *e)
+/* One warp for each row of an int4 matrix. The arguments give the operands
+ * of x, w, out, rows, and cols: 0, 1, 3, 4, 5 for GP_INT4_LINEAR, and 3, 4,
+ * 6, 7, 8 for the matrix of GP_GELU_MUL_INT4. The kernel reads the float16
+ * scale of each block, not the float32 scales. np_gemma/gpu.py checks that
+ * the two scales are equal. */
+__global__ void k_int4_linear(const gp_rec *r, const int64_t *e, int xk, int wk, int ok,
+                              int rk, int ck)
 {
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
-    int rows = DI(4), cols = DI(5);
+    int rows = DI(rk), cols = DI(ck);
     if (row >= rows) {
         return;
     }
-    float v = int4_row(DP(const uint8_t, 1) + (size_t)row * (cols / 32) * 18,
-                       DP(const float, 0), cols);
+    float v = int4_row(DP(const uint8_t, wk) + (size_t)row * (cols / 32) * 18,
+                       DP(const float, xk), cols);
     if (threadIdx.x % 32 == 0) {
-        DP(float, 3)[row] = v;
+        DP(float, ok)[row] = v;
     }
 }
 
-/* x, cols, then (w, s, out, rows) for each of up to four matrices. A null w
- * skips a matrix. The rows of the four matrices follow each other. */
-__global__ void k_int4_multi4(const gp_rec *r, const int64_t *e)
+/* Up to four int4 matrices on the same x. The operand xk is x and ck is
+ * cols. Then come (w, s, out, rows) for each matrix, from operand m0. A null
+ * w skips a matrix. The rows of the four matrices follow each other. The
+ * values are 0, 1, 2 for GP_INT4_MULTI4 and 2, 3, 5 for GP_RMS_NORM_MULTI4.
+ * The x of GP_RMS_NORM_MULTI4 is the scratch of its norm. */
+__global__ void k_int4_multi4(const gp_rec *r, const int64_t *e, int xk, int ck, int m0)
 {
     int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
-    int cols = DI(1);
+    int cols = DI(ck);
     int m = 0;
     for (; m < 4; ++m) {
-        int rows = DP(const uint8_t, 2 + 4 * m) ? DI(5 + 4 * m) : 0;
+        int rows = DP(const uint8_t, m0 + 4 * m) ? DI(m0 + 3 + 4 * m) : 0;
         if (row < rows) {
             break;
         }
@@ -267,10 +320,10 @@ __global__ void k_int4_multi4(const gp_rec *r, const int64_t *e)
     if (m == 4) {
         return;
     }
-    float v = int4_row(DP(const uint8_t, 2 + 4 * m) + (size_t)row * (cols / 32) * 18,
-                       DP(const float, 0), cols);
+    float v = int4_row(DP(const uint8_t, m0 + 4 * m) + (size_t)row * (cols / 32) * 18,
+                       DP(const float, xk), cols);
     if (threadIdx.x % 32 == 0) {
-        DP(float, 4 + 4 * m)[row] = v;
+        DP(float, m0 + 2 + 4 * m)[row] = v;
     }
 }
 
@@ -307,22 +360,29 @@ __global__ void k_bf16_linear(const gp_rec *r, const int64_t *e)
 
 /* ---------- attention ---------- */
 
-/* q, q_w, q_rows, k, k_w, k_rows, v, v_rows, head_dim, eps. One block for
- * each row of head_dim values. A row of v has no weight. */
-__global__ void k_qkv_norm(const gp_rec *r, const int64_t *e)
+/* The operands of the norm of the query, the key, and the value. GP_QKV_NORM
+ * has them in this order. GP_QKV_NORM_ROPE has head_dim and eps at 12 and
+ * 13. */
+struct qkv_ix {
+    int q, qw, qr, k, kw, kr, v, vr, hd, eps;
+};
+
+/* The norm of each head of q, k, and v, in place. One block for each row of
+ * head_dim values. A row of v has no weight. */
+__global__ void k_qkv_norm(const gp_rec *r, const int64_t *e, qkv_ix ix)
 {
     int row = blockIdx.x;
-    int qr = DI(2), kr = DI(5), hd = DI(8);
+    int qr = DI(ix.qr), kr = DI(ix.kr), hd = DI(ix.hd);
     float *x;
     const float *w;
     if (row < qr) {
-        x = DP(float, 0) + (size_t)row * hd;
-        w = DP(const float, 1);
+        x = DP(float, ix.q) + (size_t)row * hd;
+        w = DP(const float, ix.qw);
     } else if (row < qr + kr) {
-        x = DP(float, 3) + (size_t)(row - qr) * hd;
-        w = DP(const float, 4);
+        x = DP(float, ix.k) + (size_t)(row - qr) * hd;
+        w = DP(const float, ix.kw);
     } else {
-        x = DP(float, 6) + (size_t)(row - qr - kr) * hd;
+        x = DP(float, ix.v) + (size_t)(row - qr - kr) * hd;
         w = NULL;
     }
     float ss = 0.f;
@@ -330,29 +390,34 @@ __global__ void k_qkv_norm(const gp_rec *r, const int64_t *e)
         ss += x[i] * x[i];
     }
     ss = block_sum(ss);
-    float s = 1.0f / sqrtf(ss / (float)hd + df(r, e, 9));
+    float s = 1.0f / sqrtf(ss / (float)hd + df(r, e, ix.eps));
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         x[i] = w ? x[i] * s * w[i] : x[i] * s;
     }
 }
 
-/* q, q_rows, q_heads, k, k_rows, k_heads, cos, sin, head_dim. One block for
- * each row. As gemma_rope_body. */
-__global__ void k_rope(const gp_rec *r, const int64_t *e)
+/* The operands of the rope. GP_ROPE has them in this order. */
+struct rope_ix {
+    int q, qr, qh, k, kr, kh, cos, sin, hd;
+};
+
+/* The rope of each head of q and k, in place. One block for each row. As
+ * gemma_rope_body. */
+__global__ void k_rope(const gp_rec *r, const int64_t *e, rope_ix ix)
 {
     int row = blockIdx.x;
-    int qr = DI(1), hd = DI(8), d = hd / 2;
+    int qr = DI(ix.qr), hd = DI(ix.hd), d = hd / 2;
     float *x;
     int tok;
     if (row < qr) {
-        x = DP(float, 0) + (size_t)row * hd;
-        tok = row / DI(2);
+        x = DP(float, ix.q) + (size_t)row * hd;
+        tok = row / DI(ix.qh);
     } else {
-        x = DP(float, 3) + (size_t)(row - qr) * hd;
-        tok = (row - qr) / DI(5);
+        x = DP(float, ix.k) + (size_t)(row - qr) * hd;
+        tok = (row - qr) / DI(ix.kh);
     }
-    const float *c = DP(const float, 6) + (size_t)tok * hd;
-    const float *s = DP(const float, 7) + (size_t)tok * hd;
+    const float *c = DP(const float, ix.cos) + (size_t)tok * hd;
+    const float *s = DP(const float, ix.sin) + (size_t)tok * hd;
     for (int i = threadIdx.x; i < d; i += blockDim.x) {
         float a = x[i], b = x[i + d];
         x[i] = a * c[i] - b * s[i];
@@ -395,46 +460,89 @@ __global__ void k_kv_write_heads(const gp_rec *r, const int64_t *e)
  * of the cache. The scale is 1, as in gemma_attn_decode_f32_body. */
 #define ATTN_CHUNKS 32
 
-__device__ __forceinline__ void attn_range(const gp_rec *r, const int64_t *e, int64_t *p,
-                                           int64_t *lo, int *n)
+/* The operands of one attention, for either layout of the cache. */
+struct attn_d {
+    const float *q, *k, *v;
+    float *sc, *out;
+    int qh, kvh, hd, n, window;
+    int64_t kp0, p;          /* the position of key row 0, and of the query */
+    size_t hstride, rstride; /* the distance of two heads and of two rows */
+};
+
+/* GP_ATTN_F32H reads the E4B cache, which has the shape (heads, positions,
+ * head_dim). Its operands:
+ *
+ *     q, k, v, scores, out, q_heads, kv_heads, head_dim, tokens (1), pos,
+ *     head_stride, window, slide
+ *
+ * The pointers k and v point at position 0. With slide, the keys start at
+ * the first position of the window.
+ *
+ * GP_ATTN_F32 reads the cache of the 26B model, which has the shape (rows,
+ * kv_heads, head_dim). Its operands:
+ *
+ *     q, k, v, scores, out, q_heads, kv_heads, head_dim, n, pos, base, window
+ *
+ * The pointers k and v point at the first key row. Its position is base. */
+__device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
 {
-    int window = DI(11), slide = DI(12);
-    *p = di(r, e, 9);
-    *lo = (slide && window > 0) ? *p - window + 1 : 0;
-    if (*lo < 0) {
-        *lo = 0;
+    attn_d a;
+    a.q = DP(const float, 0);
+    a.sc = DP(float, 3);
+    a.out = DP(float, 4);
+    a.qh = DI(5);
+    a.kvh = DI(6);
+    a.hd = DI(7);
+    a.p = di(r, e, 9);
+    if (r->op == GP_ATTN_F32H) {
+        a.window = DI(11);
+        int64_t lo = (DI(12) && a.window > 0) ? a.p - a.window + 1 : 0;
+        if (lo < 0) {
+            lo = 0;
+        }
+        a.kp0 = lo;
+        a.n = (int)(a.p + 1 - lo);
+        a.hstride = (size_t)di(r, e, 10);
+        a.rstride = (size_t)a.hd;
+        a.k = DP(const float, 1) + (size_t)lo * a.hd;
+        a.v = DP(const float, 2) + (size_t)lo * a.hd;
+    } else {
+        a.window = DI(11);
+        a.kp0 = di(r, e, 10);
+        a.n = DI(8);
+        a.hstride = (size_t)a.hd;
+        a.rstride = (size_t)a.kvh * a.hd;
+        a.k = DP(const float, 1);
+        a.v = DP(const float, 2);
     }
-    *n = (int)(*p + 1 - *lo);
+    return a;
 }
 
 __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
 {
+    attn_d a = attn_get(r, e);
     int h = blockIdx.x, c = blockIdx.y;
-    int qh = DI(5), kvh = DI(6), hd = DI(7), window = DI(11);
-    int64_t p, lo;
-    int n;
-    attn_range(r, e, &p, &lo, &n);
+    int n = a.n, hd = a.hd;
     int len = (n + ATTN_CHUNKS - 1) / ATTN_CHUNKS;
     int j0 = c * len, j1 = min(n, j0 + len);
-    int kv = h / (qh / kvh);
-    size_t hs = (size_t)di(r, e, 10);
-    const float *q = DP(const float, 0) + (size_t)h * hd;
-    const float *k = DP(const float, 1) + kv * hs + (size_t)lo * hd;
-    const float *v = DP(const float, 2) + kv * hs + (size_t)lo * hd;
-    float *sc = DP(float, 3) + (size_t)h * n;
+    int kv = h / (a.qh / a.kvh);
+    const float *q = a.q + (size_t)h * hd;
+    const float *k = a.k + kv * a.hstride;
+    const float *v = a.v + kv * a.hstride;
+    float *sc = a.sc + (size_t)h * n;
     float *o = part + ((size_t)h * ATTN_CHUNKS + c) * (hd + 2);
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
     for (int j = j0 + warp; j < j1; j += nw) {
-        int64_t kp = lo + j;
+        int64_t kp = a.kp0 + j;
         float s = 0.f;
         for (int i = lane; i < hd; i += 32) {
-            s += q[i] * k[(size_t)j * hd + i];
+            s += q[i] * k[(size_t)j * a.rstride + i];
         }
         for (int off = 16; off > 0; off >>= 1) {
             s += __shfl_xor_sync(0xffffffff, s, off);
         }
         if (lane == 0) {
-            sc[j] = (kp > p || (window > 0 && p - kp >= window)) ? -INFINITY : s;
+            sc[j] = (kp > a.p || (a.window > 0 && a.p - kp >= a.window)) ? -INFINITY : s;
         }
     }
     __syncthreads();
@@ -454,7 +562,7 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float acc = 0.f;
         for (int j = j0; j < j1; ++j) {
-            acc += sc[j] * v[(size_t)j * hd + i];
+            acc += sc[j] * v[(size_t)j * a.rstride + i];
         }
         o[i] = acc;
     }
@@ -490,6 +598,102 @@ __global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part
             }
         }
         out[i] = acc * inv;
+    }
+}
+
+/* ---------- the router ----------
+ * The operands of GP_ROUTER:
+ *
+ *     x, scale, proj, per_expert, hidden, experts, top_k, eps, hscale, val,
+ *     idx, r, logits
+ *
+ * Three kernels do the three steps of gemma_router_body:
+ *
+ * 1. the norm of x into r;
+ * 2. the logit of each expert;
+ * 3. the softmax, and the choice of the top_k experts. */
+__global__ void k_router_norm(const gp_rec *r, const int64_t *e)
+{
+    const float *x = DP(const float, 0);
+    const float *scale = DP(const float, 1);
+    float *rv = DP(float, 11);
+    int hidden = DI(4);
+    float ss = 0.f;
+    for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
+        ss += x[k] * x[k];
+    }
+    ss = block_sum(ss);
+    float inv = 1.0f / sqrtf(ss / (float)hidden + df(r, e, 7));
+    float hs = df(r, e, 8);
+    for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
+        rv[k] = x[k] * inv * scale[k] * hs;
+    }
+}
+
+__global__ void k_router_logits(const gp_rec *r, const int64_t *e)
+{
+    int ex = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int hidden = DI(4);
+    if (ex >= DI(5)) {
+        return;
+    }
+    const float *pe = DP(const float, 2) + (size_t)ex * hidden;
+    const float *rv = DP(const float, 11);
+    float s = 0.f;
+    for (int k = lane; k < hidden; k += 32) {
+        s += rv[k] * pe[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        s += __shfl_xor_sync(0xffffffff, s, o);
+    }
+    if (lane == 0) {
+        DP(float, 12)[ex] = s;
+    }
+}
+
+/* One thread: the softmax, the top_k experts, and their weights. The count
+ * of experts is small (128), so one thread is enough. */
+__global__ void k_router_top(const gp_rec *r, const int64_t *e)
+{
+    float *logits = DP(float, 12);
+    const float *per_expert = DP(const float, 3);
+    float *val = DP(float, 9);
+    int *idx = DP(int, 10);
+    int experts = DI(5), top_k = DI(6);
+    float m = logits[0];
+    for (int x = 1; x < experts; ++x) {
+        m = fmaxf(m, logits[x]);
+    }
+    float sum = 0.f;
+    for (int x = 0; x < experts; ++x) {
+        logits[x] = expf(logits[x] - m);
+        sum += logits[x];
+    }
+    float invs = 1.0f / sum;
+    for (int x = 0; x < experts; ++x) {
+        logits[x] *= invs;
+    }
+    for (int j = 0; j < top_k; ++j) {
+        int best = 0;
+        float bv = logits[0];
+        for (int x = 1; x < experts; ++x) {
+            if (logits[x] > bv) {
+                bv = logits[x];
+                best = x;
+            }
+        }
+        val[j] = bv;
+        idx[j] = best;
+        logits[best] = -1.0f;
+    }
+    float vs = 0.f;
+    for (int j = 0; j < top_k; ++j) {
+        vs += val[j];
+    }
+    float invv = 1.0f / vs;
+    for (int j = 0; j < top_k; ++j) {
+        val[j] = val[j] * invv * per_expert[idx[j]];
     }
 }
 
@@ -547,19 +751,38 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
 
 /* ---------- the host side ---------- */
 
+/* The runner of a CPU program: gemma_run of the CPU library. Python gives its
+ * address with gg_set_cpu_runner. */
+typedef int (*gg_cpu_runner)(const int64_t *prog, int limit);
+static gg_cpu_runner gg_cpu_run;
+
+/* A segment: the kernel records from start to end - 1, and their graph. */
+typedef struct {
+    int start, end;
+    cudaGraphExec_t exec;
+} gg_seg;
+
 typedef struct {
     int n_env, n_code;
     int64_t *henv;       /* the environment on the host */
     int64_t *denv;       /* the environment on the GPU */
     gp_rec *hcode;       /* the records, with device addresses */
     gp_rec *dcode;
-    cudaGraphExec_t exec;
     int use_graph;
     float *part;         /* the scratch of the attention */
+    int n_seg;
+    gg_seg *seg;         /* the segments, in the order of the records */
+    int n_ev;
+    cudaEvent_t *ev;     /* the events of the GP_TO_HOST records */
 } gg_prog;
 
 /* The size of the scratch of the attention: 32 heads of 1024 values. */
 #define GG_PART_FLOATS ((size_t)32 * ATTN_CHUNKS * (1024 + 2))
+
+static int is_boundary(int op)
+{
+    return op == GP_TO_HOST || op == GP_CPU_JOIN || op == GP_TO_DEV;
+}
 
 static int64_t hi(const gp_rec *r, const int64_t *e, int k)
 {
@@ -581,19 +804,46 @@ static int64_t cdiv(int64_t a, int64_t b)
     return (a + b - 1) / b;
 }
 
-/* Launch the kernel of one record. Return 0, or -1 for an operation that
+/* The rows of up to four matrices from operand m0, as k_int4_multi4 reads
+ * them. */
+static int64_t multi4_rows(const gp_rec *r, int m0, int *bad)
+{
+    int64_t rows = 0;
+    for (int m = 0; m < 4; ++m) {
+        if (r->v[m0 + 4 * m] != 0) {
+            rows += hlit(r, m0 + 3 + 4 * m, bad);
+        }
+    }
+    return rows;
+}
+
+static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
+                       const int64_t *denv, int *bad)
+{
+    unsigned qh = (unsigned)hlit(r, 5, bad);
+    if ((size_t)qh * ATTN_CHUNKS * (size_t)(hlit(r, 7, bad) + 2) > GG_PART_FLOATS) {
+        *bad = 1;
+        return 0;
+    }
+    k_attn_part<<<dim3(qh, ATTN_CHUNKS), 128, 0, gg_stream>>>(dr, denv, g->part);
+    k_attn_join<<<qh, 128, 0, gg_stream>>>(dr, denv, g->part);
+    return 0;
+}
+
+/* Launch the kernels of one record. Return 0, or -1 for an operation that
  * this file does not have or a size that is not a literal. */
 static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const int64_t *denv)
 {
     int bad = 0;
     cudaStream_t s = gg_stream;
     const int T = 256;
+    const int W = 32 * ROWS_PER_BLOCK;
     switch (r->op) {
     case GP_S_MOV: case GP_S_ADD: case GP_S_SUB: case GP_S_MUL: case GP_S_MAX:
     case GP_S_MIN:
         return 0;
     case GP_RMS_NORM:
-        k_rms_norm<<<(unsigned)hlit(r, 3, &bad), T, 0, s>>>(dr, denv);
+        k_rms_norm<<<(unsigned)hlit(r, 3, &bad), T, 0, s>>>(dr, denv, 0, 1, 2, 4, 5);
         break;
     case GP_ADD:
         k_add<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
@@ -611,33 +861,57 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_mul<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad), T), T, 0, s>>>(dr, denv);
         break;
     case GP_INT4_LINEAR:
-        k_int4_linear<<<(unsigned)cdiv(hlit(r, 4, &bad), ROWS_PER_BLOCK),
-                        32 * ROWS_PER_BLOCK, 0, s>>>(dr, denv);
+        k_int4_linear<<<(unsigned)cdiv(hlit(r, 4, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
+            dr, denv, 0, 1, 3, 4, 5);
         break;
-    case GP_INT4_MULTI4: {
-        int64_t rows = 0;
-        for (int m = 0; m < 4; ++m) {
-            if (r->v[2 + 4 * m] != 0) {
-                rows += hlit(r, 5 + 4 * m, &bad);
-            }
-        }
-        k_int4_multi4<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, s>>>(
-            dr, denv);
+    case GP_INT4_MULTI4:
+        k_int4_multi4<<<(unsigned)cdiv(multi4_rows(r, 2, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
+            dr, denv, 0, 1, 2);
         break;
-    }
+    case GP_RMS_NORM_MULTI4:
+        /* x, wn, scratch, cols, eps, then the matrices from operand 5. */
+        k_rms_norm<<<1, T, 0, s>>>(dr, denv, 0, 1, 2, 3, 4);
+        k_int4_multi4<<<(unsigned)cdiv(multi4_rows(r, 5, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
+            dr, denv, 2, 3, 5);
+        break;
+    case GP_GELU_MUL_INT4:
+        /* g, u, inner, scratch, w, s, out, rows, cols */
+        k_gelu_mul<<<(unsigned)cdiv(hlit(r, 2, &bad), T), T, 0, s>>>(dr, denv);
+        k_int4_linear<<<(unsigned)cdiv(hlit(r, 7, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
+            dr, denv, 3, 4, 6, 7, 8);
+        break;
     case GP_BF16_LINEAR:
         if (hlit(r, 5, &bad) != 1 || hlit(r, 4, &bad) % 8 != 0) {
             bad = 1;
         }
-        k_bf16_linear<<<(unsigned)cdiv(hlit(r, 3, &bad), ROWS_PER_BLOCK),
-                        32 * ROWS_PER_BLOCK, 0, s>>>(dr, denv);
+        k_bf16_linear<<<(unsigned)cdiv(hlit(r, 3, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
         break;
-    case GP_QKV_NORM:
+    case GP_QKV_NORM: {
+        qkv_ix ix = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
         k_qkv_norm<<<(unsigned)(hlit(r, 2, &bad) + hlit(r, 5, &bad) + hlit(r, 7, &bad)),
-                     128, 0, s>>>(dr, denv);
+                     128, 0, s>>>(dr, denv, ix);
         break;
-    case GP_ROPE:
-        k_rope<<<(unsigned)(hlit(r, 1, &bad) + hlit(r, 4, &bad)), 128, 0, s>>>(dr, denv);
+    }
+    case GP_ROPE: {
+        rope_ix ix = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+        k_rope<<<(unsigned)(hlit(r, 1, &bad) + hlit(r, 4, &bad)), 128, 0, s>>>(dr, denv, ix);
+        break;
+    }
+    case GP_QKV_NORM_ROPE: {
+        /* q, q_w, q_rows, k, k_w, k_rows, v, v_rows, cos, sin, q_heads,
+         * k_heads, head_dim, eps */
+        qkv_ix nx = {0, 1, 2, 3, 4, 5, 6, 7, 12, 13};
+        rope_ix rx = {0, 2, 10, 3, 5, 11, 8, 9, 12};
+        k_qkv_norm<<<(unsigned)(hlit(r, 2, &bad) + hlit(r, 5, &bad) + hlit(r, 7, &bad)),
+                     128, 0, s>>>(dr, denv, nx);
+        k_rope<<<(unsigned)(hlit(r, 2, &bad) + hlit(r, 5, &bad)), 128, 0, s>>>(dr, denv, rx);
+        break;
+    }
+    case GP_KV_WRITE:
+        if (r->v[4] != 0) {
+            bad = 1;    /* the GPU keeps no int16 copy of the cache */
+        }
+        k_kv_write<<<(unsigned)cdiv(hlit(r, 8, &bad), T), T, 0, s>>>(dr, denv);
         break;
     case GP_KV_WRITE_HEADS:
         k_kv_write_heads<<<(unsigned)(hlit(r, 6, &bad) * hlit(r, 7, &bad)), 128, 0, s>>>(
@@ -647,13 +921,16 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (hlit(r, 8, &bad) != 1) {
             bad = 1;
         }
-        if (hlit(r, 5, &bad) * ATTN_CHUNKS * (hlit(r, 7, &bad) + 2) > GG_PART_FLOATS) {
-            bad = 1;
-            break;
-        }
-        k_attn_part<<<dim3((unsigned)hlit(r, 5, &bad), ATTN_CHUNKS), 128, 0, s>>>(
-            dr, denv, g->part);
-        k_attn_join<<<(unsigned)hlit(r, 5, &bad), 128, 0, s>>>(dr, denv, g->part);
+        attn_launch(g, r, dr, denv, &bad);
+        break;
+    case GP_ATTN_F32:
+        attn_launch(g, r, dr, denv, &bad);
+        break;
+    case GP_ROUTER:
+        k_router_norm<<<1, T, 0, s>>>(dr, denv);
+        k_router_logits<<<(unsigned)cdiv(hlit(r, 5, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
+            dr, denv);
+        k_router_top<<<1, 1, 0, s>>>(dr, denv);
         break;
     default:
         snprintf(gg_error, sizeof(gg_error), "no GPU kernel for operation %d", r->op);
@@ -664,6 +941,92 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                  "operation %d: a size is not a literal, or the form is not supported", r->op);
         return -1;
     }
+    return 0;
+}
+
+/* Run a record that moves work between the GPU and the CPU.
+ *
+ * GP_TO_HOST: (device source, host target, bytes) three times, then the
+ * index of an event. Null sources are not copied.
+ * GP_CPU_JOIN: the address of a CPU program, then the index of the event.
+ * GP_TO_DEV: host source, device target, bytes. */
+static int gg_boundary(gg_prog *g, const gp_rec *r)
+{
+    switch (r->op) {
+    case GP_TO_HOST:
+        for (int k = 0; k < 3; ++k) {
+            if (r->v[3 * k] != 0) {
+                CK(cudaMemcpyAsync((void *)(intptr_t)r->v[3 * k + 1],
+                                   (const void *)(intptr_t)r->v[3 * k],
+                                   (size_t)r->v[3 * k + 2], cudaMemcpyDeviceToHost, gg_stream));
+            }
+        }
+        CK(cudaEventRecord(g->ev[r->v[9]], gg_stream));
+        return 0;
+    case GP_CPU_JOIN:
+        CK(cudaEventSynchronize(g->ev[r->v[1]]));
+        if (gg_cpu_run == NULL || gg_cpu_run((const int64_t *)(intptr_t)r->v[0], -1) != 0) {
+            snprintf(gg_error, sizeof(gg_error), "the CPU program of a GP_CPU_JOIN failed");
+            return -1;
+        }
+        return 0;
+    case GP_TO_DEV:
+        CK(cudaMemcpyAsync((void *)(intptr_t)r->v[1], (const void *)(intptr_t)r->v[0],
+                           (size_t)r->v[2], cudaMemcpyHostToDevice, gg_stream));
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/* Launch the kernels of a segment one at a time. */
+static int gg_launch_seg(gg_prog *g, const gg_seg *sg)
+{
+    for (int pc = sg->start; pc < sg->end; ++pc) {
+        if (gg_launch(g, g->hcode + pc, g->dcode + pc, g->denv) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Run the segments and the boundary records in order. With the graph, the
+ * first run records the graph of each segment. */
+static int gg_exec(gg_prog *g)
+{
+    int pc = 0, k = 0;
+    while (pc < g->n_code) {
+        const gp_rec *r = g->hcode + pc;
+        if (is_boundary(r->op)) {
+            if (gg_boundary(g, r) != 0) {
+                return -1;
+            }
+            ++pc;
+            continue;
+        }
+        gg_seg *sg = g->seg + k++;
+        if (!g->use_graph) {
+            if (gg_launch_seg(g, sg) != 0) {
+                return -1;
+            }
+        } else {
+            if (sg->exec == NULL) {
+                CK(cudaStreamBeginCapture(gg_stream, cudaStreamCaptureModeThreadLocal));
+                int rc = gg_launch_seg(g, sg);
+                cudaGraph_t graph;
+                cudaError_t err = cudaStreamEndCapture(gg_stream, &graph);
+                if (rc != 0) {
+                    return rc;
+                }
+                CK(err);
+                CK(cudaGraphInstantiate(&sg->exec, graph, 0));
+                CK(cudaGraphDestroy(graph));
+            }
+            CK(cudaGraphLaunch(sg->exec, gg_stream));
+        }
+        pc = sg->end;
+    }
+    CK(cudaGetLastError());
     return 0;
 }
 
@@ -710,6 +1073,11 @@ int gg_init(int device)
     return 0;
 }
 
+void gg_set_cpu_runner(void *fn)
+{
+    gg_cpu_run = (gg_cpu_runner)fn;
+}
+
 int gg_mem_info(size_t *free_b, size_t *total_b)
 {
     CK(cudaMemGetInfo(free_b, total_b));
@@ -732,6 +1100,24 @@ int gg_free(void *p)
     return 0;
 }
 
+/* Pinned host memory, for the copies of the handoff to the CPU. */
+void *gg_host_alloc(size_t n)
+{
+    void *p = NULL;
+    if (cudaMallocHost(&p, n) != cudaSuccess) {
+        snprintf(gg_error, sizeof(gg_error), "cudaMallocHost of %zu bytes failed", n);
+        return NULL;
+    }
+    memset(p, 0, n);
+    return p;
+}
+
+int gg_host_free(void *p)
+{
+    CK(cudaFreeHost(p));
+    return 0;
+}
+
 /* Copies on the stream of the programs. A copy to the host waits for the
  * stream. */
 int gg_h2d(void *d, const void *h, size_t n)
@@ -744,6 +1130,21 @@ int gg_d2h(void *h, const void *d, size_t n)
 {
     CK(cudaMemcpyAsync(h, d, n, cudaMemcpyDeviceToHost, gg_stream));
     CK(cudaStreamSynchronize(gg_stream));
+    return 0;
+}
+
+/* A copy on the GPU. The areas can overlap. */
+int gg_d2d(void *d, const void *src, size_t n)
+{
+    if ((const char *)d < (const char *)src + n && (const char *)src < (const char *)d + n) {
+        void *tmp = NULL;
+        CK(cudaMallocAsync(&tmp, n, gg_stream));
+        CK(cudaMemcpyAsync(tmp, src, n, cudaMemcpyDeviceToDevice, gg_stream));
+        CK(cudaMemcpyAsync(d, tmp, n, cudaMemcpyDeviceToDevice, gg_stream));
+        CK(cudaFreeAsync(tmp, gg_stream));
+        return 0;
+    }
+    CK(cudaMemcpyAsync(d, src, n, cudaMemcpyDeviceToDevice, gg_stream));
     return 0;
 }
 
@@ -778,6 +1179,32 @@ void *gg_load(const int64_t *prog, int use_graph)
         return NULL;
     }
     memcpy(g->henv, prog + 4, (size_t)g->n_env * sizeof(int64_t));
+    /* The segments, and one event for each GP_TO_HOST. */
+    g->seg = (gg_seg *)calloc((size_t)g->n_code + 1, sizeof(gg_seg));
+    int in_seg = 0;
+    for (int pc = 0; pc < g->n_code; ++pc) {
+        const gp_rec *r = g->hcode + pc;
+        if (is_boundary(r->op)) {
+            in_seg = 0;
+            if (r->op == GP_TO_HOST && r->v[9] + 1 > g->n_ev) {
+                g->n_ev = (int)r->v[9] + 1;
+            }
+            continue;
+        }
+        if (!in_seg) {
+            g->seg[g->n_seg].start = pc;
+            ++g->n_seg;
+            in_seg = 1;
+        }
+        g->seg[g->n_seg - 1].end = pc + 1;
+    }
+    g->ev = (cudaEvent_t *)calloc((size_t)g->n_ev + 1, sizeof(cudaEvent_t));
+    for (int k = 0; k < g->n_ev; ++k) {
+        if (cudaEventCreateWithFlags(&g->ev[k], cudaEventDisableTiming) != cudaSuccess) {
+            snprintf(gg_error, sizeof(gg_error), "gg_load: no event");
+            return NULL;
+        }
+    }
     return g;
 }
 
@@ -790,38 +1217,13 @@ int gg_run(void *handle, const int64_t *env)
     gg_scalars(g);
     CK(cudaMemcpyAsync(g->denv, g->henv, (size_t)g->n_env * sizeof(int64_t),
                        cudaMemcpyHostToDevice, gg_stream));
-    if (g->use_graph && g->exec != NULL) {
-        CK(cudaGraphLaunch(g->exec, gg_stream));
-        return 0;
-    }
-    if (g->use_graph) {
-        CK(cudaStreamBeginCapture(gg_stream, cudaStreamCaptureModeThreadLocal));
-    }
-    int rc = 0;
-    for (int pc = 0; pc < g->n_code && rc == 0; ++pc) {
-        rc = gg_launch(g, g->hcode + pc, g->dcode + pc, g->denv);
-    }
-    if (g->use_graph) {
-        cudaGraph_t graph;
-        cudaError_t err = cudaStreamEndCapture(gg_stream, &graph);
-        if (rc != 0) {
-            return rc;
-        }
-        CK(err);
-        CK(cudaGraphInstantiate(&g->exec, graph, 0));
-        CK(cudaGraphDestroy(graph));
-        CK(cudaGraphLaunch(g->exec, gg_stream));
-        return 0;
-    }
-    if (rc == 0) {
-        CK(cudaGetLastError());
-    }
-    return rc;
+    return gg_exec(g);
 }
 
 /* Run a program without the graph and measure each record. The array ms
- * gets the time of each record on the GPU, in milliseconds. This is for a profile:
- * the events add time between the kernels. */
+ * gets the time of each record on the GPU, in milliseconds. A boundary
+ * record gets the time of its copies and of its CPU program. This is for a
+ * profile: the events add time between the kernels. */
 int gg_profile(void *handle, const int64_t *env, float *ms)
 {
     gg_prog *g = (gg_prog *)handle;
@@ -829,24 +1231,24 @@ int gg_profile(void *handle, const int64_t *env, float *ms)
     gg_scalars(g);
     CK(cudaMemcpyAsync(g->denv, g->henv, (size_t)g->n_env * sizeof(int64_t),
                        cudaMemcpyHostToDevice, gg_stream));
-    cudaEvent_t *ev = (cudaEvent_t *)malloc(sizeof(cudaEvent_t) * (size_t)(g->n_code + 1));
-    for (int pc = 0; pc <= g->n_code; ++pc) {
-        CK(cudaEventCreate(&ev[pc]));
-    }
+    cudaEvent_t a, b;
+    CK(cudaEventCreate(&a));
+    CK(cudaEventCreate(&b));
     int rc = 0;
-    CK(cudaEventRecord(ev[0], gg_stream));
     for (int pc = 0; pc < g->n_code && rc == 0; ++pc) {
-        rc = gg_launch(g, g->hcode + pc, g->dcode + pc, g->denv);
-        CK(cudaEventRecord(ev[pc + 1], gg_stream));
+        const gp_rec *r = g->hcode + pc;
+        CK(cudaEventRecord(a, gg_stream));
+        if (is_boundary(r->op)) {
+            rc = gg_boundary(g, r);
+        } else {
+            rc = gg_launch(g, r, g->dcode + pc, g->denv);
+        }
+        CK(cudaEventRecord(b, gg_stream));
+        CK(cudaEventSynchronize(b));
+        CK(cudaEventElapsedTime(&ms[pc], a, b));
     }
-    CK(cudaStreamSynchronize(gg_stream));
-    for (int pc = 0; pc < g->n_code; ++pc) {
-        CK(cudaEventElapsedTime(&ms[pc], ev[pc], ev[pc + 1]));
-    }
-    for (int pc = 0; pc <= g->n_code; ++pc) {
-        cudaEventDestroy(ev[pc]);
-    }
-    free(ev);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
     return rc;
 }
 
@@ -864,9 +1266,16 @@ int gg_q6k_head(const void *w, const float *x, float *out, int rows, int cols, f
 int gg_unload(void *handle)
 {
     gg_prog *g = (gg_prog *)handle;
-    if (g->exec != NULL) {
-        cudaGraphExecDestroy(g->exec);
+    for (int k = 0; k < g->n_seg; ++k) {
+        if (g->seg[k].exec != NULL) {
+            cudaGraphExecDestroy(g->seg[k].exec);
+        }
     }
+    for (int k = 0; k < g->n_ev; ++k) {
+        cudaEventDestroy(g->ev[k]);
+    }
+    free(g->seg);
+    free(g->ev);
     cudaFree(g->denv);
     cudaFree(g->dcode);
     cudaFree(g->part);

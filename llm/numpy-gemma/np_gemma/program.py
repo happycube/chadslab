@@ -74,6 +74,8 @@ ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54,
 ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
 # The operations of a program in parts (np_gemma/parts.py, SPLIT_PLAN.md).
 XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
+# The records that move work between the GPU and the CPU (np_gemma/gpu.py).
+TO_HOST, CPU_JOIN, TO_DEV = 84, 85, 86
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -86,7 +88,8 @@ OP_NAMES = {v: k for k, v in dict(
     ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
     ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART,
-    ATTN_QC_H=ATTN_QC_H, ATTN_F32_H=ATTN_F32_H).items()}
+    ATTN_QC_H=ATTN_QC_H, ATTN_F32_H=ATTN_F32_H, TO_HOST=TO_HOST, CPU_JOIN=CPU_JOIN,
+    TO_DEV=TO_DEV).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -1026,13 +1029,18 @@ def layer_form(model, i, attn="qc", t=1):
                       ("let", "a", ("attn_" + attn, i, "q", "lo", "n")))
     else:
         attn_forms = (("let", "a", ("attn_rows_" + attn, i, "q")),)
+    # The router and the experts come before the dense feed-forward part. The
+    # two parts read the same x and do not depend on each other, so the order
+    # does not change the result. On a GPU (np_gemma/gpu.py), the CPU then
+    # computes the experts while the GPU computes the dense part.
     if cfg.enable_moe_block:
-        ffn = (("let", ("val", "idx"), ("router", "x", i)),
-               ("let", "e", ("moe", ("rms_norm", "x", w("pre_feedforward_layernorm_2")),
-                             "val", "idx", i)),
-               ("let", "f", ("add", ("rms_norm", "m", w("post_feedforward_layernorm_1")),
-                             ("rms_norm", "e", w("post_feedforward_layernorm_2")))))
+        experts = (("let", ("val", "idx"), ("router", "x", i)),
+                   ("let", "e", ("moe", ("rms_norm", "x", w("pre_feedforward_layernorm_2")),
+                                 "val", "idx", i)))
+        ffn = (("let", "f", ("add", ("rms_norm", "m", w("post_feedforward_layernorm_1")),
+                             ("rms_norm", "e", w("post_feedforward_layernorm_2")))),)
     else:
+        experts = ()
         ffn = (("let", "f", "m"),)
     return ("layer", i,
             ("let", "h", ("rms_norm", "x", w("input_layernorm"))),
@@ -1044,6 +1052,7 @@ def layer_form(model, i, attn="qc", t=1):
             *attn_forms,
             ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
             ("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),
+            *experts,
             ("let", ("g", "u"), ("rms_norm_multi4", "x", w("pre_feedforward_layernorm"),
                                  w("mlp.gate_proj"), w("mlp.up_proj"))),
             ("let", "m", ("gelu_mul_int4", "g", "u", w("mlp.down_proj"))),

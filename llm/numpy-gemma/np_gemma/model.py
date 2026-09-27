@@ -61,6 +61,9 @@ _F32_ATTN_C = os.environ.get("NP_GEMMA_F32_ATTN", "c") != "numpy"
 # loop over the layers. The program needs NP_GEMMA_F32_ATTN=c for the float
 # cache, so "numpy" also turns it off.
 _PROGRAM = os.environ.get("NP_GEMMA_PROGRAM", "1") != "0" and _F32_ATTN_C
+# Run a decode step of one token and the output head on a CUDA GPU, with the
+# experts on the CPU (np_gemma/gpu.py, SPLIT_PLAN.md, phase 4).
+_GPU = os.environ.get("NP_GEMMA_GPU", "0") == "1"
 
 
 def emit(hook, key, value):
@@ -694,6 +697,10 @@ class Model:
         """
         cfg = self.cfg
         t = len(input_ids)
+        if (_GPU and t == 1 and hook is None and max_layers is None
+                and isinstance(cache, KVCache) and self._dtype == "int4" and self.keep_weights):
+            return self._gpu_step(input_ids, cache, int(start_pos))
+        self._gpu_release(cache)
         if (_PROGRAM and (t == 1 or ops.mt_ready(t)) and hook is None
                 and max_layers is None and isinstance(cache, KVCache)
                 and self._dtype == "int4" and self.keep_weights):
@@ -993,12 +1000,42 @@ class Model:
         return out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
 
     # ---- output head -------------------------------------------------------
+    def _gpu_step(self, ids, cache, pos):
+        """Run a decode step on the GPU. The first step with a cache copies
+        the cache to the GPU. From then on, the GPU has the new rows, until
+        _gpu_release writes them into the host cache."""
+        g = self.__dict__.get("_gpu")
+        if g is None:
+            from . import gpu
+            g = self._gpu = gpu.ModelGPU(self)
+            self._gpu_cache = None
+        if self._gpu_cache is not cache:
+            if self._gpu_cache is not None:
+                g.detach(self._gpu_cache)
+            g.attach(cache)
+            self._gpu_cache = cache
+        self._gpu_xn = g.step(ids, pos)
+        return self._gpu_xn
+
+    def _gpu_release(self, cache):
+        """Write the rows of the GPU cache into the host cache before the CPU
+        uses it."""
+        g = self.__dict__.get("_gpu")
+        if g is not None and self._gpu_cache is cache:
+            g.detach(cache)
+            self._gpu_cache = None
+            self._gpu_xn = None
+
     def logits(self, x, chunk=32768, apply_softcap=True):
         """Return the logits for the hidden states x.
 
         Use the embedding table. The embeddings are tied to the output head.
         Apply the softcap when requested.
         """
+        xn = self.__dict__.get("_gpu_xn")
+        if xn is not None and apply_softcap and (x is xn or getattr(x, "base", None) is xn):
+            # The hidden state of the last GPU step: the GPU runs the head.
+            return self._gpu.logits()
         if self._embed_q6k is not None:
             out = ops.linear_q6k(x, self._embed_q6k_bytes, self.cfg.hidden_size)
         elif self._embed_q is not None:

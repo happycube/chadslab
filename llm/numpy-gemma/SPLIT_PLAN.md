@@ -393,6 +393,49 @@ operations (about 700 kernels) take most of the rest. Fusing them is the
 next work for the E4B. NP_GEMMA_GPU=1 turns the GPU on for E4B.forward. The
 MTP drafter reads the cache in host memory, so NP_GEMMA_GPU=1 turns MTP off.
 
+## Results of phase 4: the 26B with the experts on the CPU
+
+The compiler of the split (SplitCompiler in np_gemma/gpu.py) compiles the
+step of the 26B for the GPU with the float cache. The operation moe becomes
+three records:
+
+- GP_TO_HOST copies the input of the experts to pinned host memory. It also
+  copies the weights and the indices that the router selected. Then it
+  records an event.
+- GP_CPU_JOIN comes before the first operation that reads the output of the
+  experts. It waits for the event and runs a CPU program with the MOE record
+  of the CPU interpreter.
+- GP_TO_DEV copies the output of the experts to the GPU.
+
+The form of a layer now puts the router and the experts before the dense
+feed-forward part. The two parts read the same input, so the order does not
+change the bits of the CPU program (scripts/check_program.py passes). On the
+GPU, the runner launches the dense part before it runs the CPU program. Thus
+the GPU computes the dense part while the CPU computes the experts. The
+kernels between two records of the handoff are one segment with its own CUDA
+graph: 61 segments for a step of the 26B.
+
+The GPU keeps its own float cache (GPUKV). For a layer with a window,
+the GPU drops the oldest rows, as KVCache.prepare does on the host.
+The function detach() writes the new rows into the host cache with
+KVCache.write, which also makes their int16 copy. A CPU step after detach agrees with a CPU step on the CPU cache.
+
+scripts/check_gpu_split.py, with the true tokens as input:
+
+    context   steps   logits, median |d|   same top token   CPU      GPU and CPU
+    200       32      0.001                 32 of 32         56.0 ms  25.0 ms
+    1100      32      0.001                 32 of 32         66.1 ms  26.1 ms
+
+The times include the output head. At a context of 1100, one step had a
+difference of 3.1 in the logits: the router selected a different expert.
+A greedy generation of 128 tokens with scripts/gguf_generate.py gives the
+same tokens with NP_GEMMA_GPU=1 and without it. The GPU holds 0.98 GB of
+weights, 0.6 GB for the head, and the cache: 2.9 GB in all.
+
+A step takes 25 ms, or 40 tokens/s, against 17.9 tokens/s on the CPU. This
+is the value of the estimate. The experts on the CPU take most of the time.
+The next step is the hot experts on the GPU.
+
 ## Verification
 
 - A row split on NUMA nodes keeps the bits. `scripts/check_program.py`
@@ -424,8 +467,8 @@ MTP drafter reads the cache in host memory, so NP_GEMMA_GPU=1 turns MTP off.
   needs no split. Test it against the CPU and the reference. (The E4B is
   done, see the results of phase 3.)
 - Phase 4: the CPU and GPU split of the 26B. First the operation split, with
-  the experts on the CPU. Then the hot experts on the GPU. Then the layer
-  split, to compare. Measure the
+  the experts on the CPU (done, see the results of phase 4). Then the hot
+  experts on the GPU. Then the layer split, to compare. Measure the
   tokens/s against the CPU program and against llama.cpp with the same
   split.
 - Phase 5: the prompt pass and the MTP group on the GPU. The prompt pass is

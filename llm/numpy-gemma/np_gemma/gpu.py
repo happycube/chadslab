@@ -52,9 +52,13 @@ _LIB_DIR = _HERE / "_libs"
 _lib = None
 _error = None
 
-# The operands that the GPU kernels do not read: the float32 scales of the
-# int4 matrices. The kernels read the float16 scale in each block.
-SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15)}
+# The operands that keep their host address. The GPU kernels do not read the
+# float32 scales of the int4 matrices: they read the float16 scale in each
+# block. The records of the handoff to the CPU hold host addresses: pinned
+# buffers and the address of a CPU program.
+SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
+        P.RMS_NORM_MULTI4: (6, 10, 14, 18), P.GELU_MUL_INT4: (5,),
+        P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,)}
 
 
 def _nvcc():
@@ -113,9 +117,17 @@ def lib():
     L.gg_unload.argtypes = [vp]
     L.gg_profile.argtypes = [vp, vp, vp]
     L.gg_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float]
+    L.gg_set_cpu_runner.argtypes = [vp]
+    L.gg_host_alloc.argtypes = [sz]
+    L.gg_host_alloc.restype = vp
+    L.gg_d2d.argtypes = [vp, vp, sz]
     if L.gg_init(int(os.environ.get("NP_GEMMA_GPU_DEVICE", "0"))) != 0:
         _error = L.gg_last_error().decode()
         raise RuntimeError(_error)
+    # A GP_CPU_JOIN record runs a CPU program with gemma_run of the CPU library.
+    from . import cops
+    if cops._lib is not None:
+        L.gg_set_cpu_runner(ctypes.cast(cops._lib.gemma_run, ctypes.c_void_p))
     _lib = L
     return L
 
@@ -225,10 +237,15 @@ def _check_scales(prog):
     """Check that the float16 scale of each int4 block equals the float32
     scale that the CPU kernels read."""
     for op, args in prog.recs:
+        # (w, s, rows, cols) of each matrix of the record.
         if op == P.INT4_LINEAR:
             pairs = [(1, 2, 4, 5)]
         elif op == P.INT4_MULTI4:
             pairs = [(2 + 4 * m, 3 + 4 * m, 5 + 4 * m, 1) for m in range(4)]
+        elif op == P.RMS_NORM_MULTI4:
+            pairs = [(5 + 4 * m, 6 + 4 * m, 8 + 4 * m, 3) for m in range(4)]
+        elif op == P.GELU_MUL_INT4:
+            pairs = [(4, 5, 7, 8)]
         else:
             continue
         for wk, sk, rk, ck in pairs:
@@ -236,6 +253,8 @@ def _check_scales(prog):
             if not w:
                 continue
             rows, cols = args[rk][1], args[ck][1]
+            if not rows:
+                continue
             n = rows * (cols // 32)
             blocks = P._arr(w, n * 18, ctypes.c_uint8).reshape(n, 18)
             half = blocks[:, :2].copy().view(np.float16).reshape(-1).astype(np.float32)
@@ -417,6 +436,261 @@ class E4BGPU:
             if not (model._q4 and model._head_is_q6k()):
                 raise RuntimeError("the GPU head needs a Q6_K head")
             w = np.ascontiguousarray(model._head_q6k)
+            rows = w.shape[0]
+            self.head = Buffer(w.nbytes)
+            self.head.upload(w)
+            self.out = Buffer(4 * rows)
+            self.host_logits = np.empty((1, rows), dtype=np.float32)
+        xn = self.g.mirror.buffer_of(self.prog.names["xn"])
+        cap = float(cfg.final_logit_softcapping or 0.0)
+        _check(lib().gg_q6k_head(self.head.ptr, xn.ptr, self.out.ptr,
+                                 self.host_logits.shape[1], cfg.hidden_size, cap))
+        self.out.download(self.host_logits)
+        return self.host_logits.copy()
+
+
+# ---- the 26B model: the experts on the CPU (SPLIT_PLAN.md, phase 4) -----------
+
+def pinned(shape, dtype=np.float32):
+    """Return a NumPy array in pinned host memory. A copy between the GPU and
+    pinned memory does not wait for the host. The memory is not freed."""
+    n = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    ptr = lib().gg_host_alloc(max(n, 1))
+    if not ptr:
+        raise MemoryError(lib().gg_last_error().decode())
+    raw = (ctypes.c_uint8 * max(n, 1)).from_address(ptr)
+    return np.frombuffer(raw, dtype=np.uint8, count=n).view(dtype).reshape(shape)
+
+
+def _arrays(vals):
+    out = []
+    for v in vals:
+        if isinstance(v, np.ndarray):
+            out.append(v)
+        elif isinstance(v, tuple):
+            out += _arrays(v)
+    return out
+
+
+class SplitCompiler(P.Compiler):
+    """The compiler of a step of the 26B model for the GPU, with the experts
+    on the CPU.
+
+    The operation moe becomes a GP_TO_HOST record: the copy of its input, its
+    weights, and its indices to pinned host memory. Its CPU program is the
+    MOE record of the program of one part, on those pinned buffers. The first
+    operation that reads the output of the experts gets two records before
+    it: GP_CPU_JOIN, which runs the CPU program, and GP_TO_DEV, which copies
+    the output to the GPU. The operations between the two parts run on the
+    GPU while the CPU computes the experts.
+    """
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.pending = {}      # id of an output -> (CPU program, host output, event)
+        self.n_events = 0
+        self.cpu_progs = []
+
+    def kernel(self, head, vals, out=None):
+        for a in _arrays(vals):
+            if id(a) in self.pending:
+                self.join(a)
+        if head == "moe":
+            assert out is None
+            return self.moe(*vals)
+        return super().kernel(head, vals, out)
+
+    def join(self, a):
+        cpu, host, ev = self.pending.pop(id(a))
+        self.p.emit(P.CPU_JOIN, cpu.buf, ev)
+        self.p.emit(P.TO_DEV, host, a, a.nbytes)
+
+    def moe(self, h, val, idx, layer):
+        assert h.shape[0] == 1, "the GPU runs a step of one token"
+        hp, vp, ip = pinned(h.shape), pinned(val.shape), pinned(idx.shape, np.int32)
+        ev = self.n_events
+        self.n_events += 1
+        self.p.emit(P.TO_HOST, h, hp, h.nbytes, val, vp, val.nbytes, idx, ip, idx.nbytes, ev)
+        cc = P.Compiler(self.model)
+        host_out = P.k_moe(cc, hp, vp, ip, layer)
+        cpu = cc.p.finish()
+        self.cpu_progs.append(cpu)
+        dev_out = self.buffer(h.shape)
+        self.pending[id(dev_out)] = (cpu, host_out, ev)
+        return dev_out
+
+
+def compile_split_step(model):
+    """Compile a step of one token of the 26B model (or of a dense model) for
+    the GPU, with the float cache. "x" is the input and "xn" the result."""
+    c = SplitCompiler(model)
+    c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
+    c.p.slot("pos")
+    c.compile(P.step_form(model, "f32", 1))
+    assert not c.pending, "an output of the experts has no reader"
+    c.p.layers = list(range(model.cfg.num_hidden_layers))
+    c.p.attn = "f32"
+    c.p.tokens = 1
+    c.p.cpu_progs = c.cpu_progs
+    return c.p.finish()
+
+
+class GPUKV:
+    """The float cache of the 26B model on the GPU.
+
+    Each layer has a key and a value buffer of (rows, kv_heads, head_dim)
+    values. Row 0 has the position base, as in KVCache. A sliding layer drops
+    its oldest rows when the buffer holds more than two windows, as
+    KVCache.prepare does, with a copy on the GPU. attach() copies the rows of
+    a KVCache to the GPU. detach() writes the rows that only the GPU has into
+    the KVCache with KVCache.write, which also makes their int16 copy.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.window = cfg.sliding_window or 0
+        n = cfg.num_hidden_layers
+        self.k = [None] * n
+        self.v = [None] * n
+        self.cap = [0] * n
+        self.base = [0] * n
+        self.end = [0] * n
+        self.host_end = [0] * n
+
+    def _row(self, i):
+        plan = self.cfg.plan[i]
+        return plan.num_kv_heads * plan.head_dim * 4
+
+    def _alloc(self, i, cap, keep_rows=0):
+        """Give layer i a buffer of cap rows. Keep the first keep_rows rows."""
+        rb = self._row(i)
+        k, v = Buffer(cap * rb), Buffer(cap * rb)
+        if keep_rows:
+            _check(lib().gg_d2d(k.ptr, self.k[i].ptr, keep_rows * rb))
+            _check(lib().gg_d2d(v.ptr, self.v[i].ptr, keep_rows * rb))
+        if self.k[i] is not None:
+            lib().gg_sync()
+            self.k[i].free()
+            self.v[i].free()
+        self.k[i], self.v[i], self.cap[i] = k, v, cap
+
+    def attach(self, cache, max_len):
+        for i in range(self.cfg.num_hidden_layers):
+            rows = cache.end[i] - cache.base[i]
+            plan = self.cfg.plan[i]
+            cap = (2 * self.window + 64) if plan.is_sliding else max(max_len, rows + 64)
+            cap = max(cap, rows + 64)
+            if self.k[i] is None or self.cap[i] < cap:
+                self._alloc(i, cap)
+            self.base[i], self.end[i] = cache.base[i], cache.end[i]
+            self.host_end[i] = cache.end[i]
+            if rows > 0:
+                Buffer.upload(self.k[i], np.ascontiguousarray(cache.k[i][:rows]))
+                Buffer.upload(self.v[i], np.ascontiguousarray(cache.v[i][:rows]))
+
+    def prepare(self, i, pos):
+        """Make room for the row of position pos in layer i."""
+        rb = self._row(i)
+        if self.cfg.plan[i].is_sliding:
+            w = self.window
+            if pos - self.base[i] > 2 * w:
+                keep = pos - w + 1
+                off = keep - self.base[i]
+                rows = self.end[i] - keep
+                if rows > 0:
+                    _check(lib().gg_d2d(self.k[i].ptr, self.k[i].ptr + off * rb, rows * rb))
+                    _check(lib().gg_d2d(self.v[i].ptr, self.v[i].ptr + off * rb, rows * rb))
+                self.base[i] = keep
+                # The host now lacks some rows that the GPU dropped. Only the
+                # rows of the window matter to a later step.
+                self.host_end[i] = max(self.host_end[i], keep)
+        need = pos + 1 - self.base[i]
+        if need > self.cap[i]:
+            self._alloc(i, max(need + 64, 2 * self.cap[i]), self.end[i] - self.base[i])
+        self.end[i] = max(self.end[i], pos + 1)
+
+    def detach(self, cache):
+        """Write the rows that the GPU made into the host cache."""
+        for i in range(self.cfg.num_hidden_layers):
+            start = max(self.host_end[i], cache.end[i], self.base[i])
+            n = self.end[i] - start
+            if n <= 0:
+                continue
+            plan = self.cfg.plan[i]
+            shape = (n, plan.num_kv_heads, plan.head_dim)
+            k, v = np.empty(shape, np.float32), np.empty(shape, np.float32)
+            off = (start - self.base[i]) * self._row(i)
+            _check(lib().gg_d2h(k.ctypes.data, self.k[i].ptr + off, k.nbytes))
+            _check(lib().gg_d2h(v.ctypes.data, self.v[i].ptr + off, v.nbytes))
+            cache.write(i, start, k, v)
+            self.host_end[i] = self.end[i]
+
+    def params(self):
+        kw = {}
+        for i in range(self.cfg.num_hidden_layers):
+            kw["base.%d" % i] = self.base[i]
+            kw["k.%d" % i] = self.k[i].ptr
+            kw["v.%d" % i] = self.v[i].ptr
+        return kw
+
+
+class ModelGPU:
+    """A decode step of the 26B model on the GPU, with the experts on the CPU.
+    A dense model (the 12B) runs wholly on the GPU if it fits. See the module
+    text and GPUKV.
+
+        g = gpu.ModelGPU(model)
+        g.attach(cache)                  # after the prompt pass on the CPU
+        xn = g.step([token], pos)        # the hidden state after the final norm
+        logits = g.logits()              # the head of the last step
+        g.detach(cache)                  # the host cache has the new rows
+    """
+
+    def __init__(self, model, graph=True):
+        self.model = model
+        self.prog = compile_split_step(model)
+        self.g = GPUProgram(self.prog, graph=graph)
+        self.kv = GPUKV(model.cfg)
+        self.head = None
+        self.max_len = 4096
+
+    def attach(self, cache):
+        self.kv.attach(cache, max(self.max_len, cache.max_len))
+
+    def detach(self, cache):
+        self.kv.detach(cache)
+
+    def step(self, tokens, pos):
+        model, cfg = self.model, self.model.cfg
+        assert len(tokens) == 1, "the GPU runs a step of one token"
+        for i in range(cfg.num_hidden_layers):
+            self.kv.prepare(i, pos)
+        kw = {"pos": pos}
+        kw.update(self.kv.params())
+        positions = np.array([pos])
+        for kind, sliding in (("s", True), ("f", False)):
+            plan = next((p for p in cfg.plan if p.is_sliding == sliding), None)
+            if plan is None:
+                continue
+            cos, sin, _ca, _sa = model._rope(plan, positions)
+            kw["cos." + kind] = np.ascontiguousarray(cos, dtype=np.float32)
+            kw["sin." + kind] = np.ascontiguousarray(sin, dtype=np.float32)
+        need = max(p.num_q_heads * (pos + 1) for p in cfg.plan)
+        kw["scores"] = np.empty(need, dtype=np.float32)
+        self.prog.names["x"][:] = model.embed(tokens)
+        self.g.upload("x")
+        self.g.bind(kw)
+        self.g.run()
+        self.g.download("xn")
+        return self.prog.names["xn"].copy()
+
+    def logits(self):
+        """Return the logits of the last step, with the soft cap."""
+        model, cfg = self.model, self.model.cfg
+        if self.head is None:
+            if model._embed_q6k is None:
+                raise RuntimeError("the GPU head needs a Q6_K head")
+            w = np.ascontiguousarray(model._embed_q6k_bytes)
             rows = w.shape[0]
             self.head = Buffer(w.nbytes)
             self.head.upload(w)
