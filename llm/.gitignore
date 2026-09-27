@@ -1,4 +1,5 @@
 llama.cpp/
+llama.cpp-qwen4exp/
 *.swp
 *.swo
 .fuse_hidden*
