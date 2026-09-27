@@ -1470,6 +1470,9 @@ class HotCache:
         cfg = model.cfg
         self.decay = float(decay or os.environ.get("NP_GEMMA_GPU_HOT_DECAY", "0.97"))
         self.max_ins = int(max_ins or os.environ.get("NP_GEMMA_GPU_HOT_INS", "8"))
+        # A cold expert goes to the GPU only from its admit-th use while it
+        # is cold. Its first uses run on the CPU.
+        self.admit = int(os.environ.get("NP_GEMMA_GPU_HOT_ADMIT", "2"))
         self.top_k = cfg.top_k_experts
         self.layers = []        # one entry for each layer with hot experts
         for layer, (_hot, gu_store, dn_store, slots) in sorted(dev.prog.hot_stores.items()):
@@ -1487,6 +1490,7 @@ class HotCache:
         self.score = np.zeros((m, cfg.num_experts), dtype=np.float32)
         self.held = np.stack([e["slots"] >= 0 for e in self.layers]) if m else self.score > 0
         self.incoming = np.zeros_like(self.held)
+        self.uses = np.zeros(self.score.shape, dtype=np.int32)   # uses while cold
         self.rows = np.arange(m)[:, None]
         self.pending = []       # (job id, [(row, expert, slot)], ranges)
         self.due = False        # a step is done, and observe has not run
@@ -1540,10 +1544,12 @@ class HotCache:
         score = self.score
         score *= self.decay
         score[self.rows, sel] += 1.0          # the experts of a row differ
+        self.uses[self.rows, sel] += 1
+        self.uses[self.held] = 0
         low = np.where(self.held, score, np.inf).min(axis=1)
         cand = np.zeros_like(self.held)
         cand[self.rows, sel] = True
-        cand &= ~self.held & ~self.incoming & (score > low[:, None])
+        cand &= ~self.held & ~self.incoming & (score > low[:, None]) & (self.uses >= self.admit)
         if not cand.any():
             return
         ri, xi = np.nonzero(cand)

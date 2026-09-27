@@ -1026,6 +1026,24 @@ step. With NumPy on all the layers at one time it takes 0.5 ms. It now runs
 while the GPU runs the head of the step, so it adds almost nothing. If the
 set does not change after 64 tokens, the rate is 63.7 tok/s.
 
+A second test: a cold expert goes to the GPU only from its second (or
+third) use while it is cold. Its first uses run on the CPU
+(NP_GEMMA_GPU_HOT_ADMIT):
+
+    26B, 1.5 GB hot     uses before a copy   rate          copies, each token
+    CPU cache answer    1 / 2 / 3            56.0 / 56.2 / 56.2   8.0 / 7.9 / 7.6
+    story               1 / 2 / 3            58.0 / 58.8 / 58.9   7.8 / 7.4 / 7.1
+    Rust                1 / 2 / 3            59.9 / 60.0 / 60.2   7.5 / 7.0 / 6.7
+
+The cold experts of each layer and the tokens do not change. The copies go
+down by 1% to 7% with 2 uses.
+
+The score already does most of this work. An
+expert after one use has a score of about 1. It takes the place of a held
+expert only if that score is lower. Also, the limit of 8 copies for each
+step is almost always full. Thus the rule changes which experts come to
+the GPU more than their count. The default is 2.
+
 ### A difference from one run to the next
 
 Two runs of the same decode steps of the 26B gave results that differed by
