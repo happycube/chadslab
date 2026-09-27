@@ -119,9 +119,13 @@ def lib():
     L.gg_profile.argtypes = [vp, vp, vp]
     L.gg_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
     L.gg_set_cpu_runner.argtypes = [vp]
+    L.gg_set_tc.argtypes = [i]
     L.gg_host_alloc.argtypes = [sz]
     L.gg_host_alloc.restype = vp
     L.gg_d2d.argtypes = [vp, vp, sz]
+    # NP_GEMMA_GPU_TC=0 gives the float32 kernels for the products of a
+    # large group, in place of the tensor cores.
+    L.gg_set_tc(int(os.environ.get("NP_GEMMA_GPU_TC", "1")))
     if L.gg_init(int(os.environ.get("NP_GEMMA_GPU_DEVICE", "0"))) != 0:
         _error = L.gg_last_error().decode()
         raise RuntimeError(_error)
@@ -281,9 +285,11 @@ class GPUProgram:
     """A Program on the GPU: its records with device addresses, its data, and
     the device buffers of its parameters."""
 
-    def __init__(self, prog, graph=True, mirror=None):
+    def __init__(self, prog, graph=True, mirror=None, tc=True):
         """mirror is the Mirror of an earlier program of the same model. The
-        programs then share the device copies of the weights."""
+        programs then share the device copies of the weights. tc False keeps
+        float32 products for the large groups of this program, in place of
+        the tensor cores."""
         self.prog = prog
         self.mirror = mirror if mirror is not None else Mirror()
         for a in prog.keep:
@@ -301,7 +307,7 @@ class GPUProgram:
                 d = self.mirror.translate(val)
                 if d is not None:
                     code[i]["v"][k] = d
-        self.handle = lib().gg_load(buf.ctypes.data, 1 if graph else 0)
+        self.handle = lib().gg_load(buf.ctypes.data, (1 if graph else 0) | (0 if tc else 2))
         if not self.handle:
             raise RuntimeError(lib().gg_last_error().decode())
         self.env = np.array(prog.buf[4:4 + n_env], dtype=np.int64)
@@ -404,8 +410,89 @@ class GPUCache:
         self.bufs = {}
 
 
+class PoolCompiler(P.Compiler):
+    """A compiler that reuses the buffers of a layer in every layer.
+
+    With pool, the n-th buffer of a shape in a layer is the same array in
+    every layer. A layer does not read the buffers of an earlier layer, and
+    the GPU runs the layers in order, so this is safe. A buffer outside the
+    layers is a new array. A group of 1024 tokens of the 26B then needs about
+    0.3 GB, not 8 GB.
+    """
+
+    def __init__(self, model, pool=False):
+        super().__init__(model)
+        self.pool_on = pool
+        self.pool = {}
+        self.pool_n = {}
+        self.in_layer = False
+
+    def compile(self, form):
+        if form[0] == "layer":
+            self.pool_n = {}
+            self.in_layer = True
+            try:
+                return super().compile(form)
+            finally:
+                self.in_layer = False
+        return super().compile(form)
+
+    def buffer(self, shape, dtype=np.float32):
+        if not (self.pool_on and self.in_layer):
+            return super().buffer(shape, dtype)
+        shape = tuple(shape) if isinstance(shape, (tuple, list)) else (int(shape),)
+        k = (shape, np.dtype(dtype).str)
+        n = self.pool_n.get(k, 0)
+        self.pool_n[k] = n + 1
+        b = self.pool.get((k, n))
+        if b is None:
+            b = self.pool[(k, n)] = np.zeros(shape, dtype=dtype)
+        return b
+
+
+class E4BGroupCompiler(PoolCompiler):
+    """The compiler of a group of the E4B model. A small group (at most MT_CPU
+    tokens, such as an MTP verify group) runs the attention of each query
+    with the record of a decode step. That kernel computes in float32, as
+    the decode step does, so the verify group agrees with the decode."""
+
+    def kernel(self, head, vals, out=None):
+        if head == "attn_e4b" and vals[1].shape[0] <= MT_CPU:
+            return self.attn_small(*vals)
+        return super().kernel(head, vals, out)
+
+    def attn_small(self, layer, q):
+        plan = self.cfg.plan[layer]
+        hd, qh = plan.head_dim, plan.num_q_heads
+        t = q.shape[0]
+        out = self.buffer((t, qh * hd))
+        s = lambda name: self.p.slot("%s.%d" % (name, plan.source))  # noqa: E731
+        slide = 1 if os.environ.get("NP_GEMMA_SLIDE", "1") == "1" else 0
+        for j in range(t):
+            pos_j = self.scalar("+", [self.p.slot("pos"), j])
+            self.p.emit(P.ATTN_F32H, q[j:j + 1], s("k"), s("v"), self.p.slot("scores"),
+                        out[j:j + 1], qh, plan.num_kv_heads, hd, 1, pos_j, s("hs"),
+                        plan.window, slide)
+        return out
+
+
+def compile_e4b_group(model, t):
+    """Compile a step of t tokens of the E4B model for the GPU, with the
+    buffers of the layers reused (PoolCompiler)."""
+    cfg = model.cfg
+    c = E4BGroupCompiler(model, pool=True)
+    c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
+    c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
+                            dtype=np.float32)
+    c.p.slot("pos")
+    c.compile(P.e4b_step_form(model))
+    c.p.tokens = t
+    return c.p.finish()
+
+
 class E4BGPU:
-    """The decode step of the E4B model on the GPU. See the module text."""
+    """The decode step, the groups of tokens, and the prompt pass of the
+    E4B model on the GPU. See the module text."""
 
     def __init__(self, model, graph=True):
         self.model = model
@@ -415,8 +502,12 @@ class E4BGPU:
             prog = progs[1] = P.compile_e4b_step(model, 1)
         self.prog = prog
         self.g = GPUProgram(prog, graph=graph)
+        self.graph = graph
         self.cache = GPUCache()
         self.head = None
+        self.groups = {}      # t -> (Program, GPUProgram)
+        self.last = self.g.mirror.buffer_of(prog.names["xn"]).ptr
+        self.rows = 1
 
     def attach(self, cache):
         self.cache.attach(cache)
@@ -442,27 +533,99 @@ class E4BGPU:
         self.g.bind(kw, self.cache)
         self.g.run()
         self.g.download("xn")
+        self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
+        self.rows = 1
         return names["xn"].copy()
 
-    def logits(self):
-        """Return the logits of the last step, with the soft cap, shape
-        (1, vocabulary). The first call copies the head to the GPU."""
+    def _group(self, t):
+        e = self.groups.get(t)
+        if e is None:
+            prog = compile_e4b_group(self.model, t)
+            e = self.groups[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
+        return e
+
+    def group(self, tokens, pos, cache, size=None):
+        """Run a group of tokens from position pos. Return the hidden states
+        after the final norm, shape (len(tokens), hidden). size pads the group
+        to a program of that many tokens. The padding rows write cache rows
+        after the group, and a later step writes them again."""
+        model, cfg = self.model, self.model.cfg
+        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        t = ids.size
+        size = size or t
+        prog, g = self._group(size)
+        if self._ensure(cache):
+            self.cache.attach(cache)
+        self.cache.reserve(cache, pos + size)
+        kw = P.e4b_step_params(prog, model, cache, pos)
+        cache.n = pos + t
+        names = prog.names
+        names["x"][:t] = model.embed_rows(P.E4B_PREFIX + "embed_tokens", ids) * cfg.embed_scale
+        names["x"][t:] = 0.0
+        tok = model.embed_rows(P.E4B_PREFIX + "embed_tokens_per_layer", ids)
+        names["tok"][:t] = (tok * cfg.per_layer_embed_scale).reshape(t, -1)
+        names["tok"][t:] = 0.0
+        g.upload("x")
+        g.upload("tok")
+        g.bind(kw, self.cache)
+        g.run()
+        g.download("xn")
+        self.last = g.mirror.buffer_of(names["xn"]).ptr + (t - 1) * cfg.hidden_size * 4
+        self.rows = t
+        return names["xn"][:t].copy()
+
+    def _ensure(self, cache):
+        """Make the buffers of every layer that stores a key, as
+        E4BCache.append does. Return True when a buffer is new."""
+        new = False
+        for plan in self.model.cfg.plan:
+            if plan.shared or plan.idx in cache.kv:
+                continue
+            shape = (plan.num_kv_heads, cache.cap, plan.head_dim)
+            store = [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]
+            cache.kv[plan.idx] = store
+            if plan.stores:
+                cache.shared[plan.kind] = store
+            new = True
+        return new
+
+    def prefill(self, ids, pos, cache):
+        """Run a prompt from position pos in chunks of CHUNK tokens. A group
+        of up to MT_CPU tokens runs as it is. A longer chunk goes to a
+        program of the next power of two. Return the hidden states of every
+        token."""
+        ids = list(ids)
+        out = []
+        for c0 in range(0, len(ids), CHUNK):
+            chunk = ids[c0:c0 + CHUNK]
+            size = None
+            if len(chunk) > MT_CPU:
+                size = min(CHUNK, 1 << (len(chunk) - 1).bit_length())
+            out.append(self.group(chunk, pos + c0, cache, size))
+        return np.concatenate(out)
+
+    def logits(self, rows=1):
+        """Return the logits of the last rows of the last step or group, with
+        the soft cap, shape (rows, vocabulary). The first call copies the
+        head to the GPU."""
         model, cfg = self.model, self.model.cfg
         if self.head is None:
             if not (model._q4 and model._head_is_q6k()):
                 raise RuntimeError("the GPU head needs a Q6_K head")
             w = np.ascontiguousarray(model._head_q6k)
-            rows = w.shape[0]
+            vocab = w.shape[0]
             self.head = Buffer(w.nbytes)
             self.head.upload(w)
-            self.out = Buffer(4 * rows)
-            self.host_logits = np.empty((1, rows), dtype=np.float32)
-        xn = self.g.mirror.buffer_of(self.prog.names["xn"])
+            self.out = Buffer(4 * vocab * MT_CPU)
+            self.host_logits = np.empty((MT_CPU, vocab), dtype=np.float32)
+        assert 1 <= rows <= min(self.rows, MT_CPU)
+        vocab = self.host_logits.shape[1]
         cap = float(cfg.final_logit_softcapping or 0.0)
-        _check(lib().gg_q6k_head(self.head.ptr, xn.ptr, self.out.ptr,
-                                 self.host_logits.shape[1], cfg.hidden_size, cap, 1))
-        self.out.download(self.host_logits)
-        return self.host_logits.copy()
+        first = self.last - (rows - 1) * cfg.hidden_size * 4
+        _check(lib().gg_q6k_head(self.head.ptr, first, self.out.ptr, vocab, cfg.hidden_size,
+                                 cap, rows))
+        _check(lib().gg_d2h(self.host_logits.ctypes.data, self.out.ptr, rows * vocab * 4))
+        return self.host_logits[:rows].copy()
 
 
 # ---- the 26B model: the experts on the CPU (SPLIT_PLAN.md, phase 4) -----------
@@ -488,7 +651,7 @@ def _arrays(vals):
     return out
 
 
-class SplitCompiler(P.Compiler):
+class SplitCompiler(PoolCompiler):
     """The compiler of a step of the 26B model for the GPU, with the experts
     on the CPU.
 
@@ -502,15 +665,8 @@ class SplitCompiler(P.Compiler):
     """
 
     def __init__(self, model, hot=None, kv="int16", pool=False, stage=None):
-        super().__init__(model)
+        super().__init__(model, pool)
         self.kv = kv
-        # With pool, the n-th buffer of a shape in a layer is the same array
-        # in every layer. A layer does not read the buffers of an earlier
-        # layer, and the GPU runs the layers in order, so this is safe. A
-        # group of 1024 tokens then needs about 0.3 GB, not 8 GB.
-        self.pool_on = pool
-        self.pool = {}
-        self.pool_n = {}
         # The two device buffers for the weights of the experts of a layer
         # (see moe_group_gpu), or None.
         self.stage = stage
@@ -527,23 +683,6 @@ class SplitCompiler(P.Compiler):
         # layer -> (hot experts, gate and up blocks, down blocks) of the step
         # program, for a small group (see moe_hot_group).
         self.hot_host = {}
-
-    def compile(self, form):
-        if form[0] == "layer":
-            self.pool_n = {}
-        return super().compile(form)
-
-    def buffer(self, shape, dtype=np.float32):
-        if not self.pool_on:
-            return super().buffer(shape, dtype)
-        shape = tuple(np.atleast_1d(shape)) if not isinstance(shape, tuple) else shape
-        k = (shape, np.dtype(dtype).str)
-        n = self.pool_n.get(k, 0)
-        self.pool_n[k] = n + 1
-        b = self.pool.get((k, n))
-        if b is None:
-            b = self.pool[(k, n)] = np.zeros(shape, dtype=dtype)
-        return b
 
     def kernel(self, head, vals, out=None):
         for a in _arrays(vals):
@@ -1151,7 +1290,15 @@ class ModelGPU:
             prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
                                        hot_stores=self._hot_devices() if stage else None,
                                        hot_host=self.prog.hot_stores)
-            e = self.groups[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
+            # The tensor cores round the input of a product to float16. The
+            # router of the experts then selects another expert more often:
+            # 93% of the top tokens agree with the CPU, against 98% with the
+            # float32 products. The prompt pass of the 26B waits for the copy
+            # of the experts anyway, so it keeps float32 products.
+            tc = os.environ.get("NP_GEMMA_GPU_TC_MOE", "0") == "1" or \
+                not self.model.cfg.enable_moe_block
+            e = self.groups[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror,
+                                                   tc=tc))
         return e
 
     def group(self, tokens, pos, size=None):

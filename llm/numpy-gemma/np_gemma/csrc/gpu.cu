@@ -859,7 +859,13 @@ __global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part
 template <int F32W>
 __device__ __forceinline__ void w_block32(const void *w, int row, int cols, int g, float *out32)
 {
-    if (F32W) {
+    if (F32W == 2) {
+        /* bfloat16 rows */
+        const uint16_t *p = (const uint16_t *)w + (size_t)row * cols + (size_t)g * 32;
+        for (int k = 0; k < 32; ++k) {
+            out32[k] = __uint_as_float((uint32_t)p[k] << 16);
+        }
+    } else if (F32W) {
         const float *p = (const float *)w + (size_t)row * cols + (size_t)g * 32;
         for (int k = 0; k < 32; ++k) {
             out32[k] = p[k];
@@ -936,6 +942,208 @@ __global__ void k_gemm(const float *x, const void *w, float *out, int t, int row
     }
 }
 
+/* ---------- the int4 product on the tensor cores ----------
+ * k_gemm_tc: the product of an int4 matrix and a group of rows of x, with
+ * the instruction mma.sync m16n8k16 (float16 inputs, float32 sums).
+ *
+ * The weights: a value of an int4 block is the 4-bit number minus 8, times
+ * the float16 scale of the block. The number minus 8 is exact in float16.
+ * The kernel multiplies by the scale in float32, after the two steps of 16
+ * columns of a block. Thus the weights lose no precision.
+ *
+ * The rows of x become float16 values. That rounds each value to 11
+ * significant bits.
+ *
+ * A block of 128 threads (4 warps) takes a tile of TM tokens by TN rows and
+ * steps over the columns 64 at a time (2 int4 blocks). Warp w takes 32
+ * tokens by 32 rows of the tile: 2 by 4 tiles of the instruction. With
+ * gather, token q of the tile is row pair_tok[q] of x (the experts of a
+ * large group, see k_moe_gemm).
+ *
+ * The fragments of mma.sync m16n8k16 (g = lane / 4, c = lane % 4):
+ *
+ *     A (16 x 16, rows):  a0 = A[g][2c..], a1 = A[g+8][2c..],
+ *                         a2 = A[g][2c+8..], a3 = A[g+8][2c+8..]
+ *     B (16 x 8, cols):   b0 = B[2c..][g], b1 = B[2c+8..][g]
+ *     C (16 x 8):         c0, c1 = C[g][2c, 2c+1], c2, c3 = C[g+8][2c, 2c+1]
+ */
+#define TM 64
+#define TN 64
+#define TK 64
+
+__device__ __forceinline__ void mma16816(float *c, const uint32_t *a, const uint32_t *b)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/* One tile of WM * 32 tokens by TN rows, with WM * 2 warps. x holds float16
+ * values (see k_to_half), cols in each row. w points at the int4 blocks of
+ * row 0 of the matrix; rows are the rows of the matrix. The tokens of the
+ * tile are q0 to q1 - 1: of x, or of pair_tok with gather. out has ostride
+ * values in each row, and the tile writes rows n0 to n0 + TN - 1.
+ *
+ * Each thread of the block dequantizes parts of 8 bytes of the int4 blocks,
+ * so every thread shares that work. */
+template <int WM>
+__device__ __forceinline__ void tc_tile(const __half *x, const uint8_t *w, float *out,
+                                        int q0, int q1, int n0, int rows, int cols,
+                                        size_t ostride, const int *gather)
+{
+    const int TMv = WM * 32;
+    __shared__ __align__(16) __half as_[WM * 32][TK + 8];
+    __shared__ __align__(16) __half bs[TN][TK + 8];
+    __shared__ float ds[TN][TK / 32];
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int wm = (warp / 2) * 32, wn = (warp % 2) * 32;
+    int g = lane / 4, c = lane % 4;
+    float acc[2][4][4];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            for (int k = 0; k < 4; ++k) {
+                acc[i][j][k] = 0.f;
+            }
+        }
+    }
+    size_t rb = (size_t)(cols / 32) * 18;
+    for (int k0 = 0; k0 < cols; k0 += TK) {
+        /* x: TMv tokens by TK columns, 8 values at a time. */
+        for (int e = threadIdx.x; e < TMv * TK / 8; e += blockDim.x) {
+            int m = e / (TK / 8), kk = (e % (TK / 8)) * 8;
+            int q = q0 + m;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (q < q1) {
+                int src = gather ? gather[q] : q;
+                v = *(const uint4 *)(x + (size_t)src * cols + k0 + kk);
+            }
+            *(uint4 *)&as_[m][kk] = v;
+        }
+        /* w: TN rows by TK / 32 blocks; a unit is half of the 16 bytes of
+         * values of a block: 8 bytes give 8 low and 8 high values. */
+        for (int e = threadIdx.x; e < TN * (TK / 32) * 2; e += blockDim.x) {
+            int n = e / ((TK / 32) * 2), rem = e % ((TK / 32) * 2);
+            int bk = rem / 2, hf = rem % 2;
+            int row = n0 + n;
+            __half2 *dst_lo = (__half2 *)&bs[n][bk * 32 + 8 * hf];
+            __half2 *dst_hi = (__half2 *)&bs[n][bk * 32 + 16 + 8 * hf];
+            if (row < rows) {
+                const uint8_t *blk = w + (size_t)row * rb + (size_t)(k0 / 32 + bk) * 18;
+                if (hf == 0) {
+                    ds[n][bk] = __half2float(__ushort_as_half((uint16_t)(blk[0] | (blk[1] << 8))));
+                }
+                const uint8_t *qb = blk + 2 + 8 * hf;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int b0 = qb[2 * i], b1 = qb[2 * i + 1];
+                    dst_lo[i] = __halves2half2(__int2half_rn((b0 & 15) - 8), __int2half_rn((b1 & 15) - 8));
+                    dst_hi[i] = __halves2half2(__int2half_rn((b0 >> 4) - 8), __int2half_rn((b1 >> 4) - 8));
+                }
+            } else {
+                if (hf == 0) {
+                    ds[n][bk] = 0.f;
+                }
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    dst_lo[i] = __float2half2_rn(0.f);
+                    dst_hi[i] = __float2half2_rn(0.f);
+                }
+            }
+        }
+        __syncthreads();
+        for (int bk = 0; bk < TK / 32; ++bk) {
+            float blk[2][4][4];
+            for (int i = 0; i < 2; ++i) {
+                for (int j = 0; j < 4; ++j) {
+                    for (int k = 0; k < 4; ++k) {
+                        blk[i][j][k] = 0.f;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int ks = 0; ks < 32; ks += 16) {
+                int kk = bk * 32 + ks;
+                uint32_t a[2][4], b[4][2];
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    int r0 = wm + i * 16;
+                    a[i][0] = *(const uint32_t *)&as_[r0 + g][kk + 2 * c];
+                    a[i][1] = *(const uint32_t *)&as_[r0 + g + 8][kk + 2 * c];
+                    a[i][2] = *(const uint32_t *)&as_[r0 + g][kk + 2 * c + 8];
+                    a[i][3] = *(const uint32_t *)&as_[r0 + g + 8][kk + 2 * c + 8];
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int n = wn + j * 8 + g;
+                    b[j][0] = *(const uint32_t *)&bs[n][kk + 2 * c];
+                    b[j][1] = *(const uint32_t *)&bs[n][kk + 2 * c + 8];
+                }
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        mma16816(blk[i][j], a[i], b[j]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float d0 = ds[wn + j * 8 + 2 * c][bk], d1 = ds[wn + j * 8 + 2 * c + 1][bk];
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    acc[i][j][0] += d0 * blk[i][j][0];
+                    acc[i][j][1] += d1 * blk[i][j][1];
+                    acc[i][j][2] += d0 * blk[i][j][2];
+                    acc[i][j][3] += d1 * blk[i][j][3];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int n = n0 + wn + j * 8 + 2 * c;
+            int m = q0 + wm + i * 16 + g;
+            if (m < q1) {
+                if (n < rows) out[(size_t)m * ostride + n] = acc[i][j][0];
+                if (n + 1 < rows) out[(size_t)m * ostride + n + 1] = acc[i][j][1];
+            }
+            if (m + 8 < q1) {
+                if (n < rows) out[(size_t)(m + 8) * ostride + n] = acc[i][j][2];
+                if (n + 1 < rows) out[(size_t)(m + 8) * ostride + n + 1] = acc[i][j][3];
+            }
+        }
+    }
+}
+
+/* The rows of a dense product: tiles of 128 tokens (8 warps). */
+#define TMD 128
+
+__global__ void k_gemm_tc(const __half *x, const uint8_t *w, float *out, int t, int rows, int cols)
+{
+    int q0 = blockIdx.y * TMD;
+    tc_tile<4>(x, w, out, q0, min(t, q0 + TMD), blockIdx.x * TN, rows, cols, (size_t)rows, NULL);
+}
+
+/* The float16 copy of n values, for the tensor cores. */
+__global__ void k_to_half(const float *x, __half *y, size_t n)
+{
+    size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 v = *(const float4 *)(x + i);
+        *(__half2 *)(y + i) = __floats2half2_rn(v.x, v.y);
+        *(__half2 *)(y + i + 2) = __floats2half2_rn(v.z, v.w);
+    } else {
+        for (; i < n; ++i) {
+            y[i] = __float2half_rn(x[i]);
+        }
+    }
+}
+
 #define MT_MAX 16
 
 __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, int rows, int cols)
@@ -968,6 +1176,53 @@ __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, i
                 float4 xh = *(const float4 *)(xb + 16 + 4 * sub);
                 sum[j] += wl[0] * xl.x + wl[1] * xl.y + wl[2] * xl.z + wl[3] * xl.w
                         + wh[0] * xh.x + wh[1] * xh.y + wh[2] * xh.z + wh[3] * xh.w;
+            }
+        }
+    }
+    for (int j = 0; j < MT_MAX; ++j) {
+        if (j < t) {
+            float v = sum[j];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, o);
+            }
+            if (lane == 0) {
+                out[(size_t)j * rows + row] = v;
+            }
+        }
+    }
+}
+
+/* A bfloat16 matrix on a small group: one warp for each row. Each lane reads
+ * 8 values of the row at a time and uses them for every token. */
+__global__ void k_mt_gemv_bf16(const float *x, const uint16_t *w, float *out, int t, int rows,
+                               int cols)
+{
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (row >= rows) {
+        return;
+    }
+    const uint4 *wr = (const uint4 *)(w + (size_t)row * cols);
+    float sum[MT_MAX];
+    for (int j = 0; j < MT_MAX; ++j) {
+        sum[j] = 0.f;
+    }
+    for (int i = lane; i < cols / 8; i += 32) {
+        uint4 q = wr[i];
+        uint32_t u[4] = {q.x, q.y, q.z, q.w};
+        float wv[8];
+        for (int k = 0; k < 4; ++k) {
+            wv[2 * k] = __uint_as_float(u[k] << 16);
+            wv[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u);
+        }
+        for (int j = 0; j < MT_MAX; ++j) {
+            if (j < t) {
+                const float *xi = x + (size_t)j * cols + i * 8;
+                float a = 0.f;
+                for (int k = 0; k < 8; ++k) {
+                    a += wv[k] * xi[k];
+                }
+                sum[j] += a;
             }
         }
     }
@@ -1130,19 +1385,36 @@ __global__ void k_attn_qc_mt(const gp_rec *r, const int64_t *e)
 #define FK 32
 #define FD 64
 
+/* F32H 0: GP_ATTN_QC_MT, the int16 cache of the 26B (rows, heads, dim).
+ * F32H 1: GP_ATTN_F32H, the float cache of the E4B (heads, positions, dim).
+ * Its operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, t, pos,
+ * head_stride, window, slide. Its buffer row 0 has position 0. */
+template <int F32H>
+__device__ __forceinline__ float flash_kv(const gp_rec *r, const int64_t *e, int key,
+                                          int64_t kp, int kv, int d)
+{
+    if (F32H) {
+        const float *b = DP(const float, key ? 1 : 2);
+        return b[(size_t)kv * di(r, e, 10) + (size_t)kp * DI(7) + d];
+    }
+    size_t o = (size_t)(kp - di(r, e, 12)) * DI(8) * DI(9) + (size_t)kv * DI(9) + d;
+    const int16_t *q = DP(const int16_t, key ? 1 : 3);
+    const float *sc = DP(const float, key ? 2 : 4);
+    return (float)q[o] * sc[o / 32];
+}
+
+template <int F32H>
 __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
 {
     __shared__ float qs[FQ][FD + 1];
     __shared__ float kvs[FK][FD + 1];
     __shared__ float ps[FQ][FK + 1];
     const float *q = DP(const float, 0);
-    const int16_t *kq = DP(const int16_t, 1);
-    const float *ksc = DP(const float, 2);
-    const int16_t *vq = DP(const int16_t, 3);
-    const float *vsc = DP(const float, 4);
-    float *out = DP(float, 6);
-    int qh = DI(7), kvh = DI(8), hd = DI(9), t = DI(10), window = DI(13);
-    int64_t pos = di(r, e, 11), base = di(r, e, 12);
+    float *out = DP(float, F32H ? 4 : 6);
+    int o0 = F32H ? 5 : 7;
+    int qh = DI(o0), kvh = DI(o0 + 1), hd = DI(o0 + 2), t = DI(o0 + 3);
+    int window = F32H ? DI(11) : DI(13);
+    int64_t pos = di(r, e, F32H ? 9 : 11), base = F32H ? 0 : di(r, e, 12);
     int h = blockIdx.x, kv = h / (qh / kvh);
     int j0 = blockIdx.y * FQ;
     int qi = threadIdx.x / 8, sl = threadIdx.x % 8;
@@ -1154,7 +1426,21 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
         first = base;
     }
     int64_t last = pos + jl;
-    size_t row = (size_t)kvh * hd;
+    /* The rows of head kv: the float cache (head-major) or the int16 cache
+     * (row-major, from the head offset). */
+    const float *kf = NULL, *vf = NULL;
+    const int16_t *kq16 = NULL, *vq16 = NULL;
+    const float *ks16 = NULL, *vs16 = NULL;
+    size_t rowq = (size_t)kvh * hd;
+    if (F32H) {
+        kf = DP(const float, 1) + (size_t)kv * di(r, e, 10);
+        vf = DP(const float, 2) + (size_t)kv * di(r, e, 10);
+    } else {
+        kq16 = DP(const int16_t, 1) + (size_t)kv * hd;
+        vq16 = DP(const int16_t, 3) + (size_t)kv * hd;
+        ks16 = DP(const float, 2) + (size_t)kv * hd / 32;
+        vs16 = DP(const float, 4) + (size_t)kv * hd / 32;
+    }
     float o[64];
     for (int u = 0; u < 64; ++u) {
         o[u] = 0.f;
@@ -1168,8 +1454,16 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
                 int a = x / FD, d = x % FD;
                 int jj = j0 + a;
                 qs[a][d] = jj < t ? q[((size_t)jj * qh + h) * hd + d0 + d] : 0.f;
-                size_t o2 = (size_t)(k0 - base + a) * row + (size_t)kv * hd + d0 + d;
-                kvs[a][d] = a < kn ? (float)kq[o2] * ksc[o2 / 32] : 0.f;
+                float kv_v = 0.f;
+                if (a < kn) {
+                    if (F32H) {
+                        kv_v = kf[(size_t)(k0 + a) * hd + d0 + d];
+                    } else {
+                        size_t o2 = (size_t)(k0 - base + a) * rowq + d0 + d;
+                        kv_v = (float)kq16[o2] * ks16[o2 / 32];
+                    }
+                }
+                kvs[a][d] = kv_v;
             }
             __syncthreads();
             #pragma unroll 8
@@ -1224,8 +1518,16 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
             }
             for (int x = threadIdx.x; x < FK * FD; x += blockDim.x) {
                 int a = x / FD, d = x % FD;
-                size_t o2 = (size_t)(k0 - base + a) * row + (size_t)kv * hd + d0 + d;
-                kvs[a][d] = a < kn ? (float)vq[o2] * vsc[o2 / 32] : 0.f;
+                float kv_v = 0.f;
+                if (a < kn) {
+                    if (F32H) {
+                        kv_v = vf[(size_t)(k0 + a) * hd + d0 + d];
+                    } else {
+                        size_t o2 = (size_t)(k0 - base + a) * rowq + d0 + d;
+                        kv_v = (float)vq16[o2] * vs16[o2 / 32];
+                    }
+                }
+                kvs[a][d] = kv_v;
             }
             __syncthreads();
             #pragma unroll
@@ -1252,6 +1554,200 @@ __global__ void k_flash_qc_mt(const gp_rec *r, const int64_t *e)
             for (int w = 0; w < FD / 8; ++w) {
                 out[((size_t)j * qh + h) * hd + c * FD + sl + 8 * w] = o[c * (FD / 8) + w] * inv;
             }
+        }
+    }
+}
+
+/* ---------- the attention of a large group on the tensor cores ----------
+ * k_flash_tc: FlashAttention-2 with mma.sync m16n8k16. The queries, the
+ * keys, the values, and the weights p become float16. The sums are float32.
+ *
+ * Block (h, tile) takes query head h and FQ2 queries. Warp w takes the 16
+ * queries (w % 2) * 16 of the tile, and the 256 output values (w / 2) * 256
+ * of each query. A head of 512 values has 4 warps. Each warp computes the
+ * scores of its queries itself.
+ *
+ * For each step of FK2 keys:
+ *
+ * 1. S = Q K^T: the keys come to shared memory as float16.
+ * 2. The online softmax on the fragments of S. The 4 lanes that hold a row
+ *    find its maximum and its sum with shuffles.
+ * 3. O += P V: the fragments of S are the fragments of A. The values come
+ *    to shared memory with the keys as columns (Vt), so a fragment of B is
+ *    two adjacent values.
+ *
+ * The record is GP_ATTN_QC_MT (F32H 0) or GP_ATTN_F32H (F32H 1), as for
+ * k_flash_qc_mt. head_dim is 256 or 512. */
+#define FQ2 32
+#define FK2 16
+
+template <int F32H>
+__global__ void k_flash_tc(const gp_rec *r, const int64_t *e)
+{
+    extern __shared__ __half fsm[];
+    int o0 = F32H ? 5 : 7;
+    int qh = DI(o0), kvh = DI(o0 + 1), hd = DI(o0 + 2), t = DI(o0 + 3);
+    int window = F32H ? DI(11) : DI(13);
+    int64_t pos = di(r, e, F32H ? 9 : 11), base = F32H ? 0 : di(r, e, 12);
+    const float *q = DP(const float, 0);
+    float *out = DP(float, F32H ? 4 : 6);
+    int h = blockIdx.x, kv = h / (qh / kvh);
+    int j0 = blockIdx.y * FQ2;
+    int ld = hd + 8;
+    __half *qs = fsm;                      /* FQ2 x ld */
+    __half *ks = qs + FQ2 * ld;            /* FK2 x ld */
+    __half *vt = ks + FK2 * ld;            /* hd x (FK2 + 8) */
+    const int vld = FK2 + 8;
+    const float *kf = NULL, *vf = NULL;
+    const int16_t *kq16 = NULL, *vq16 = NULL;
+    const float *ks16 = NULL, *vs16 = NULL;
+    size_t rowq = (size_t)kvh * hd;
+    if (F32H) {
+        kf = DP(const float, 1) + (size_t)kv * di(r, e, 10);
+        vf = DP(const float, 2) + (size_t)kv * di(r, e, 10);
+    } else {
+        kq16 = DP(const int16_t, 1) + (size_t)kv * hd;
+        vq16 = DP(const int16_t, 3) + (size_t)kv * hd;
+        ks16 = DP(const float, 2) + (size_t)kv * hd / 32;
+        vs16 = DP(const float, 4) + (size_t)kv * hd / 32;
+    }
+    for (int x = threadIdx.x; x < FQ2 * hd; x += blockDim.x) {
+        int a = x / hd, d = x % hd;
+        int jj = j0 + a;
+        qs[a * ld + d] = __float2half_rn(jj < t ? q[((size_t)jj * qh + h) * hd + d] : 0.f);
+    }
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int qg = warp % 2, dsl = warp / 2;
+    int g = lane / 4, c = lane % 4;
+    int jl = min(t, j0 + FQ2) - 1;
+    int64_t first = window > 0 ? pos + j0 - window + 1 : 0;
+    if (first < base) {
+        first = base;
+    }
+    int64_t last = pos + jl;
+    int64_t p0 = pos + j0 + qg * 16 + g, p1 = p0 + 8;   /* the positions of rows g, g + 8 */
+    bool live0 = j0 + qg * 16 + g < t, live1 = j0 + qg * 16 + g + 8 < t;
+    float o[32][4];
+    for (int i = 0; i < 32; ++i) {
+        o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    }
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    for (int64_t k0 = first; k0 <= last; k0 += FK2) {
+        int kn = (int)min((int64_t)FK2, last - k0 + 1);
+        __syncthreads();
+        for (int x = threadIdx.x; x < FK2 * hd; x += blockDim.x) {
+            int a = x / hd, d = x % hd;
+            float kvk = 0.f, kvv = 0.f;
+            if (a < kn) {
+                if (F32H) {
+                    kvk = kf[(size_t)(k0 + a) * hd + d];
+                    kvv = vf[(size_t)(k0 + a) * hd + d];
+                } else {
+                    size_t o2 = (size_t)(k0 - base + a) * rowq + d;
+                    kvk = (float)kq16[o2] * ks16[o2 / 32];
+                    kvv = (float)vq16[o2] * vs16[o2 / 32];
+                }
+            }
+            ks[a * ld + d] = __float2half_rn(kvk);
+            vt[d * vld + a] = __float2half_rn(kvv);
+        }
+        __syncthreads();
+        /* S: 16 queries by FK2 keys = 2 tiles of 8 keys. */
+        float sc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        const __half *qa = qs + (qg * 16) * ld;
+        for (int kk = 0; kk < hd; kk += 16) {
+            uint32_t a[4];
+            a[0] = *(const uint32_t *)&qa[g * ld + kk + 2 * c];
+            a[1] = *(const uint32_t *)&qa[(g + 8) * ld + kk + 2 * c];
+            a[2] = *(const uint32_t *)&qa[g * ld + kk + 2 * c + 8];
+            a[3] = *(const uint32_t *)&qa[(g + 8) * ld + kk + 2 * c + 8];
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                uint32_t b[2];
+                b[0] = *(const uint32_t *)&ks[(nt * 8 + g) * ld + kk + 2 * c];
+                b[1] = *(const uint32_t *)&ks[(nt * 8 + g) * ld + kk + 2 * c + 8];
+                mma16816(sc[nt], a, b);
+            }
+        }
+        /* The mask and the online softmax. sc[nt][0..1] are row g, keys
+         * nt * 8 + 2c and + 1; sc[nt][2..3] are row g + 8. */
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                int kk = nt * 8 + 2 * c + u;
+                int64_t kp = k0 + kk;
+                bool ok0 = live0 && kk < kn && kp <= p0 && (window == 0 || p0 - kp < window);
+                bool ok1 = live1 && kk < kn && kp <= p1 && (window == 0 || p1 - kp < window);
+                sc[nt][u] = ok0 ? sc[nt][u] : -INFINITY;
+                sc[nt][2 + u] = ok1 ? sc[nt][2 + u] : -INFINITY;
+                mx0 = fmaxf(mx0, sc[nt][u]);
+                mx1 = fmaxf(mx1, sc[nt][2 + u]);
+            }
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, off));
+        }
+        float sc0 = (mx0 == -INFINITY || m0 == -INFINITY) ? (m0 == -INFINITY ? 0.f : 1.f)
+                                                            : expf(m0 - mx0);
+        float sc1 = (mx1 == -INFINITY || m1 == -INFINITY) ? (m1 == -INFINITY ? 0.f : 1.f)
+                                                            : expf(m1 - mx1);
+        float ls0 = 0.f, ls1 = 0.f;
+        uint32_t pa[4];
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            float e0 = sc[nt][0] == -INFINITY ? 0.f : expf(sc[nt][0] - mx0);
+            float e1 = sc[nt][1] == -INFINITY ? 0.f : expf(sc[nt][1] - mx0);
+            float e2 = sc[nt][2] == -INFINITY ? 0.f : expf(sc[nt][2] - mx1);
+            float e3 = sc[nt][3] == -INFINITY ? 0.f : expf(sc[nt][3] - mx1);
+            ls0 += e0 + e1;
+            ls1 += e2 + e3;
+            __half2 h01 = __floats2half2_rn(e0, e1), h23 = __floats2half2_rn(e2, e3);
+            pa[nt * 2 + 0] = *(uint32_t *)&h01;
+            pa[nt * 2 + 1] = *(uint32_t *)&h23;
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            ls0 += __shfl_xor_sync(0xffffffff, ls0, off);
+            ls1 += __shfl_xor_sync(0xffffffff, ls1, off);
+        }
+        if (mx0 != -INFINITY) {
+            l0 = l0 * sc0 + ls0;
+            m0 = mx0;
+        }
+        if (mx1 != -INFINITY) {
+            l1 = l1 * sc1 + ls1;
+            m1 = mx1;
+        }
+        /* The A fragment of P: a0 = row g, keys 2c.. (tile 0); a1 = row g+8
+         * (tile 0); a2 = row g, keys 8 + 2c (tile 1); a3 = row g + 8 (tile 1). */
+        uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+        #pragma unroll
+        for (int nt = 0; nt < 32; ++nt) {
+            o[nt][0] *= (mx0 == -INFINITY ? 1.f : sc0);
+            o[nt][1] *= (mx0 == -INFINITY ? 1.f : sc0);
+            o[nt][2] *= (mx1 == -INFINITY ? 1.f : sc1);
+            o[nt][3] *= (mx1 == -INFINITY ? 1.f : sc1);
+            int d = dsl * 256 + nt * 8 + g;
+            uint32_t b[2];
+            b[0] = *(const uint32_t *)&vt[d * vld + 2 * c];
+            b[1] = *(const uint32_t *)&vt[d * vld + 2 * c + 8];
+            mma16816(o[nt], a, b);
+        }
+    }
+    float inv0 = l0 > 0.f ? 1.0f / l0 : 0.f, inv1 = l1 > 0.f ? 1.0f / l1 : 0.f;
+    int ja = j0 + qg * 16 + g;
+    #pragma unroll
+    for (int nt = 0; nt < 32; ++nt) {
+        int d = dsl * 256 + nt * 8 + 2 * c;
+        if (live0) {
+            out[((size_t)ja * qh + h) * hd + d] = o[nt][0] * inv0;
+            out[((size_t)ja * qh + h) * hd + d + 1] = o[nt][1] * inv0;
+        }
+        if (live1) {
+            out[((size_t)(ja + 8) * qh + h) * hd + d] = o[nt][2] * inv1;
+            out[((size_t)(ja + 8) * qh + h) * hd + d + 1] = o[nt][3] * inv1;
         }
     }
 }
@@ -1459,6 +1955,22 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
             }
         }
     }
+}
+
+/* k_moe_gemm on the tensor cores: the same tiles, with tc_tile. */
+__global__ void k_moe_gemm_tc(const gp_rec *r, const int64_t *e, const void *a, int gather,
+                              const int64_t *wtab, int rows, int cols, float *out)
+{
+    const int *tiles = DP(const int, 16);
+    const int *off = DP(const int, 12);
+    int tile = blockIdx.y;
+    if (tile >= tiles[0]) {
+        return;
+    }
+    int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile];
+    int q1 = min(off[ex + 1], q0 + TM);
+    tc_tile<2>((const __half *)a, (const uint8_t *)(intptr_t)wtab[ex], out, q0, q1,
+               blockIdx.x * TN, rows, cols, (size_t)rows, gather ? DP(const int, 14) : NULL);
 }
 
 /* act holds the gate and the up values of each pair: 2 inner values. */
@@ -1852,6 +2364,9 @@ typedef struct {
     gg_seg *seg;         /* the segments, in the order of the records */
     int n_ev;
     cudaEvent_t *ev;     /* the events of the GP_TO_HOST records */
+    __half *xh;          /* the float16 copy of the input of a product */
+    size_t xh_n;
+    int tc;              /* 1: the tensor cores for a large group */
 } gg_prog;
 
 /* The size of the scratch of the attention: 16 query heads of 512 values,
@@ -1996,12 +2511,38 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
  * lower it with gg_set_gemv_max to check k_gemm with a small group. */
 static int gg_gemv_max = MT_MAX;
 
+/* 1: the tensor cores for the int4 products of a large group (k_gemm_tc,
+ * k_moe_gemm_tc). 0: the float32 kernels (k_gemm, k_moe_gemm). */
+static int gg_tc = 1;
+
+static int flash_tc_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, int f32h,
+                           int *bad)
+{
+    int o0 = f32h ? 5 : 7;
+    int64_t qh = hlit(r, o0, bad), hd = hlit(r, o0 + 2, bad), t = hlit(r, o0 + 3, bad);
+    if (hd != 256 && hd != 512) {
+        return -1;
+    }
+    size_t smem = ((size_t)(FQ2 + FK2) * (hd + 8) + (size_t)hd * (FK2 + 8)) * sizeof(__half);
+    unsigned warps = 2 * (unsigned)(hd / 256);
+    dim3 grid((unsigned)qh, (unsigned)cdiv(t, FQ2));
+    if (f32h) {
+        cudaFuncSetAttribute(k_flash_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        k_flash_tc<1><<<grid, 32 * warps, smem, gg_stream>>>(dr, denv);
+    } else {
+        cudaFuncSetAttribute(k_flash_tc<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        k_flash_tc<0><<<grid, 32 * warps, smem, gg_stream>>>(dr, denv);
+    }
+    return 0;
+}
+
 /* The product of an int4 matrix and a group of rows. The operands give x,
  * w, out, rows, cols, and t. The pointers must be literals, because the
  * kernel takes them as arguments: the compiler of a group passes arrays,
  * not slots. */
-static void gemm_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, int xk,
-                        int wk, int ok, int rk, int ck, int tk, int *bad)
+static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
+                        const int64_t *denv, int xk, int wk, int ok, int rk, int ck, int tk,
+                        int *bad)
 {
     if (r->tag[xk] == GP_T_SLOT || r->tag[wk] == GP_T_SLOT || r->tag[ok] == GP_T_SLOT) {
         *bad = 1;
@@ -2014,6 +2555,11 @@ static void gemm_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, 
     if (t <= gg_gemv_max) {
         k_mt_gemv<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
             x, (const uint8_t *)w, out, t, rows, cols);
+    } else if (gg_tc && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
+        size_t n = (size_t)t * cols;
+        k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, gg_stream>>>(x, g->xh, n);
+        k_gemm_tc<<<dim3((unsigned)cdiv(rows, TN), (unsigned)cdiv(t, TMD)), 256, 0, gg_stream>>>(
+            g->xh, (const uint8_t *)w, out, t, rows, cols);
     } else {
         k_gemm<0><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(
             x, w, out, t, rows, cols);
@@ -2070,12 +2616,25 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_int4_linear<<<(unsigned)cdiv(hlit(r, 7, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
             dr, denv, 3, 4, 6, 7, 8);
         break;
-    case GP_BF16_LINEAR:
-        if (hlit(r, 5, &bad) != 1 || hlit(r, 4, &bad) % 8 != 0) {
+    case GP_BF16_LINEAR: {
+        /* x, w, out, rows, cols, tokens */
+        int64_t t = hlit(r, 5, &bad), rows = hlit(r, 3, &bad), cols = hlit(r, 4, &bad);
+        if (cols % 32 != 0) {
             bad = 1;
         }
-        k_bf16_linear<<<(unsigned)cdiv(hlit(r, 3, &bad), ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        if (t == 1) {
+            k_bf16_linear<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        } else if (t <= MT_MAX) {
+            k_mt_gemv_bf16<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(
+                (const float *)(intptr_t)hlit(r, 0, &bad), (const uint16_t *)(intptr_t)hlit(r, 1, &bad),
+                (float *)(intptr_t)hlit(r, 2, &bad), (int)t, (int)rows, (int)cols);
+        } else {
+            k_gemm<2><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, s>>>(
+                (const float *)(intptr_t)hlit(r, 0, &bad), (const void *)(intptr_t)hlit(r, 1, &bad),
+                (float *)(intptr_t)hlit(r, 2, &bad), (int)t, (int)rows, (int)cols);
+        }
         break;
+    }
     case GP_QKV_NORM: {
         qkv_ix ix = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
         k_qkv_norm<<<(unsigned)(hlit(r, 2, &bad) + hlit(r, 5, &bad) + hlit(r, 7, &bad)),
@@ -2105,10 +2664,20 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             dr, denv);
         break;
     case GP_ATTN_F32H:
-        if (hlit(r, 8, &bad) != 1) {
-            bad = 1;
+        if (hlit(r, 8, &bad) == 1) {
+            attn_launch(g, r, dr, denv, &bad);
+        } else {
+            /* A group: every query sees the keys of a window before it, as
+             * the decode step does. */
+            if (hlit(r, 7, &bad) % FD != 0 || hlit(r, 7, &bad) > 512) {
+                bad = 1;
+            }
+            if (!(gg_tc && g->tc && flash_tc_launch(r, dr, denv, 1, &bad) == 0)) {
+                k_flash_qc_mt<1><<<dim3((unsigned)hlit(r, 5, &bad),
+                                        (unsigned)cdiv(hlit(r, 8, &bad), FQ)), 256, 0, s>>>(
+                    dr, denv);
+            }
         }
-        attn_launch(g, r, dr, denv, &bad);
         break;
     case GP_ATTN_F32:
     case GP_ATTN_QC:
@@ -2133,13 +2702,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     case GP_INT4_LINEAR_MT:
         /* x, w, s, out, rows, cols, t */
-        gemm_launch(r, dr, denv, 0, 1, 3, 4, 5, 6, &bad);
+        gemm_launch(g, r, dr, denv, 0, 1, 3, 4, 5, 6, &bad);
         break;
     case GP_INT4_MULTI4_MT:
         /* x, cols, t, then (w, s, out, rows) for up to four matrices */
         for (int m = 0; m < 4; ++m) {
             if (r->v[3 + 4 * m] != 0) {
-                gemm_launch(r, dr, denv, 0, 3 + 4 * m, 5 + 4 * m, 6 + 4 * m, 1, 2, &bad);
+                gemm_launch(g, r, dr, denv, 0, 3 + 4 * m, 5 + 4 * m, 6 + 4 * m, 1, 2, &bad);
             }
         }
         break;
@@ -2151,9 +2720,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (hlit(r, 9, &bad) > 512 || hlit(r, 9, &bad) % 16 != 0) {
             bad = 1;
         }
-        if (hlit(r, 10, &bad) > MT_MAX && hlit(r, 9, &bad) % FD == 0) {
-            k_flash_qc_mt<<<dim3((unsigned)hlit(r, 7, &bad),
-                                 (unsigned)cdiv(hlit(r, 10, &bad), FQ)), 256, 0, s>>>(dr, denv);
+        if (hlit(r, 10, &bad) > MT_MAX && gg_tc && g->tc &&
+            flash_tc_launch(r, dr, denv, 0, &bad) == 0) {
+            /* the tensor cores */
+        } else if (hlit(r, 10, &bad) > MT_MAX && hlit(r, 9, &bad) % FD == 0) {
+            k_flash_qc_mt<0><<<dim3((unsigned)hlit(r, 7, &bad),
+                                    (unsigned)cdiv(hlit(r, 10, &bad), FQ)), 256, 0, s>>>(dr, denv);
         } else {
             k_attn_qc_mt<<<dim3((unsigned)hlit(r, 7, &bad),
                                 (unsigned)cdiv(hlit(r, 10, &bad), QT)), QT * 16, 0, s>>>(dr, denv);
@@ -2187,11 +2759,23 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         float *de = (float *)(intptr_t)hlit(r, 19, &bad);
         k_moe_sort<<<1, 1024, 0, s>>>(dr, denv);
         k_moe_tiles<<<1, 1, 0, s>>>(dr, denv);
-        k_moe_gemm<<<dim3((unsigned)cdiv(gu_rows, GN), max_tiles), 256, 0, s>>>(
-            dr, denv, h, 1, gu, gu_rows, cols, act);
-        k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
-        k_moe_gemm<<<dim3((unsigned)cdiv(dn_rows, GN), max_tiles), 256, 0, s>>>(
-            dr, denv, act2, 0, dn, dn_rows, inner, de);
+        if (gg_tc && g->tc && cols % TK == 0 && inner % TK == 0 &&
+            (size_t)t * cols <= g->xh_n && (size_t)pairs * inner <= g->xh_n) {
+            size_t n1 = (size_t)t * cols, n2 = (size_t)pairs * inner;
+            k_to_half<<<(unsigned)cdiv((int64_t)n1 / 4 + 1, 256), 256, 0, s>>>(h, g->xh, n1);
+            k_moe_gemm_tc<<<dim3((unsigned)cdiv(gu_rows, TN), max_tiles), 128, 0, s>>>(
+                dr, denv, g->xh, 1, gu, gu_rows, cols, act);
+            k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+            k_to_half<<<(unsigned)cdiv((int64_t)n2 / 4 + 1, 256), 256, 0, s>>>(act2, g->xh, n2);
+            k_moe_gemm_tc<<<dim3((unsigned)cdiv(dn_rows, TN), max_tiles), 128, 0, s>>>(
+                dr, denv, g->xh, 0, dn, dn_rows, inner, de);
+        } else {
+            k_moe_gemm<<<dim3((unsigned)cdiv(gu_rows, GN), max_tiles), 256, 0, s>>>(
+                dr, denv, h, 1, gu, gu_rows, cols, act);
+            k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+            k_moe_gemm<<<dim3((unsigned)cdiv(dn_rows, GN), max_tiles), 256, 0, s>>>(
+                dr, denv, act2, 0, dn, dn_rows, inner, de);
+        }
         k_moe_sum<<<(unsigned)cdiv(t * dn_rows, T), T, 0, s>>>(dr, denv);
         break;
     }
@@ -2387,6 +2971,11 @@ void gg_set_gemv_max(int t)
     gg_gemv_max = t < MT_MAX ? t : MT_MAX;
 }
 
+void gg_set_tc(int on)
+{
+    gg_tc = on ? 1 : 0;
+}
+
 int gg_mem_info(size_t *free_b, size_t *total_b)
 {
     CK(cudaMemGetInfo(free_b, total_b));
@@ -2474,7 +3063,10 @@ void *gg_load(const int64_t *prog, int use_graph)
     gg_prog *g = (gg_prog *)calloc(1, sizeof(gg_prog));
     g->n_env = (int)prog[1];
     g->n_code = (int)prog[2];
-    g->use_graph = use_graph;
+    /* Bit 0 of the flags: the CUDA graph. Bit 1: no tensor cores for this
+     * program (the 26B keeps float32 products; see gpu.py). */
+    g->use_graph = use_graph & 1;
+    g->tc = (use_graph & 2) ? 0 : 1;
     size_t env_b = (size_t)(g->n_env > 0 ? g->n_env : 1) * sizeof(int64_t);
     size_t code_b = (size_t)g->n_code * sizeof(gp_rec);
     g->hcode = (gp_rec *)malloc(code_b);
@@ -2507,6 +3099,27 @@ void *gg_load(const int64_t *prog, int use_graph)
         }
         g->seg[g->n_seg - 1].end = pc + 1;
     }
+    /* The float16 scratch of the products of large groups. */
+    size_t need = 0;
+    for (int pc = 0; pc < g->n_code; ++pc) {
+        const gp_rec *r = g->hcode + pc;
+        size_t n = 0;
+        if (r->op == GP_INT4_LINEAR_MT && r->v[6] > MT_MAX) {
+            n = (size_t)r->v[6] * (size_t)r->v[5];
+        } else if (r->op == GP_INT4_MULTI4_MT && r->v[2] > MT_MAX) {
+            n = (size_t)r->v[2] * (size_t)r->v[1];
+        } else if (r->op == GP_MOE_GPU) {
+            size_t a = (size_t)r->v[3] * (size_t)r->v[8];
+            size_t b = (size_t)r->v[3] * (size_t)r->v[4] * (size_t)r->v[10];
+            n = a > b ? a : b;
+        }
+        need = n > need ? n : need;
+    }
+    if (need > 0 && cudaMalloc(&g->xh, need * sizeof(__half)) != cudaSuccess) {
+        snprintf(gg_error, sizeof(gg_error), "gg_load: no memory for the float16 scratch");
+        return NULL;
+    }
+    g->xh_n = need;
     g->ev = (cudaEvent_t *)calloc((size_t)g->n_ev + 1, sizeof(cudaEvent_t));
     for (int k = 0; k < g->n_ev; ++k) {
         if (cudaEventCreateWithFlags(&g->ev[k], cudaEventDisableTiming) != cudaSuccess) {
@@ -2599,6 +3212,7 @@ int gg_unload(void *handle)
     cudaFree(g->denv);
     cudaFree(g->dcode);
     cudaFree(g->part);
+    cudaFree(g->xh);
     cudaFreeHost(g->henv);
     free(g->hcode);
     free(g);

@@ -806,10 +806,13 @@ class E4B:
         """
         cfg = self.cfg
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
-        if _GPU and hook is None and isinstance(cache, E4BCache) and ids.size == 1:
+        if _GPU and hook is None and isinstance(cache, E4BCache):
             from . import program
-            if program.e4b_ready(self, cache):
+            if ids.size == 1 and program.e4b_ready(self, cache):
                 return self._gpu_step(ids, cache, int(start_pos))
+            if ids.size > 1 and self._q4 and self.mode == "int4":
+                # A prompt, or the verify group of an MTP step.
+                return self._gpu_prefill(ids, cache, int(start_pos))
         self._gpu_release(cache)
         if (_PROGRAM and hook is None and isinstance(cache, E4BCache)
                 and (ids.size == 1 or ops.mt_ready(ids.size))):
@@ -828,10 +831,10 @@ class E4B:
             x = self.layer(x, per_layer[:, i, :], i, cache, start_pos, hook)
         return ops.rms_norm(x, self.T(PREFIX + "norm.weight"), cfg.rms_norm_eps)
 
-    def _gpu_step(self, ids, cache, pos):
-        """Run a decode step on the GPU. The first step with a cache copies
-        the cache to the GPU. From then on, the copy on the GPU is the true
-        one, until _gpu_release copies it back."""
+    def _gpu_attach(self, cache):
+        """Put the cache on the GPU. The first use of a cache copies it to the
+        GPU. From then on, the copy on the GPU is the true one, until
+        _gpu_release copies it back."""
         if self._gpu is None:
             from . import gpu
             self._gpu = gpu.E4BGPU(self)
@@ -840,7 +843,17 @@ class E4B:
                 self._gpu.detach(self._gpu_cache)
             self._gpu.attach(cache)
             self._gpu_cache = cache
+
+    def _gpu_step(self, ids, cache, pos):
+        """Run a decode step on the GPU."""
+        self._gpu_attach(cache)
         self._gpu_xn = self._gpu.step(ids, pos, cache)
+        return self._gpu_xn
+
+    def _gpu_prefill(self, ids, cache, pos):
+        """Run a group or a prompt on the GPU (E4BGPU.prefill)."""
+        self._gpu_attach(cache)
+        self._gpu_xn = self._gpu.prefill(ids, pos, cache)
         return self._gpu_xn
 
     def _gpu_release(self, cache):
@@ -862,9 +875,13 @@ class E4B:
     def logits(self, hidden, softcap=True):
         """Project the hidden state onto the vocabulary."""
         xn = self._gpu_xn
-        if xn is not None and softcap and (hidden is xn or getattr(hidden, "base", None) is xn):
-            # The hidden state of the last GPU step: the GPU runs the head.
-            return self._gpu.logits()
+        if (xn is not None and softcap and hidden.shape[0] <= 16
+                and (hidden is xn or (getattr(hidden, "base", None) is xn and
+                                      hidden.ctypes.data + hidden.nbytes ==
+                                      xn.ctypes.data + xn.nbytes))):
+            # The last rows of the last GPU step or group: the GPU runs the
+            # head.
+            return self._gpu.logits(hidden.shape[0])
         out = None
         if self._q4 and self._head_is_q6k():
             # The head of a GGUF file is the token embedding, and the file
