@@ -6962,6 +6962,123 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
  * faulty operation. A limit below zero runs every record.
  */
 
+/* ---------- the other parts of the library ----------
+ * mlx_affine.c: the MLX affine weight format (mlx-community, OptiQ).
+ * deltanet.c: the Gated DeltaNet (Qwen3.5). The program records below
+ * call their bodies. */
+#include "mlx_affine.c"
+#include "deltanet.c"
+
+/* ---------- small operations of other models (Qwen3.5) ---------- */
+
+/* The router of a MoE layer as softmax, then the top k, then the k weights
+ * divided by their sum (Qwen3.5, Mixtral). At an equal value the lower index
+ * wins. One token for each thread. */
+static void gp_router_topk_body(const float *logits, int t, int experts, int k, float *val,
+                                int32_t *idx)
+{
+    #pragma omp for schedule(static)
+    for (int j = 0; j < t; ++j) {
+        const float *l = logits + (size_t)j * experts;
+        float m = -INFINITY;
+        for (int x = 0; x < experts; ++x) {
+            m = l[x] > m ? l[x] : m;
+        }
+        float p[1024];
+        float sum = 0.f;
+        for (int x = 0; x < experts; ++x) {
+            p[x] = expf(l[x] - m);
+            sum += p[x];
+        }
+        float vs = 0.f;
+        for (int s2 = 0; s2 < k; ++s2) {
+            int b = -1;
+            for (int x = 0; x < experts; ++x) {
+                if (p[x] >= 0.f && (b < 0 || p[x] > p[b])) {
+                    b = x;
+                }
+            }
+            idx[(size_t)j * k + s2] = b;
+            val[(size_t)j * k + s2] = p[b] / sum;
+            vs += p[b] / sum;
+            p[b] = -1.f;
+        }
+        for (int s2 = 0; s2 < k; ++s2) {
+            val[(size_t)j * k + s2] /= vs;
+        }
+    }
+}
+
+/* out = x * sigmoid(g), for n values. */
+static void gp_sigmul_body(const float *x, const float *g, float *out, int64_t n)
+{
+    #pragma omp for schedule(static)
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = x[i] / (1.f + expf(-g[i]));
+    }
+}
+
+/* The steps before the attention of a gated attention with partial RoPE
+ * (Qwen3.5), for t tokens from pos:
+ *
+ * - qg (t x nq x 2 hd): the query and the gate of each head;
+ * - the query: rms_norm with qn, RoPE on the first rot values, times scale,
+ *   into qout (t x nq x hd); the gate into gate (t x nq x hd);
+ * - kk, vv (t x nk x hd): the key gets rms_norm with kn and RoPE; the key and
+ *   the value go to the cache K, V (nk heads, hs values between heads) at
+ *   the positions pos to pos + t - 1.
+ *
+ * cos and sin have rot values for each token (the two halves the same). */
+static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
+                              const float *qn, const float *kn, const float *cos,
+                              const float *sin, float *K, float *V, int64_t hs, int64_t pos,
+                              int t, int nq, int nk, int hd, int rot, float eps, float scale,
+                              float *qout, float *gate)
+{
+    int half = rot / 2;
+    #pragma omp for schedule(static)
+    for (int x = 0; x < t * (nq + nk); ++x) {
+        int j = x / (nq + nk), h = x % (nq + nk);
+        const float *src;
+        const float *w;
+        float *dst;
+        float sc;
+        if (h < nq) {
+            src = qg + ((size_t)j * nq + h) * 2 * hd;
+            memcpy(gate + ((size_t)j * nq + h) * hd, src + hd, (size_t)hd * 4);
+            dst = qout + ((size_t)j * nq + h) * hd;
+            w = qn;
+            sc = scale;
+        } else {
+            int kh = h - nq;
+            src = kk + ((size_t)j * nk + kh) * hd;
+            dst = K + (size_t)kh * hs + (size_t)(pos + j) * hd;
+            memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * hd,
+                   vv + ((size_t)j * nk + kh) * hd, (size_t)hd * 4);
+            w = kn;
+            sc = 1.f;
+        }
+        float ss = 0.f;
+        for (int d = 0; d < hd; ++d) {
+            ss += src[d] * src[d];
+        }
+        float inv = 1.f / sqrtf(ss / (float)hd + eps);
+        float y[1024];
+        for (int d = 0; d < hd; ++d) {
+            y[d] = src[d] * inv * w[d];
+        }
+        const float *c = cos + (size_t)j * rot, *sn = sin + (size_t)j * rot;
+        for (int d = 0; d < half; ++d) {
+            float a = y[d], b = y[d + half];
+            dst[d] = (a * c[d] - b * sn[d]) * sc;
+            dst[d + half] = (b * c[d + half] + a * sn[d + half]) * sc;
+        }
+        for (int d = rot; d < hd; ++d) {
+            dst[d] = y[d] * sc;
+        }
+    }
+}
+
 #define GP_NARG 24
 #define GP_MAGIC 0x4750524f47303031LL   /* "GPROG001" */
 
@@ -6987,6 +7104,10 @@ enum {
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67, GP_MOE_N = 68,
     GP_XBAR = 80, GP_MOE_PART = 81, GP_ATTN_QC_H = 82, GP_ATTN_F32_H = 83,
+    /* The MLX affine format, the Gated DeltaNet, and the small operations of
+     * Qwen3.5 (QWEN_PLAN.md). */
+    GP_MA_QUANT = 100, GP_MA_LINEAR = 101, GP_MA_MOE = 102, GP_ROUTER_TOPK = 103,
+    GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106,
 };
 
 int gemma_gp_record_size(void)
@@ -7312,6 +7433,53 @@ static void gp_moe_part(const gp_rec *r, const int64_t *e)
 static void gp_step(const gp_rec *r, int64_t *e)
 {
     switch (r->op) {
+    case GP_MA_QUANT:
+        /* x, t, cols, xq4, xq8, xs, xsum */
+        ma_quant_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3), GP_P(int8_t, 4),
+                      GP_P(float, 5), GP_P(float, 6));
+        break;
+    case GP_MA_LINEAR:
+        /* xq, xs, xsum, w, s, b, bits, rows, cols, t, out */
+        ma_linear_body(GP_P(const uint32_t, 3), GP_P(const uint16_t, 4), GP_P(const uint16_t, 5),
+                       GP_I(6), GP_I(7), GP_I(8), GP_P(const int8_t, 0), GP_P(const float, 1),
+                       GP_P(const float, 2), GP_I(9), GP_P(float, 10));
+        break;
+    case GP_MA_MOE:
+        /* hq4, hq8, hs, hsum, ids, val, t, k, experts, mats, shared_logit, hidden,
+         * inner, scratch, out */
+        ma_moe_body(GP_P(const int8_t, 0), GP_P(const int8_t, 1), GP_P(const float, 2),
+                    GP_P(const float, 3), GP_P(const int32_t, 4), GP_P(const float, 5), GP_I(6),
+                    GP_I(7), GP_I(8), GP_P(const int64_t, 9), GP_P(const float, 10), GP_I(11),
+                    GP_I(12), GP_P(uint8_t, 13), GP_P(float, 14));
+        break;
+    case GP_ROUTER_TOPK:
+        /* logits, t, experts, k, val, idx */
+        gp_router_topk_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_I(3), GP_P(float, 4),
+                            GP_P(int32_t, 5));
+        break;
+    case GP_GDN:
+        /* qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch,
+         * t, k_heads, v_heads, k_dim, v_dim, eps */
+        gdn_body(GP_P(const float, 0), GP_P(float, 1), GP_P(const float, 2), GP_I(3),
+                 GP_P(const float, 4), GP_P(const float, 5), GP_P(const float, 6),
+                 GP_P(const float, 7), GP_P(const float, 8), GP_P(const float, 9), GP_P(float, 10),
+                 GP_P(float, 11), GP_P(float, 12), GP_I(13), GP_I(14), GP_I(15), GP_I(16),
+                 GP_I(17), gp_f(r, e, 18));
+        break;
+    case GP_ATTN_PREP:
+        /* qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps, scale,
+         * qout, gate */
+        gp_attn_prep_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2),
+                          GP_P(const float, 3), GP_P(const float, 4), GP_P(const float, 5),
+                          GP_P(const float, 6), GP_P(float, 7), GP_P(float, 8), gp_i(r, e, 9),
+                          gp_i(r, e, 10), GP_I(11), GP_I(12), GP_I(13), GP_I(14), GP_I(15),
+                          gp_f(r, e, 16), gp_f(r, e, 17), GP_P(float, 18), GP_P(float, 19));
+        break;
+    case GP_SIGMUL:
+        /* x, g, out, n */
+        gp_sigmul_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2),
+                       gp_i(r, e, 3));
+        break;
     /* ---- scalar operations: every thread, private copy ---- */
     case GP_S_MOV: e[r->v[0]] = gp_i(r, e, 1); break;
     case GP_S_ADD: e[r->v[0]] = gp_i(r, e, 1) + gp_i(r, e, 2); break;
@@ -7783,8 +7951,3 @@ int gemma_run_parts(const int64_t *const *progs, int nparts, int team, int64_t *
     return 0;
 }
 
-/* ---------- the other parts of the library ----------
- * mlx_affine.c: the MLX affine weight format (mlx-community, OptiQ).
- * deltanet.c: the Gated DeltaNet (Qwen3.5). */
-#include "mlx_affine.c"
-#include "deltanet.c"

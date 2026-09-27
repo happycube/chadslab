@@ -273,6 +273,25 @@ Status of phase 2 (first part, done):
   of xq cancels only with the bias term of the same xq. With the sum of x,
   the error was 2%; with the sum of xq it is 0.7%, the error of int8 x.
 
+Status of phase 2 (second part, done):
+
+- compile_qwen_step (np_gemma/qwen.py) makes the whole step one program of
+  records (QwenProgram). The records are MA_QUANT, MA_LINEAR, and MA_MOE
+  (mlx_affine.c), and GDN (deltanet.c). ROUTER_TOPK, ATTN_PREP, and SIGMUL
+  are in the core of cops. The attention is ATTN_F32H of the E4B.
+- MA_MOE sorts the pairs (token, expert) by expert, so a group or a prompt
+  reads each expert one time. A decode step uses a path for one token: the
+  scales of a row come 16 groups at a time. A group uses tiles of 4 rows by
+  4 tokens.
+- The decode: 46 ms for the step and 8.6 ms for the head, 17 tok/s, while
+  the machine reads 58 GB/s (with its other load). The dense products run
+  at about 56 GB/s and the experts at about 46 GB/s.
+- The prompt pass: about 92 tok/s for 1024 tokens (chunks of 512). The
+  tiles give about 0.5 TMAC/s; with the scales removed (a test) they give
+  0.9, so the loads of this CPU are the limit. The rest is the experts (few
+  tokens for each expert), the DeltaNet (the tokens in order), and the
+  attention (one query at a time).
+
 The next steps of phase 2:
 
 - the program records for the whole step (one parallel region, as the

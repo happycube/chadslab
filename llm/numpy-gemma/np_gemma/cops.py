@@ -230,10 +230,11 @@ try:
         _lib.ma_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p, _void_p,
                                    _void_p, _int, _void_p]
         _lib.ma_linear.restype = None
-        _lib.ma_moe_step.argtypes = [_void_p] * 4 + [_void_p, _void_p, _int] + \
-            [_void_p, _void_p, _void_p, _int] * 6 + \
-            [ctypes.c_float, _int, _int, _void_p, _void_p, _void_p, _void_p, _void_p, _void_p]
-        _lib.ma_moe_step.restype = None
+        _lib.ma_moe.argtypes = [_void_p] * 6 + [_int, _int, _int, _void_p, _void_p, _int, _int,
+                                                 _void_p, _void_p]
+        _lib.ma_moe.restype = None
+        _lib.ma_moe_scratch.argtypes = [_int] * 5
+        _lib.ma_moe_scratch.restype = ctypes.c_size_t
         _lib.gdn_step.argtypes = [_void_p, _void_p, _void_p, _int] + [_void_p] * 9 + \
             [_int] * 5 + [ctypes.c_float]
         _lib.gdn_step.restype = None
@@ -633,24 +634,30 @@ def ma_linear(q, scales, biases, bits, rows, cols, xq, xs, xsum, t, out):
                    xq.ctypes.data, xs.ctypes.data, xsum.ctypes.data, t, out.ctypes.data)
 
 
-def ma_moe_step(hq4, hq8, hs, hsum, ids, val, gate, up, down, shared, shared_w, hidden, inner,
-                scratch, out):
-    """The experts of one token with MLX affine weights (csrc/mlx_affine.c).
-    gate, up, down are stacks of experts, shared is (gate, up, down) or
-    None; each matrix is (q, scales, biases, bits)."""
-    k = len(ids)
-    z = (None, None, None, 0)
-    sg, su, sd = shared if shared is not None else (z, z, z)
+def ma_moe_mats(gate, up, down, shared):
+    """The descriptor of the matrices of ma_moe: 6 x (q, scales, biases,
+    bits) as int64 (0 for no shared expert). Each matrix is a QMat.c()."""
+    rows = []
+    for m in (gate, up, down) + (tuple(shared) if shared is not None else (None, None, None)):
+        rows += [0, 0, 0, 0] if m is None else [m[0].ctypes.data, m[1].ctypes.data,
+                                                 m[2].ctypes.data, m[3]]
+    return np.array(rows, dtype=np.int64)
 
-    def m(t):
-        return [None if a is None else a.ctypes.data for a in t[:3]] + [t[3]]
 
-    act, aq, a_s, asum, de = scratch
-    _lib.ma_moe_step(hq4.ctypes.data, hq8.ctypes.data, hs.ctypes.data, hsum.ctypes.data,
-                     ids.ctypes.data, val.ctypes.data, k, *m(gate), *m(up), *m(down), *m(sg),
-                     *m(su), *m(sd), float(shared_w), hidden, inner, act.ctypes.data,
-                     aq.ctypes.data, a_s.ctypes.data, asum.ctypes.data, de.ctypes.data,
-                     out.ctypes.data)
+def ma_moe_scratch(t, k, experts, hidden, inner):
+    return np.empty(_lib.ma_moe_scratch(t, k, experts, hidden, inner), dtype=np.uint8)
+
+
+def ma_moe(hq4, hq8, hs, hsum, ids, val, experts, mats, shared_logit, hidden, inner, scratch,
+           out):
+    """The experts of t tokens with MLX affine weights (csrc/mlx_affine.c,
+    ma_moe_body). ids and val are (t, k); mats comes from ma_moe_mats;
+    shared_logit (t values) or None."""
+    t, k = ids.shape
+    _lib.ma_moe(hq4.ctypes.data, hq8.ctypes.data, hs.ctypes.data, hsum.ctypes.data,
+                ids.ctypes.data, val.ctypes.data, t, k, experts, mats.ctypes.data,
+                None if shared_logit is None else shared_logit.ctypes.data, hidden, inner,
+                scratch.ctypes.data, out.ctypes.data)
 
 
 def gdn_step(qkv, conv, conv_w, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, k_heads,

@@ -431,20 +431,15 @@ class QwenCPU(Qwen):
         top = np.argsort(-probs, axis=-1, kind="stable")[:, :cfg.top_k].astype(np.int32)
         val = np.take_along_axis(probs, top, axis=-1)
         val = (val / val.sum(axis=-1, keepdims=True)).astype(np.float32)
-        sgate = sigmoid(self.lin(p + "shared_expert_gate", qx))[:, 0]
-        experts = [self.M(p + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        g, u, d = (self.M(p + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj"))
         shared = [self.M(p + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        mats = cops.ma_moe_mats(g, u, d, shared)
+        slog = np.ascontiguousarray(self.lin(p + "shared_expert_gate", qx)[:, 0])
         k, inner, hid = cfg.top_k, cfg.moe_inter, cfg.hidden_size
-        ne = k + 1
-        scratch = (np.empty(ne * 2 * inner, np.float32), np.empty(ne * inner, np.int8),
-                   np.empty(ne * inner // 64, np.float32), np.empty(ne * inner // 64, np.float32),
-                   np.empty(ne * hid, np.float32))
         out = np.empty((t, hid), np.float32)
-        q4, q8 = qx.get(4), qx.get(8)
-        for j in range(t):
-            cops.ma_moe_step(q4[j], q8[j], qx.xs[j], qx.xsum[j], np.ascontiguousarray(top[j]),
-                             np.ascontiguousarray(val[j]), *experts, shared, sgate[j], hid,
-                             inner, scratch, out[j])
+        cops.ma_moe(qx.get(4), qx.get(8), qx.xs, qx.xsum, np.ascontiguousarray(top),
+                    np.ascontiguousarray(val), cfg.num_experts, mats, slog, hid, inner,
+                    cops.ma_moe_scratch(t, k, cfg.num_experts, hid, inner), out)
         return out
 
     def embed(self, ids):
@@ -452,3 +447,144 @@ class QwenCPU(Qwen):
 
     def logits(self, h, chunk=None):
         return mlx_affine.linear(self.M("lm_head", "language_model.lm_head"), mlx_affine.QX(h))
+
+
+# ---- the step as a program of records (gemma_run, one parallel region) --------
+
+def compile_qwen_step(model, t):
+    """Compile a step of t tokens of the model (a QwenCPU) into a program of
+    records: one parallel region for the whole step, as the Gemma step.
+
+    The input is names["x"] (t x hidden, the rows of the embeddings) and the
+    output names["xn"] (after the final norm). bind_qwen_step writes the
+    parameters: pos, the RoPE tables, and the arrays of the cache."""
+    from . import program as P
+    cfg = model.cfg
+    prog = P.Program()
+    hid, eps = cfg.hidden_size, float(cfg.rms_norm_eps)
+    nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+    kd, vd, cd = cfg.lin_key_dim, cfg.lin_value_dim, cfg.conv_dim
+    k, E, inner = cfg.top_k, cfg.num_experts, cfg.moe_inter
+    f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
+    x, h, xn = f32(t, hid), f32(t, hid), f32(t, hid)
+    wide = max(cd, nq * 2 * hd, vd, nq * hd)
+    xq4, xq8 = np.zeros((t, wide), np.int8), np.zeros((t, wide), np.int8)
+    xs, xsum = f32(t, wide // 64), f32(t, wide // 64)
+    o1, o2, o3, o4 = f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide)
+    att, gate, qout = f32(t, nq * hd), f32(t, nq * hd), f32(t, nq * hd)
+    mo, logits = f32(t, hid), f32(t, E)
+    val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
+    scratch = cops.ma_moe_scratch(t, k, E, hid, inner)
+    gscr = f32(t, cd)
+    prog.names.update(x=x, xn=xn)
+    pos = prog.slot("pos")
+    cos, sin, scores = prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
+    hs = prog.slot("hs")
+
+    def quant(src, cols):
+        prog.emit(P.MA_QUANT, src, t, cols, xq4, xq8, xs, xsum)
+
+    def lin(name, out, full=None):
+        m = model.M(name, full)
+        prog.emit(P.MA_LINEAR, xq4 if m.bits == 4 else xq8, xs, xsum, m.q, m.scales, m.biases,
+                  m.bits, m.rows, m.cols, t, out)
+        return m.rows
+
+    for i in range(model.n_layers):
+        p = "layers.%d." % i
+        prog.emit(P.RMS_NORM, x, model.F(p + "input_layernorm.weight"), h, t, hid, eps)
+        quant(h, hid)
+        if cfg.layer_types[i] == "full_attention":
+            a = p + "self_attn."
+            lin(a + "q_proj", o1)
+            lin(a + "k_proj", o2)
+            lin(a + "v_proj", o3)
+            prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(a + "q_norm.weight"),
+                      model.F(a + "k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
+                      prog.slot("V.%d" % i), hs, pos, t, nq, nk, hd, cfg.rotary_dim, eps,
+                      float(hd ** -0.5), qout, gate)
+            prog.emit(P.ATTN_F32H, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i), scores,
+                      att, nq, nk, hd, t, pos, hs, 0, 0)
+            prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
+            quant(att, nq * hd)
+            lin(a + "o_proj", o4)
+        else:
+            a = p + "linear_attn."
+            lin(a + "in_proj_qkv", o1)
+            lin(a + "in_proj_z", o2)
+            lin(a + "in_proj_b", o3)
+            lin(a + "in_proj_a", att)
+            prog.emit(P.GDN, o1, prog.slot("conv.%d" % i),
+                      model.F(a + "conv1d.weight", (cd, cfg.conv_kernel)), cfg.conv_kernel, o2,
+                      att, o3, model.F(a + "A_log"), model.F(a + "dt_bias"),
+                      model.F(a + "norm.weight"), prog.slot("S.%d" % i), gate, gscr, t,
+                      cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps)
+            quant(gate, vd)
+            lin(a + "out_proj", o4)
+        # o4 (t x hidden) has the output of the attention; x += o4.
+        prog.emit(P.ADD, x, o4, x, t * hid)
+        prog.emit(P.RMS_NORM, x, model.F(p + "post_attention_layernorm.weight"), h, t, hid, eps)
+        quant(h, hid)
+        m = p + "mlp."
+        lin(m + "gate", logits)
+        prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
+        lin(m + "shared_expert_gate", slog)
+        g, u, d = (model.M(m + "switch_mlp." + n).c() for n in ("gate_proj", "up_proj", "down_proj"))
+        shared = [model.M(m + "shared_expert." + n).c() for n in ("gate_proj", "up_proj", "down_proj")]
+        mats = cops.ma_moe_mats(g, u, d, shared)
+        prog.emit(P.MA_MOE, xq4, xq8, xs, xsum, idx, val, t, k, E, mats, slog, hid, inner,
+                  scratch, mo)
+        prog.emit(P.ADD, x, mo, x, t * hid)
+    prog.emit(P.RMS_NORM, x, model.F("norm.weight"), xn, t, hid, eps)
+    prog.tokens = t
+    return prog.finish()
+
+
+def bind_qwen_step(prog, model, cache, pos):
+    """Write the parameters of a step of prog.tokens tokens from pos."""
+    cfg = model.cfg
+    t = prog.tokens
+    cos, sin = model.rope(np.arange(pos, pos + t))
+    kw = {"pos": pos, "cos": np.ascontiguousarray(cos), "sin": np.ascontiguousarray(sin),
+          "scores": np.empty(cfg.num_heads * (pos + t) + 64, np.float32)}
+    for i in range(model.n_layers):
+        if cfg.layer_types[i] == "full_attention":
+            K, V = cache.kv[i]
+            kw["K.%d" % i], kw["V.%d" % i] = K, V
+            kw["hs"] = K.shape[1] * K.shape[2]
+        else:
+            kw["conv.%d" % i], kw["S.%d" % i] = cache.conv[i], cache.state[i]
+    prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
+
+
+class QwenProgram(QwenCPU):
+    """QwenCPU with the step as one program (compile_qwen_step). A prompt
+    runs in chunks of at most CHUNK tokens; each token count has its own
+    program."""
+
+    CHUNK = 128
+
+    def __init__(self, path, cfg=None, layers=None):
+        super().__init__(path, cfg, layers)
+        self.programs = {}
+
+    def program(self, t):
+        prog = self.programs.get(t)
+        if prog is None:
+            prog = self.programs[t] = compile_qwen_step(self, t)
+        return prog
+
+    def forward(self, ids, cache, start_pos=0, hook=None):
+        ids = list(ids)
+        out = []
+        c0 = 0
+        while c0 < len(ids):
+            chunk = ids[c0:c0 + self.CHUNK]
+            prog = self.program(len(chunk))
+            bind_qwen_step(prog, self, cache, start_pos + c0)
+            prog.names["x"][:] = self.embed(chunk)
+            prog.run()
+            out.append(prog.names["xn"].copy())
+            c0 += len(chunk)
+        cache.n = start_pos + len(ids)
+        return np.concatenate(out)

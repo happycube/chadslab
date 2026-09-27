@@ -24,7 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from np_gemma import ops  # noqa: E402
-from np_gemma.qwen import QwenCache, QwenConfig, QwenCPU  # noqa: E402
+from np_gemma.qwen import QwenCache, QwenConfig, QwenCPU, QwenProgram  # noqa: E402
 from np_gemma.qwen_tok import QwenTokenizer  # noqa: E402
 
 PATH = "models/Qwen3.6-35B-A3B-OptiQ-4bit"
@@ -37,13 +37,17 @@ def main():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--split", type=int, default=30)
     ap.add_argument("--tokens", type=int, default=48)
+    ap.add_argument("--impl", choices=("program", "cpu"), default="program",
+                    help="program: the step as one program (QwenProgram); cpu: one call "
+                         "for each operation (QwenCPU).")
     args = ap.parse_args()
     cfg = QwenConfig(args.path)
+    Model = QwenProgram if args.impl == "program" else QwenCPU
     ok = True
     if args.ref:
         ref = np.load(args.ref)
         ids = [int(x) for x in ref["ids"]]
-        m = QwenCPU(args.path, cfg, layers=args.layers)
+        m = Model(args.path, cfg, layers=args.layers)
         lg = m.logits(m.forward(ids, QwenCache(cfg, len(ids) + 8)))
         r = float(np.abs(lg - ref["logits"]).max() / np.abs(ref["logits"]).max())
         same = float((lg.argmax(-1) == ref["logits"].argmax(-1)).mean())
@@ -59,7 +63,7 @@ def main():
             args.layers, args.split, 100 * same2))
         ok &= same >= 0.9 and same2 >= 0.9
 
-    m = QwenCPU(args.path, cfg)
+    m = Model(args.path, cfg)
     tok = QwenTokenizer(os.path.join(args.path, "tokenizer.json"))
     prompt = ("<|im_start|>user\nExplain in two sentences why the sky is blue.<|im_end|>\n"
               "<|im_start|>assistant\n<think>\n\n</think>\n\n")

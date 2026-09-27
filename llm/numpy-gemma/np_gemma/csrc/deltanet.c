@@ -21,17 +21,17 @@ static inline float gdn_silu(float v)
  * v_dim), a and b (t x v_heads). S (v_heads x k_dim x v_dim) is the state.
  * out (t x v_heads * v_dim) gets rms_norm(o) * norm_w * silu(z).
  *
- * One parallel region: first the convolution of all the channels (tokens
+ * gdn_body runs inside a parallel region: first the convolution of all the channels (tokens
  * in order), then each value head on its own thread. */
-void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
-              const float *z, const float *a, const float *b, const float *A_log,
-              const float *dt_bias, const float *norm_w, float *S, float *out, float *scratch,
-              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps)
+static void gdn_body(const float *qkv, float *conv, const float *conv_w, int kernel,
+                     const float *z, const float *a, const float *b, const float *A_log,
+                     const float *dt_bias, const float *norm_w, float *S, float *out,
+                     float *scratch, int t, int k_heads, int v_heads, int k_dim, int v_dim,
+                     float eps)
 {
     int kd = k_heads * k_dim, vd = v_heads * v_dim, cd = 2 * kd + vd;
     int rep = v_heads / k_heads;
     float *cv = scratch;                              /* t x cd, after conv and silu */
-    #pragma omp parallel
     {
         #pragma omp for schedule(static)
         for (int c = 0; c < cd; ++c) {
@@ -119,4 +119,14 @@ void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
             }
         }
     }
+}
+
+void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
+              const float *z, const float *a, const float *b, const float *A_log,
+              const float *dt_bias, const float *norm_w, float *S, float *out, float *scratch,
+              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps)
+{
+    #pragma omp parallel
+    gdn_body(qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, t,
+             k_heads, v_heads, k_dim, v_dim, eps);
 }
