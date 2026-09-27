@@ -486,7 +486,7 @@ def compile_e4b_group(model, t):
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
     c.p.slot("pos")
-    c.compile(P.e4b_step_form(model))
+    c.compile(P.e4b_step_form(model, fused=True))
     c.p.tokens = t
     return c.p.finish()
 

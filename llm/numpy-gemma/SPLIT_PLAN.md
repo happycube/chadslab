@@ -756,8 +756,29 @@ The products were not the cause of the difference. Two things were:
     int8 products           1756 tok/s   4093 tok/s   5113 tok/s
 
 The layers with heads of 512 values take 9 of the 16 ms of the attention.
-The next steps are the projection of the layer input in float16 (11 ms to
-about 1 ms), and fused small operations (about 10 ms).
+
+Two more changes followed:
+
+1. The projection of the layer input has a bfloat16 matrix, and k_gemm<2>
+   computed it in float32 (11 ms). The kernel k_gemm_bh computes it on the
+   tensor cores. It copies the bfloat16 rows with cp.async and changes each
+   fragment to float16 in registers. It takes 1.8 ms.
+2. The GPU group of the E4B uses fused operations (e4b_layer_form with
+   fused=True). GP_ADD_NORM does the norm of o, the add to x, and the
+   multiplication by the layer scalar in one pass. GP_GELU_MUL_ROWS does
+   GELU and the product with u. The small operations go from 39 ms to 22
+   ms. The fused kernels do the same operations in the same order, with no
+   fused multiply-add, so the values are the same as before.
+
+    E4B, 1024 tokens    GPU kernels   pass         top token as float32
+    float16 products    -             3107 tok/s   99.9% (before: 99.9%)
+    int8 products       197 ms        4492 tok/s   98.0% (before: 98.6%)
+    llama.cpp           171 ms        5178 tok/s   -
+
+The float16 of the projection changes 6 of the 1024 top tokens of the int8
+mode, and none of the float16 mode. The products and the quantization of
+x now take about 26 ms more than in llama.cpp. The other kernels take
+about the same time as in llama.cpp.
 
 ### The drafter on the GPU
 

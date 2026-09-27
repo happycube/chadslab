@@ -76,7 +76,7 @@ enum {
     GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
     GP_HOT_MOE = 88, GP_MOE_GPU = 89, GP_FETCH = 90, GP_FETCH_WAIT = 91,
     GP_FETCH_DONE = 92, GP_HOT_SPLIT_MT = 93, GP_F32_LINEAR = 94, GP_DRAFT_HEAD = 95,
-    GP_ARGMAX = 96,
+    GP_ARGMAX = 96, GP_ADD_NORM = 97,
 };
 
 static cudaStream_t gg_stream;
@@ -189,6 +189,32 @@ __global__ void k_mul_s(const gp_rec *r, const int64_t *e)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI(3)) {
         DP(float, 2)[i] = DP(const float, 0)[i] * df(r, e, 1);
+    }
+}
+
+/* GP_ADD_NORM: o, w, x, out, rows, cols, eps, scale. For each row,
+ * out = (x + o s w) scale, where s = 1 / sqrt(mean of o^2 + eps). This is
+ * GP_RMS_NORM of o, GP_ADD, and GP_MUL_S in one pass, with the same
+ * operations in the same order (as k_rms_norm), so the values are the same.
+ * out can be x. One block of 256 threads for each row. */
+__global__ void k_add_norm(const gp_rec *r, const int64_t *e)
+{
+    int cols = DI(5);
+    const float *o = DP(const float, 0) + (size_t)blockIdx.x * cols;
+    const float *w = DP(const float, 1);
+    const float *x = DP(const float, 2) + (size_t)blockIdx.x * cols;
+    float *out = DP(float, 3) + (size_t)blockIdx.x * cols;
+    float eps = df(r, e, 6), scale = df(r, e, 7);
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        ss += o[i] * o[i];
+    }
+    ss = block_sum(ss);
+    float s = 1.0f / sqrtf(ss / (float)cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        /* No fused multiply-add, so the rounding is that of the three
+         * kernels. */
+        out[i] = __fmul_rn(__fadd_rn(x[i], __fmul_rn(__fmul_rn(o[i], s), w[i])), scale);
     }
 }
 
@@ -1290,6 +1316,108 @@ __global__ void __launch_bounds__(256) k_gemm_tc2(const __half *x, const uint8_t
                     acc[i][j][1] += dsc[j][1] * blk[i][j][1];
                     acc[i][j][2] += dsc[j][0] * blk[i][j][2];
                     acc[i][j][3] += dsc[j][1] * blk[i][j][3];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int n = n0 + wn + j * 8 + 2 * c;
+            int m = m0 + wm + i * 16 + g;
+            if (m < t) {
+                if (n < rows) out[(size_t)m * rows + n] = acc[i][j][0];
+                if (n + 1 < rows) out[(size_t)m * rows + n + 1] = acc[i][j][1];
+            }
+            if (m + 8 < t) {
+                if (n < rows) out[(size_t)(m + 8) * rows + n] = acc[i][j][2];
+                if (n + 1 < rows) out[(size_t)(m + 8) * rows + n + 1] = acc[i][j][3];
+            }
+        }
+    }
+}
+
+/* ---------- the product with a bfloat16 matrix on the tensor cores ----------
+ * k_gemm_bh: as k_gemm_tc2, for a matrix of bfloat16 rows (GP_BF16_LINEAR,
+ * the projection of the layer input of the E4B). The block copies steps of
+ * BHK columns of x (float16) and of w (bfloat16) with cp.async into two
+ * buffers. A fragment of B changes from bfloat16 to float16 in registers.
+ * The sums are float32. */
+#define BHK 32
+
+__device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v)
+{
+    __half2 h = __floats2half2_rn(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+    return *(uint32_t *)&h;
+}
+
+__global__ void __launch_bounds__(256) k_gemm_bh(const __half *x, const uint16_t *w, float *out,
+                                                 int t, int rows, int cols)
+{
+    __shared__ __align__(16) __half as_[2][T2M][BHK + 8];
+    __shared__ __align__(16) uint16_t bs[2][T2N][BHK + 8];
+    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
+    int g = lane / 4, c = lane % 4;
+    int steps = cols / BHK;
+    float acc[4][4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+        }
+    }
+    /* Copy step st to buffer b. A row past the end reads the last row; the
+     * tile does not write its result. */
+    auto load = [&](int st, int b) {
+        int k0 = st * BHK;
+        for (int e = threadIdx.x; e < T2M * BHK / 8; e += blockDim.x) {
+            int m = e / (BHK / 8), kk = (e % (BHK / 8)) * 8;
+            int q = min(m0 + m, t - 1);
+            cp_async16(&as_[b][m][kk], x + (size_t)q * cols + k0 + kk);
+        }
+        for (int e = threadIdx.x; e < T2N * BHK / 8; e += blockDim.x) {
+            int n = e / (BHK / 8), kk = (e % (BHK / 8)) * 8;
+            int row = min(n0 + n, rows - 1);
+            cp_async16(&bs[b][n][kk], w + (size_t)row * cols + k0 + kk);
+        }
+        cp_async_commit();
+    };
+    load(0, 0);
+    for (int st = 0; st < steps; ++st) {
+        int b = st & 1;
+        if (st + 1 < steps) {
+            load(st + 1, b ^ 1);
+            cp_async_wait1();
+        } else {
+            cp_async_wait0();
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int ks = 0; ks < BHK / 16; ++ks) {
+            int kk = ks * 16;
+            uint32_t bf[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint16_t *br = &bs[b][wn + j * 8 + g][kk + 2 * c];
+                bf[j][0] = bf2_to_h2(*(const uint32_t *)br);
+                bf[j][1] = bf2_to_h2(*(const uint32_t *)(br + 8));
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int r0 = wm + i * 16;
+                uint32_t a[4];
+                a[0] = *(const uint32_t *)&as_[b][r0 + g][kk + 2 * c];
+                a[1] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 2 * c];
+                a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 2 * c + 8];
+                a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 2 * c + 8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    mma16816(acc[i][j], a, bf[j]);
                 }
             }
         }
@@ -3496,6 +3624,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_mt_gemv_bf16<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(
                 (const float *)(intptr_t)hlit(r, 0, &bad), (const uint16_t *)(intptr_t)hlit(r, 1, &bad),
                 (float *)(intptr_t)hlit(r, 2, &bad), (int)t, (int)rows, (int)cols);
+        } else if (gg_tc && g->tc && cols % BHK == 0 && (size_t)t * cols <= g->xh_n) {
+            const float *x = (const float *)(intptr_t)hlit(r, 0, &bad);
+            size_t n = (size_t)t * cols;
+            k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, s>>>(x, g->xh, n);
+            k_gemm_bh<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0, s>>>(
+                g->xh, (const uint16_t *)(intptr_t)hlit(r, 1, &bad),
+                (float *)(intptr_t)hlit(r, 2, &bad), (int)t, (int)rows, (int)cols);
         } else {
             k_gemm<2><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, s>>>(
                 (const float *)(intptr_t)hlit(r, 0, &bad), (const void *)(intptr_t)hlit(r, 1, &bad),
@@ -3582,6 +3717,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     }
     case GP_ARGMAX:
         k_argmax<<<1, 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_ADD_NORM:
+        k_add_norm<<<(unsigned)hlit(r, 4, &bad), T, 0, s>>>(dr, denv);
         break;
     case GP_HOT_SPLIT_MT:
         k_hot_split_mt<<<(unsigned)cdiv(hlit(r, 5, &bad), T), T, 0, s>>>(dr, denv);
@@ -3994,6 +4132,8 @@ void *gg_load(const int64_t *prog, int use_graph)
             n = (size_t)r->v[6] * (size_t)r->v[5];
         } else if (r->op == GP_INT4_MULTI4_MT && r->v[2] > MT_MAX) {
             n = (size_t)r->v[2] * (size_t)r->v[1];
+        } else if (r->op == GP_BF16_LINEAR && r->v[5] > MT_MAX) {
+            n = (size_t)r->v[5] * (size_t)r->v[4];
         } else if (r->op == GP_MOE_GPU) {
             size_t a = (size_t)r->v[3] * (size_t)r->v[8];
             size_t b = (size_t)r->v[3] * (size_t)r->v[4] * (size_t)r->v[10];

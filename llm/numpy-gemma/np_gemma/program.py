@@ -77,7 +77,7 @@ XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 # The records that move work between the GPU and the CPU (np_gemma/gpu.py).
 TO_HOST, CPU_JOIN, TO_DEV, HOT_SPLIT, HOT_MOE = 84, 85, 86, 87, 88
 MOE_GPU, FETCH, FETCH_WAIT, FETCH_DONE, HOT_SPLIT_MT = 89, 90, 91, 92, 93
-F32_LINEAR, DRAFT_HEAD, ARGMAX = 94, 95, 96
+F32_LINEAR, DRAFT_HEAD, ARGMAX, ADD_NORM = 94, 95, 96, 97
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -94,7 +94,7 @@ OP_NAMES = {v: k for k, v in dict(
     TO_DEV=TO_DEV, MOE_N=MOE_N, HOT_SPLIT=HOT_SPLIT, HOT_MOE=HOT_MOE, MOE_GPU=MOE_GPU,
     FETCH=FETCH, FETCH_WAIT=FETCH_WAIT, FETCH_DONE=FETCH_DONE,
     HOT_SPLIT_MT=HOT_SPLIT_MT, F32_LINEAR=F32_LINEAR, DRAFT_HEAD=DRAFT_HEAD,
-    ARGMAX=ARGMAX).items()}
+    ARGMAX=ARGMAX, ADD_NORM=ADD_NORM).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -299,6 +299,13 @@ def _py_step(op, a, e):
         e[a[0][1]] = min(V(1), V(2))
     elif op == RMS_NORM:
         L.gemma_rms_norm(V(0), V(1) or None, V(2), V(3), V(4), F(5))
+    elif op == ADD_NORM:
+        rows, cols = V(4), V(5)
+        o = _arr(V(0), rows * cols).reshape(rows, cols)
+        x = _arr(V(2), rows * cols).reshape(rows, cols)
+        s = 1.0 / np.sqrt(np.mean(o * o, axis=1, keepdims=True) + np.float32(F(6)))
+        y = (x + o * s.astype(np.float32) * _arr(V(1), cols)) * np.float32(F(7))
+        _arr(V(3), rows * cols)[:] = y.reshape(-1)
     elif op == ADD:
         n = V(3)
         np.add(_arr(V(0), n), _arr(V(1), n), out=_arr(V(2), n))
@@ -649,6 +656,24 @@ def k_add(c, a, b, out=None):
     return out
 
 
+def k_add_norm(c, x, o, w, s=1.0, out=None):
+    """(add_norm x o w [s]): (x + rms_norm(o) w) s in one pass. The GPU group
+    of the E4B uses it in place of rms_norm, add, and mul; the values are
+    the same."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ADD_NORM, o, w, x, out, x.shape[0], x.shape[1], float(c.eps),
+             float(np.asarray(s).reshape(-1)[0]))
+    return out
+
+
+def k_gelu_mul(c, g, u, out=None):
+    """(gelu_mul g u): gelu(g) * u in one pass, as gelu then mul_v."""
+    out = c.buffer(g.shape) if out is None else out
+    t = g.shape[0] if g.ndim > 1 else 1
+    c.p.emit(GELU_MUL_ROWS, g, u, out, t, g.size // t)
+    return out
+
+
 def k_mul(c, x, s, out=None):
     """(mul x s): x times the float32 s. As x * layer_scalar in NumPy. s can
     be an array of one value."""
@@ -983,6 +1008,8 @@ KERNELS = {
     "attn_rows_f32": lambda c, layer, q: k_attn_rows(c, layer, q, "f32"),
     "router": k_router,
     "gelu": k_gelu,
+    "gelu_mul": k_gelu_mul,
+    "add_norm": k_add_norm,
     "mul_v": k_mul_v,
     "mul_pli": k_mul_pli,
     "linear": k_linear,
@@ -1225,12 +1252,15 @@ def step_params(prog, model, cache, pos):
 E4B_PREFIX = "model.language_model."
 
 
-def e4b_layer_form(model, i):
+def e4b_layer_form(model, i, fused=False):
     """Return one decoder layer of the E4B model as a nested expression.
 
     The expression follows E4B.layer, E4B.attention, and E4B.mlp. A shared
     layer computes only the query. It reads the key and the value of its
     source layer.
+
+    fused uses add_norm and gelu_mul, which do two or three operations in
+    one pass and give the same values. The GPU group uses it.
     """
     plan = model.cfg.plan[i]
     kind = "s" if plan.is_sliding else "f"
@@ -1241,6 +1271,13 @@ def e4b_layer_form(model, i):
 
     def M(k):
         return ("m", p + k)
+
+    def add_norm(o, w, scale=None):
+        """x += rms_norm(o) w, then x *= scale."""
+        if fused:
+            return (("set", "x", ("add_norm", "x", o, T(w)) + ((T(scale),) if scale else ())),)
+        forms = (("set", "x", ("add", "x", ("rms_norm", o, T(w)))),)
+        return forms + ((("set", "x", ("mul", "x", T(scale))),) if scale else ())
 
     if plan.shared:
         attn = (("let", "q", ("linear", M("self_attn.q_proj"), "h")),
@@ -1258,20 +1295,19 @@ def e4b_layer_form(model, i):
             *attn,
             ("let", "a", ("attn_e4b", i, "q")),
             ("let", "o", ("linear", M("self_attn.o_proj"), "a")),
-            ("set", "x", ("add", "x", ("rms_norm", "o", T("post_attention_layernorm.weight")))),
+            *add_norm("o", "post_attention_layernorm.weight"),
             ("let", ("g", "u"), ("int4_multi4",
                                  ("rms_norm", "x", T("pre_feedforward_layernorm.weight")),
                                  M("mlp.gate_proj"), M("mlp.up_proj"))),
-            ("let", "d", ("linear", M("mlp.down_proj"), ("mul_v", ("gelu", "g"), "u"))),
-            ("set", "x", ("add", "x", ("rms_norm", "d", T("post_feedforward_layernorm.weight")))),
+            ("let", "d", ("linear", M("mlp.down_proj"),
+                          ("gelu_mul", "g", "u") if fused else ("mul_v", ("gelu", "g"), "u"))),
+            *add_norm("d", "post_feedforward_layernorm.weight"),
             ("let", "pg", ("gelu", ("linear", M("per_layer_input_gate"), "x"))),
             ("let", "pp", ("linear", M("per_layer_projection"), ("mul_pli", "pg", "pl", i))),
-            ("set", "x", ("add", "x", ("rms_norm", "pp",
-                                       T("post_per_layer_input_norm.weight")))),
-            ("set", "x", ("mul", "x", T("layer_scalar"))))
+            *add_norm("pp", "post_per_layer_input_norm.weight", "layer_scalar"))
 
 
-def e4b_step_form(model):
+def e4b_step_form(model, fused=False):
     """Return a whole step of the E4B model.
 
     The step starts with the per-layer inputs, as E4B.per_layer_inputs does
@@ -1286,7 +1322,7 @@ def e4b_step_form(model):
             ("let", "pn", ("rms_norm_rows", "proj", n,
                            ("t", E4B_PREFIX + "per_layer_projection_norm.weight"))),
             ("let", "pl", ("mul", ("add", "pn", "tok"), cfg.per_layer_input_scale)),
-            *[e4b_layer_form(model, i) for i in range(cfg.num_hidden_layers)],
+            *[e4b_layer_form(model, i, fused) for i in range(cfg.num_hidden_layers)],
             ("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))))
 
 
