@@ -317,6 +317,24 @@ Two parts of this runtime cut the cache:
 Test: MTP gives the tokens of the plain decode; a second turn gives the
 tokens of one prompt pass of the whole chat.
 
+Status of phase 3 (done):
+
+- The DeltaNet record has a log mode (csrc/deltanet.c). A verify group runs
+  its tokens on a copy of the state of each head. For each token it keeps
+  the input of the convolution, k, the delta, and the decay. The call
+  gdn_commit applies the first n tokens with the same operations. QwenProgram.verify
+  and QwenProgram.commit use it.
+- The products now add in one order for 1 token, a few tokens, and the
+  tiles. Thus a token gives the same bits alone and in a group. A verify
+  group of 4 gives the rows of 4 plain steps, and commit(2) gives the state
+  of 2 plain steps, bit for bit. Before, the three ways of the product
+  differed in the last bits. Then the state after a commit was not the
+  state of the plain decode.
+- QwenSession keeps a copy of the state (60 MB) at the end of each prompt.
+  A new turn starts from the last copy at or before the end of the common
+  prefix. A second turn and a turn that goes back to the first prompt give
+  the same bits as one prompt pass of the whole chat.
+
 ## Phase 4: the GPU path
 
 The design of the 26B: the dense part on the GPU (about 2.0 GB), the

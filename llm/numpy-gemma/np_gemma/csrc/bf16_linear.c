@@ -7459,12 +7459,12 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_GDN:
         /* qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch,
-         * t, k_heads, v_heads, k_dim, v_dim, eps */
+         * t, k_heads, v_heads, k_dim, v_dim, eps, log (null, or an MTP verify group) */
         gdn_body(GP_P(const float, 0), GP_P(float, 1), GP_P(const float, 2), GP_I(3),
                  GP_P(const float, 4), GP_P(const float, 5), GP_P(const float, 6),
                  GP_P(const float, 7), GP_P(const float, 8), GP_P(const float, 9), GP_P(float, 10),
                  GP_P(float, 11), GP_P(float, 12), GP_I(13), GP_I(14), GP_I(15), GP_I(16),
-                 GP_I(17), gp_f(r, e, 18));
+                 GP_I(17), gp_f(r, e, 18), GP_P(float, 19));
         break;
     case GP_ATTN_PREP:
         /* qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps, scale,

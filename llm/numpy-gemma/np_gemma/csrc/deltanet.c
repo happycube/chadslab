@@ -21,18 +21,39 @@ static inline float gdn_silu(float v)
  * v_dim), a and b (t x v_heads). S (v_heads x k_dim x v_dim) is the state.
  * out (t x v_heads * v_dim) gets rms_norm(o) * norm_w * silu(z).
  *
- * gdn_body runs inside a parallel region: first the convolution of all the channels (tokens
- * in order), then each value head on its own thread. */
+ * gdn_body runs inside a parallel region: first the convolution of all the
+ * channels (tokens in order), then each value head on its own thread.
+ *
+ * With a log (an MTP verify group), the call does not change conv and S: it
+ * runs the tokens on a copy of the state of each head (in the scratch after
+ * the convolution), and the log gets, for each token, the raw input of the
+ * convolution (cd values) and, for each head, k, the delta, and the decay
+ * (k_dim + v_dim + 1 values). gdn_commit then applies the first n tokens.
+ * The scratch has t * cd floats, and v_heads * k_dim * v_dim more with a
+ * log. */
+static inline size_t gdn_log_size(int t, int k_heads, int v_heads, int k_dim, int v_dim)
+{
+    size_t cd = (size_t)2 * k_heads * k_dim + (size_t)v_heads * v_dim;
+    return (size_t)t * (cd + (size_t)v_heads * (k_dim + v_dim + 1));
+}
+
 static void gdn_body(const float *qkv, float *conv, const float *conv_w, int kernel,
                      const float *z, const float *a, const float *b, const float *A_log,
                      const float *dt_bias, const float *norm_w, float *S, float *out,
                      float *scratch, int t, int k_heads, int v_heads, int k_dim, int v_dim,
-                     float eps)
+                     float eps, float *log)
 {
     int kd = k_heads * k_dim, vd = v_heads * v_dim, cd = 2 * kd + vd;
     int rep = v_heads / k_heads;
     float *cv = scratch;                              /* t x cd, after conv and silu */
+    size_t lrow = (size_t)cd + (size_t)v_heads * (k_dim + v_dim + 1);
     {
+        if (log != NULL) {
+            #pragma omp for schedule(static)
+            for (int i = 0; i < t; ++i) {
+                memcpy(log + (size_t)i * lrow, qkv + (size_t)i * cd, (size_t)cd * 4);
+            }
+        }
         #pragma omp for schedule(static)
         for (int c = 0; c < cd; ++c) {
             const float *w = conv_w + (size_t)c * kernel;
@@ -52,14 +73,22 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
                 }
                 hist[kernel - 2] = xin;
             }
-            for (int j = 0; j < kernel - 1; ++j) {
-                conv[(size_t)j * cd + c] = hist[j];
+            if (log == NULL) {
+                for (int j = 0; j < kernel - 1; ++j) {
+                    conv[(size_t)j * cd + c] = hist[j];
+                }
             }
         }
         #pragma omp for schedule(static)
         for (int hv = 0; hv < v_heads; ++hv) {
             int hk = hv / rep;
             float *Sh = S + (size_t)hv * k_dim * v_dim;
+            if (log != NULL) {
+                /* A verify group: a copy of the state of the head. */
+                float *cp = scratch + (size_t)t * cd + (size_t)hv * k_dim * v_dim;
+                memcpy(cp, Sh, (size_t)k_dim * v_dim * 4);
+                Sh = cp;
+            }
             float q[256], kk[256], o[256], kv[256];
             float Aexp = expf(A_log[hv]);
             for (int i = 0; i < t; ++i) {
@@ -97,6 +126,12 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
                     kv[e] = (vs[e] - kv[e]) * beta;
                     o[e] = 0.f;
                 }
+                if (log != NULL) {
+                    float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (k_dim + v_dim + 1);
+                    memcpy(lg, kk, (size_t)k_dim * 4);
+                    memcpy(lg + k_dim, kv, (size_t)v_dim * 4);
+                    lg[k_dim + v_dim] = decay;
+                }
                 for (int d = 0; d < k_dim; ++d) {
                     float *Sr = Sh + (size_t)d * v_dim;
                     float kd_ = kk[d], qd = q[d];
@@ -124,9 +159,69 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
 void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
               const float *z, const float *a, const float *b, const float *A_log,
               const float *dt_bias, const float *norm_w, float *S, float *out, float *scratch,
-              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps)
+              int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps, float *log)
 {
     #pragma omp parallel
     gdn_body(qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, t,
-             k_heads, v_heads, k_dim, v_dim, eps);
+             k_heads, v_heads, k_dim, v_dim, eps, log);
+}
+
+/* Apply the first n tokens of a log (gdn_body with a log of t tokens) to
+ * conv and S: the same operations on S as gdn_body (S *= decay, then
+ * S += k delta^T), so the state is the state after n plain steps. */
+static void gdn_commit_body(float *conv, float *S, const float *log, int n, int kernel,
+                            int k_heads, int v_heads, int k_dim, int v_dim)
+{
+    int cd = 2 * k_heads * k_dim + v_heads * v_dim;
+    size_t lrow = (size_t)cd + (size_t)v_heads * (k_dim + v_dim + 1);
+    #pragma omp for schedule(static)
+    for (int c = 0; c < cd; ++c) {
+        float hist[8];
+        for (int j = 0; j < kernel - 1; ++j) {
+            hist[j] = conv[(size_t)j * cd + c];
+        }
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < kernel - 2; ++j) {
+                hist[j] = hist[j + 1];
+            }
+            hist[kernel - 2] = log[(size_t)i * lrow + c];
+        }
+        for (int j = 0; j < kernel - 1; ++j) {
+            conv[(size_t)j * cd + c] = hist[j];
+        }
+    }
+    #pragma omp for schedule(static)
+    for (int hv = 0; hv < v_heads; ++hv) {
+        float *Sh = S + (size_t)hv * k_dim * v_dim;
+        for (int i = 0; i < n; ++i) {
+            const float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (k_dim + v_dim + 1);
+            const float *kk = lg, *dl = lg + k_dim;
+            float decay = lg[k_dim + v_dim];
+            for (int d = 0; d < k_dim; ++d) {
+                float *Sr = Sh + (size_t)d * v_dim;
+                for (int e = 0; e < v_dim; ++e) {
+                    Sr[e] *= decay;
+                }
+            }
+            for (int d = 0; d < k_dim; ++d) {
+                float *Sr = Sh + (size_t)d * v_dim;
+                float kd_ = kk[d];
+                for (int e = 0; e < v_dim; ++e) {
+                    Sr[e] += kd_ * dl[e];
+                }
+            }
+        }
+    }
+}
+
+void gdn_commit(float *conv, float *S, const float *log, int n, int kernel, int k_heads,
+                int v_heads, int k_dim, int v_dim)
+{
+    #pragma omp parallel
+    gdn_commit_body(conv, S, log, n, kernel, k_heads, v_heads, k_dim, v_dim);
+}
+
+size_t gdn_log_floats(int t, int k_heads, int v_heads, int k_dim, int v_dim)
+{
+    return gdn_log_size(t, k_heads, v_heads, k_dim, v_dim);
 }

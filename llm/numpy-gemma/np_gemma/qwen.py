@@ -122,6 +122,29 @@ class QwenCache:
                                          np.float32)
 
 
+def _cache_snapshot(self):
+    """A copy of the state at position n: the convolution inputs and the
+    states of the linear layers (about 60 MB for the 35B). The keys and
+    values need no copy: the rows before n do not change."""
+    return (self.n, {i: a.copy() for i, a in self.conv.items()},
+            {i: a.copy() for i, a in self.state.items()})
+
+
+def _cache_restore(self, snap):
+    """Go back to a snapshot: the state of its position. Rows of keys and
+    values after it are written again by the next tokens."""
+    n, conv, state = snap
+    for i, a in conv.items():
+        self.conv[i][...] = a
+    for i, a in state.items():
+        self.state[i][...] = a
+    self.n = n
+
+
+QwenCache.snapshot = _cache_snapshot
+QwenCache.restore = _cache_restore
+
+
 class Qwen:
     """The text model. Weights stay quantized in the memory maps; the NumPy
     path dequantizes each matrix when it uses it.
@@ -451,13 +474,17 @@ class QwenCPU(Qwen):
 
 # ---- the step as a program of records (gemma_run, one parallel region) --------
 
-def compile_qwen_step(model, t):
+def compile_qwen_step(model, t, verify=False):
     """Compile a step of t tokens of the model (a QwenCPU) into a program of
     records: one parallel region for the whole step, as the Gemma step.
 
     The input is names["x"] (t x hidden, the rows of the embeddings) and the
     output names["xn"] (after the final norm). bind_qwen_step writes the
-    parameters: pos, the RoPE tables, and the arrays of the cache."""
+    parameters: pos, the RoPE tables, and the arrays of the cache.
+
+    verify makes an MTP verify group: the linear layers do not change their
+    state; each writes a log (names["log.<layer>"]) that QwenProgram.commit
+    applies for the accepted tokens."""
     from . import program as P
     cfg = model.cfg
     prog = P.Program()
@@ -475,7 +502,8 @@ def compile_qwen_step(model, t):
     mo, logits = f32(t, hid), f32(t, E)
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
     scratch = cops.ma_moe_scratch(t, k, E, hid, inner)
-    gscr = f32(t, cd)
+    gscr = np.zeros(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0),
+                    np.float32)
     prog.names.update(x=x, xn=xn)
     pos = prog.slot("pos")
     cos, sin, scores = prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
@@ -489,6 +517,14 @@ def compile_qwen_step(model, t):
         prog.emit(P.MA_LINEAR, xq4 if m.bits == 4 else xq8, xs, xsum, m.q, m.scales, m.biases,
                   m.bits, m.rows, m.cols, t, out)
         return m.rows
+
+    def log_of(i):
+        if not verify:
+            return None
+        log = np.zeros(cops.gdn_log_floats(t, cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim,
+                                           cfg.lin_v_dim), np.float32)
+        prog.names["log.%d" % i] = log
+        return log
 
     for i in range(model.n_layers):
         p = "layers.%d." % i
@@ -518,7 +554,8 @@ def compile_qwen_step(model, t):
                       model.F(a + "conv1d.weight", (cd, cfg.conv_kernel)), cfg.conv_kernel, o2,
                       att, o3, model.F(a + "A_log"), model.F(a + "dt_bias"),
                       model.F(a + "norm.weight"), prog.slot("S.%d" % i), gate, gscr, t,
-                      cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps)
+                      cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps,
+                      log_of(i))
             quant(gate, vd)
             lin(a + "out_proj", o4)
         # o4 (t x hidden) has the output of the attention; x += o4.
@@ -560,9 +597,13 @@ def bind_qwen_step(prog, model, cache, pos):
 class QwenProgram(QwenCPU):
     """QwenCPU with the step as one program (compile_qwen_step). A prompt
     runs in chunks of at most CHUNK tokens; each token count has its own
-    program."""
+    program.
 
-    CHUNK = 128
+    verify() and commit() are the MTP verify group: verify runs the tokens
+    and keeps the state of the linear layers; commit(n) applies the first n
+    tokens to the state (QWEN_PLAN.md, phase 3)."""
+
+    CHUNK = 512
 
     def __init__(self, path, cfg=None, layers=None):
         super().__init__(path, cfg, layers)
@@ -573,6 +614,33 @@ class QwenProgram(QwenCPU):
         if prog is None:
             prog = self.programs[t] = compile_qwen_step(self, t)
         return prog
+
+    def verify(self, ids, cache, start_pos):
+        """Run a group of tokens from start_pos as an MTP verify group.
+        Return the hidden states of every token. The keys and values of the
+        full layers are written for all the tokens; the state of the linear
+        layers does not change until commit()."""
+        t = len(ids)
+        prog = self.programs.get(("verify", t))
+        if prog is None:
+            prog = self.programs[("verify", t)] = compile_qwen_step(self, t, verify=True)
+        bind_qwen_step(prog, self, cache, start_pos)
+        prog.names["x"][:] = self.embed(ids)
+        prog.run()
+        self._pending = (prog, cache, start_pos)
+        return prog.names["xn"].copy()
+
+    def commit(self, n):
+        """Keep the first n tokens of the last verify group."""
+        prog, cache, start = self._pending
+        cfg = self.cfg
+        for i in range(self.n_layers):
+            if cfg.layer_types[i] != "full_attention":
+                cops.gdn_commit(cache.conv[i], cache.state[i], prog.names["log.%d" % i], n,
+                                cfg.conv_kernel, cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim,
+                                cfg.lin_v_dim)
+        cache.n = start + n
+        self._pending = None
 
     def forward(self, ids, cache, start_pos=0, hook=None):
         ids = list(ids)
@@ -588,3 +656,60 @@ class QwenProgram(QwenCPU):
             c0 += len(chunk)
         cache.n = start_pos + len(ids)
         return np.concatenate(out)
+
+
+class QwenSession:
+    """Keep the cache between the turns of a chat, as model.Session does for
+    Gemma. The state of the linear layers cannot go back to an earlier
+    position, so the session keeps a snapshot at the end of each prompt. A
+    new turn that shares a prefix with the tokens of the cache restarts from
+    the last snapshot at or before the end of that prefix."""
+
+    def __init__(self, model, max_len=8192, snapshots=4):
+        self.model = model
+        self.max_len = max_len
+        self.cache = QwenCache(model.cfg, max_len)
+        self.ids = []
+        self.snaps = []            # (position, snapshot), the oldest first
+        self.max_snaps = snapshots
+        self.prefilled = 0
+
+    def prefill(self, ids):
+        """Put ids in the cache. Return the hidden state of the last token."""
+        ids = list(ids)
+        common = 0
+        while common < min(len(ids), len(self.ids)) and ids[common] == self.ids[common]:
+            common += 1
+        start = common if common == len(self.ids) else 0
+        if start == 0 and common > 0:
+            snap = [sp for sp in self.snaps if sp[0] <= common]
+            if snap:
+                pos, sn = snap[-1]
+                self.cache.restore(sn)
+                start = pos
+                self.snaps = [sp for sp in self.snaps if sp[0] <= pos]
+        if start == len(ids):
+            # The prompt is the cache: run its last token again.
+            start = len(ids) - 1
+            snap = [sp for sp in self.snaps if sp[0] <= start]
+            if not snap:
+                start = 0
+            else:
+                self.cache.restore(snap[-1][1])
+                start = snap[-1][0]
+        if start == 0:
+            self.cache = QwenCache(self.model.cfg, self.max_len)
+            self.snaps = []
+        self.prefilled = len(ids) - start
+        h = self.model.forward(ids[start:], self.cache, start_pos=start)
+        self.ids = ids
+        self.snaps.append((len(ids), self.cache.snapshot()))
+        del self.snaps[:-self.max_snaps]
+        return h[-1:]
+
+    def step(self, token):
+        """Run one generated token. Return its hidden state."""
+        pos = len(self.ids)
+        h = self.model.forward([token], self.cache, start_pos=pos)
+        self.ids.append(int(token))
+        return h

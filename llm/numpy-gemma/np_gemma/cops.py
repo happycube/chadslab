@@ -236,8 +236,12 @@ try:
         _lib.ma_moe_scratch.argtypes = [_int] * 5
         _lib.ma_moe_scratch.restype = ctypes.c_size_t
         _lib.gdn_step.argtypes = [_void_p, _void_p, _void_p, _int] + [_void_p] * 9 + \
-            [_int] * 5 + [ctypes.c_float]
+            [_int] * 5 + [ctypes.c_float, _void_p]
         _lib.gdn_step.restype = None
+        _lib.gdn_commit.argtypes = [_void_p, _void_p, _void_p] + [_int] * 6
+        _lib.gdn_commit.restype = None
+        _lib.gdn_log_floats.argtypes = [_int] * 5
+        _lib.gdn_log_floats.restype = ctypes.c_size_t
         _lib.gemma_argmax.restype = ctypes.c_int64
         _lib.gemma_int4_moe_gemv.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                              _int, _void_p, _int, _int, _int]
@@ -668,7 +672,18 @@ def gdn_step(qkv, conv, conv_w, z, a, b, A_log, dt_bias, norm_w, S, out, scratch
     _lib.gdn_step(qkv.ctypes.data, conv.ctypes.data, conv_w.ctypes.data, conv_w.shape[1],
                   z.ctypes.data, a.ctypes.data, b.ctypes.data, A_log.ctypes.data,
                   dt_bias.ctypes.data, norm_w.ctypes.data, S.ctypes.data, out.ctypes.data,
-                  scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps))
+                  scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps), None)
+
+
+def gdn_log_floats(t, k_heads, v_heads, k_dim, v_dim):
+    """The size of the log of a verify group of t tokens (csrc/deltanet.c)."""
+    return int(_lib.gdn_log_floats(t, k_heads, v_heads, k_dim, v_dim))
+
+
+def gdn_commit(conv, S, log, n, kernel, k_heads, v_heads, k_dim, v_dim):
+    """Apply the first n tokens of the log of a verify group to conv and S."""
+    _lib.gdn_commit(conv.ctypes.data, S.ctypes.data, log.ctypes.data, n, kernel, k_heads,
+                    v_heads, k_dim, v_dim)
 
 
 def q6k_rows(table, ids, cols):

@@ -133,20 +133,12 @@ static inline float ma_row_dot1(const uint8_t *wb, const uint16_t *s, const uint
         _mm512_mask_storeu_ps(sc + g0, m, _mm512_mul_ps(sv, _mm512_maskz_loadu_ps(m, xs + g0)));
         bacc = _mm512_fmadd_ps(bv, _mm512_maskz_loadu_ps(m, xsum + g0), bacc);
     }
-    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    /* One sum in the order of the groups: the tiles (ma_tile4) add in the
+     * same order, so a token gives the same bits alone and in a group. An
+     * MTP verify group then gives the values of the plain decode. */
+    __m512 a0 = _mm512_setzero_ps();
     if (bits == 8) {
-        int g = 0;
-        for (; g + 1 < ng; g += 2) {
-            __m512i w0 = _mm512_loadu_si512((const void *)(wb + (size_t)g * MA_G));
-            __m512i w1 = _mm512_loadu_si512((const void *)(wb + (size_t)(g + 1) * MA_G));
-            __m512i i0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0,
-                                             _mm512_loadu_si512((const void *)(xq + g * MA_G)));
-            __m512i i1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1,
-                                             _mm512_loadu_si512((const void *)(xq + (g + 1) * MA_G)));
-            a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i0), _mm512_set1_ps(sc[g]), a0);
-            a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i1), _mm512_set1_ps(sc[g + 1]), a1);
-        }
-        for (; g < ng; ++g) {
+        for (int g = 0; g < ng; ++g) {
             __m512i w0 = _mm512_loadu_si512((const void *)(wb + (size_t)g * MA_G));
             __m512i i0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0,
                                              _mm512_loadu_si512((const void *)(xq + g * MA_G)));
@@ -165,14 +157,10 @@ static inline float ma_row_dot1(const uint8_t *wb, const uint16_t *s, const uint
             is = _mm512_dpbusd_epi32(is, hi, _mm512_loadu_si512((const void *)(xp + 64)));
             __m512 pv = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(sc[2 * p]),
                                              _mm512_set1_ps(sc[2 * p + 1]));
-            if (p & 1) {
-                a1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), pv, a1);
-            } else {
-                a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), pv, a0);
-            }
+            a0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), pv, a0);
         }
     }
-    return _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) + _mm512_reduce_add_ps(bacc);
+    return _mm512_reduce_add_ps(a0) + _mm512_reduce_add_ps(bacc);
 }
 #endif
 
@@ -328,8 +316,12 @@ static void ma_row_dot(const uint32_t *w, const uint16_t *s, const uint16_t *b, 
     int ng = cols / MA_G;
     const uint8_t *wb = (const uint8_t *)w;
 #if defined(__AVX512VNNI__)
-    if (t == 1 && ng <= 256) {
-        out[0] = ma_row_dot1(wb, s, b, bits, cols, xq, xs, xsum);
+    if (ng <= 256) {
+        /* A few tokens: each one alone, for the same bits as the tiles. */
+        for (int j = 0; j < t; ++j) {
+            out[(size_t)j * ostride] = ma_row_dot1(wb, s, b, bits, cols, xq + (size_t)j * cols,
+                                                  xs + (size_t)j * ng, xsum + (size_t)j * ng);
+        }
         return;
     }
     __m512 acc[MA_MAX_T];
