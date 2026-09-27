@@ -682,6 +682,39 @@ agrees with the decode steps (6e-6). k_mt_gemv now fixes the token count
 when it compiles (1 to 16). The general form ran at half the rate of one
 token. A group of 3 tokens of the E4B went from 22.9 ms to 15.2 ms.
 
+### The limit of the tensor cores
+
+scripts/mma_peak.cu measures the peak rate of mma.sync on this GPU:
+
+    inputs    sums      rate
+    float16   float32   37 TFLOPS
+    float16   float16   38 TFLOPS
+    int8      int32     204 TOPS
+
+The products of the prompt pass of the E4B need about 8 TFLOP for 1024
+tokens. The kernel k_gemm_tc took 263 ms (30 TFLOPS). The kernel k_gemm_tc2 copies each step with
+cp.async into two buffers, so the copy of the next step runs during the
+compute. It uses tiles of 128 tokens by 128 rows, and it makes the float16
+values of the weights in registers from the 4-bit numbers. It takes 243 ms:
+33 TFLOPS, about 89% of the peak of float16. Thus a better float16 kernel
+cannot give much more.
+
+The kernel k_gemm_q8 (NP_GEMMA_GPU_TC=8) quantizes the rows of x to int8.
+Each block of 32 values has a scale, as in the Q8_0 form of ggml. The instruction
+m16n8k32 covers one int4 block, and its int32 sum is exact. The kernel then
+applies the two scales in float32. This is the method of llama.cpp.
+
+    E4B, 1024 tokens     products   pass         top token as float32 GPU
+    float32 kernels      -          589 tok/s    -
+    float16 (default)    243 ms     1527 tok/s   99.9%
+    int8                 150 ms     1756 tok/s   98.6%
+
+The int8 products take 150 ms, about 26% of the peak of int8. The
+multiplication by the two scales after each block costs as much as the
+products. The attention (80 ms) and the small operations (about 45 ms) now
+take as much time as the products. The default stays float16, because it
+stays closer to the float32 result.
+
 ### The drafter on the GPU
 
 GPUDrafter compiles one draft step of the E4B assistant for the GPU. The

@@ -1137,6 +1137,337 @@ __global__ void k_gemm_tc(const __half *x, const uint8_t *w, float *out, int t, 
     tc_tile<4>(x, w, out, q0, min(t, q0 + TMD), blockIdx.x * TN, rows, cols, (size_t)rows, NULL);
 }
 
+/* ---------- the int4 product on the tensor cores, pipelined ----------
+ * k_gemm_tc2: a tile of 128 tokens by 128 rows for each block of 8 warps.
+ * Warp w takes 64 tokens by 32 rows: 4 by 4 tiles of the instruction.
+ *
+ * The block copies each step of 64 columns to shared memory with cp.async.
+ * It copies the float16 rows of x and the raw int4 blocks of the rows of w
+ * (36 bytes of each row). Two buffers take turns, so the copy of step s + 1 runs
+ * while the tensor cores compute step s.
+ *
+ * A fragment of B comes from the raw bytes in registers. For a 4-bit number
+ * n, the float16 bits 0x6400 | n give 1024 + n exactly; less 1032 gives
+ * n - 8. Two such values fill one register. Thus the kernel needs no
+ * float16 copy of the weights in shared memory. */
+#define T2M 128
+#define T2N 128
+#define T2RB 40      /* bytes of one row of a step: 2 blocks of 18, and 4 to align */
+
+__device__ __forceinline__ void cp_async4(void *smem, const void *gmem)
+{
+    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(sa), "l"(gmem));
+}
+
+__device__ __forceinline__ void cp_async16(void *smem, const void *gmem)
+{
+    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(gmem));
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait1()
+{
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait0()
+{
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+/* Two float16 values n0 - 8 and n1 - 8 from two 4-bit numbers. */
+__device__ __forceinline__ uint32_t nib2(uint32_t n0, uint32_t n1)
+{
+    uint32_t bits = 0x64006400u | n0 | (n1 << 16);
+    __half2 h = *(__half2 *)&bits;
+    h = __hsub2(h, __float2half2_rn(1032.0f));
+    return *(uint32_t *)&h;
+}
+
+__global__ void __launch_bounds__(256) k_gemm_tc2(const __half *x, const uint8_t *w, float *out,
+                                                  int t, int rows, int cols)
+{
+    __shared__ __align__(16) __half as_[2][T2M][TK + 8];
+    __shared__ __align__(16) uint8_t bs[2][T2N][T2RB];
+    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
+    int g = lane / 4, c = lane % 4;
+    size_t rb = (size_t)(cols / 32) * 18;
+    int steps = cols / TK;
+    float acc[4][4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+        }
+    }
+    /* Copy step st to buffer b. A row past the end reads row 0 of its
+     * matrix; the tile does not write its result. */
+    auto load = [&](int st, int b) {
+        int k0 = st * TK;
+        for (int e = threadIdx.x; e < T2M * TK / 8; e += blockDim.x) {
+            int m = e / (TK / 8), kk = (e % (TK / 8)) * 8;
+            int q = min(m0 + m, t - 1);
+            cp_async16(&as_[b][m][kk], x + (size_t)q * cols + k0 + kk);
+        }
+        for (int e = threadIdx.x; e < T2N * 9; e += blockDim.x) {
+            int n = e / 9, wd = e % 9;
+            int row = min(n0 + n, rows - 1);
+            cp_async4(&bs[b][n][wd * 4], w + (size_t)row * rb + (size_t)(k0 / 32) * 18 + wd * 4);
+        }
+        cp_async_commit();
+    };
+    load(0, 0);
+    for (int st = 0; st < steps; ++st) {
+        int b = st & 1;
+        if (st + 1 < steps) {
+            load(st + 1, b ^ 1);
+            cp_async_wait1();
+        } else {
+            cp_async_wait0();
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int bk = 0; bk < 2; ++bk) {
+            float blk[4][4][4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    blk[i][j][0] = blk[i][j][1] = blk[i][j][2] = blk[i][j][3] = 0.f;
+                }
+            }
+            /* B: the rows wn + 8j + g. Bytes 2c, 2c+1 and 2c+8, 2c+9 of the
+             * 16 bytes of values give the fragments. Their low 4 bits are
+             * columns 0 to 15, and their high 4 bits columns 16 to 31. */
+            uint32_t blo[4][2], bhi[4][2];
+            float dsc[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t *blkp = &bs[b][wn + j * 8 + g][bk * 18];
+                uint32_t v0 = *(const uint16_t *)(blkp + 2 + 2 * c);
+                uint32_t v1 = *(const uint16_t *)(blkp + 2 + 2 * c + 8);
+                blo[j][0] = nib2(v0 & 15, (v0 >> 8) & 15);
+                blo[j][1] = nib2(v1 & 15, (v1 >> 8) & 15);
+                bhi[j][0] = nib2((v0 >> 4) & 15, (v0 >> 12) & 15);
+                bhi[j][1] = nib2((v1 >> 4) & 15, (v1 >> 12) & 15);
+                const uint8_t *d0 = &bs[b][wn + j * 8 + 2 * c][bk * 18];
+                const uint8_t *d1 = &bs[b][wn + j * 8 + 2 * c + 1][bk * 18];
+                dsc[j][0] = __half2float(__ushort_as_half((uint16_t)(d0[0] | (d0[1] << 8))));
+                dsc[j][1] = __half2float(__ushort_as_half((uint16_t)(d1[0] | (d1[1] << 8))));
+            }
+            #pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                int kk = bk * 32 + ks * 16;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int r0 = wm + i * 16;
+                    uint32_t a[4];
+                    a[0] = *(const uint32_t *)&as_[b][r0 + g][kk + 2 * c];
+                    a[1] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 2 * c];
+                    a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 2 * c + 8];
+                    a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 2 * c + 8];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        mma16816(blk[i][j], a, ks ? bhi[j] : blo[j]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j][0] += dsc[j][0] * blk[i][j][0];
+                    acc[i][j][1] += dsc[j][1] * blk[i][j][1];
+                    acc[i][j][2] += dsc[j][0] * blk[i][j][2];
+                    acc[i][j][3] += dsc[j][1] * blk[i][j][3];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int n = n0 + wn + j * 8 + 2 * c;
+            int m = m0 + wm + i * 16 + g;
+            if (m < t) {
+                if (n < rows) out[(size_t)m * rows + n] = acc[i][j][0];
+                if (n + 1 < rows) out[(size_t)m * rows + n + 1] = acc[i][j][1];
+            }
+            if (m + 8 < t) {
+                if (n < rows) out[(size_t)(m + 8) * rows + n] = acc[i][j][2];
+                if (n + 1 < rows) out[(size_t)(m + 8) * rows + n + 1] = acc[i][j][3];
+            }
+        }
+    }
+}
+
+/* ---------- the int4 product with int8 activations ----------
+ * k_gemm_q8: as k_gemm_tc2, but the rows of x are int8 with one float32
+ * scale for each block of 32 values (k_quant_q8, as the Q8_0 form of
+ * ggml). The instruction mma.sync m16n8k32 (int8 inputs, int32 sums) covers
+ * one int4 block of 32 columns, and its int32 sum is exact. The kernel then
+ * multiplies the sum by the scale of the block of x and the scale of the
+ * block of w, in float32. On the RTX 5060 Ti the int8 instruction has about
+ * 5 times the rate of the float16 one (204 against 37 TOPS).
+ *
+ * The fragments of m16n8k32 (g = lane / 4, c = lane % 4), 4 int8 values in
+ * a register:
+ *
+ *     A (16 x 32, rows):  a0 = A[g][4c..], a1 = A[g+8][4c..],
+ *                         a2 = A[g][4c+16..], a3 = A[g+8][4c+16..]
+ *     B (32 x 8, cols):   b0 = B[4c..][g], b1 = B[4c+16..][g]
+ *
+ * The low 4 bits of byte i of a block are value i, and the high 4 bits are
+ * value i + 16. Thus b0 comes from the low 4 bits of bytes 4c to 4c + 3.
+ * b1 comes from their high 4 bits. __vsub4 subtracts 8 from each byte. */
+__device__ __forceinline__ void mma16832(int *c, const uint32_t *a, const uint32_t *b)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/* x (n rows of cols values) to int8, with one scale for each block of 32:
+ * q = round(x / s), s = max |x| / 127. One warp for each block. */
+__global__ void k_quant_q8(const float *x, int8_t *q, float *sc, size_t blocks)
+{
+    size_t bi = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (bi >= blocks) {
+        return;
+    }
+    float v = x[bi * 32 + lane];
+    float m = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    }
+    float s2 = m / 127.0f;
+    q[bi * 32 + lane] = (int8_t)(s2 > 0.f ? __float2int_rn(v / s2) : 0);
+    if (lane == 0) {
+        sc[bi] = s2;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *xs,
+                                                 const uint8_t *w, float *out, int t, int rows,
+                                                 int cols)
+{
+    __shared__ __align__(16) int8_t as_[2][T2M][TK + 16];
+    __shared__ float ss[2][T2M][TK / 32];
+    __shared__ __align__(16) uint8_t bs[2][T2N][T2RB];
+    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
+    int g = lane / 4, c = lane % 4;
+    size_t rb = (size_t)(cols / 32) * 18;
+    int nb = cols / 32, steps = cols / TK;
+    float acc[4][4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+        }
+    }
+    auto load = [&](int st, int b) {
+        int k0 = st * TK;
+        for (int e = threadIdx.x; e < T2M * TK / 16; e += blockDim.x) {
+            int m = e / (TK / 16), kk = (e % (TK / 16)) * 16;
+            int q = min(m0 + m, t - 1);
+            cp_async16(&as_[b][m][kk], xq + (size_t)q * cols + k0 + kk);
+        }
+        for (int e = threadIdx.x; e < T2M * (TK / 32); e += blockDim.x) {
+            int m = e / (TK / 32), bk = e % (TK / 32);
+            int q = min(m0 + m, t - 1);
+            cp_async4(&ss[b][m][bk], xs + (size_t)q * nb + k0 / 32 + bk);
+        }
+        for (int e = threadIdx.x; e < T2N * 9; e += blockDim.x) {
+            int n = e / 9, wd = e % 9;
+            int row = min(n0 + n, rows - 1);
+            cp_async4(&bs[b][n][wd * 4], w + (size_t)row * rb + (size_t)(k0 / 32) * 18 + wd * 4);
+        }
+        cp_async_commit();
+    };
+    load(0, 0);
+    for (int st = 0; st < steps; ++st) {
+        int b = st & 1;
+        if (st + 1 < steps) {
+            load(st + 1, b ^ 1);
+            cp_async_wait1();
+        } else {
+            cp_async_wait0();
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int bk = 0; bk < 2; ++bk) {
+            uint32_t bf[4][2];
+            float dw[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t *blkp = &bs[b][wn + j * 8 + g][bk * 18];
+                uint32_t v = (uint32_t)*(const uint16_t *)(blkp + 2 + 4 * c) |
+                             ((uint32_t)*(const uint16_t *)(blkp + 4 + 4 * c) << 16);
+                bf[j][0] = __vsub4(v & 0x0f0f0f0fu, 0x08080808u);
+                bf[j][1] = __vsub4((v >> 4) & 0x0f0f0f0fu, 0x08080808u);
+                const uint8_t *d0 = &bs[b][wn + j * 8 + 2 * c][bk * 18];
+                const uint8_t *d1 = &bs[b][wn + j * 8 + 2 * c + 1][bk * 18];
+                dw[j][0] = __half2float(__ushort_as_half((uint16_t)(d0[0] | (d0[1] << 8))));
+                dw[j][1] = __half2float(__ushort_as_half((uint16_t)(d1[0] | (d1[1] << 8))));
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int r0 = wm + i * 16;
+                int kk = bk * 32;
+                uint32_t a[4];
+                a[0] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c];
+                a[1] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c];
+                a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c + 16];
+                a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c + 16];
+                float s0 = ss[b][r0 + g][bk], s1 = ss[b][r0 + g + 8][bk];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int ci[4] = {0, 0, 0, 0};
+                    mma16832(ci, a, bf[j]);
+                    acc[i][j][0] += (float)ci[0] * s0 * dw[j][0];
+                    acc[i][j][1] += (float)ci[1] * s0 * dw[j][1];
+                    acc[i][j][2] += (float)ci[2] * s1 * dw[j][0];
+                    acc[i][j][3] += (float)ci[3] * s1 * dw[j][1];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int n = n0 + wn + j * 8 + 2 * c;
+            int m = m0 + wm + i * 16 + g;
+            if (m < t) {
+                if (n < rows) out[(size_t)m * rows + n] = acc[i][j][0];
+                if (n + 1 < rows) out[(size_t)m * rows + n + 1] = acc[i][j][1];
+            }
+            if (m + 8 < t) {
+                if (n < rows) out[(size_t)(m + 8) * rows + n] = acc[i][j][2];
+                if (n + 1 < rows) out[(size_t)(m + 8) * rows + n + 1] = acc[i][j][3];
+            }
+        }
+    }
+}
+
 /* The float16 copy of n values, for the tensor cores. */
 __global__ void k_to_half(const float *x, __half *y, size_t n)
 {
@@ -2753,11 +3084,25 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         default:
             k_mt_gemv<<<grid, blk, 0, gg_stream>>>(x, wb, out, t, rows, cols);
         }
+    } else if (gg_tc == 8 && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
+        /* int8 x: the scratch of xh holds the int8 values, then the scales. */
+        size_t n = (size_t)t * cols;
+        int8_t *xq = (int8_t *)g->xh;
+        float *xs = (float *)((char *)g->xh + ((n + 255) & ~(size_t)255));
+        k_quant_q8<<<(unsigned)cdiv((int64_t)(n / 32) * 32, 256), 256, 0, gg_stream>>>(
+            x, xq, xs, n / 32);
+        k_gemm_q8<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0,
+                     gg_stream>>>(xq, xs, (const uint8_t *)w, out, t, rows, cols);
     } else if (gg_tc && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
         size_t n = (size_t)t * cols;
         k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, gg_stream>>>(x, g->xh, n);
-        k_gemm_tc<<<dim3((unsigned)cdiv(rows, TN), (unsigned)cdiv(t, TMD)), 256, 0, gg_stream>>>(
-            g->xh, (const uint8_t *)w, out, t, rows, cols);
+        if (gg_tc == 2) {
+            k_gemm_tc<<<dim3((unsigned)cdiv(rows, TN), (unsigned)cdiv(t, TMD)), 256, 0,
+                         gg_stream>>>(g->xh, (const uint8_t *)w, out, t, rows, cols);
+        } else {
+            k_gemm_tc2<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0,
+                          gg_stream>>>(g->xh, (const uint8_t *)w, out, t, rows, cols);
+        }
     } else {
         k_gemm<0><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(
             x, w, out, t, rows, cols);
@@ -3185,7 +3530,7 @@ void gg_set_gemv_max(int t)
 
 void gg_set_tc(int on)
 {
-    gg_tc = on ? 1 : 0;
+    gg_tc = on;    /* 0: float32, 1: k_gemm_tc2, 2: k_gemm_tc (for a test), 8: k_gemm_q8 */
 }
 
 int gg_mem_info(size_t *free_b, size_t *total_b)

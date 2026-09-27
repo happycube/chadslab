@@ -123,8 +123,9 @@ def lib():
     L.gg_host_alloc.argtypes = [sz]
     L.gg_host_alloc.restype = vp
     L.gg_d2d.argtypes = [vp, vp, sz]
-    # NP_GEMMA_GPU_TC=0 gives the float32 kernels for the products of a
-    # large group, in place of the tensor cores.
+    # The products of a large group: NP_GEMMA_GPU_TC=1 (the default) runs
+    # them on the tensor cores with float16 inputs, 8 with int8 inputs (the
+    # Q8_0 form: faster, less exact), and 0 with float32 kernels.
     L.gg_set_tc(int(os.environ.get("NP_GEMMA_GPU_TC", "1")))
     if L.gg_init(int(os.environ.get("NP_GEMMA_GPU_DEVICE", "0"))) != 0:
         _error = L.gg_last_error().decode()
