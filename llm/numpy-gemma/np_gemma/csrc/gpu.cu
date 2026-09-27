@@ -1222,7 +1222,9 @@ __global__ void __launch_bounds__(256) k_gemm_tc2(const __half *x, const uint8_t
 {
     __shared__ __align__(16) __half as_[2][T2M][TK + 8];
     __shared__ __align__(16) uint8_t bs[2][T2N][T2RB];
-    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    /* blockIdx.x is the tile of tokens, so the blocks that read the same rows of
+     * w run together and the rows come from DRAM one time. */
+    int m0 = blockIdx.x * T2M, n0 = blockIdx.y * T2N;
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
     int g = lane / 4, c = lane % 4;
@@ -1358,7 +1360,9 @@ __global__ void __launch_bounds__(256) k_gemm_bh(const __half *x, const uint16_t
 {
     __shared__ __align__(16) __half as_[2][T2M][BHK + 8];
     __shared__ __align__(16) uint16_t bs[2][T2N][BHK + 8];
-    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    /* blockIdx.x is the tile of tokens, so the blocks that read the same rows of
+     * w run together and the rows come from DRAM one time. */
+    int m0 = blockIdx.x * T2M, n0 = blockIdx.y * T2N;
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
     int g = lane / 4, c = lane % 4;
@@ -1470,39 +1474,75 @@ __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, const uint32
 }
 
 /* x (n rows of cols values) to int8, with one scale for each block of 32:
- * q = round(x / s), s = max |x| / 127. One warp for each block. */
+ * q = round(x / s), s = max |x| / 127. Eight threads for each block; each
+ * thread reads 4 values as a float4 and writes 4 bytes. */
 __global__ void k_quant_q8(const float *x, int8_t *q, float *sc, size_t blocks)
 {
-    size_t bi = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int lane = threadIdx.x % 32;
-    if (bi >= blocks) {
-        return;
-    }
-    float v = x[bi * 32 + lane];
-    float m = fabsf(v);
-    for (int o = 16; o > 0; o >>= 1) {
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t bi = tid / 8;
+    int sub = threadIdx.x % 8;
+    bool live = bi < blocks;
+    float4 v = live ? *(const float4 *)(x + bi * 32 + sub * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    for (int o = 4; o > 0; o >>= 1) {
         m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
     }
+    if (!live) {
+        return;
+    }
     float s2 = m / 127.0f;
-    q[bi * 32 + lane] = (int8_t)(s2 > 0.f ? __float2int_rn(v / s2) : 0);
-    if (lane == 0) {
+    char4 c4;
+    c4.x = (signed char)(s2 > 0.f ? __float2int_rn(v.x / s2) : 0);
+    c4.y = (signed char)(s2 > 0.f ? __float2int_rn(v.y / s2) : 0);
+    c4.z = (signed char)(s2 > 0.f ? __float2int_rn(v.z / s2) : 0);
+    c4.w = (signed char)(s2 > 0.f ? __float2int_rn(v.w / s2) : 0);
+    *(char4 *)(q + bi * 32 + sub * 4) = c4;
+    if (sub == 0) {
         sc[bi] = s2;
     }
 }
 
+/* The float32 value of an int32 i with |i| < 2^22, with no I2F instruction
+ * (it has a low rate): the bits 0x4B400000 + i are the float 12582912 + i.
+ * The subtraction is exact. */
+__device__ __forceinline__ float i2f_exact(int i)
+{
+    return __int_as_float(0x4B400000 + i) - 12582912.0f;
+}
+
+__device__ __forceinline__ void cp_async16_z(void *smem, const void *gmem, int bytes);
+
+#define Q8K 128      /* the columns of a step of k_gemm_q8: 4 blocks */
+#define Q8RB 80      /* bytes of a row of w in a step: 72 bytes, and 8 of pad */
+#define Q8NS 3       /* the buffers of k_gemm_q8 */
+#define Q8SMEM ((size_t)Q8NS * (T2M * (Q8K + 16) + T2N * Q8RB + T2M * (Q8K / 32) * 4))
+
+__device__ __forceinline__ void cp_async8(void *smem, const void *gmem)
+{
+    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(sa), "l"(gmem));
+}
+
+template <int AL>
 __global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *xs,
                                                  const uint8_t *w, float *out, int t, int rows,
                                                  int cols)
 {
-    __shared__ __align__(16) int8_t as_[2][T2M][TK + 16];
-    __shared__ float ss[2][T2M][TK / 32];
-    __shared__ __align__(16) uint8_t bs[2][T2N][T2RB];
-    int m0 = blockIdx.y * T2M, n0 = blockIdx.x * T2N;
+    /* Q8NS buffers in dynamic shared memory: the copies of Q8NS - 1 steps
+     * run during the compute of a step. */
+    extern __shared__ __align__(16) uint8_t q8sm[];
+    int8_t (*as_)[T2M][Q8K + 16] = (int8_t (*)[T2M][Q8K + 16])q8sm;
+    uint8_t (*bs)[T2N][Q8RB] = (uint8_t (*)[T2N][Q8RB])(q8sm + Q8NS * T2M * (Q8K + 16));
+    float (*ss)[T2M][Q8K / 32] = (float (*)[T2M][Q8K / 32])(q8sm + Q8NS * (T2M * (Q8K + 16) +
+                                                                          T2N * Q8RB));
+    /* blockIdx.x is the tile of tokens, so the blocks that read the same rows of
+     * w run together and the rows come from DRAM one time. */
+    int m0 = blockIdx.x * T2M, n0 = blockIdx.y * T2N;
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
     int g = lane / 4, c = lane % 4;
     size_t rb = (size_t)(cols / 32) * 18;
-    int nb = cols / 32, steps = cols / TK;
+    int nb = cols / 32, steps = cols / Q8K;
     float acc[4][4][4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -1512,47 +1552,68 @@ __global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *
         }
     }
     auto load = [&](int st, int b) {
-        int k0 = st * TK;
-        for (int e = threadIdx.x; e < T2M * TK / 16; e += blockDim.x) {
-            int m = e / (TK / 16), kk = (e % (TK / 16)) * 16;
+        int k0 = st * Q8K;
+        for (int e = threadIdx.x; e < T2M * Q8K / 16; e += blockDim.x) {
+            int m = e / (Q8K / 16), kk = (e % (Q8K / 16)) * 16;
             int q = min(m0 + m, t - 1);
             cp_async16(&as_[b][m][kk], xq + (size_t)q * cols + k0 + kk);
         }
-        for (int e = threadIdx.x; e < T2M * (TK / 32); e += blockDim.x) {
-            int m = e / (TK / 32), bk = e % (TK / 32);
+        for (int e = threadIdx.x; e < T2M * (Q8K / 32); e += blockDim.x) {
+            int m = e / (Q8K / 32), bk = e % (Q8K / 32);
             int q = min(m0 + m, t - 1);
             cp_async4(&ss[b][m][bk], xs + (size_t)q * nb + k0 / 32 + bk);
         }
-        for (int e = threadIdx.x; e < T2N * 9; e += blockDim.x) {
-            int n = e / 9, wd = e % 9;
-            int row = min(n0 + n, rows - 1);
-            cp_async4(&bs[b][n][wd * 4], w + (size_t)row * rb + (size_t)(k0 / 32) * 18 + wd * 4);
+        /* The 4 blocks of a row in the step are 72 bytes. With AL, they
+         * start at a multiple of 8 bytes (rb is a multiple of 16), so 9
+         * copies of 8 bytes take them. */
+        const uint8_t *wk = w + (size_t)(k0 / 32) * 18;
+        if (AL) {
+            for (int e = threadIdx.x; e < T2N * 9; e += blockDim.x) {
+                int n = e / 9, wd = e % 9;
+                int row = min(n0 + n, rows - 1);
+                cp_async8(&bs[b][n][wd * 8], wk + (size_t)row * rb + wd * 8);
+            }
+        } else {
+            for (int e = threadIdx.x; e < T2N * 18; e += blockDim.x) {
+                int n = e / 18, wd = e % 18;
+                int row = min(n0 + n, rows - 1);
+                cp_async4(&bs[b][n][wd * 4], wk + (size_t)row * rb + wd * 4);
+            }
         }
         cp_async_commit();
     };
-    load(0, 0);
-    for (int st = 0; st < steps; ++st) {
-        int b = st & 1;
-        if (st + 1 < steps) {
-            load(st + 1, b ^ 1);
-            cp_async_wait1();
+    for (int st = 0; st < Q8NS - 1; ++st) {
+        if (st < steps) {
+            load(st, st);
         } else {
-            cp_async_wait0();
+            cp_async_commit();
         }
+    }
+    for (int st = 0; st < steps; ++st) {
+        int b = st % Q8NS;
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(Q8NS - 2));
         __syncthreads();
+        /* Buffer (st + Q8NS - 1) % Q8NS held step st - 1, which every warp
+         * has passed. */
+        if (st + Q8NS - 1 < steps) {
+            load(st + Q8NS - 1, (st + Q8NS - 1) % Q8NS);
+        } else {
+            cp_async_commit();
+        }
+        const int sh = 0;
         #pragma unroll
-        for (int bk = 0; bk < 2; ++bk) {
+        for (int bk = 0; bk < Q8K / 32; ++bk) {
             uint32_t bf[4][2];
             float dw[4][2];
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const uint8_t *blkp = &bs[b][wn + j * 8 + g][bk * 18];
+                const uint8_t *blkp = &bs[b][wn + j * 8 + g][sh + bk * 18];
                 uint32_t v = (uint32_t)*(const uint16_t *)(blkp + 2 + 4 * c) |
                              ((uint32_t)*(const uint16_t *)(blkp + 4 + 4 * c) << 16);
                 bf[j][0] = __vsub4(v & 0x0f0f0f0fu, 0x08080808u);
                 bf[j][1] = __vsub4((v >> 4) & 0x0f0f0f0fu, 0x08080808u);
-                const uint8_t *d0 = &bs[b][wn + j * 8 + 2 * c][bk * 18];
-                const uint8_t *d1 = &bs[b][wn + j * 8 + 2 * c + 1][bk * 18];
+                const uint8_t *d0 = &bs[b][wn + j * 8 + 2 * c][sh + bk * 18];
+                const uint8_t *d1 = &bs[b][wn + j * 8 + 2 * c + 1][sh + bk * 18];
                 dw[j][0] = __half2float(__ushort_as_half((uint16_t)(d0[0] | (d0[1] << 8))));
                 dw[j][1] = __half2float(__ushort_as_half((uint16_t)(d1[0] | (d1[1] << 8))));
             }
@@ -1570,14 +1631,13 @@ __global__ void __launch_bounds__(256) k_gemm_q8(const int8_t *xq, const float *
                 for (int j = 0; j < 4; ++j) {
                     int ci[4] = {0, 0, 0, 0};
                     mma16832(ci, a, bf[j]);
-                    acc[i][j][0] += (float)ci[0] * s0 * dw[j][0];
-                    acc[i][j][1] += (float)ci[1] * s0 * dw[j][1];
-                    acc[i][j][2] += (float)ci[2] * s1 * dw[j][0];
-                    acc[i][j][3] += (float)ci[3] * s1 * dw[j][1];
+                    acc[i][j][0] += i2f_exact(ci[0]) * s0 * dw[j][0];
+                    acc[i][j][1] += i2f_exact(ci[1]) * s0 * dw[j][1];
+                    acc[i][j][2] += i2f_exact(ci[2]) * s1 * dw[j][0];
+                    acc[i][j][3] += i2f_exact(ci[3]) * s1 * dw[j][1];
                 }
             }
         }
-        __syncthreads();
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -3516,7 +3576,7 @@ static int flash_tc_launch(const gp_rec *r, const gp_rec *dr, const int64_t *den
  * not slots. */
 static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                         const int64_t *denv, int xk, int wk, int ok, int rk, int ck, int tk,
-                        int *bad)
+                        int *bad, int quant = 1)
 {
     if (r->tag[xk] == GP_T_SLOT || r->tag[wk] == GP_T_SLOT || r->tag[ok] == GP_T_SLOT) {
         *bad = 1;
@@ -3537,23 +3597,44 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         default:
             k_mt_gemv<<<grid, blk, 0, gg_stream>>>(x, wb, out, t, rows, cols);
         }
-    } else if (gg_tc == 8 && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
+    } else if (gg_tc == 8 && g->tc && cols % Q8K == 0 && (size_t)t * cols <= g->xh_n) {
         /* int8 x: the scratch of xh holds the int8 values, then the scales. */
         size_t n = (size_t)t * cols;
         int8_t *xq = (int8_t *)g->xh;
         float *xs = (float *)((char *)g->xh + ((n + 255) & ~(size_t)255));
-        k_quant_q8<<<(unsigned)cdiv((int64_t)(n / 32) * 32, 256), 256, 0, gg_stream>>>(
-            x, xq, xs, n / 32);
-        k_gemm_q8<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0,
-                     gg_stream>>>(xq, xs, (const uint8_t *)w, out, t, rows, cols);
+        /* quant 0: the scratch already holds x as int8, from the matrix
+         * before this one in GP_INT4_MULTI4_MT. */
+        if (quant) {
+            k_quant_q8<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(
+                x, xq, xs, n / 32);
+        }
+        dim3 grid((unsigned)cdiv(t, T2M), (unsigned)cdiv(rows, T2N));
+        static int attr = 0;
+        if (!attr) {
+            cudaFuncSetAttribute(k_gemm_q8<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)Q8SMEM);
+            cudaFuncSetAttribute(k_gemm_q8<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)Q8SMEM);
+            attr = 1;
+        }
+        if ((cols / 32) % 8 == 0 && ((uintptr_t)w & 15) == 0) {
+            /* The rows of w start at a multiple of 16 bytes. */
+            k_gemm_q8<1><<<grid, 256, Q8SMEM, gg_stream>>>(xq, xs, (const uint8_t *)w, out, t,
+                                                          rows, cols);
+        } else {
+            k_gemm_q8<0><<<grid, 256, Q8SMEM, gg_stream>>>(xq, xs, (const uint8_t *)w, out, t,
+                                                          rows, cols);
+        }
     } else if (gg_tc && g->tc && cols % TK == 0 && (size_t)t * cols <= g->xh_n) {
         size_t n = (size_t)t * cols;
-        k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, gg_stream>>>(x, g->xh, n);
+        if (quant) {
+            k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, gg_stream>>>(x, g->xh, n);
+        }
         if (gg_tc == 2) {
             k_gemm_tc<<<dim3((unsigned)cdiv(rows, TN), (unsigned)cdiv(t, TMD)), 256, 0,
                          gg_stream>>>(g->xh, (const uint8_t *)w, out, t, rows, cols);
         } else {
-            k_gemm_tc2<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0,
+            k_gemm_tc2<<<dim3((unsigned)cdiv(t, T2M), (unsigned)cdiv(rows, T2N)), 256, 0,
                           gg_stream>>>(g->xh, (const uint8_t *)w, out, t, rows, cols);
         }
     } else {
@@ -3628,7 +3709,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             const float *x = (const float *)(intptr_t)hlit(r, 0, &bad);
             size_t n = (size_t)t * cols;
             k_to_half<<<(unsigned)cdiv((int64_t)n / 4 + 1, 256), 256, 0, s>>>(x, g->xh, n);
-            k_gemm_bh<<<dim3((unsigned)cdiv(rows, T2N), (unsigned)cdiv(t, T2M)), 256, 0, s>>>(
+            k_gemm_bh<<<dim3((unsigned)cdiv(t, T2M), (unsigned)cdiv(rows, T2N)), 256, 0, s>>>(
                 g->xh, (const uint16_t *)(intptr_t)hlit(r, 1, &bad),
                 (float *)(intptr_t)hlit(r, 2, &bad), (int)t, (int)rows, (int)cols);
         } else {
@@ -3730,9 +3811,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     case GP_INT4_MULTI4_MT:
         /* x, cols, t, then (w, s, out, rows) for up to four matrices */
-        for (int m = 0; m < 4; ++m) {
+        for (int m = 0, first = 1; m < 4; ++m) {
             if (r->v[3 + 4 * m] != 0) {
-                gemm_launch(g, r, dr, denv, 0, 3 + 4 * m, 5 + 4 * m, 6 + 4 * m, 1, 2, &bad);
+                gemm_launch(g, r, dr, denv, 0, 3 + 4 * m, 5 + 4 * m, 6 + 4 * m, 1, 2, &bad,
+                            first);
+                first = 0;
             }
         }
         break;

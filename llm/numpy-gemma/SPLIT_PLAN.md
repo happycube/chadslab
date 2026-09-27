@@ -772,13 +772,49 @@ Two more changes followed:
 
     E4B, 1024 tokens    GPU kernels   pass         top token as float32
     float16 products    -             3107 tok/s   99.9% (before: 99.9%)
-    int8 products       197 ms        4492 tok/s   98.0% (before: 98.6%)
+    int8 products       197 ms        4492 tok/s   98.6% (before: 98.6%)
     llama.cpp           171 ms        5178 tok/s   -
 
-The float16 of the projection changes 6 of the 1024 top tokens of the int8
-mode, and none of the float16 mode. The products and the quantization of
-x now take about 26 ms more than in llama.cpp. The other kernels take
-about the same time as in llama.cpp.
+A first test gave 98.0% for int8. That test used an old output. The
+output came from before the fix of the fused multiply-add in GP_ADD_NORM. The products and
+the quantization of x now take about 26 ms more than in llama.cpp. The
+other kernels take about the same time as in llama.cpp.
+
+### The int8 products
+
+These changes give the same values as before:
+
+- k_quant_q8 reads 4 values with each thread (float4), not one. A record
+  of GP_INT4_MULTI4_MT quantizes x one time for all its matrices (q, k, v;
+  gate, up). The quantization goes from 15.6 ms to 6.8 ms (llama.cpp: 7.2).
+- k_gemm_q8 takes 128 columns in each step, not 64. The 72 bytes of a row
+  of w in a step then start at a multiple of 8. Thus 9 copies of 8 bytes
+  take them, not 18 copies of 4 bytes. It has 3 buffers in dynamic shared memory
+  and one barrier in each step.
+- The grid puts the tiles of tokens on x, so the blocks that read the same
+  rows of w run together.
+- i2f_exact changes the int32 sums to float32 with an add, not with I2F.
+
+The product kernel goes from about 145 ms to 137 ms (llama.cpp: 120). The
+pass of 1024 tokens goes from 4492 to about 4650 tok/s.
+
+Tests that removed a part of k_gemm_q8 (the results were wrong, only the
+time counts) show where the time is. The kernel has no access to the
+counters of Nsight Compute on this machine (RmProfilingAdminOnly).
+
+    part removed                     gate and up, 42 records
+    nothing                          75.6 ms
+    the scale of each block          66.6 ms
+    the mma instructions             58.7 ms
+    the copies of x                  62.2 ms
+    the copies of w                  31.9 ms
+    all the compute (copies only)    39.9 ms
+
+The copies of w cost the most. The kernel does not overlap the copies and
+the compute well, and more buffers or a second block on each SM did not
+help. The card also runs at its power limit (about 170 of 180 W, 2.6 to
+2.85 GHz). The next test is the tile of llama.cpp: w changed to int8 in
+shared memory one time for each block, not in each warp.
 
 ### The drafter on the GPU
 
