@@ -180,6 +180,12 @@ class QwenCache:
                                          np.float32)
 
 
+def gdn_flags(cfg):
+    """The flags of the GDN record: 1 for the tiled order of the value heads,
+    2 for the sigmoid gate of its norm (qwen4exp)."""
+    return (1 if cfg.v_tiled else 0) | (2 if getattr(cfg, "lin_gate", "silu") == "sigmoid" else 0)
+
+
 def kv_store(cache, i, k, v, pos):
     """Write the keys and values k, v (t x heads x head_dim) of layer i at
     positions pos .. pos + t - 1."""
@@ -499,7 +505,7 @@ class QwenCPU(Qwen):
                       z, a, b, self.F(p + "A_log"), self.F(p + "dt_bias"), self.F(p + "norm.weight"),
                       cache.state[i], out, np.empty((t, cfg.conv_dim), np.float32),
                       cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim,
-                      cfg.rms_norm_eps, cfg.v_tiled)
+                      cfg.rms_norm_eps, gdn_flags(cfg))
         return self.lin(p + "out_proj", self.QX(out))
 
     def full_attention(self, i, h, cache, pos):
@@ -726,7 +732,7 @@ def compile_qwen_step(model, t, verify=False):
                       att, o3, model.F(a + "A_log"), model.F(a + "dt_bias"),
                       model.F(a + "norm.weight"), prog.slot("S.%d" % i), gate, gscr, t,
                       cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps,
-                      log_of(i), int(cfg.v_tiled), prog.slot("nreal"))
+                      log_of(i), gdn_flags(cfg), prog.slot("nreal"))
             quant(gate, vd)
             lin(a + "out_proj", o4)
         # o4 (t x hidden) has the output of the attention; x += o4.

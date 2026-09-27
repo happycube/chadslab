@@ -3975,7 +3975,7 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
 
 /* GP_GDN (gdn_body of csrc/deltanet.c): qkv, conv, conv_w, kernel, z, a, b,
  * A_log, dt_bias, norm_w, S, out, scratch, t, k_heads, v_heads, k_dim,
- * v_dim, eps, log, tiled, nreal.
+ * v_dim, eps, log, flags (1: tiled heads; 2: a sigmoid gate of the norm), nreal.
  *
  * Only the first nreal tokens change the state (0: all t); the other rows
  * pad a group to the size of its program. With a log (an MTP verify group)
@@ -4039,7 +4039,7 @@ __global__ void __launch_bounds__(KD) k_gdn_heads(const gp_rec *r, const int64_t
 {
     PDL_START();
     __shared__ float qsh[KD], ksh[KD];
-    int kh = DI(14), vh = DI(15), t = gdn_nreal(r, e), tiled = DI(20);
+    int kh = DI(14), vh = DI(15), t = gdn_nreal(r, e), flags = DI(20), tiled = flags & 1;
     int kd = kh * KD, vd = vh * KD, cd = 2 * kd + vd;
     float *log = DP(float, 19);
     size_t lrow = (size_t)cd + (size_t)vh * (2 * KD + 1);
@@ -4091,7 +4091,9 @@ __global__ void __launch_bounds__(KD) k_gdn_heads(const gp_rec *r, const int64_t
         float ss = block_sum(o * o);
         float inv = 1.f / sqrtf(ss / (float)KD + eps);
         size_t oi = (size_t)i * vd + (size_t)hv * KD + c;
-        DP(float, 11)[oi] = o * inv * DP(const float, 9)[c] * qw_silu(DP(const float, 4)[oi]);
+        float zv = DP(const float, 4)[oi];
+        float zg = (flags & 2) ? 1.f / (1.f + expf(-zv)) : qw_silu(zv);
+        DP(float, 11)[oi] = o * inv * DP(const float, 9)[c] * zg;
         __syncthreads();
     }
     if (log == NULL) {

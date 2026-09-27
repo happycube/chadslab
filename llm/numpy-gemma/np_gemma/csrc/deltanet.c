@@ -10,6 +10,11 @@
  *     out = rms_norm(o) * norm_w * silu(z)
  */
 
+/* The flags of gdn_body: the order of the value heads, and the gate of the
+ * norm (sigmoid for qwen4exp, silu for Qwen3.5). */
+#define GDN_TILED 1
+#define GDN_SIGMOID 2
+
 static inline float gdn_silu(float v)
 {
     return v / (1.f + expf(-v));
@@ -22,7 +27,7 @@ static inline float gdn_silu(float v)
  * out (t x v_heads * v_dim) gets rms_norm(o) * norm_w * silu(z).
  *
  * The value head hv reads the key head hv / (v_heads / k_heads) (the order of
- * transformers and MLX), or hv % k_heads with tiled (the order of the GGUF
+ * transformers and MLX), or hv % k_heads with the flag 1 (the order of the GGUF
  * files of llama.cpp).
  *
  * gdn_body runs inside a parallel region: first the convolution of all the
@@ -45,7 +50,7 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
                      const float *z, const float *a, const float *b, const float *A_log,
                      const float *dt_bias, const float *norm_w, float *S, float *out,
                      float *scratch, int t, int k_heads, int v_heads, int k_dim, int v_dim,
-                     float eps, float *log, int tiled)
+                     float eps, float *log, int flags)
 {
     int kd = k_heads * k_dim, vd = v_heads * v_dim, cd = 2 * kd + vd;
     int rep = v_heads / k_heads;
@@ -85,7 +90,7 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
         }
         #pragma omp for schedule(static)
         for (int hv = 0; hv < v_heads; ++hv) {
-            int hk = tiled ? hv % k_heads : hv / rep;
+            int hk = (flags & GDN_TILED) ? hv % k_heads : hv / rep;
             float *Sh = S + (size_t)hv * k_dim * v_dim;
             if (log != NULL) {
                 /* A verify group: a copy of the state of the head. */
@@ -153,7 +158,8 @@ static void gdn_body(const float *qkv, float *conv, const float *conv_w, int ker
                 const float *zr = z + (size_t)i * vd + (size_t)hv * v_dim;
                 float *orow = out + (size_t)i * vd + (size_t)hv * v_dim;
                 for (int e = 0; e < v_dim; ++e) {
-                    orow[e] = o[e] * inv * norm_w[e] * gdn_silu(zr[e]);
+                    float zg = (flags & GDN_SIGMOID) ? 1.f / (1.f + expf(-zr[e])) : gdn_silu(zr[e]);
+                    orow[e] = o[e] * inv * norm_w[e] * zg;
                 }
             }
         }
@@ -164,11 +170,11 @@ void gdn_step(const float *qkv, float *conv, const float *conv_w, int kernel,
               const float *z, const float *a, const float *b, const float *A_log,
               const float *dt_bias, const float *norm_w, float *S, float *out, float *scratch,
               int t, int k_heads, int v_heads, int k_dim, int v_dim, float eps, float *log,
-              int tiled)
+              int flags)
 {
     #pragma omp parallel
     gdn_body(qkv, conv, conv_w, kernel, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, t,
-             k_heads, v_heads, k_dim, v_dim, eps, log, tiled);
+             k_heads, v_heads, k_dim, v_dim, eps, log, flags);
 }
 
 /* Apply the first n tokens of a log (gdn_body with a log of t tokens) to

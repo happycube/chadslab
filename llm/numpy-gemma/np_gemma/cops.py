@@ -30,7 +30,8 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
 # The files that bf16_linear.c includes; the hash of the library covers them.
-_SOURCES = [_SRC] + [_HERE / "csrc" / n for n in ("moe.c", "mlx_affine.c", "kquants.c", "deltanet.c")]
+_SOURCES = [_SRC] + [_HERE / "csrc" / n for n in ("moe.c", "mlx_affine.c", "kquants.c", "deltanet.c",
+                                                 "hyperconn.c")]
 _LIB_DIR = _HERE / "_libs"
 # The code builds three libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The third adds the VNNI
@@ -676,16 +677,17 @@ def ma_moe(hq4, hq8, hs, hsum, ids, val, experts, mats, shared_logit, hidden, in
 
 
 def gdn_step(qkv, conv, conv_w, z, a, b, A_log, dt_bias, norm_w, S, out, scratch, k_heads,
-             v_heads, k_dim, v_dim, eps, tiled=False):
+             v_heads, k_dim, v_dim, eps, flags=0):
     """The Gated DeltaNet for the rows of qkv, in order (csrc/deltanet.c).
-    conv and S are the state; the call changes them. tiled: the order of
-    the value heads of the GGUF files."""
+    conv and S are the state; the call changes them. flags: 1 for the order of
+    the value heads of the GGUF files, 2 for a sigmoid gate of the norm
+    (qwen.gdn_flags)."""
     t = qkv.shape[0]
     _lib.gdn_step(qkv.ctypes.data, conv.ctypes.data, conv_w.ctypes.data, conv_w.shape[1],
                   z.ctypes.data, a.ctypes.data, b.ctypes.data, A_log.ctypes.data,
                   dt_bias.ctypes.data, norm_w.ctypes.data, S.ctypes.data, out.ctypes.data,
                   scratch.ctypes.data, t, k_heads, v_heads, k_dim, v_dim, float(eps), None,
-                  int(tiled))
+                  int(flags))
 
 
 def gdn_log_floats(t, k_heads, v_heads, k_dim, v_dim):

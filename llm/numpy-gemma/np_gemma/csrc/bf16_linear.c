@@ -6972,6 +6972,7 @@ static void gemma_qkv_norm_rope_body(float *q, const float *q_w, int q_rows,
 #include "mlx_affine.c"
 #include "kquants.c"
 #include "deltanet.c"
+#include "hyperconn.c"
 
 /* ---------- small operations of other models (Qwen3.5) ---------- */
 
@@ -7120,6 +7121,9 @@ enum {
     GP_MA_QUANT = 100, GP_MA_LINEAR = 101, GP_MA_MOE = 102, GP_ROUTER_TOPK = 103,
     GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106, GP_KQ_QUANT = 107, GP_KQ_LINEAR = 108,
     GP_KQ_MOE = 109,
+    /* qwen4exp: the gated residual and the n-gram layer (hyperconn.c) */
+    GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
+    GP_PLE_CONV = 119,
 };
 
 int gemma_gp_record_size(void)
@@ -7478,6 +7482,35 @@ static void gp_step(const gp_rec *r, int64_t *e)
                  GP_P(const float, 7), GP_P(const float, 8), GP_P(const float, 9), GP_P(float, 10),
                  GP_P(float, 11), GP_P(float, 12), GP_I(13), GP_I(14), GP_I(15), GP_I(16),
                  GP_I(17), gp_f(r, e, 18), GP_P(float, 19), GP_I(20));
+        break;
+    case GP_HC_NORM:
+        /* x, w, out, t, groups, hid, eps */
+        hc_norm_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_I(3), GP_I(4),
+                     GP_I(5), gp_f(r, e, 6));
+        break;
+    case GP_HC_ACT:
+        /* x, out, n, scale */
+        hc_act_body(GP_P(const float, 0), GP_P(float, 1), gp_i(r, e, 2), gp_f(r, e, 3));
+        break;
+    case GP_HC_MIX:
+        /* hn, g, out, t, hc, hid */
+        hc_mix_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_I(3), GP_I(4),
+                    GP_I(5));
+        break;
+    case GP_HC_ADD:
+        /* H, out, inject, t, hc, hid, scale */
+        hc_add_body(GP_P(float, 0), GP_P(const float, 1), GP_P(const float, 2), GP_I(3), GP_I(4),
+                    GP_I(5), gp_f(r, e, 6));
+        break;
+    case GP_PLE_GATE:
+        /* keyn, qn, value, gated, t, hc, hid */
+        ple_gate_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2),
+                      GP_P(float, 3), GP_I(4), GP_I(5), GP_I(6));
+        break;
+    case GP_PLE_CONV:
+        /* gn, gated, H, state, w, t, channels, kernel, dilation */
+        ple_conv_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_P(float, 3),
+                      GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7), GP_I(8));
         break;
     case GP_KQ_QUANT:
         /* x, t, cols, xq, xs, xm */

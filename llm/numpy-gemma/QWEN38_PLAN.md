@@ -215,6 +215,26 @@ Status (in progress):
 
 ### Phase 2: the CPU path
 
+Status (in progress):
+
+- compile_qwen4_step and Qwen4CPU (np_gemma/qwen4.py): the step as one
+  program. New records in csrc/hyperconn.c: HC_NORM, HC_ACT, HC_MIX,
+  HC_ADD (the gated residual), PLE_GATE, and PLE_CONV (the n-gram layer; its
+  convolution state is in Qwen4Cache). Python makes the 16 rows of the
+  n-gram table of each token (the hash, then kq_rows of IQ4_NL).
+- kquants.c has Q5_1 (the down matrices of the experts: the one-token
+  product and the tiles, bit-equal) and the rows of IQ4_NL.
+- The flags of the GDN record (CPU and GPU): 1 for the tiled order, 2 for
+  the sigmoid gate of the norm.
+- A chat prompt: "The capital of France is Paris."; the decode is 5.9 to
+  7.4 tok/s on the CPU (llama.cpp: 5.0 tok/s).
+- scripts/check_qwen4_cpu.py: with 4 layers, 86% of the top tokens are
+  those of the NumPy model, and the logits are within 13%. The error of
+  int8 x is spread over all the products: with one group of products
+  exact, it changes little. A router of 512 experts turns small changes
+  into another expert more often than the 256 of Qwen3.6.
+- The program has no QSA indexer yet: at most 2051 positions.
+
 - Use the kernels of kquants.c for these parts:
   - the products (int8 x, a scale for each 32 values);
   - the MoE (512 experts, 10 for each token);

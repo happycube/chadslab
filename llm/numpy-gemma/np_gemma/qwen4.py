@@ -318,3 +318,237 @@ class Qwen4(QwenGGUF):
         cache.n = start_pos + len(ids)
         self.last_streams = H
         return self.hc_pre(H, "output_hc", inject=False)
+
+
+# ---- the CPU path: the step as a program of records (QWEN38_PLAN.md, phase 2) ----
+
+def compile_qwen4_step(model, t):
+    """Compile a step of t tokens of a Qwen4CPU into a program of records.
+
+    The inputs are names["H"] (t x hc * hid: the embeddings in each stream)
+    and names["ple"] (t x hid: the rows of the n-gram table). The output is
+    names["xn"], the input of the head. The products are KQ_QUANT and
+    KQ_LINEAR (csrc/kquants.c); the gated residual and the n-gram layer are
+    the records of csrc/hyperconn.c. QSA is the full attention (at most
+    2048 + 3 positions: the indexer is not in the program yet)."""
+    from . import cops
+    from . import program as P
+    cfg = model.cfg
+    prog = P.Program()
+    hid, hc, eps = cfg.hidden_size, cfg.hc_count, float(cfg.rms_norm_eps)
+    HD, lr = hc * hid, cfg.hc_lowrank
+    nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+    kd, vd, cd = cfg.lin_key_dim, cfg.lin_value_dim, cfg.conv_dim
+    k, E, inner = cfg.top_k, cfg.num_experts, cfg.moe_inter
+    f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
+    H, ple, xn = f32(t, HD), f32(t, hid), f32(t, hid)
+    hn, g, lo, loa, mixed, inj = f32(t, HD), f32(t, HD), f32(t, lr), f32(t, lr), f32(t, hid), f32(t, hc)
+    wide = max(HD, cd, nq * 2 * hd, vd, nq * hd)
+    xq, xs, xm = np.zeros((t, wide), np.int8), f32(t, wide // 32), f32(t, wide // 16)
+    o1, o2, o3, o4, o5 = f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide), f32(t, wide)
+    att, gate, qout, kbuf = f32(t, nq * hd), f32(t, nq * hd), f32(t, nq * hd), f32(t, nk * hd)
+    lo_n = (np.zeros(t, np.int32), np.zeros(t, np.int32))
+    keyn, qn, gated, gn = f32(t, HD), f32(t, HD), f32(t, HD), f32(t, HD)
+    mo, logits = f32(t, hid), f32(t, E)
+    val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
+    scratch = cops.kq_moe_scratch(t, k, E, hid, inner)
+    gscr = f32(t * cd)
+    prog.names.update(H=H, ple=ple, xn=xn)
+    pos, cos, sin, scores = prog.slot("pos"), prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
+    cur = {}
+
+    def quant(src, cols):
+        prog.emit(P.KQ_QUANT, src, t, cols, xq, xs, xm)
+        cur["src"] = src
+
+    def lin(gname, out, src=None):
+        m = model.K(gname)
+        prog.emit(P.KQ_LINEAR, xq, xs, xm, cur["src"] if src is None else src, m.data, m.type,
+                  m.rows, m.cols, t, out)
+
+    def scalar(op, a, b):
+        r = prog.temp()
+        prog.emit(op, r, a, b)
+        return r
+
+    def hc_pre(prefix, out, inject=True):
+        prog.emit(P.HC_NORM, H, model.F(prefix + "_norm.weight"), hn, t, hc, hid, eps)
+        quant(hn, HD)
+        lin(prefix + "_down.weight", lo)
+        prog.emit(P.HC_ACT, lo, loa, t * lr, 1.0 / hc)
+        quant(loa, lr)
+        lin(prefix + "_up.weight", g)
+        prog.emit(P.HC_MIX, hn, g, out, t, hc, hid)
+        if inject:
+            lin(prefix + "_inject.weight", inj, src=hn)
+
+    def attention(i):
+        b = "blk.%d." % i
+        lin(b + "attn_q.weight", o1)
+        lin(b + "attn_k.weight", o2)
+        lin(b + "attn_v.weight", o3)
+        prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(b + "attn_q_norm.weight"),
+                  model.F(b + "attn_k_norm.weight"), cos, sin, None, None, 0, pos, t, nq, nk, hd,
+                  cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate, kbuf)
+        base = [prog.slot("%s.%d" % (nm, i)) for nm in ("kq", "ks", "vq", "vs")]
+        per = nk * hd
+        rows = [scalar(P.S_ADD, bs, scalar(P.S_MUL, pos, step))
+                for bs, step in zip(base, (2 * per, per // 8, 2 * per, per // 8))]
+        prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
+        if t <= 16:
+            for j in range(t):
+                nj = scalar(P.S_ADD, pos, j + 1)
+                prog.emit(P.ATTN_QC, qout[j:j + 1], *base, scores, att[j:j + 1], nq, nk, hd, nj)
+        else:
+            prog.emit(P.ATTN_QC_MT, qout, *base, scores, att, nq, nk, hd, t, pos, 0, 0, *lo_n)
+        prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
+        quant(att, nq * hd)
+        lin(b + "attn_output.weight", o5)
+
+    def deltanet(i):
+        b = "blk.%d." % i
+        lin(b + "attn_qkv.weight", o1)
+        lin(b + "attn_gate.weight", o2)
+        lin(b + "ssm_beta.weight", o3)
+        lin(b + "ssm_alpha.weight", o4)
+        from .qwen import gdn_flags
+        prog.emit(P.GDN, o1, prog.slot("conv.%d" % i), model.F(b + "ssm_conv1d.weight", (cd, cfg.conv_kernel)),
+                  cfg.conv_kernel, o2, o4, o3, model.A_log(i), model.F(b + "ssm_dt.bias"),
+                  model.F(b + "ssm_norm.weight"), prog.slot("S.%d" % i), att, gscr, t,
+                  cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim, eps, None,
+                  gdn_flags(cfg), prog.slot("nreal"))
+        quant(att, vd)
+        lin(b + "ssm_out.weight", o5)
+
+    def ple_layer(i):
+        b = "blk.%d.ple_" % i
+        quant(ple, hid)
+        lin(b + "key.weight", o1)
+        lin(b + "value.weight", o2)
+        prog.emit(P.HC_NORM, o1, model.F(b + "norm_key.weight"), keyn, t, hc, hid, eps)
+        prog.emit(P.HC_NORM, H, model.F(b + "norm_query.weight"), qn, t, hc, hid, eps)
+        prog.emit(P.PLE_GATE, keyn, qn, o2, gated, t, hc, hid)
+        prog.emit(P.HC_NORM, gated, model.F(b + "norm_conv.weight"), gn, t, hc, hid, eps)
+        prog.emit(P.PLE_CONV, gn, gated, H, prog.slot("pleconv.%d" % i),
+                  model.F(b + "conv1d.weight", (HD, cfg.ple_conv_kernel)), t, HD,
+                  cfg.ple_conv_kernel, cfg.ple_ngram)
+
+    for i in range(model.n_layers):
+        b = "blk.%d." % i
+        if i in cfg.ple_layers:
+            ple_layer(i)
+        hc_pre(b + "hc_attn", mixed)
+        quant(mixed, hid)
+        if cfg.layer_types[i] == "full_attention":
+            attention(i)
+        else:
+            deltanet(i)
+        prog.emit(P.HC_ADD, H, o5, inj, t, hc, hid, 1.0 / hc)
+        hc_pre(b + "hc_ffn", mixed)
+        quant(mixed, hid)
+        lin(b + "ffn_gate_inp.weight", logits)
+        lin(b + "ffn_gate_inp_shexp.weight", slog)
+        prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
+        mats = cops.kq_moe_mats(*(model.K(b + "ffn_%s_exps.weight" % n).c()
+                                  for n in ("gate", "up", "down")),
+                                [model.K(b + "ffn_%s_shexp.weight" % n).c()
+                                 for n in ("gate", "up", "down")])
+        prog.emit(P.KQ_MOE, xq, xs, xm, idx, val, t, k, E, mats, slog, hid, inner, scratch, mo)
+        prog.keep.append(mats)
+        prog.emit(P.HC_ADD, H, mo, inj, t, hc, hid, 1.0 / hc)
+    hc_pre("output_hc", xn, inject=False)
+    prog.tokens = t
+    return prog.finish()
+
+
+class Qwen4CPU(Qwen4):
+    """Qwen3.8-Flash-Next with the step as one program of records (the C
+    kernels of cops). The weights stay in the blocks of the file."""
+
+    CHUNK = 512
+
+    def __init__(self, path, cfg=None, layers=None):
+        super().__init__(path, cfg, layers)
+        self._k = {}
+        self._f = {}
+        self.programs = {}
+
+    def K(self, gname):
+        from .qwen import KMat
+        m = self._k.get(gname)
+        if m is None:
+            m = self._k[gname] = KMat(self.g, gname)
+        return m
+
+    def F(self, gname, shape=None):
+        a = self._f.get((gname, shape))
+        if a is None:
+            a = np.ascontiguousarray(self.G(gname), dtype=np.float32)
+            a = self._f[(gname, shape)] = a.reshape(shape) if shape is not None else a
+        return a
+
+    def A_log(self, i):
+        key = ("A_log", i)
+        a = self._f.get(key)
+        if a is None:
+            a = self._f[key] = np.log(-self.G("blk.%d.ssm_a" % i)).astype(np.float32)
+        return a
+
+    def embed(self, ids):
+        from . import cops
+        m = self.K("token_embd.weight")
+        return cops.kq_rows(m.data, m.type, m.cols, ids)
+
+    def logits(self, h, chunk=None):
+        from . import cops
+        from .qwen import KX
+        m, qx = self.K("output.weight"), KX(h)
+        out = np.empty((qx.t, m.rows), np.float32)
+        cops.kq_linear(m.data, m.type, m.rows, m.cols, qx.xq, qx.xs, qx.xm, qx.x, qx.t, out)
+        return out
+
+    def ple_rows(self, ids, cache):
+        """The 16 rows of the n-gram table of each token (t x hid)."""
+        from . import cops
+        rows = self.ple_ids(ids, cache)
+        m = self.K("per_layer_token_embd.weight")
+        return cops.kq_rows(m.data, m.type, m.cols, rows.reshape(-1)).reshape(len(ids), -1)
+
+    def program(self, t):
+        prog = self.programs.get(t)
+        if prog is None:
+            prog = self.programs[t] = compile_qwen4_step(self, t)
+        return prog
+
+    def _bind(self, prog, cache, pos, t):
+        from .qwen import cache_params, scores_buffer
+        cfg = self.cfg
+        cos, sin = self.rope(np.arange(pos, pos + t))
+        kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos),
+              "sin": np.ascontiguousarray(sin), "scores": scores_buffer(cfg, pos + t)}
+        kw.update(cache_params(self, cache))
+        for i in cfg.ple_layers:
+            kw["pleconv.%d" % i] = cache.ple_conv[i]
+        prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
+
+    def forward(self, ids, cache, start_pos=0, hook=None):
+        ids = list(ids)
+        cfg = self.cfg
+        if start_pos + len(ids) > 2048 + 3:
+            raise NotImplementedError("the program has no QSA indexer yet: at most 2051 "
+                                      "positions (Qwen4 has it)")
+        out = []
+        c0 = 0
+        while c0 < len(ids):
+            chunk = ids[c0:c0 + self.CHUNK]
+            prog = self.program(len(chunk))
+            self._bind(prog, cache, start_pos + c0, len(chunk))
+            x = self.embed(chunk)
+            prog.names["H"][:] = np.repeat(x[:, None, :], cfg.hc_count, axis=1).reshape(len(chunk), -1)
+            if cfg.ple_layers:
+                prog.names["ple"][:] = self.ple_rows(chunk, cache)
+            prog.run()
+            out.append(prog.names["xn"].copy())
+            c0 += len(chunk)
+        cache.n = start_pos + len(ids)
+        return np.concatenate(out)

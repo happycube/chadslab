@@ -83,6 +83,8 @@ MA_QUANT, MA_LINEAR, MA_MOE, ROUTER_TOPK, GDN, ATTN_PREP, SIGMUL = 100, 101, 102
 KQ_QUANT, KQ_LINEAR, KQ_MOE = 107, 108, 109
 # The GPU only (np_gemma/qwen_gpu.py).
 KQ_HOT_MOE, KQ_MULTI, ADD_RMS, KQ_GROUP_MOE = 110, 111, 112, 113
+# qwen4exp: the gated residual and the n-gram layer (csrc/hyperconn.c).
+HC_NORM, HC_ACT, HC_MIX, HC_ADD, PLE_GATE, PLE_CONV = 114, 115, 116, 117, 118, 119
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -102,7 +104,8 @@ OP_NAMES = {v: k for k, v in dict(
     ARGMAX=ARGMAX, ADD_NORM=ADD_NORM, COUNT=COUNT, MA_QUANT=MA_QUANT, MA_LINEAR=MA_LINEAR,
     MA_MOE=MA_MOE, ROUTER_TOPK=ROUTER_TOPK, GDN=GDN, ATTN_PREP=ATTN_PREP, SIGMUL=SIGMUL,
     KQ_QUANT=KQ_QUANT, KQ_LINEAR=KQ_LINEAR, KQ_MOE=KQ_MOE, KQ_HOT_MOE=KQ_HOT_MOE,
-    KQ_MULTI=KQ_MULTI, ADD_RMS=ADD_RMS, KQ_GROUP_MOE=KQ_GROUP_MOE).items()}
+    KQ_MULTI=KQ_MULTI, ADD_RMS=ADD_RMS, KQ_GROUP_MOE=KQ_GROUP_MOE, HC_NORM=HC_NORM, HC_ACT=HC_ACT,
+    HC_MIX=HC_MIX, HC_ADD=HC_ADD, PLE_GATE=PLE_GATE, PLE_CONV=PLE_CONV).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
