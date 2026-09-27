@@ -37,9 +37,9 @@ _LIB_DIR = _HERE / "_libs"
 # instruction. The code loads the fastest library that the CPU gives.
 _FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC", "-lm"]
 _FLAGS = _FLAGS_COMMON + ["-mavx2", "-mfma"]
-_FLAGS_AVX512 = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl", "-mfma"]
+_FLAGS_AVX512 = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl", "-mfma", "-mf16c"]
 _FLAGS_VNNI = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl",
-                               "-mavx512vnni", "-mfma"]
+                               "-mavx512vnni", "-mfma", "-mf16c"]
 
 _MAX_GEMM_TOKENS = 1024
 

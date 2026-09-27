@@ -335,6 +335,49 @@ Status of phase 3 (done):
   prefix. A second turn and a turn that goes back to the first prompt give
   the same bits as one prompt pass of the whole chat.
 
+## The GGUF file (UD-Q4_K_M, done)
+
+The same model runs on the GGUF file of llama.cpp. The step program and the
+DeltaNet are the same; only the products change.
+
+- np_gemma/gguf.py reads Q8_0, Q4_K, and Q5_K (and Q6_K), bit-equal with
+  the dequantize functions of ggml. QwenGGUF (np_gemma/qwen.py) is the
+  NumPy model on the file. It maps the GGUF names and gets A_log from
+  ssm_a = -exp(A_log). The value heads are in the tiled order of the
+  converter: value head h reads key head h % 16 (QwenConfig.v_tiled). The
+  norms have the 1 added, as in the MLX file.
+- csrc/kquants.c has the products for Q8_0, Q4_K, Q5_K, Q6_K, and F32.
+  There, x is int8 in its natural order, with one scale for each 32 values and the
+  sum of each 16 values. The same x serves all the formats. The router,
+  ssm_alpha, ssm_beta, and the gate of the shared expert are F32 in the
+  file, and use x without quantization.
+- The one-token product and the tiles (4 rows by 4 tokens) use the same
+  scales and add in the same order. A verify
+  group gives the bits of plain steps.
+- The sort of the pairs and the weighted sum of a MoE layer are in
+  csrc/moe.c, for both formats. QwenGGUFCPU and QwenGGUFProgram use the
+  step program through the format hooks of QwenCPU (x_buffers, emit_quant,
+  emit_lin, emit_moe).
+- scripts/check_qwen_gguf.py compares 4 layers with QwenGGUF: 95% to 98%
+  of the top tokens are the same, and the logits are within 5%. It also
+  checks verify and commit, and runs a chat prompt.
+
+The rate on the CPU, with the other load of this machine:
+
+    path                          prompt             decode
+    this runtime, GGUF            72 tok/s (512)     18.4 tok/s
+    this runtime, MLX             92 tok/s (1024)    17.7 tok/s
+    llama.cpp -ngl 0, GGUF        60 tok/s (128)     10.1 tok/s
+
+The GGUF tiles give 0.3 to 0.37 TMAC/s for rows of 2048 values. The rows
+of 512 values (the down products of the experts) are slower. For each 64
+values of each (row, token) pair, a tile does dpbusd, a conversion, and a
+multiply-add with the scale of the part. The next step is the
+x of llama.cpp for the K formats (Q8_K): one scale of x for each 256
+values. Then the scales of the parts are integers, and the sums stay in int32
+for the whole block (vpmaddubsw and vpdpwssd). Only one conversion is
+necessary for each block.
+
 ## Phase 4: the GPU path
 
 The design of the 26B: the dense part on the GPU (about 2.0 GB), the
