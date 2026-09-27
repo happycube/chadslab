@@ -66,6 +66,21 @@ Also time the host part of a decode step (bind_step, the rows of the
 embeddings, the logits, the sampler), as for the GPU. The argmax in C and the rows of
 the embeddings in one C call already help the CPU path too.
 
+Phase 0 is done: gemma_profile (C) and Program.profile_ops (Python). The
+profile of the E4B step in C (55 ms) corrects the table above:
+
+    record          time      records   each
+    INT4_MULTI4     30.9 ms   66        469 us
+    INT4_LINEAR     19.2 ms   186       103 us
+    ATTN_F32H       2.8 ms    42        67 us
+    RMS_NORM        0.9 ms    212       4 us
+    BF16_LINEAR     0.9 ms    1         881 us
+    MUL, GELU, ADD  1.6 ms    295       4 to 7 us
+
+In the real parallel region the small records take about 3 ms, not 11 ms.
+The products take 50 ms. Thus phase 1 gives about 2 ms, and the products
+are the target.
+
 ## Phase 1: the fused forms for the E4B on the CPU (low risk)
 
 The GPU step uses e4b_step_form(fused=2): add_norm2 and gelu_mul. The CPU

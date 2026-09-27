@@ -229,6 +229,22 @@ class Program:
         if rc != 0:
             raise RuntimeError("gemma_run returned %d" % rc)
 
+    def profile(self):
+        """Run the records in C with a barrier after each one. Return the
+        time of each record in ms (CPU_PLAN.md, phase 0)."""
+        return cops.gp_profile(self.buf, len(self.recs))
+
+    def profile_ops(self, reps=3):
+        """Run profile() reps times. Return {op name: (ms, count)} for one
+        run, the largest first."""
+        acc = {}
+        for _ in range(reps):
+            for (op, _a), ms in zip(self.recs, self.profile()):
+                name = OP_NAMES.get(op, str(op))
+                t, n = acc.get(name, (0.0, 0))
+                acc[name] = (t + ms / reps, n + 1.0 / reps)
+        return dict(sorted(acc.items(), key=lambda kv: -kv[1][0]))
+
     def dump(self, limit=None):
         """Return the program as text: the slots, then the records."""
         lines = ["env:"]

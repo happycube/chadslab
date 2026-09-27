@@ -224,6 +224,7 @@ try:
         _lib.gemma_q6k_rows.argtypes = [_void_p, _void_p, _int, _int, _void_p]
         _lib.gemma_q6k_rows.restype = None
         _lib.gemma_argmax.argtypes = [_void_p, ctypes.c_int64]
+        _lib.gemma_profile.argtypes = [_void_p, _void_p]
         _lib.ma_quant_x.argtypes = [_void_p, _int, _int, _int, _void_p, _void_p, _void_p]
         _lib.ma_quant_x.restype = None
         _lib.ma_linear.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p, _void_p,
@@ -600,6 +601,16 @@ def linear_int4(x, packed, scales, group):
                            ctypes.c_int(rows), ctypes.c_int(cols),
                            ctypes.c_int(x.shape[0]), ctypes.c_int(group))
     return out
+
+
+def gp_profile(buf, n):
+    """Run a program with the time of each record (gemma_profile). Return
+    the times in ms, one for each of the n records."""
+    ms = np.zeros(n, dtype=np.float64)
+    rc = _lib.gemma_profile(buf.ctypes.data, ms.ctypes.data)
+    if rc != 0:
+        raise RuntimeError("gemma_profile returned %d" % rc)
+    return ms
 
 
 def argmax(x):

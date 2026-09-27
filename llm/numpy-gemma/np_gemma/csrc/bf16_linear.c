@@ -7707,6 +7707,39 @@ static void gp_exec(const int64_t *prog, int limit)
     free(e);
 }
 
+/* Run a program with a barrier after each record, and the time of each
+ * record in ms (CPU_PLAN.md, phase 0). ms has one value for each record.
+ * The barriers add a little time; the times show where the step goes. */
+int gemma_profile(const int64_t *prog, double *ms)
+{
+    if (prog[0] != GP_MAGIC) {
+        return -1;
+    }
+    #pragma omp parallel
+    {
+        const int n_env = (int)prog[1];
+        const int n_code = (int)prog[2];
+        const int64_t *env0 = prog + 4;
+        const gp_rec *code = (const gp_rec *)(env0 + n_env);
+        int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
+        memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
+        #pragma omp barrier
+        double t0 = omp_get_wtime();
+        for (int pc = 0; pc < n_code; ++pc) {
+            gp_step(code + pc, e);
+            #pragma omp barrier
+            #pragma omp master
+            {
+                double t1 = omp_get_wtime();
+                ms[pc] = (t1 - t0) * 1e3;
+                t0 = t1;
+            }
+        }
+        free(e);
+    }
+    return 0;
+}
+
 int gemma_run(const int64_t *prog, int limit)
 {
     if (prog[0] != GP_MAGIC) {
