@@ -401,6 +401,50 @@ the cache, and about 1 GB of hot experts fit in it.
   delta rule (torch_chunk_gated_delta_rule, chunks of 64) on the tensor
   cores. The experts of a large group come to the GPU, as for the 26B.
 
+Status of phase 4 (the decode of the GGUF file, done):
+
+- np_gemma/qwen_gpu.py (QwenGPU) compiles the step of compile_qwen_step
+  with other hooks. The dense products read copies of the weights on the
+  GPU. Q8_0 goes to rows of int8 values, then their scales (type 100 of
+  csrc/gpu.cu), for 16-byte loads. The GPU products read x in float32.
+- New kernels of csrc/gpu.cu: KQ_LINEAR, GDN, ATTN_PREP, SIGMUL,
+  ROUTER_TOPK, and KQ_HOT_MOE. KQ_LINEAR takes F32, Q8_0, Q4_K, Q5_K, and
+  Q6_K, with one warp for each row. GDN does the convolution, then one
+  block for each value head keeps its column of the state in registers. KQ_HOT_MOE computes the hot experts and the
+  shared expert. The attention is ATTN_F32H of the E4B; the head is
+  gg_q6k_head.
+- The cold experts run on the CPU, with GP_HOT_SPLIT, GP_TO_HOST,
+  GP_CPU_JOIN, and GP_TO_DEV. The CPU program is KQ_QUANT and KQ_MOE, with
+  the count of the cold experts. HotCache of np_gemma/gpu.py now takes the parts of an expert
+  as a list, so it serves the three matrices of a Qwen expert.
+- The prompt still runs on the CPU (QwenGGUFProgram); attach() copies the
+  cache to the GPU.
+
+The rate of scripts/check_qwen_gpu.py (256 tokens). The machine had its
+other load, and about 7.5 GB of the GPU was free.
+
+    setup                                        decode
+    37 hot experts in each layer (2.8 GB), new   51 tok/s
+    the same, HotCache warm                      54 to 57 tok/s
+    24 hot experts (2 GB), HotCache warm         51 tok/s
+    CPU only (this runtime)                      16 to 18 tok/s
+    llama.cpp, dense part on the GPU             39.5 tok/s
+
+About 4 of the 8 experts of a token are cold with 37 slots. A step takes
+about 17 ms. The cold experts take about 9 ms on the CPU, and the hot
+experts run on the GPU at the same time. The dense part takes about 7 ms
+on the GPU; the large products read about 320 GB/s. 18 CPU threads
+(OMP_NUM_THREADS=18) were faster than 36 in one test.
+
+The next steps of phase 4:
+
+- the prompt pass on the GPU. The products take groups of tokens, and the
+  DeltaNet runs the tokens in order (later the chunked form). The experts
+  of a large group come to the GPU, as for the 26B;
+- the MTP verify group (the log of GDN on the GPU);
+- fewer small launches (alpha, beta, and the gate of the shared expert in
+  one record).
+
 ## Phase 5: MTP
 
 The MTP layer has these steps. The matrix fc takes two norms: the row of

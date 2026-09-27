@@ -1485,7 +1485,13 @@ class HotCache:
     NP_GEMMA_GPU_HOT_INS change decay and max_ins. See SPLIT_PLAN.md.
     """
 
-    def __init__(self, dev, decay=None, max_ins=None):
+    def __init__(self, dev, decay=None, max_ins=None, layers=None, top_k=None):
+        """layers (or None for a ModelGPU) gives one dict for each layer
+        with slots: layer, slots (the host array), dslots (its device
+        address), ip (the pinned array of GP_HOT_SPLIT), and parts: for each
+        part of an expert, (host address of expert 0, bytes of one expert,
+        device address of slot 0). top_k (or None for a ModelGPU) is the
+        count of experts of a token."""
         self.dev = dev
         model = dev.model
         cfg = model.cfg
@@ -1494,16 +1500,17 @@ class HotCache:
         # A cold expert goes to the GPU only from its admit-th use while it
         # is cold. Its first uses run on the CPU.
         self.admit = int(os.environ.get("NP_GEMMA_GPU_HOT_ADMIT", "2"))
-        self.top_k = cfg.top_k_experts
-        self.layers = []        # one entry for each layer with hot experts
-        for layer, (_hot, gu_store, dn_store, slots) in sorted(dev.prog.hot_stores.items()):
+        self.top_k = top_k or cfg.top_k_experts
+        self.layers = layers if layers is not None else []  # the layers with hot experts
+        for layer, (_hot, gu_store, dn_store, slots) in (
+                sorted(dev.prog.hot_stores.items()) if layers is None else ()):
             w = model._layers[layer]
             gq, dq = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
             n = gq.shape[0]
             self.layers.append(dict(
                 layer=layer, slots=slots, dslots=dev.g.mirror.buffer_of(slots).ptr,
-                gu=dev.g.mirror.buffer_of(gu_store).ptr, dn=dev.g.mirror.buffer_of(dn_store).ptr,
-                egu=gq.nbytes // n, edn=dq.nbytes // n, gsrc=gq.ctypes.data, dsrc=dq.ctypes.data,
+                parts=[(gq.ctypes.data, gq.nbytes // n, dev.g.mirror.buffer_of(gu_store).ptr),
+                       (dq.ctypes.data, dq.nbytes // n, dev.g.mirror.buffer_of(dn_store).ptr)],
                 ip=dev.prog.hot_ip[layer]))
         m = len(self.layers)
         # One row for each entry of layers: the score of each expert, the
@@ -1636,8 +1643,8 @@ class HotCache:
             self.incoming[r, x] = True
             changed.add(r)
             items.append((r, x, slot))
-            rows += _pieces(e["gsrc"] + x * e["egu"], e["gu"] + slot * e["egu"], e["egu"])
-            rows += _pieces(e["dsrc"] + x * e["edn"], e["dn"] + slot * e["edn"], e["edn"])
+            for src, nb, dst in e["parts"]:
+                rows += _pieces(src + x * nb, dst + slot * nb, nb)
         if not items:
             return
         # The old experts are cold on the GPU before the copies start.

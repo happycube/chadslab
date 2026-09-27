@@ -660,12 +660,18 @@ static inline kq_mat kq_mat_of(const int64_t *d)
 /* The experts of t tokens in the GGUF formats, as ma_moe_body. h is
  * quantized (hq, hs, hm; kq_quant_body). mats has 6 descriptors (w, type):
  * gate, up, down of the stacked experts, then of the shared expert (w = 0
- * for none). The weight of the shared expert is sigmoid(shared_logit). */
+ * for none). The weight of the shared expert is sigmoid(shared_logit).
+ * kcount (or null) holds k, for one token. */
 static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, const int32_t *ids,
                         const float *val, int t, int k, int experts, const int64_t *mats,
                         const float *shared_logit, int hidden, int inner, uint8_t *scratch,
-                        float *out)
+                        float *out, const int32_t *kcount)
 {
+    if (kcount != NULL) {
+        /* One token with a count of experts in memory: the cold experts of a
+         * GPU step (GP_HOT_SPLIT writes the count). */
+        k = *kcount;
+    }
     kq_mat G = kq_mat_of(mats), U = kq_mat_of(mats + 2), D = kq_mat_of(mats + 4);
     kq_mat SG = kq_mat_of(mats + 6), SU = kq_mat_of(mats + 8), SD = kq_mat_of(mats + 10);
     int shared = SG.w != NULL;
@@ -744,5 +750,5 @@ void kq_moe(const int8_t *hq, const float *hs, const float *hm, const int32_t *i
 {
     #pragma omp parallel
     kq_moe_body(hq, hs, hm, ids, val, t, k, experts, mats, shared_logit, hidden, inner, scratch,
-                out);
+                out, NULL);
 }

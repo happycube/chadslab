@@ -7483,11 +7483,12 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_KQ_MOE:
         /* hq, hs, hm, ids, val, t, k, experts, mats, shared_logit, hidden, inner, scratch,
-         * out */
+         * out, kcount (null, or the count of experts of one token) */
         kq_moe_body(GP_P(const int8_t, 0), GP_P(const float, 1), GP_P(const float, 2),
                     GP_P(const int32_t, 3), GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7),
                     GP_P(const int64_t, 8), GP_P(const float, 9), GP_I(10), GP_I(11),
-                    GP_P(uint8_t, 12), GP_P(float, 13));
+                    GP_P(uint8_t, 12), GP_P(float, 13),
+                    GP_P(const int32_t, 14));
         break;
     case GP_ATTN_PREP:
         /* qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps, scale,
