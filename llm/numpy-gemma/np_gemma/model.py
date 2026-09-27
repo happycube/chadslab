@@ -303,6 +303,10 @@ class Model:
         # The prompt GEMM uses a packed copy of the int8 weights when this is
         # on. The copy is the transpose of the data, so it is the same size.
         self._packed = os.environ.get("NP_GEMMA_PACKED") == "1"
+        # The activations of the int4 products of a prompt pass: "1" (int8),
+        # "16" (float matrices and int16 experts), or "0" (float). See
+        # ops.prompt_act.
+        self.prompt_act = ops.prompt_act(cfg.enable_moe_block)
 
     # ---- weights -----------------------------------------------------------
     def _load_layer(self, i, dtype):
@@ -512,7 +516,7 @@ class Model:
                 return ops.linear_int8(x, w[0], w[1], w[2])
             return ops.linear_int8(x, w[0], w[1])
         if self._dtype == "int4":
-            return ops.linear_int4(x, w[0], w[1])
+            return ops.linear_int4(x, w[0], w[1], q8=self.prompt_act == "1")
         if self._dtype == "bf16":
             return ops.linear_bf16(x, w)
         return ops.linear(x, w)
@@ -555,12 +559,12 @@ class Model:
             return self._moe_one_token(h, w, val, idx)
         if self._dtype == "int4" and ops.mt_ready(h.shape[0]):
             return self._moe_mt(h, w, val, idx)
-        if self._dtype == "int4" and h.shape[0] >= 2 and ops.moe_prompt_ready():
+        if self._dtype == "int4" and h.shape[0] >= 2 and ops.moe_prompt_ready(self.prompt_act):
             # One parallel region covers every expert of the layer. The
-            # activations are int8, int16, or float32 (NP_GEMMA_INT4_Q8).
+            # activations are int8, int16, or float32 (self.prompt_act).
             return ops.moe_prompt(h, w["experts.gate_up_proj"],
                                   w["experts.down_proj"], val, idx,
-                                  self.cfg.moe_intermediate_size)
+                                  self.cfg.moe_intermediate_size, self.prompt_act)
         inner = self.cfg.moe_intermediate_size
         out = np.zeros_like(h)
         gu = w["experts.gate_up_proj"]
@@ -999,7 +1003,8 @@ class Model:
             out = ops.linear_q6k(x, self._embed_q6k_bytes, self.cfg.hidden_size)
         elif self._embed_q is not None:
             if self._dtype == "int4":
-                out = ops.linear_int4(x, self._embed_q, self._embed_s)
+                out = ops.linear_int4(x, self._embed_q, self._embed_s,
+                                      q8=self.prompt_act == "1")
             else:
                 out = ops.linear_int8(x, self._embed_q, self._embed_s)
         elif self._embed_bf16 is not None:

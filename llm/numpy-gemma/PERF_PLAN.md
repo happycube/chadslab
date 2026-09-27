@@ -542,6 +542,13 @@ The perplexity of 1024 tokens is a noisy measure for these small changes.
 The simulated int8 gives 49.4 and the int8 kernel gives 59.3, on the same
 text, against 55.1 for float. Use the share of the same token.
 
+The default is now per model. A model with a mixture of experts (the 26B)
+uses mode 16, and a dense model (the 12B and the E4B) uses mode 1. For a
+dense model, mode 16 is the same as mode 0. The variable NP_GEMMA_INT4_Q8
+selects one mode for every model. With the new default, a 512-token prompt
+of the 26B takes 8.39 s (61.0 tokens/s). 99.7 per cent of the tokens agree
+with the float products.
+
 Mode 0 now runs the experts in one region too. The int16 tile of a dense
 matrix (cops.linear_int4_q16) stays in the code for a comparison. No mode
 uses it, because the float GEMM is as fast.

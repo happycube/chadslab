@@ -252,7 +252,7 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_ATTN_IMPL     auto                    c, avx2, or avx512 forces one version of the flash kernel.
     NP_GEMMA_FLASH         0 for the 12B,         1 sends a prompt of more than one token to the C flash kernel. "slide" uses it for a sliding layer only.
                            1 for E4B
-    NP_GEMMA_INT4_Q8       1                       The activations of the int4 products of a prompt pass. 1 uses int8 for every product, as llama.cpp does. 16 uses float32 for the attention and dense matrices and int16 for the experts: 99.7 per cent of the tokens agree with float32, at 1.5 times the time of 1. 0 uses float32 for every product, at 1.9 times the time of 1.
+    NP_GEMMA_INT4_Q8       per model               The activations of the int4 products of a prompt pass. 1 uses int8 for every product, as llama.cpp does. 16 uses float32 for the attention and dense matrices and int16 for the experts: 99.7 per cent of the tokens agree with float32, at 1.4 times the time of 1. 0 uses float32 for every product, at 1.9 times the time of 1. Without the variable, a model with experts (the 26B) uses 16 and a dense model uses 1.
     NP_GEMMA_INT4_Q8_TOKENS 2                       The smallest token count for the int8 tile. A lower value is slower for one token.
     NP_GEMMA_INT4_MULTI4   1                       1 runs the query, key, and value in one call, and the gate with the up projection. 0 gives one call for each matrix.
     NP_GEMMA_INT4_Q8_GEMV  0                       1 uses the int8 activation for the matrices of one token, on a machine with VNNI. It is not faster. See "What llama.cpp does differently".

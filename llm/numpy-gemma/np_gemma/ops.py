@@ -43,19 +43,36 @@ _FUSED_QKV = os.environ.get("NP_GEMMA_FUSED_QKV", "1") == "1"
 _INT4_MULTI4 = os.environ.get("NP_GEMMA_INT4_MULTI4", "1") == "1"
 # The activations of the int4 products of a prompt pass (PERF_PLAN.md,
 # "Accuracy against the reference"):
-#   "1"   int8 for every product. This is the default and the method of
-#         llama.cpp. It changes the most probable token at about 16 per cent
-#         of the positions, against the float products.
+#   "1"   int8 for every product. This is the method of llama.cpp. It
+#         changes the most probable token at about 16 per cent of the
+#         positions, against the float products. A dense model uses it by
+#         default.
 #   "16"  float32 for the attention and the dense matrices, and int16 for the
-#         experts. It changes about 0.5 per cent of the positions, and the
-#         prompt pass takes about 1.37 times the time of "1".
-#   "0"   float32 for every product. The prompt pass takes about 1.8 times the
+#         experts. It changes about 0.3 per cent of the positions, and the
+#         prompt pass takes about 1.5 times the time of "1". A model with a
+#         mixture of experts (the 26B) uses it by default.
+#   "0"   float32 for every product. The prompt pass takes about 1.9 times the
 #         time of "1".
-_PROMPT_ACT = os.environ.get("NP_GEMMA_INT4_Q8", "1")
-_INT4_Q8 = _PROMPT_ACT == "1"
+# Set NP_GEMMA_INT4_Q8 to select one form for every model. See prompt_act.
+_PROMPT_ACT_ENV = os.environ.get("NP_GEMMA_INT4_Q8")
+_INT4_Q8 = _PROMPT_ACT_ENV in (None, "1")
 _INT4_Q8_GEMV = os.environ.get("NP_GEMMA_INT4_Q8_GEMV", "0") == "1"
 # The int8 tile needs AVX-512. The int8 dot product for one token needs VNNI.
-_INT4_Q8_OK = _INT4_Q8 and _COPS_READY and bool(getattr(_cops, "AVX512", False))
+_INT4_Q8_HW = _COPS_READY and bool(getattr(_cops, "AVX512", False))
+_INT4_Q8_OK = _INT4_Q8 and _INT4_Q8_HW
+
+
+def prompt_act(moe):
+    """Return the form of the prompt activations of a model: "1", "16", or "0".
+
+    NP_GEMMA_INT4_Q8 selects one form for every model. Without it, a model
+    with a mixture of experts uses "16" and a dense model uses "1". The
+    experts make the int16 form cheap for the 26B. For a dense model, "16"
+    is the same as "0", which takes about 1.9 times the time of "1".
+    """
+    if _PROMPT_ACT_ENV is not None:
+        return _PROMPT_ACT_ENV
+    return "16" if moe else "1"
 _INT4_Q8_GEMV_OK = (_INT4_Q8_GEMV and _COPS_READY
                     and bool(getattr(_cops, "VNNI", False)))
 _QKV_OK = _FUSED_QKV and _COPS_READY
@@ -709,7 +726,7 @@ def linear_int4_numpy(x, packed, scales):
 # Use the int4 kernel with int8 activations. The kernel quantizes the
 # activations to int8 with one scale for each group of 32 columns. The dot then
 # uses the integer multiply maddubs. NP_GEMMA_INT4_Q8 selects the activations
-# of a prompt pass; see _PROMPT_ACT at the top of this module.
+# of a prompt pass; see prompt_act at the top of this module.
 # The smallest token count for the int8 tile. A smaller count wastes the token
 # lanes and pays for the quantization of the activations.
 _INT4_Q8_TOKENS = int(os.environ.get("NP_GEMMA_INT4_Q8_TOKENS", "2"))
@@ -782,22 +799,22 @@ def int4_q8_moe_ready():
     return int4_q8_ready()
 
 
-def moe_prompt_ready():
-    """Return True when a fused expert kernel serves the prompt pass."""
-    if _PROMPT_ACT == "1":
-        return _INT4_Q8_OK
+def moe_prompt_ready(act):
+    """Return True when a fused expert kernel serves the prompt form act."""
+    if act == "1":
+        return _INT4_Q8_HW
     return _COPS_READY
 
 
-def moe_prompt(h, gu, dn, val, idx, inner):
-    """Run the experts of a prompt pass with the activations of NP_GEMMA_INT4_Q8.
+def moe_prompt(h, gu, dn, val, idx, inner, act):
+    """Run the experts of a prompt pass with the activations of the form act.
 
     "1" uses int8, "16" uses int16, and "0" uses float32. Each form runs the
-    experts of the layer in one region.
+    experts of the layer in one region. See prompt_act.
     """
-    if _PROMPT_ACT == "1":
+    if act == "1":
         return moe_int4_q8(h, gu, dn, val, idx, inner)
-    if _PROMPT_ACT == "16":
+    if act == "16":
         return moe_int4_q16(h, gu, dn, val, idx, inner)
     return moe_int4_f32(h, gu, dn, val, idx, inner)
 
@@ -922,18 +939,20 @@ def moe_int4_q8(h, gu, dn, val, idx, inner):
 _INT4_GEMM_TOKENS = int(os.environ.get("NP_GEMMA_INT4_GEMM_TOKENS", "64"))
 
 
-def linear_int4(x, packed, scales):
+def linear_int4(x, packed, scales, q8=None):
     """Multiply x by W. W is packed 4-bit data.
 
     Use the C kernel when the C path is available. Otherwise, dequantize W and
-    use NumPy.
+    use NumPy. q8 selects the int8 activations for two or more tokens. None
+    uses the default of the process (NP_GEMMA_INT4_Q8).
     """
+    q8_ok = _INT4_Q8_OK if q8 is None else (q8 and _INT4_Q8_HW)
     if _KERNEL_MODE != "numpy" and _COPS_READY:
         group = INT4_GROUP
         tokens = x.shape[0]
         if tokens == 1 and _INT4_Q8_GEMV_OK:
             return linear_int4_q8_gemv(x, packed, scales)
-        if tokens >= _INT4_Q8_TOKENS and _INT4_Q8_OK:
+        if tokens >= _INT4_Q8_TOKENS and q8_ok:
             return linear_int4_q8(x, packed, scales)
         if tokens >= _INT4_GEMM_TOKENS:
             xt = np.ascontiguousarray(x.T)
