@@ -466,12 +466,48 @@ The decode of the 26B has the speed of the old int8 copy:
 The server now uses the int16 copy by default (--kv-attn int16). The
 program and the Python path keep the same bits in the new mode.
 
-The int8 activations of the prompt pass (NP_GEMMA_INT4_Q8=1, the default)
-give the largest error. One matrix product is off by about 0.6 per cent.
-The prompt pass writes the keys and the values of the cache, so each later
-decode step reads that error. The int8 cache gives a smaller error. Both
-defaults need a separate decision about speed and accuracy. This plan does
-not change them.
+**To decide: the int8 activations of the prompt pass.** The prompt pass
+changes the activations to int8 before the int4 products (NP_GEMMA_INT4_Q8=1,
+the default). The prompt pass writes the keys and the values of the cache,
+so each later decode step reads that error. The error of the logits against
+the reference, and the time of a prompt of 512 tokens:
+
+    int8 activations          max |d|   mean |d|   top-1   pp512
+    all products (default)    8.19      1.135       78%    6.94 s
+    experts only              6.72      0.730      100%    8.28 s
+    dense and attention only  8.06      1.064       89%    9.32 s
+    none (float)              0.0014    0.00019    100%   11.80 s
+
+llama.cpp uses the same method: Q8_0 activations for Q4_0 weights. On the
+40 most probable next tokens, its log-probabilities differ from the
+reference by 0.71 on average (at most 2.73). This project differs by 0.92
+(at most 4.35) with int8 activations, and by less than 0.0001 with float
+activations.
+
+The error has no single source. Each int8 product differs from the float
+product by 0.45 to 1.0 per cent, for every kind of matrix:
+
+    product              mean error
+    self_attn.o_proj     1.01e-02
+    self_attn.v_proj     1.00e-02
+    experts.down         8.01e-03
+    mlp.down_proj        7.92e-03
+    mlp.up_proj          7.51e-03
+    self_attn.k_proj     7.12e-03
+    mlp.gate_proj        6.76e-03
+    self_attn.q_proj     6.69e-03
+    experts.gate_up      4.50e-03
+
+That is the step of int8 with one scale for each 32 values. Thus a float
+path for one kind of matrix does not fix it. The choices are:
+
+1. Keep int8. The accuracy is close to llama.cpp, and the prompt pass has
+   the speed of llama.cpp.
+2. Use float. The prompt pass is 1.7 times slower.
+3. Use int16 activations, as the cache now does. The AVX-512 VNNI
+   instruction vpdpwssd multiplies int16 values at half the rate of the
+   int8 instruction. The error falls by about 256 times. Measure the speed
+   of the tile with a benchmark of one layer before the full work.
 
 ## Verification
 
