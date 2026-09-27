@@ -3958,7 +3958,8 @@ void gemma_attn_decode_i16(const float *q, const int16_t *kq, const float *ks,
 
 /* The same for a group of queries. Query t reads the rows lo[t] to
  * lo[t] + n[t] - 1. A decode step of that query reads the same rows. q is
- * (tokens, q_heads, head_dim). scores holds tokens * q_heads * nmax values. */
+ * (tokens, q_heads, head_dim). scores holds nmax values for each thread
+ * (the threads of the region; a larger buffer also serves). */
 static void gemma_attn_decode_i16_mt_body(const float *q, const int16_t *kq,
                                           const float *ks, const int16_t *vq,
                                           const float *vs, float *scores, float *out,
@@ -3977,8 +3978,9 @@ static void gemma_attn_decode_i16_mt_body(const float *q, const int16_t *kq,
         size_t r = (size_t)lo[t];
         attn_i16_head(q + (size_t)u * (size_t)head_dim, kq + r * kv_stride,
                       ks + r * ks_stride, vq + r * kv_stride, vs + r * ks_stride,
-                      scores + (size_t)u * (size_t)nmax, out + (size_t)u * (size_t)head_dim,
-                      h / n_rep, head_dim, kv_stride, ks_stride, n[t]);
+                      scores + (size_t)omp_get_thread_num() * (size_t)nmax,
+                      out + (size_t)u * (size_t)head_dim, h / n_rep, head_dim, kv_stride,
+                      ks_stride, n[t]);
     }
 }
 
@@ -7028,14 +7030,15 @@ static void gp_sigmul_body(const float *x, const float *g, float *out, int64_t n
  *   into qout (t x nq x hd); the gate into gate (t x nq x hd);
  * - kk, vv (t x nk x hd): the key gets rms_norm with kn and RoPE; the key and
  *   the value go to the cache K, V (nk heads, hs values between heads) at
- *   the positions pos to pos + t - 1.
+ *   the positions pos to pos + t - 1. With a null K (the int16 cache), the
+ *   key goes to kout (t x nk x hd) instead.
  *
  * cos and sin have rot values for each token (the two halves the same). */
 static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
                               const float *qn, const float *kn, const float *cos,
                               const float *sin, float *K, float *V, int64_t hs, int64_t pos,
                               int t, int nq, int nk, int hd, int rot, float eps, float scale,
-                              float *qout, float *gate)
+                              float *qout, float *gate, float *kout)
 {
     int half = rot / 2;
     #pragma omp for schedule(static)
@@ -7054,9 +7057,15 @@ static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
         } else {
             int kh = h - nq;
             src = kk + ((size_t)j * nk + kh) * hd;
-            dst = K + (size_t)kh * hs + (size_t)(pos + j) * hd;
-            memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * hd,
-                   vv + ((size_t)j * nk + kh) * hd, (size_t)hd * 4);
+            if (K == NULL) {
+                /* The int16 cache: the key goes to kout, and GP_KV_WRITE
+                 * stores the key and the value. */
+                dst = kout + ((size_t)j * nk + kh) * hd;
+            } else {
+                dst = K + (size_t)kh * hs + (size_t)(pos + j) * hd;
+                memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * hd,
+                       vv + ((size_t)j * nk + kh) * hd, (size_t)hd * 4);
+            }
             w = kn;
             sc = 1.f;
         }
@@ -7497,7 +7506,8 @@ static void gp_step(const gp_rec *r, int64_t *e)
                           GP_P(const float, 3), GP_P(const float, 4), GP_P(const float, 5),
                           GP_P(const float, 6), GP_P(float, 7), GP_P(float, 8), gp_i(r, e, 9),
                           gp_i(r, e, 10), GP_I(11), GP_I(12), GP_I(13), GP_I(14), GP_I(15),
-                          gp_f(r, e, 16), gp_f(r, e, 17), GP_P(float, 18), GP_P(float, 19));
+                          gp_f(r, e, 16), gp_f(r, e, 17), GP_P(float, 18), GP_P(float, 19),
+                          GP_P(float, 20));
         break;
     case GP_SIGMUL:
         /* x, g, out, n */
@@ -7677,8 +7687,10 @@ static void gp_step(const gp_rec *r, int64_t *e)
         int n = GP_I(8);
         #pragma omp single
         {
-            memcpy(kd, k, (size_t)n * sizeof(float));
-            memcpy(vd, v, (size_t)n * sizeof(float));
+            if (kd != NULL) {
+                memcpy(kd, k, (size_t)n * sizeof(float));
+                memcpy(vd, v, (size_t)n * sizeof(float));
+            }
             for (int g = 0; kqd != NULL && g < n / 32; ++g) {
                 ksd[g] = gemma_quant_group32_i16(k + (size_t)g * 32, kqd + (size_t)g * 32);
                 vsd[g] = gemma_quant_group32_i16(v + (size_t)g * 32, vqd + (size_t)g * 32);

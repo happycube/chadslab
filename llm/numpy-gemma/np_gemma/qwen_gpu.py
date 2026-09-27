@@ -45,7 +45,7 @@ import numpy as np
 from . import cops
 from . import program as P
 from .gpu import Buffer, GPUProgram, HotCache, _check, lib, mem_info, pinned
-from .qwen import compile_qwen_step
+from .qwen import cache_params, compile_qwen_step
 
 Q8_0, Q8_R = 8, 100     # the ggml type; its rows for the GPU (csrc/gpu.cu)
 MT = 16                 # the largest small group (MT_MAX of csrc/gpu.cu)
@@ -426,20 +426,13 @@ class QwenGPU:
         self.cache_dev.release()
 
     def _params(self, pos, t, nreal):
-        cfg = self.cfg
         cache = self.cache
-        assert pos + t <= cache.kv[next(iter(cache.kv))][0].shape[1], "the cache is too short"
+        assert pos + t <= cache.max_len, "the cache is too short"
         cos, sin = self.model.rope(np.arange(pos, pos + t))
         kw = {"pos": pos, "nreal": nreal, "cos": np.ascontiguousarray(cos, np.float32),
               "sin": np.ascontiguousarray(sin, np.float32),
-              "scores": np.empty(cfg.num_heads * (pos + t) + 64, np.float32)}
-        for i in range(self.model.n_layers):
-            if cfg.layer_types[i] == "full_attention":
-                K, V = cache.kv[i]
-                kw["K.%d" % i], kw["V.%d" % i] = K, V
-                kw["hs"] = K.shape[1] * K.shape[2]
-            else:
-                kw["conv.%d" % i], kw["S.%d" % i] = cache.conv[i], cache.state[i]
+              "scores": np.empty(self.cfg.num_heads * (pos + t) + 64, np.float32)}
+        kw.update(cache_params(self.model, cache))
         return kw
 
     # ---- the runs ----
@@ -526,7 +519,7 @@ class QwenGPU:
         ids = list(ids)
         c0 = 0
         h = None
-        room = self.cache.kv[next(iter(self.cache.kv))][0].shape[1]
+        room = self.cache.max_len
         while c0 < len(ids):
             size, n, fetch = self._sizes(len(ids) - c0, room - pos - c0)
             h = self.group(ids[c0:c0 + n], pos + c0, size, fetch=fetch)

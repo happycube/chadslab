@@ -3735,7 +3735,8 @@ __global__ void k_router_topk(const gp_rec *r, const int64_t *e)
 }
 
 /* GP_ATTN_PREP: qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps,
- * scale, qout, gate (gp_attn_prep_body of the CPU). One block of hd threads
+ * scale, qout, gate, kout (gp_attn_prep_body of the CPU; with a null K the
+ * key goes to kout, for GP_KV_WRITE). One block of hd threads
  * for each (token, head). */
 __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
 {
@@ -3755,9 +3756,13 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
     } else {
         int kh = h - nq;
         src = DP(const float, 1) + ((size_t)j * nk + kh) * hd;
-        dst = DP(float, 7) + (size_t)kh * hs + (size_t)(pos + j) * hd;
-        DP(float, 8)[(size_t)kh * hs + (size_t)(pos + j) * hd + d] =
-            DP(const float, 2)[((size_t)j * nk + kh) * hd + d];
+        if (DP(float, 7) == NULL) {
+            dst = DP(float, 20) + ((size_t)j * nk + kh) * hd;
+        } else {
+            dst = DP(float, 7) + (size_t)kh * hs + (size_t)(pos + j) * hd;
+            DP(float, 8)[(size_t)kh * hs + (size_t)(pos + j) * hd + d] =
+                DP(const float, 2)[((size_t)j * nk + kh) * hd + d];
+        }
         w = DP(const float, 4);
         sc = 1.f;
     }

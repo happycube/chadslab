@@ -523,6 +523,40 @@ With no hot experts the decode is 42 to 46 tok/s. Thus the dense part on
 the GPU gives most of the gain over the CPU (17 tok/s). Each 0.5 GB then adds
 about 2 to 4 tok/s.
 
+Status of phase 4 (the int16 cache, done):
+
+- The keys and values of the 10 full layers are int16 with a float32 scale
+  for each 32 values, the form of the 26B. QwenConfig.kv_form comes from
+  NP_GEMMA_QWEN_KV: "int16" is the default, "f32" is the old form. A
+  position takes 20.6 KB, not 40 KB.
+- ATTN_PREP writes the key to a buffer (operand kout), and GP_KV_WRITE
+  stores the rows of the key and the value. GP_ATTN_QC reads the cache: a
+  step, and each query of a group of at most 16 tokens (the bits of the
+  steps). A larger group uses GP_ATTN_QC_MT. The CPU and the GPU use the
+  same records. The NumPy model uses the same quantization (kv_store,
+  kv_rows).
+- GP_ATTN_QC_MT of the CPU now uses one row of scores for each thread, not
+  one for each (token, head). Before, a long cache needed gigabytes of
+  scores.
+- The checks pass (the logits of 4 layers of NumPy against transformers:
+  6.6e-6). The GPU and the CPU now give the same 128 tokens of an answer.
+
+The decode at far positions (scripts/bench_qwen_ctx.py; hot experts fixed,
+0.5 GB; 0 GB for the last two rows):
+
+    position   int16          f32
+    1000       41.9 tok/s     41.7 tok/s
+    32000      36.5 tok/s     36.1 tok/s
+    64000      34.1 tok/s     32.3 tok/s
+    131000     27.4 tok/s     (5.4 GB; does not fit)
+    190000     24.2 tok/s     (does not fit)
+
+The int16 cache of 190000 positions takes 4.1 GB, and it fit next to the
+other work of the GPU (8.7 GB). The full context of 262144 positions takes
+5.7 GB. That needs a GPU without the other work: the dense part, the head,
+and the cache then take about 8.5 GB. The attention of int16 costs about
+0.08 ms for each 1000 positions (at 64000: 5.4 ms, f32 6.9 ms).
+
 ## Phase 5: MTP
 
 The MTP layer has these steps. The matrix fc takes two norms: the row of
