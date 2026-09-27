@@ -485,11 +485,14 @@ class SplitCompiler(P.Compiler):
     GPU while the CPU computes the experts.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, hot=None):
         super().__init__(model)
-        self.pending = {}      # id of an output -> (CPU program, host output, event)
+        # id of an output of the experts -> (CPU program, host output, event,
+        # device buffer of the CPU part, device buffer of the GPU part).
+        self.pending = {}
         self.n_events = 0
         self.cpu_progs = []
+        self.hot = hot or {}   # layer -> the experts that the GPU holds
 
     def kernel(self, head, vals, out=None):
         for a in _arrays(vals):
@@ -501,12 +504,16 @@ class SplitCompiler(P.Compiler):
         return super().kernel(head, vals, out)
 
     def join(self, a):
-        cpu, host, ev = self.pending.pop(id(a))
+        cpu, host, ev, part, gpu_part = self.pending.pop(id(a))
         self.p.emit(P.CPU_JOIN, cpu.buf, ev)
-        self.p.emit(P.TO_DEV, host, a, a.nbytes)
+        self.p.emit(P.TO_DEV, host, part, part.nbytes)
+        if gpu_part is not None:
+            self.p.emit(P.ADD, gpu_part, part, a, a.size)
 
     def moe(self, h, val, idx, layer):
         assert h.shape[0] == 1, "the GPU runs a step of one token"
+        if self.hot.get(layer):
+            return self.moe_hot(h, val, idx, layer, self.hot[layer])
         hp, vp, ip = pinned(h.shape), pinned(val.shape), pinned(idx.shape, np.int32)
         ev = self.n_events
         self.n_events += 1
@@ -516,14 +523,102 @@ class SplitCompiler(P.Compiler):
         cpu = cc.p.finish()
         self.cpu_progs.append(cpu)
         dev_out = self.buffer(h.shape)
-        self.pending[id(dev_out)] = (cpu, host_out, ev)
+        self.pending[id(dev_out)] = (cpu, host_out, ev, dev_out, None)
         return dev_out
 
+    def moe_hot(self, h, val, idx, layer, hot):
+        """The experts of a layer when the GPU holds some of them.
 
-def compile_split_step(model):
+        GP_HOT_SPLIT writes the selected experts that the GPU does not hold
+        (the cold experts), with their weights and their count. GP_TO_HOST
+        copies them and the input to the host. GP_HOT_MOE computes the hot
+        experts on the GPU, while the CPU computes the cold experts with
+        GP_MOE_N. The output is the sum of the two parts.
+        """
+        w = self.model._layers[layer]
+        gu_q, gu_s = w["experts.gate_up_proj"]
+        dn_q, dn_s = w["experts.down_proj"]
+        inner = self.cfg.moe_intermediate_size
+        top_k = idx.size
+        hidden = h.shape[1]
+        slots = np.full(gu_q.shape[0], -1, dtype=np.int32)
+        slots[hot] = np.arange(len(hot), dtype=np.int32)
+        gu_store = np.ascontiguousarray(gu_q[hot])
+        dn_store = np.ascontiguousarray(dn_q[hot])
+        for store, scales in ((gu_store, gu_s), (dn_store, dn_s)):
+            half = store[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)
+            if not np.array_equal(half, scales[hot]):
+                raise ValueError("an expert has float32 scales that are not its float16 scales")
+        cold = np.zeros(top_k + 1, dtype=np.int32)
+        cold_val = self.buffer(top_k)
+        self.p.emit(P.HOT_SPLIT, idx, val, slots, cold, cold_val, top_k)
+        hp, vp, ip = pinned(h.shape), pinned((top_k,)), pinned((top_k + 1,), np.int32)
+        ev = self.n_events
+        self.n_events += 1
+        self.p.emit(P.TO_HOST, h, hp, h.nbytes, cold_val, vp, vp.nbytes, cold, ip, ip.nbytes, ev)
+        gpu_part = self.buffer(h.shape)
+        self.p.emit(P.HOT_MOE, h, val, idx, slots, gu_store, dn_store,
+                    self.buffer((top_k, 2 * inner)), self.buffer((top_k, inner)),
+                    self.buffer((top_k, hidden)), gpu_part, top_k, 2 * inner, hidden,
+                    dn_q.shape[1], inner)
+        cc = P.Compiler(self.model)
+        host_out = np.zeros(h.shape, dtype=np.float32)
+        cc.p.emit(P.MOE_N, hp, vp, ip, ip[top_k:], gu_q, gu_s, dn_q, dn_s, gu_q.shape[1],
+                  hidden, dn_q.shape[1], inner, np.zeros(top_k, dtype=np.int32),
+                  np.zeros((top_k, 2 * inner), np.float32), np.zeros((top_k, inner), np.float32),
+                  np.zeros((top_k, dn_q.shape[1]), np.float32), host_out)
+        cpu = cc.p.finish()
+        self.cpu_progs.append(cpu)
+        out = self.buffer(h.shape)
+        self.pending[id(out)] = (cpu, host_out, ev, self.buffer(h.shape), gpu_part)
+        return out
+
+
+def pick_hot(model, counts, budget):
+    """Return the experts that the GPU holds, as a dict layer -> the sorted
+    expert indices. counts has shape (layers, experts): the selections of each
+    expert on a text (scripts/expert_use.py). The set takes the most used
+    experts over all layers, up to budget bytes."""
+    w = model._layers[0]
+    per = (w["experts.gate_up_proj"][0][0].nbytes + w["experts.down_proj"][0][0].nbytes)
+    n = int(budget // per)
+    flat = np.asarray(counts).reshape(-1)
+    order = np.argsort(flat, kind="stable")[::-1][:n]
+    order = order[flat[order] > 0]
+    e = counts.shape[1]
+    hot = {}
+    for k in order:
+        hot.setdefault(int(k // e), []).append(int(k % e))
+    return {layer: sorted(v) for layer, v in hot.items()}
+
+
+# The counts of the experts of the 26B QAT model on 800 tokens of each of four
+# texts. The texts are the README, Python code, C code, and notes in English
+# (SPLIT_PLAN.md).
+HOT_COUNTS = _HERE / "data" / "gemma-4-26B-expert-counts.npz"
+
+
+def hot_counts(model):
+    """Return the counts of the experts for the hot experts, or None."""
+    path = os.environ.get("NP_GEMMA_GPU_HOT")
+    if path == "0":
+        return None
+    f = np.load(path or HOT_COUNTS)
+    counts = sum(f[k] for k in f.files)
+    shape = (model.cfg.num_hidden_layers, model.cfg.num_experts)
+    if counts.shape != shape:
+        if path:
+            raise ValueError("the counts of %s have the shape %s, not %s"
+                             % (path, counts.shape, shape))
+        return None
+    return counts
+
+
+def compile_split_step(model, hot=None):
     """Compile a step of one token of the 26B model (or of a dense model) for
-    the GPU, with the float cache. "x" is the input and "xn" the result."""
-    c = SplitCompiler(model)
+    the GPU, with the float cache. "x" is the input and "xn" the result. hot
+    gives the experts that the GPU holds (see pick_hot)."""
+    c = SplitCompiler(model, hot)
     c.env["x"] = np.zeros((1, model.cfg.hidden_size), dtype=np.float32)
     c.p.slot("pos")
     c.compile(P.step_form(model, "f32", 1))
@@ -646,9 +741,26 @@ class ModelGPU:
         g.detach(cache)                  # the host cache has the new rows
     """
 
-    def __init__(self, model, graph=True):
+    def __init__(self, model, graph=True, hot=None):
+        """hot is a dict layer -> experts (see pick_hot), or None.
+
+        Without hot, a model with experts gets the most used experts of a
+        file of counts (scripts/expert_use.py). The file is NP_GEMMA_GPU_HOT,
+        or else HOT_COUNTS when its shape agrees with the model.
+        NP_GEMMA_GPU_HOT=0 turns the hot experts off. NP_GEMMA_GPU_HOT_GB
+        gives the budget in GB. The default budget is the free memory of the
+        GPU less 4.5 GB: the rest of the step takes about 3 GB, and the
+        display needs some memory too.
+        """
         self.model = model
-        self.prog = compile_split_step(model)
+        if hot is None and model.cfg.enable_moe_block:
+            counts = hot_counts(model)
+            if counts is not None:
+                gb = os.environ.get("NP_GEMMA_GPU_HOT_GB")
+                budget = float(gb) * 1e9 if gb else max(0.0, mem_info()[0] - 4.5e9)
+                hot = pick_hot(model, counts, budget)
+        self.hot = hot or {}
+        self.prog = compile_split_step(model, self.hot)
         self.g = GPUProgram(self.prog, graph=graph)
         self.kv = GPUKV(model.cfg)
         self.head = None

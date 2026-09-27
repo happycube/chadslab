@@ -70,7 +70,8 @@ enum {
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_F32 = 51,
     GP_QKV_NORM = 54, GP_ROPE = 55, GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64,
-    GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86,
+    GP_TO_HOST = 84, GP_CPU_JOIN = 85, GP_TO_DEV = 86, GP_HOT_SPLIT = 87,
+    GP_HOT_MOE = 88,
 };
 
 static cudaStream_t gg_stream;
@@ -652,49 +653,187 @@ __global__ void k_router_logits(const gp_rec *r, const int64_t *e)
     }
 }
 
-/* One thread: the softmax, the top_k experts, and their weights. The count
- * of experts is small (128), so one thread is enough. */
+/* One warp: the softmax, the top_k experts, and their weights. Each lane
+ * keeps the logits of experts lane, lane + 32, and so on. At an equal
+ * probability, the expert with the lower index wins, as in
+ * gemma_router_body. At most 256 experts. */
 __global__ void k_router_top(const gp_rec *r, const int64_t *e)
 {
-    float *logits = DP(float, 12);
+    const float *logits = DP(const float, 12);
     const float *per_expert = DP(const float, 3);
     float *val = DP(float, 9);
     int *idx = DP(int, 10);
     int experts = DI(5), top_k = DI(6);
-    float m = logits[0];
-    for (int x = 1; x < experts; ++x) {
-        m = fmaxf(m, logits[x]);
+    int lane = threadIdx.x;
+    float p[8];
+    float m = -INFINITY;
+    for (int k = 0; k < 8; ++k) {
+        int x = lane + 32 * k;
+        p[k] = x < experts ? logits[x] : -INFINITY;
+        m = fmaxf(m, p[k]);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
     }
     float sum = 0.f;
-    for (int x = 0; x < experts; ++x) {
-        logits[x] = expf(logits[x] - m);
-        sum += logits[x];
+    for (int k = 0; k < 8; ++k) {
+        p[k] = lane + 32 * k < experts ? expf(p[k] - m) : 0.f;
+        sum += p[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
     }
     float invs = 1.0f / sum;
-    for (int x = 0; x < experts; ++x) {
-        logits[x] *= invs;
-    }
-    for (int j = 0; j < top_k; ++j) {
-        int best = 0;
-        float bv = logits[0];
-        for (int x = 1; x < experts; ++x) {
-            if (logits[x] > bv) {
-                bv = logits[x];
-                best = x;
-            }
-        }
-        val[j] = bv;
-        idx[j] = best;
-        logits[best] = -1.0f;
+    for (int k = 0; k < 8; ++k) {
+        p[k] = lane + 32 * k < experts ? p[k] * invs : -2.0f;
     }
     float vs = 0.f;
     for (int j = 0; j < top_k; ++j) {
-        vs += val[j];
+        /* The best expert of this lane, then of the warp. */
+        float bv = -3.0f;
+        int bx = 1 << 30;
+        for (int k = 0; k < 8; ++k) {
+            if (p[k] > bv) {
+                bv = p[k];
+                bx = lane + 32 * k;
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int ox = __shfl_xor_sync(0xffffffff, bx, o);
+            if (ov > bv || (ov == bv && ox < bx)) {
+                bv = ov;
+                bx = ox;
+            }
+        }
+        if (lane == 0) {
+            val[j] = bv;
+            idx[j] = bx;
+        }
+        vs += bv;
+        if ((bx & 31) == lane) {
+            p[bx / 32] = -1.0f;
+        }
     }
-    float invv = 1.0f / vs;
+    if (lane == 0) {
+        float invv = 1.0f / vs;
+        for (int j = 0; j < top_k; ++j) {
+            val[j] = val[j] * invv * per_expert[idx[j]];
+        }
+    }
+}
+
+/* ---------- the hot experts ----------
+ * The GPU holds some experts of each layer (SPLIT_PLAN.md, the hot experts).
+ * The array map of a layer gives the slot of each expert on the GPU, or -1.
+ *
+ * GP_HOT_SPLIT: idx, val, map, cold_idx, cold_val, top_k. Write the
+ * selected experts that the GPU does not hold, and their weights, to
+ * cold_idx and cold_val. cold_idx[top_k] gets their count. The CPU computes
+ * these experts (GP_MOE_N of the CPU interpreter). */
+__global__ void k_hot_split(const gp_rec *r, const int64_t *e)
+{
+    const int *idx = DP(const int, 0);
+    const float *val = DP(const float, 1);
+    const int *map = DP(const int, 2);
+    int *cold = DP(int, 3);
+    float *cold_val = DP(float, 4);
+    int top_k = DI(5), n = 0;
     for (int j = 0; j < top_k; ++j) {
-        val[j] = val[j] * invv * per_expert[idx[j]];
+        if (map[idx[j]] < 0) {
+            cold[n] = idx[j];
+            cold_val[n] = val[j];
+            ++n;
+        }
     }
+    cold[top_k] = n;
+}
+
+/* The operands of GP_HOT_MOE:
+ *
+ *     h, val, idx, map, gu, dn, act, act2, de, out, top_k, gu_rows, cols,
+ *     dn_rows, inner
+ *
+ * The record computes the selected experts that the GPU holds. Four kernels
+ * do the steps:
+ *
+ * 1. the gate and up rows into act;
+ * 2. the GELU into act2;
+ * 3. the down rows into de;
+ * 4. the sum with the router weights into out.
+ *
+ * A block of an expert that the GPU does not hold does nothing. The arrays
+ * gu and dn hold the int4 blocks of the experts of the layer, one expert
+ * after the other. */
+__device__ __forceinline__ int hot_slot(const gp_rec *r, const int64_t *e, int j)
+{
+    return DP(const int, 3)[DP(const int, 2)[j]];
+}
+
+__global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
+{
+    int j = blockIdx.y, slot = hot_slot(r, e, j);
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int rows = DI(11), cols = DI(12);
+    if (slot < 0 || row >= rows) {
+        return;
+    }
+    size_t rb = (size_t)(cols / 32) * 18;
+    float v = int4_row(DP(const uint8_t, 4) + ((size_t)slot * rows + row) * rb,
+                       DP(const float, 0), cols);
+    if (threadIdx.x % 32 == 0) {
+        DP(float, 6)[(size_t)j * rows + row] = v;
+    }
+}
+
+__global__ void k_hot_gelu(const gp_rec *r, const int64_t *e)
+{
+    int j = blockIdx.x;
+    if (hot_slot(r, e, j) < 0) {
+        return;
+    }
+    int inner = DI(14);
+    const float *g = DP(const float, 6) + (size_t)j * 2 * inner;
+    float *o = DP(float, 7) + (size_t)j * inner;
+    for (int i = threadIdx.x; i < inner; i += blockDim.x) {
+        float v = g[i];
+        o[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)))
+               * g[inner + i];
+    }
+}
+
+__global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
+{
+    int j = blockIdx.y, slot = hot_slot(r, e, j);
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int rows = DI(13), inner = DI(14);
+    if (slot < 0 || row >= rows) {
+        return;
+    }
+    size_t rb = (size_t)(inner / 32) * 18;
+    float v = int4_row(DP(const uint8_t, 5) + ((size_t)slot * rows + row) * rb,
+                       DP(const float, 7) + (size_t)j * inner, inner);
+    if (threadIdx.x % 32 == 0) {
+        DP(float, 8)[(size_t)j * rows + row] = v;
+    }
+}
+
+__global__ void k_hot_sum(const gp_rec *r, const int64_t *e)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int rows = DI(13), top_k = DI(10);
+    if (c >= rows) {
+        return;
+    }
+    const float *val = DP(const float, 1);
+    const float *de = DP(const float, 8);
+    float acc = 0.f;
+    for (int j = 0; j < top_k; ++j) {
+        if (hot_slot(r, e, j) >= 0) {
+            acc += val[j] * de[(size_t)j * rows + c];
+        }
+    }
+    DP(float, 9)[c] = acc;
 }
 
 /* ---------- the output head ---------- */
@@ -926,11 +1065,24 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_ATTN_F32:
         attn_launch(g, r, dr, denv, &bad);
         break;
+    case GP_HOT_SPLIT:
+        k_hot_split<<<1, 1, 0, s>>>(dr, denv);
+        break;
+    case GP_HOT_MOE: {
+        unsigned k = (unsigned)hlit(r, 10, &bad);
+        k_hot_gu<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), ROWS_PER_BLOCK), k), W, 0, s>>>(
+            dr, denv);
+        k_hot_gelu<<<k, T, 0, s>>>(dr, denv);
+        k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), ROWS_PER_BLOCK), k), W, 0, s>>>(
+            dr, denv);
+        k_hot_sum<<<(unsigned)cdiv(hlit(r, 13, &bad), T), T, 0, s>>>(dr, denv);
+        break;
+    }
     case GP_ROUTER:
         k_router_norm<<<1, T, 0, s>>>(dr, denv);
         k_router_logits<<<(unsigned)cdiv(hlit(r, 5, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
             dr, denv);
-        k_router_top<<<1, 1, 0, s>>>(dr, denv);
+        k_router_top<<<1, 32, 0, s>>>(dr, denv);
         break;
     default:
         snprintf(gg_error, sizeof(gg_error), "no GPU kernel for operation %d", r->op);

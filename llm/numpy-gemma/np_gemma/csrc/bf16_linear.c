@@ -6927,7 +6927,7 @@ enum {
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_QC = 50, GP_ATTN_F32 = 51,
     GP_ATTN_QC_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
-    GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
+    GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67, GP_MOE_N = 68,
     GP_XBAR = 80, GP_MOE_PART = 81, GP_ATTN_QC_H = 82, GP_ATTN_F32_H = 83,
 };
 
@@ -6965,13 +6965,18 @@ static void gp_add_scaled(float *out, const float *d, float v, int n)
 
 /* The experts of one token, as Model._moe_one_token does it. The kernels run
  * the selected experts in the order of their index. Then the code adds their
- * outputs with the router weights, in the same order. */
+ * outputs with the router weights, in the same order.
+ *
+ * GP_MOE gives the count of experts as operand 3. GP_MOE_N gives the address
+ * of an int32 that holds the count. The GPU writes that count with the list
+ * of the experts that it does not hold (np_gemma/gpu.py). A count of 0 gives
+ * an output of zeros. */
 static void gp_moe_one(const gp_rec *r, const int64_t *e)
 {
     const float *h = GP_P(const float, 0);
     const float *val = GP_P(const float, 1);
     const int32_t *idx = GP_P(const int32_t, 2);
-    int top_k = GP_I(3);
+    int top_k = r->op == GP_MOE_N ? *GP_P(const int32_t, 3) : GP_I(3);
     const uint8_t *gu_w = GP_P(const uint8_t, 4);
     const float *gu_s = GP_P(const float, 5);
     const uint8_t *dn_w = GP_P(const uint8_t, 6);
@@ -7568,6 +7573,7 @@ static void gp_step(const gp_rec *r, int64_t *e)
                           GP_P(float, 11), GP_P(float, 12));
         break;
     case GP_MOE:
+    case GP_MOE_N:
         gp_moe_one(r, e);
         break;
     case GP_ROUTER_MT:

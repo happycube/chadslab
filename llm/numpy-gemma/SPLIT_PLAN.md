@@ -434,7 +434,47 @@ weights, 0.6 GB for the head, and the cache: 2.9 GB in all.
 
 A step takes 25 ms, or 40 tokens/s, against 17.9 tokens/s on the CPU. This
 is the value of the estimate. The experts on the CPU take most of the time.
-The next step is the hot experts on the GPU.
+
+### The hot experts on the GPU
+
+The GPU holds the most used experts of a file of counts (pick_hot in
+np_gemma/gpu.py). The set is global over the layers, up to a budget of
+memory. For each layer, the step has these records:
+
+1. GP_HOT_SPLIT writes the selected experts that the GPU does not hold (the
+   cold experts), their weights, and their count.
+2. GP_TO_HOST copies the input and the cold experts to the host.
+3. GP_HOT_MOE computes the hot experts on the GPU, in four kernels.
+4. The dense feed-forward part runs on the GPU.
+5. GP_CPU_JOIN runs GP_MOE_N on the CPU: the MOE record with a count that it
+   reads from memory. GP_TO_DEV copies its output back, and an add joins the
+   two parts.
+
+The file np_gemma/data/gemma-4-26B-expert-counts.npz holds the counts of the
+four texts of phase 0. The test below selects the set without the counts of
+the README, and it runs on the README. Thus the set did not see the text.
+
+    budget   hot experts   context   same top token   GPU and CPU
+    0        0             200       32 of 32         25.0 ms
+    3 GB     896           200       32 of 32         15.0 ms
+    3 GB     896           1100      32 of 32         15.4 ms
+    4 GB     1195          200       32 of 32         14.1 ms
+    4 GB     1195          1100      32 of 32         14.5 ms
+
+The times include the output head. With 3 GB, a step takes 15 ms: about 65
+tokens/s, against 17.9 on the CPU and 19 for llama.cpp on the CPU. A greedy
+generation of 128 tokens with the default settings gives the same tokens as
+the CPU.
+
+With 4 GB, the free memory of the GPU falls to 0.8 GB. The GPU of jackal
+also drives the display, so the default budget is the free memory less 4.5
+GB (about 3.4 GB on jackal). The first step takes about 6.5 s: it copies the
+rows of the hot experts and moves them to the GPU.
+
+A profile of the step runs the records one at a time. In it, the CPU part
+of the experts takes about 0.27 ms for each layer, 8 ms in all. It is on the
+critical path. More hot experts, or a faster CPU part, make the step
+shorter.
 
 ## Verification
 
@@ -468,7 +508,7 @@ The next step is the hot experts on the GPU.
   done, see the results of phase 3.)
 - Phase 4: the CPU and GPU split of the 26B. First the operation split, with
   the experts on the CPU (done, see the results of phase 4). Then the hot
-  experts on the GPU. Then the layer split, to compare. Measure the
+  experts on the GPU (done). Then the layer split, to compare. Measure the
   tokens/s against the CPU program and against llama.cpp with the same
   split.
 - Phase 5: the prompt pass and the MTP group on the GPU. The prompt pass is

@@ -71,11 +71,11 @@ INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
 INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, BF16_LINEAR = 36, 37, 38, 39
 QKV_NORM_ROPE, KV_WRITE, ATTN_QC, ATTN_F32 = 48, 49, 50, 51
 ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
-ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
+ROUTER, MOE, ROUTER_MT, MOE_MT, MOE_N = 64, 65, 66, 67, 68
 # The operations of a program in parts (np_gemma/parts.py, SPLIT_PLAN.md).
 XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 # The records that move work between the GPU and the CPU (np_gemma/gpu.py).
-TO_HOST, CPU_JOIN, TO_DEV = 84, 85, 86
+TO_HOST, CPU_JOIN, TO_DEV, HOT_SPLIT, HOT_MOE = 84, 85, 86, 87, 88
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -89,7 +89,7 @@ OP_NAMES = {v: k for k, v in dict(
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
     ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART,
     ATTN_QC_H=ATTN_QC_H, ATTN_F32_H=ATTN_F32_H, TO_HOST=TO_HOST, CPU_JOIN=CPU_JOIN,
-    TO_DEV=TO_DEV).items()}
+    TO_DEV=TO_DEV, MOE_N=MOE_N, HOT_SPLIT=HOT_SPLIT, HOT_MOE=HOT_MOE).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
