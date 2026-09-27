@@ -73,7 +73,7 @@ QKV_NORM_ROPE, KV_WRITE, ATTN_QC, ATTN_F32 = 48, 49, 50, 51
 ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
 ROUTER, MOE, ROUTER_MT, MOE_MT = 64, 65, 66, 67
 # The operations of a program in parts (np_gemma/parts.py, SPLIT_PLAN.md).
-XBAR, MOE_PART = 80, 81
+XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
@@ -85,7 +85,8 @@ OP_NAMES = {v: k for k, v in dict(
     GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_QC_MT=ATTN_QC_MT, ATTN_F32_MT=ATTN_F32_MT,
     ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
     QKV_NORM=QKV_NORM, ROPE=ROPE, KV_WRITE_HEADS=KV_WRITE_HEADS,
-    ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART).items()}
+    ATTN_F32H=ATTN_F32H, XBAR=XBAR, MOE_PART=MOE_PART,
+    ATTN_QC_H=ATTN_QC_H, ATTN_F32_H=ATTN_F32_H).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same

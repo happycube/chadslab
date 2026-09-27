@@ -287,14 +287,43 @@ value is the median of 12 steps.
     12B     1100      148.5 ms   153.2 ms  -
 
 jackal has one NUMA node. Thus the parts cannot be faster than one team
-here. The cost of the parts has two causes:
+here. In this first version, the cost of the parts had two causes:
 
 - the barriers across the parts: 180 in a step of the 26B;
-- the attention, which runs only in part 0, on half of the cores. This cost
+- the attention, which ran only in part 0, on half of the cores. This cost
   increases with the context.
 
-To make the attention split, each part must hold the keys and the values of
-some heads. Do this before the test on a machine with two sockets.
+### The attention split by heads
+
+The place heads removes the second cause. Part p runs a range of the key and
+value heads and the query heads that go with them. It computes the rows of
+the query, the key, and the value of its heads. It then runs their norm and
+rope, writes its heads to the cache, and runs the attention of its heads.
+
+Each operation reads only the rows that the same part wrote. Thus the
+attention needs no barrier before it, and a layer of the 26B has four
+barriers and the one in the expert operation. Each part uses its own scores
+buffer.
+
+The attention operations GP_ATTN_QC_H and GP_ATTN_F32_H take the row stride
+of the cache as an argument. A part reads only some heads of each row. The bits are the same for all the cases of the table above, and for 3
+parts of the 12B. NP_GEMMA_PART_ATTN=one gives the first version.
+
+The time of a step, measured as before. Other work ran on jackal (load
+average 12), so a difference below 1 ms is noise.
+
+    model   context   cache    one part   2 parts   3 parts
+    26B     200       float    42.8 ms    43.7 ms   44.7 ms
+    26B     1100      int16    54.3 ms    55.9 ms   59.0 ms
+    26B     1100      float    58.1 ms    58.7 ms   60.1 ms
+    12B     200       int16    137.9 ms   137.4 ms  145.9 ms
+    12B     1100      int16    159.8 ms   161.0 ms  -
+
+At a context of 1100, 2 parts of the 26B now cost about 1.6 ms, against 4.1
+ms before. 3 parts cost about 3.5 ms, against 13.6 ms before.
+
+The cache is still one buffer for all the heads. On a machine with NUMA,
+each part must hold the cache of its heads in the memory of its node.
 
 It is important to bind the threads to the cores. Without OMP_PROC_BIND,
 a step of the 26B at a context of 200 takes 52 ms with one part. With
@@ -305,7 +334,7 @@ cases.
 
 The next steps for NUMA:
 
-- the attention split by heads, with a cache for each part;
+- a cache for each part, in the memory of its node;
 - a copy of the weights of each part in the memory of its node, made by the
   threads of that node;
 - the steps of a token group, which need a row stride of the output in the

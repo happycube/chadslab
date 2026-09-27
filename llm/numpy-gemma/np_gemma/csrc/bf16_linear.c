@@ -3854,6 +3854,25 @@ static inline void attn_i16_head(const float *qh, const int16_t *kq, const float
 
 /* The attention of one float32 query over n rows of the int16 cache. q is
  * (q_heads, head_dim). scores holds q_heads * n values. */
+/* The same with the row strides of the cache as arguments. A part of a
+ * program in parts (SPLIT_PLAN.md) runs only some heads. Its cache pointers
+ * then point at its first head, and a row of the cache holds more heads than
+ * the part runs. */
+static void gemma_attn_decode_i16_s_body(const float *q, const int16_t *kq, const float *ks,
+                                         const int16_t *vq, const float *vs, float *scores,
+                                         float *out, int q_heads, int kv_heads,
+                                         int head_dim, int n, size_t kv_stride,
+                                         size_t ks_stride)
+{
+    int n_rep = q_heads / kv_heads;
+    #pragma omp for schedule(static)
+    for (int h = 0; h < q_heads; ++h) {
+        attn_i16_head(q + (size_t)h * (size_t)head_dim, kq, ks, vq, vs,
+                      scores + (size_t)h * (size_t)n, out + (size_t)h * (size_t)head_dim,
+                      h / n_rep, head_dim, kv_stride, ks_stride, n);
+    }
+}
+
 static void gemma_attn_decode_i16_body(const float *q, const int16_t *kq, const float *ks,
                                        const int16_t *vq, const float *vs, float *scores,
                                        float *out, int q_heads, int kv_heads,
@@ -6909,7 +6928,7 @@ enum {
     GP_ATTN_QC_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67,
-    GP_XBAR = 80, GP_MOE_PART = 81,
+    GP_XBAR = 80, GP_MOE_PART = 81, GP_ATTN_QC_H = 82, GP_ATTN_F32_H = 83,
 };
 
 int gemma_gp_record_size(void)
@@ -7569,6 +7588,28 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_MOE_PART:
         gp_moe_part(r, e);
+        break;
+    case GP_ATTN_QC_H:
+        /* Operands: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+         * head_dim, n, kv_stride, ks_stride.
+         * GP_ATTN_QC for some heads. The strides are the values of a whole
+         * cache row. */
+        gemma_attn_decode_i16_s_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                     GP_P(const float, 2), GP_P(const int16_t, 3),
+                                     GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                     GP_I(7), GP_I(8), GP_I(9), GP_I(10),
+                                     (size_t)gp_i(r, e, 11), (size_t)gp_i(r, e, 12));
+        break;
+    case GP_ATTN_F32_H:
+        /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
+         * pos, base, window, row.
+         * GP_ATTN_F32 for some heads. row is the value count of a whole
+         * cache row. */
+        gemma_attn_decode_f32_body(GP_P(const float, 0), GP_P(const float, 1),
+                                   GP_P(const float, 2), GP_P(float, 3), GP_P(float, 4),
+                                   GP_I(5), GP_I(6), GP_I(7), GP_I(8),
+                                   GP_I(7), GP_I(7), (long)gp_i(r, e, 12),
+                                   (long)gp_i(r, e, 12), GP_I(9), GP_I(10), GP_I(11));
         break;
     default:
         break;
