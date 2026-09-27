@@ -66,6 +66,50 @@ class QwenConfig:
         self.moe_inter = t["moe_intermediate_size"]
         self.shared_inter = t["shared_expert_intermediate_size"]
         self.eos_token_ids = c.get("eos_token_id", t.get("eos_token_id"))
+        # The order of the value heads of the linear layers. The MLX files
+        # (and transformers) keep the heads of one key head together:
+        # value head h reads key head h // (v_heads / k_heads). The llama.cpp
+        # converter puts them in tiled order: head h reads key head
+        # h % k_heads. All the tensors of a head move together, so only
+        # this rule changes.
+        self.v_tiled = False
+
+    @classmethod
+    def from_gguf(cls, g):
+        """The config of a qwen35moe GGUF file (the metadata of llama.cpp)."""
+        m = g.meta
+        a = m.get("general.architecture", "qwen35moe")
+
+        def k(name, default=None):
+            return m.get("%s.%s" % (a, name), default)
+
+        cfg = cls.__new__(cls)
+        n = int(k("block_count"))
+        every = int(k("full_attention_interval", 4))
+        cfg.raw = {}
+        cfg.hidden_size = int(k("embedding_length"))
+        cfg.num_hidden_layers = n
+        cfg.layer_types = ["full_attention" if (i + 1) % every == 0 else "linear_attention"
+                           for i in range(n)]
+        cfg.rms_norm_eps = float(k("attention.layer_norm_rms_epsilon", 1e-6))
+        cfg.num_heads = int(k("attention.head_count"))
+        cfg.num_kv_heads = int(k("attention.head_count_kv"))
+        cfg.head_dim = int(k("attention.key_length"))
+        cfg.rope_theta = float(k("rope.freq_base"))
+        cfg.rotary_dim = int(k("rope.dimension_count"))
+        cfg.lin_k_heads = int(k("ssm.group_count"))
+        cfg.lin_v_heads = int(k("ssm.time_step_rank"))
+        cfg.lin_k_dim = int(k("ssm.state_size"))
+        cfg.lin_v_dim = int(k("ssm.inner_size")) // cfg.lin_v_heads
+        cfg.conv_kernel = int(k("ssm.conv_kernel"))
+        cfg.num_experts = int(k("expert_count"))
+        cfg.top_k = int(k("expert_used_count"))
+        cfg.moe_inter = int(k("expert_feed_forward_length"))
+        cfg.shared_inter = int(k("expert_shared_feed_forward_length"))
+        cfg.vocab_size = int(g.tensors["output.weight"][0][1])
+        cfg.eos_token_ids = None
+        cfg.v_tiled = True
+        return cfg
 
     @property
     def lin_key_dim(self):
@@ -275,7 +319,7 @@ class Qwen:
         o = np.empty((t, cfg.lin_v_heads, cfg.lin_v_dim), np.float32)
         for j in range(t):
             for hv in range(cfg.lin_v_heads):
-                hk = hv // rep
+                hk = hv % cfg.lin_k_heads if cfg.v_tiled else hv // rep
                 Sh = S[hv]
                 Sh *= np.exp(g[j, hv])
                 kv_mem = k[j, hk] @ Sh                             # S^T k
@@ -713,3 +757,98 @@ class QwenSession:
         h = self.model.forward([token], self.cache, start_pos=pos)
         self.ids.append(int(token))
         return h
+
+
+# ---- the GGUF files of llama.cpp (QWEN_PLAN.md) --------------------------------
+
+# The GGUF name of each weight of this module ("layers.N." is "blk.N.").
+_GGUF_NAMES = {
+    "linear_attn.in_proj_qkv": "attn_qkv", "linear_attn.in_proj_z": "attn_gate",
+    "linear_attn.in_proj_a": "ssm_alpha", "linear_attn.in_proj_b": "ssm_beta",
+    "linear_attn.out_proj": "ssm_out", "linear_attn.norm.weight": "ssm_norm",
+    "linear_attn.dt_bias": "ssm_dt.bias", "linear_attn.conv1d.weight": "ssm_conv1d",
+    "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k", "self_attn.v_proj": "attn_v",
+    "self_attn.o_proj": "attn_output", "self_attn.q_norm.weight": "attn_q_norm",
+    "self_attn.k_norm.weight": "attn_k_norm",
+    "input_layernorm.weight": "attn_norm", "post_attention_layernorm.weight": "post_attention_norm",
+    "mlp.gate": "ffn_gate_inp", "mlp.shared_expert_gate": "ffn_gate_inp_shexp",
+    "mlp.shared_expert.gate_proj": "ffn_gate_shexp", "mlp.shared_expert.up_proj": "ffn_up_shexp",
+    "mlp.shared_expert.down_proj": "ffn_down_shexp",
+    "mlp.switch_mlp.gate_proj": "ffn_gate_exps", "mlp.switch_mlp.up_proj": "ffn_up_exps",
+    "mlp.switch_mlp.down_proj": "ffn_down_exps",
+}
+
+
+def gguf_name(name):
+    """The GGUF name of a weight of this module (without .weight for the
+    matrices)."""
+    if name in ("norm.weight",):
+        return "output_norm.weight"
+    if name == "embed_tokens":
+        return "token_embd.weight"
+    if name == "lm_head":
+        return "output.weight"
+    _l, i, rest = name.split(".", 2)
+    g = _GGUF_NAMES[rest]
+    if not g.endswith(".bias"):
+        g += ".weight"
+    return "blk.%s.%s" % (i, g)
+
+
+class _GExperts:
+    """The stacked experts of a GGUF tensor, with dequant(expert=e)."""
+
+    def __init__(self, g, gname):
+        self.g = g
+        self.gname = gname
+
+    def dequant(self, expert):
+        return self.g.dequant(self.gname, rows=[int(expert)])[0]
+
+
+class QwenGGUF(Qwen):
+    """The NumPy model on a GGUF file of llama.cpp (UD-Q4_K_M: Q8_0, Q4_K,
+    Q5_K, Q6_K, F32). The weights are dequantized when the model uses them.
+    The converter of llama.cpp changed some tensors; this class undoes the
+    changes where the model needs it:
+
+    - ssm_a holds -exp(A_log), so A_log is log(-ssm_a);
+    - the norm weights have the 1 added, as in the MLX files;
+    - the value heads are in tiled order (config.v_tiled)."""
+
+    def __init__(self, path, cfg=None, layers=None):
+        from .gguf import GGUF
+        self.path = path
+        self.g = GGUF(path)
+        self.cfg = cfg or QwenConfig.from_gguf(self.g)
+        self.n_layers = layers or self.cfg.num_hidden_layers
+        self._deq = {}
+
+    def W(self, name):
+        w = self._deq.get(name)
+        if w is None:
+            w = self.g.dequant(gguf_name(name))
+            if w.ndim == 1:
+                w = w.reshape(1, -1)
+            w = self._deq[name] = w
+        return w
+
+    def t(self, name):
+        if name.endswith("linear_attn.A_log"):
+            i = name.split(".")[1]
+            return np.log(-self.g.dequant("blk.%s.ssm_a" % i)).astype(np.float32)
+        return self.g.dequant(gguf_name(name)).astype(np.float32)
+
+    def mat(self, name, full=None):
+        return _GExperts(self.g, gguf_name(name))
+
+    def embed(self, ids):
+        return self.g.dequant("token_embd.weight", rows=np.asarray(ids, dtype=np.int64))
+
+    def logits(self, h, chunk=16384):
+        rows = self.g.tensors["output.weight"][0][1]
+        out = np.empty((h.shape[0], rows), np.float32)
+        for r0 in range(0, rows, chunk):
+            r = np.arange(r0, min(rows, r0 + chunk))
+            out[:, r] = h @ self.g.dequant("output.weight", rows=r).T
+        return out

@@ -33,11 +33,12 @@ BF16 = 30
 _BLOCK = {
     F32: (1, 4), F16: (1, 2), BF16: (1, 2),
     Q4_0: (32, 18), Q4_1: (32, 20), Q5_0: (32, 22), Q5_1: (32, 24),
-    Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210),
+    Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210), Q4_K: (256, 144), Q5_K: (256, 176),
 }
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
+    Q4_K: "Q4_K", Q5_K: "Q5_K",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -48,7 +49,24 @@ _BLOCK_DT = {
     Q4_0: np.dtype([("d", "<f2"), ("qs", "u1", (16,))]),
     Q6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
                     ("sc", "i1", (16,)), ("d", "<f2")]),
+    Q8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
+    Q4_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qs", "u1", (128,))]),
+    Q5_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qh", "u1", (32,)),
+                    ("qs", "u1", (128,))]),
 }
+
+
+def _k_scales(sc):
+    """The 8 scales and 8 mins (6 bits each) of the 12 bytes of a Q4_K or
+    Q5_K block, as get_scale_min_k4 of ggml does it. sc is (blocks, 12)."""
+    sc = sc.astype(np.int32)
+    s = np.empty((sc.shape[0], 8), np.int32)
+    m = np.empty((sc.shape[0], 8), np.int32)
+    s[:, :4] = sc[:, 0:4] & 63
+    m[:, :4] = sc[:, 4:8] & 63
+    s[:, 4:] = (sc[:, 8:12] & 0xF) | ((sc[:, 0:4] >> 6) << 4)
+    m[:, 4:] = (sc[:, 8:12] >> 4) | ((sc[:, 4:8] >> 6) << 4)
+    return s, m
 
 # The scalar metadata types of the GGUF format.
 _NP_META = {
@@ -157,6 +175,28 @@ def _dequant(raw, t, count):
         hi = (q >> 4).astype(np.float32) - 8.0
         out = np.concatenate([lo, hi], axis=1) * d[:, None]
         return out.reshape(-1)[:count]
+    if t == Q8_0:
+        return (raw["qs"].astype(np.float32) * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
+    if t in (Q4_K, Q5_K):
+        # 256 values in 4 parts of 64: the low 4 bits of 32 bytes are the
+        # first 32 values of a part, the high 4 bits the next 32. Q5_K adds
+        # a fifth bit from qh: bit 2j for the low half of part j, 2j + 1 for
+        # the high half. Value = d * sc * q - dmin * m for each 32 values.
+        nb = raw.shape[0]
+        qs = raw["qs"].reshape(nb, 4, 32)
+        lo = (qs & 0xF).astype(np.int32)
+        hi = (qs >> 4).astype(np.int32)
+        if t == Q5_K:
+            qh = raw["qh"].astype(np.int32)                    # (nb, 32)
+            for j in range(4):
+                lo[:, j] |= ((qh >> (2 * j)) & 1) << 4
+                hi[:, j] |= ((qh >> (2 * j + 1)) & 1) << 4
+        q = np.stack([lo, hi], axis=2).reshape(nb, 8, 32)      # sub-block 2j, 2j + 1
+        sc, mn = _k_scales(raw["sc"])
+        d = raw["d"].astype(np.float32)[:, None, None]
+        dmin = raw["dmin"].astype(np.float32)[:, None, None]
+        out = d * sc[:, :, None] * q - dmin * mn[:, :, None]
+        return out.astype(np.float32).reshape(-1)[:count]
     if t == Q6_K:
         # 256 values in one block. ql holds the low 4 bits, qh the top 2 bits,
         # sc one 8-bit scale for each group of 16, and d the block scale.
@@ -227,9 +267,14 @@ class GGUF:
             self._mm.madvise(mmap.MADV_HUGEPAGE)
         except (AttributeError, OSError):
             pass
-        # Map the runtime names to the GGUF names.
+        # Map the runtime names to the GGUF names. A model that this module
+        # does not map (Qwen3.5) reads its tensors by GGUF name (raw).
         self._to_gguf = {}
         for gname in self._order:
+            try:
+                self._name(gname)
+            except KeyError:
+                continue
             self._to_gguf[self._name(gname)] = gname
 
     # ---- name mapping -----------------------------------------------------
@@ -249,6 +294,31 @@ class GGUF:
                 return _PREFIX + "layers.%s.layer_scalar" % idx
             return _PREFIX + "layers.%s.%s" % (idx, target)
         raise KeyError("unknown tensor %s" % gname)
+
+    def raw(self, gname):
+        """The blocks of a tensor by its GGUF name, as a structured array
+        (a view of the map), with its dims (ggml order) and type."""
+        dims, t, off = self.tensors[gname]
+        dt = _BLOCK_DT.get(t)
+        if dt is None:
+            raise ValueError("type %s is not implemented" % _TYPE_NAME.get(t, t))
+        bv, _bb = _BLOCK[t]
+        n = int(np.prod(dims)) // bv
+        return np.frombuffer(self._mm, dtype=dt, count=n, offset=self._base + off), dims, t
+
+    def dequant(self, gname, rows=None):
+        """float32 values of a tensor by GGUF name, in the shape of NumPy
+        (dims reversed). rows selects rows of a 2-D tensor (or the first
+        index of a 3-D one)."""
+        raw, dims, t = self.raw(gname)
+        shape = tuple(reversed(dims))
+        if rows is None:
+            return _dequant(raw, t, int(np.prod(dims))).reshape(shape)
+        bv, _bb = _BLOCK[t]
+        per = int(np.prod(shape[1:])) // bv
+        rows = np.asarray(rows).reshape(-1)
+        blocks = raw.reshape(-1, per)[rows].reshape(-1)
+        return _dequant(blocks, t, len(rows) * per * bv).reshape((len(rows),) + shape[1:])
 
     def _gguf(self, hf_name):
         try:
