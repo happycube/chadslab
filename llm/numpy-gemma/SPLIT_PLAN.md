@@ -480,6 +480,31 @@ of the experts takes about 0.27 ms for each layer, 8 ms in all. It is on the
 critical path. More hot experts, or a faster CPU part, make the step
 shorter.
 
+### Against llama.cpp with CUDA
+
+The two programs ran one after the other on jackal, which had other load
+(load average 8 to 10). The tool llama-bench (build-cuda) runs tg128 and
+pp512 with 18 threads and flash attention. scripts/bench_decode.py measures
+the decode of this runtime in the same way: 128 tokens from a short context,
+with the output head.
+
+    split                                    llama.cpp tg128   this runtime
+    CPU only (-ngl 0)                        13.3              14.8
+    experts on the CPU (-ncmoe 30, dense)    36.8              39.2
+    about 3.3 GB of experts on the GPU       43.1              47.7
+    12 layers on the GPU (-ngl 12)           21.0              -
+
+For llama.cpp, "-ncmoe 22" puts all the experts of 8 layers on the GPU
+(about 3.4 GB). This runtime puts the 952 most used experts on the GPU
+(about 3.2 GB). The layer split of llama.cpp gives half the rate of the
+operation split. Thus this runtime does not add a layer split.
+
+The prompt pass is different. llama.cpp gives 255 tokens/s with -ngl 0,
+301 with -ncmoe 30, and 407 with -ncmoe 22. The large products of a prompt
+go to the GPU, and the weights of the experts cross the link for each batch
+of 512 tokens. The prompt pass of this runtime runs on the CPU: about 61
+tokens/s. Phase 5 moves it to the GPU.
+
 ## The cache on the GPU in int16
 
 The GPU keeps the cache of the 26B in the int16 form of the CPU program
@@ -558,11 +583,10 @@ experts on the CPU take most of the rest.
   and the experts. First run the whole E4B on the GPU, because it fits and
   needs no split. Test it against the CPU and the reference. (The E4B is
   done, see the results of phase 3.)
-- Phase 4: the CPU and GPU split of the 26B. First the operation split, with
-  the experts on the CPU (done, see the results of phase 4). Then the hot
-  experts on the GPU (done). Then the layer split, to compare. Measure the
-  tokens/s against the CPU program and against llama.cpp with the same
-  split.
+- Phase 4 (done): the CPU and GPU split of the 26B. First the operation
+  split, with the experts on the CPU. Then the hot experts on the GPU. Then
+  a comparison with llama.cpp for each split. Its layer split is slower, so
+  this runtime does not add one.
 - Phase 5: the prompt pass and the MTP group on the GPU. The prompt pass is
   limited by the work of the multiply, not by memory, so the GPU gains the
   most there.
