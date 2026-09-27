@@ -330,11 +330,11 @@ reason, an early run with free threads showed two parts faster than one
 part. The runner of the parts binds its teams in all cases. The package now
 sets OMP_PLACES=cores and OMP_PROC_BIND=close when they are not set.
 
-A first measurement gave 15 per cent for the binding of one program, but
-that run had OMP_PLACES without OMP_PROC_BIND, and jackal had other load. A
-second run gave a step of 44.6 ms with the binding and 45.9 ms without it at
-a context of 200, and 64.6 ms against 62.7 ms at 1100. A clean A/B test on
-an idle machine is still to do.
+For one program, a first measurement showed 15 per cent. That run set
+OMP_PLACES without OMP_PROC_BIND, and jackal had other load. In a second
+run, a step at a context of 200 took 44.6 ms with bound threads and 45.9 ms
+with free threads. At 1100 it took 64.6 ms against 62.7 ms. A clean A/B
+test on an idle machine is still to do.
 
 The next steps for NUMA:
 

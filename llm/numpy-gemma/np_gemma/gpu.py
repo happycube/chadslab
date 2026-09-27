@@ -814,3 +814,39 @@ class ModelGPU:
                                  self.host_logits.shape[1], cfg.hidden_size, cap))
         self.out.download(self.host_logits)
         return self.host_logits.copy()
+
+
+def offload(model, experts_gb=0.0):
+    """Put the weights of a Model outside the experts, and its output head, on
+    the GPU. The decode steps of one token then run there (NP_GEMMA_GPU=1).
+
+    experts_gb 0 keeps every expert on the CPU. A value above 0 also puts the
+    most used experts on the GPU, up to that many GB. None takes the default
+    budget of ModelGPU. The function copies the weights now, so the first
+    request does not wait for them. Return the ModelGPU.
+    """
+    from . import model as model_mod
+    os.environ["NP_GEMMA_GPU"] = "1"
+    model_mod._GPU = True
+    hot = {}
+    if experts_gb is None:
+        hot = None
+    elif experts_gb > 0 and model.cfg.enable_moe_block:
+        counts = hot_counts(model)
+        hot = pick_hot(model, counts, experts_gb * 1e9) if counts is not None else {}
+    g = ModelGPU(model, hot=hot)
+    g.logits()          # copies the head to the GPU
+    model._gpu = g
+    model._gpu_cache = None
+    model._gpu_xn = None
+    return g
+
+
+def describe(g):
+    """Return one line about the GPU part of a ModelGPU."""
+    free, total = mem_info()
+    return ("GPU: %.2f GB of weights and buffers, %d hot experts, head %.2f GB; "
+            "%.1f of %.1f GB free" % (g.g.mirror.nbytes() / 1e9,
+                                       sum(len(v) for v in g.hot.values()),
+                                       (g.head.nbytes if g.head else 0) / 1e9,
+                                       free / 1e9, total / 1e9))

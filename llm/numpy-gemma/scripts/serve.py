@@ -52,6 +52,13 @@ def main():
     ap.add_argument("--mtp-n", type=int, default=2,
                     help="The count of drafts for each MTP step.")
     ap.add_argument("--mtp-dtype", choices=("int4", "int8", "f32"), default="int4")
+    ap.add_argument("--gpu", choices=("off", "dense", "hot"), default="off",
+                    help="dense puts the weights outside the experts and the output head on"
+                         " the GPU; the experts stay on the CPU. hot also puts the most used"
+                         " experts on the GPU. Needs nvcc. MTP is then off.")
+    ap.add_argument("--gpu-experts-gb", type=float, default=None,
+                    help="With --gpu hot, the GPU memory for the experts. The default is the"
+                         " free memory less 4.5 GB.")
     args = ap.parse_args()
 
     # The cache copy was int8 with an int8 query. Its error sent a long greedy
@@ -66,6 +73,11 @@ def main():
     print("loading %s ..." % args.gguf, flush=True)
     model = Model(g, cfg).load_all(dtype=args.dtype)
     model_id = args.model_id or os.path.basename(args.gguf).rsplit(".", 1)[0]
+    if args.gpu != "off":
+        from np_gemma import gpu
+        print("copying the weights to the GPU ...", flush=True)
+        dev = gpu.offload(model, 0.0 if args.gpu == "dense" else args.gpu_experts_gb)
+        print(gpu.describe(dev), flush=True)
     # The model file gives the sampling that the model wants. Use it unless the
     # caller asks for another value. A greedy default is not the wish of the
     # model and it hides the setting from the client.

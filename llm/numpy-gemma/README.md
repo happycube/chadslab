@@ -1983,6 +1983,21 @@ that the harness can reach it over the network:
 
     PYTHONPATH=. OMP_NUM_THREADS=18 python scripts/serve.py --gguf PATH --dtype int4 --host 0.0.0.0 --port 8123 --temperature 0.0
 
+With a CUDA GPU and nvcc, --gpu dense puts the weights outside the experts
+(1.66 B weights, about 1 GB) and the output head (0.6 GB) on the GPU. The
+experts (22.8 B weights) stay on the CPU. --gpu hot also puts the most used
+experts on the GPU, up to --gpu-experts-gb. The server copies the weights at
+the start. On jackal, a greedy generation of the 26B gives the same tokens
+as the CPU:
+
+    mode                    decode rate
+    CPU only                about 18 tokens/s
+    --gpu dense             about 40 tokens/s
+    --gpu hot (3.4 GB)      52 to 65 tokens/s
+
+The option works for scripts/gguf_generate.py too. MTP is off with --gpu.
+See SPLIT_PLAN.md.
+
 Then choose the provider and the model in the harness. No credential is
 needed, because the daemon reads no key. The context window is a choice. The
 model allows 262144, and the key and value cache is float32, so a smaller

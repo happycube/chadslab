@@ -40,6 +40,13 @@ def main():
                          " decode then uses MTP. The token ids do not change.")
     ap.add_argument("--mtp-n", type=int, default=2, help="The count of drafts for each step.")
     ap.add_argument("--mtp-dtype", choices=("int4", "int8", "f32"), default="int4")
+    ap.add_argument("--gpu", choices=("off", "dense", "hot"), default="off",
+                    help="dense puts the weights outside the experts and the output head on"
+                         " the GPU; the experts stay on the CPU. hot also puts the most used"
+                         " experts on the GPU. Needs nvcc. MTP is then off.")
+    ap.add_argument("--gpu-experts-gb", type=float, default=None,
+                    help="With --gpu hot, the GPU memory for the experts. The default is the"
+                         " free memory less 4.5 GB.")
     args = ap.parse_args()
 
     g = GGUF(args.gguf)
@@ -48,6 +55,11 @@ def main():
     t0 = time.perf_counter()
     model = Model(g, cfg).load_all(dtype=args.dtype)
     print("load %.1f s" % (time.perf_counter() - t0), flush=True)
+    if args.gpu != "off":
+        from np_gemma import gpu
+        t0 = time.perf_counter()
+        dev = gpu.offload(model, 0.0 if args.gpu == "dense" else args.gpu_experts_gb)
+        print("GPU copy %.1f s. %s" % (time.perf_counter() - t0, gpu.describe(dev)), flush=True)
 
     if args.raw:
         ids = tok.encode(args.prompt)
