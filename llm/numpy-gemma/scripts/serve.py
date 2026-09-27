@@ -6,6 +6,10 @@
 
 Point an OpenAI client at http://127.0.0.1:8080/v1 . The model id is the file
 name. Use --thinking to open the thought channel of the Gemma 4 chat template.
+
+The server takes the 26B and 12B models (Model) and the E2B and E4B models
+(E4B). It finds the kind from the GGUF data: the E2B and E4B models have
+inputs for each layer.
 """
 from __future__ import annotations
 
@@ -55,7 +59,9 @@ def main():
     ap.add_argument("--gpu", choices=("off", "dense", "hot"), default="off",
                     help="dense puts the weights outside the experts and the output head on"
                          " the GPU; the experts stay on the CPU. hot also puts the most used"
-                         " experts on the GPU. Needs nvcc. MTP is then off.")
+                         " experts on the GPU. For the E4B, dense and hot put the whole model"
+                         " on the GPU. Needs nvcc. MTP is then off for the 26B and on for the"
+                         " E4B, unless NP_GEMMA_MTP is set.")
     ap.add_argument("--gpu-experts-gb", type=float, default=None,
                     help="With --gpu hot, the GPU memory for the experts. The default is the"
                          " free memory less 6 GB.")
@@ -69,9 +75,20 @@ def main():
 
     g = GGUF(args.gguf)
     tok = Tokenizer(args.tokenizer) if args.tokenizer else Tokenizer.from_gguf(g)
-    cfg = Config({"text_config": g.text_config()})
+    tc = g.text_config()
+    e4b = bool(tc.get("hidden_size_per_layer_input"))
     print("loading %s ..." % args.gguf, flush=True)
-    model = Model(g, cfg).load_all(dtype=args.dtype)
+    if e4b:
+        from np_gemma.e4b import E4B, E4BConfig
+        cfg = E4BConfig({"text_config": tc})
+        model = E4B(g, cfg, mode="int4" if args.dtype == "int4" else "f32")
+        if args.mtp and args.gpu != "off":
+            # The E4B with its drafter on the GPU is faster with MTP than
+            # without it (SPLIT_PLAN.md, phase 5).
+            os.environ.setdefault("NP_GEMMA_MTP", "1")
+    else:
+        cfg = Config({"text_config": tc})
+        model = Model(g, cfg).load_all(dtype=args.dtype)
     model_id = args.model_id or os.path.basename(args.gguf).rsplit(".", 1)[0]
     if args.gpu != "off":
         from np_gemma import gpu
@@ -92,12 +109,18 @@ def main():
           flush=True)
     drafter = None
     if args.mtp:
-        from np_gemma.assistant import Assistant
         print("loading the MTP drafter %s ..." % args.mtp, flush=True)
-        drafter = Assistant(args.mtp, dtype=args.mtp_dtype)
+        if args.gpu != "off":
+            # The drafter on the GPU reads the cache on the GPU.
+            from np_gemma.gpu import GPUDrafter
+            drafter = GPUDrafter(args.mtp, model)
+        else:
+            from np_gemma.assistant import Assistant
+            drafter = Assistant(args.mtp, dtype=args.mtp_dtype)
     backend = Backend(model, tok, cfg, model_id=model_id, thinking=args.thinking,
                       max_tokens=args.max_tokens, temperature=temperature,
-                      top_k=top_k, top_p=top_p, drafter=drafter, n_draft=args.mtp_n)
+                      top_k=top_k, top_p=top_p, drafter=drafter, n_draft=args.mtp_n,
+                      empty_thought_block=not e4b)
     serve(backend, host=args.host, port=args.port, quiet=args.quiet)
     return 0
 

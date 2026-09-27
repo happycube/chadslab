@@ -2020,6 +2020,16 @@ the GPU (GPUDrafter, scripts/bench_mtp_gpu.py), the 26B gives about 47
 tokens/s with MTP, against 45 for the plain decode. The gain is small,
 because the verify group sends more experts to the CPU. Thus the server
 turns MTP off with --gpu unless NP_GEMMA_MTP=1.
+
+The server also takes the E2B and E4B models. It finds the kind from the
+GGUF data. With --gpu dense or hot, the whole E4B model runs on the GPU.
+With --mtp and --gpu, the drafter runs on the GPU too, and MTP is on by
+default for the E4B:
+
+    python scripts/serve.py --gguf gemma-4-E4B_q4_0-it.gguf --gpu dense --mtp ASSISTANT_DIR
+
+A chat turn of 197 tokens took 2.2 s, with the prompt pass and MTP. The
+server keeps the cache of a chat for the next turn, as for the 26B.
 See SPLIT_PLAN.md.
 
 Then choose the provider and the model in the harness. No credential is

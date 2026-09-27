@@ -1215,7 +1215,9 @@ class Session:
 
     def reset(self):
         """Start a new conversation. Remove the keys and the values."""
-        self.cache = KVCache(self.model.cfg, max_len=self.max_len)
+        # The E4B model has its own cache (E4B.new_cache).
+        make = getattr(self.model, "new_cache", None)
+        self.cache = make(self.max_len) if make else KVCache(self.model.cfg, max_len=self.max_len)
         self.ids = []
         self._x = None
 

@@ -319,8 +319,10 @@ class E4BCache:
         return store[0][:, :self.n, :], store[1][:, :self.n, :]
 
     def truncate(self, n):
-        """Cut the cache back to n positions. Use it to reuse a prefix."""
+        """Cut the cache back to n positions. Use it to reuse a prefix.
+        Return True, as KVCache.truncate does when it can cut the cache."""
         self.n = min(self.n, int(n))
+        return True
 
 
 class E4B:
@@ -867,6 +869,10 @@ class E4B:
         """Return the scaled token embeddings, the input of layer 0."""
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
         return self.embed_rows(PREFIX + "embed_tokens", ids) * self.cfg.embed_scale
+
+    def new_cache(self, max_len):
+        """Return an empty cache for this model. Session uses it."""
+        return E4BCache(self.cfg, max_len=max_len)
 
     def prefill(self, ids, cache, start=0):
         """Run the prompt into the cache. Return the final hidden states."""

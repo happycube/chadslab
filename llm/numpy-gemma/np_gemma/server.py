@@ -130,8 +130,10 @@ class Backend:
 
     def __init__(self, model, tokenizer, cfg=None, model_id="np-gemma",
                  thinking=False, max_tokens=1024, temperature=1.0, top_k=None,
-                 top_p=None, drafter=None, n_draft=2):
+                 top_p=None, drafter=None, n_draft=2, empty_thought_block=True):
         self.model = model
+        # False for the E2B and E4B models (Tokenizer.apply_chat_template).
+        self.empty_thought_block = empty_thought_block
         # The MTP drafter and the count of drafts for each step. None turns
         # MTP off.
         self.drafter = drafter
@@ -169,8 +171,9 @@ class Backend:
             msg["role"] = m.get("role", "user")
             msg["content"] = content_text(m.get("content"))
             msgs.append(msg)
-        text = self.tokenizer.apply_chat_template(msgs, add_generation_prompt=True,
-                                                  thinking=think, tools=tools)
+        text = self.tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, thinking=think, tools=tools,
+            empty_thought_block=self.empty_thought_block)
         return self.tokenizer.encode(text)
 
     def completion_ids(self, prompt):

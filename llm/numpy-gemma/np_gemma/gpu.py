@@ -1384,9 +1384,19 @@ def offload(model, experts_gb=0.0):
     most used experts on the GPU, up to that many GB. None takes the default
     budget of ModelGPU. The function copies the weights now, so the first
     request does not wait for them. Return the ModelGPU.
+
+    For an E4B model, put the whole model on the GPU (E4BGPU). experts_gb
+    has no effect, because the E4B has no experts. Return the E4BGPU.
     """
     from . import model as model_mod
     os.environ["NP_GEMMA_GPU"] = "1"
+    if hasattr(model, "mode"):
+        from . import e4b as e4b_mod
+        e4b_mod._GPU = True
+        g = E4BGPU(model)
+        g.logits()      # copies the head to the GPU
+        model._gpu, model._gpu_cache, model._gpu_xn = g, None, None
+        return g
     model_mod._GPU = True
     hot = {}
     if experts_gb is None:
@@ -1403,8 +1413,11 @@ def offload(model, experts_gb=0.0):
 
 
 def describe(g):
-    """Return one line about the GPU part of a ModelGPU."""
+    """Return one line about the GPU part of a ModelGPU or an E4BGPU."""
     free, total = mem_info()
+    if not hasattr(g, "hot"):
+        return "GPU: %.2f GB of weights and buffers; %.1f of %.1f GB free" % (
+            g.g.mirror.nbytes() / 1e9, free / 1e9, total / 1e9)
     return ("GPU: %.2f GB of weights and buffers, %d hot experts, head %.2f GB; "
             "%.1f of %.1f GB free" % (g.g.mirror.nbytes() / 1e9,
                                        sum(len(v) for v in g.hot.values()),
