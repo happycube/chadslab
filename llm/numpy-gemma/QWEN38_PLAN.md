@@ -414,7 +414,7 @@ Mixed groups of a prompt (np_gemma/qwen4_gpu.py, _moe_mix):
   CPU takes the other experts at the same time, on a helper thread
   (CPU_START, CPU_WAIT). The hot experts stay on the GPU.
 - The model of the costs: 0.9 ms for each copied expert (the copy and its
-  work on the GPU); 75 us for each expert on the CPU, and 15 us for each
+  work on the GPU). On the CPU: 75 us for each expert, and 15 us for each
   of its tokens. The split makes the two times about equal.
 - The copies read the map of the file at 6.8 GB/s (PCIe Gen3 x8 here).
 - On a model of 8 layers, 1100 tokens: 304 tok/s in split groups, 881
@@ -425,9 +425,12 @@ Mixed groups of a prompt (np_gemma/qwen4_gpu.py, _moe_mix):
   than random tokens: about 350 in each layer, 77 of them copied. The
   answer and 40 tokens of a summary are those of split groups and of the
   CPU program.
-- The profile of a group of 1024 rows (records one at a time): the wait
-  for the copies 0.91 s, the dense products 0.77 s, the experts on the GPU
-  0.71 s, the attention 0.40 s (one record for each query).
+- The profile of a group of 1024 rows runs the records one at a time:
+
+      the wait for the copies           0.91 s
+      the dense products                0.77 s
+      the experts on the GPU            0.71 s
+      the attention (a record a query)  0.40 s
 
 Next:
 - The attention of a large group: one record for each query now.
