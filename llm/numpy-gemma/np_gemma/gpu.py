@@ -1574,17 +1574,30 @@ class HotCache:
         of that work reads the slots. The next step comes after them."""
         self.due = False
         k = self.top_k
-        sel = np.stack([e["ip"][k + 1:2 * k + 1] for e in self.layers])
+        rows = [r for r, e in enumerate(self.layers) if e.get("step", True)]
+        sel = np.stack([self.layers[r]["ip"][k + 1:2 * k + 1] for r in rows])
         self.steps += 1
-        self.cold += int(sum(int(e["ip"][k]) for e in self.layers))
+        self.cold += int(sum(int(self.layers[r]["ip"][k]) for r in rows))
+        self.score_rows(rows, sel)
+
+    def score_rows(self, rows, sel):
+        """Score the selection sel (len(rows) x top_k experts; -1 for none)
+        of one token in the layers of the rows of layers, as a step does,
+        and start the copies of the experts that take the place of others.
+        A group (an MTP verify group, the MTP layer) gives the selections of
+        its tokens in turn."""
+        rows = np.asarray(rows)[:, None]
+        sel = np.asarray(sel)
+        ok = sel >= 0
+        rr, ss = np.broadcast_to(rows, sel.shape)[ok], sel[ok]
         score = self.score
-        score *= self.decay
-        score[self.rows, sel] += 1.0          # the experts of a row differ
-        self.uses[self.rows, sel] += 1
+        score[rows[:, 0]] *= self.decay
+        score[rr, ss] += 1.0                  # the experts of a row differ
+        self.uses[rr, ss] += 1
         self.uses[self.held] = 0
         low = np.where(self.held, score, np.inf).min(axis=1)
         cand = np.zeros_like(self.held)
-        cand[self.rows, sel] = True
+        cand[rr, ss] = True
         cand &= ~self.held & ~self.incoming & (score > low[:, None]) & (self.uses >= self.admit)
         if not cand.any():
             return

@@ -126,20 +126,23 @@ def main():
 
     g.hot_cache = hc
 
-    # 3. MTP.
-    c = Qwen4Cache(m.cfg, max_len)
-    g.attach(c)
-    st = {}
-    t0 = time.time()
-    got = generate_mtp_gpu(g, ids, len(out), draft=args.draft, stop=stop, stats=st)
-    print("MTP (%d drafts): %d tokens, %d/%d drafts accepted (%.0f%%), %.2f tokens a round" % (
-        args.draft, len(got), st["accepted"], st["drafted"],
-        100 * st["accepted"] / max(1, st["drafted"]), len(got) / max(1, st["rounds"])))
-    print("decode: %.2f tok/s; for each round: draft %.0f ms, verify %.0f ms" % (
-        (len(got) - 1) / st["decode_s"],
-        *(1e3 * st[k] / max(1, st["rounds"]) for k in ("draft", "verify"))))
-    same = next((i for i, (a, b) in enumerate(zip(got, out)) if a != b), min(len(got), len(out)))
-    print("the same tokens as the GPU decode: the first %d of %d" % (same, len(out)))
+    # 3. MTP: the MTP layer on the GPU, and on the CPU.
+    for where in ("GPU", "CPU"):
+        c = Qwen4Cache(m.cfg, max_len)
+        g.attach(c)
+        st = {}
+        got = generate_mtp_gpu(g, ids, len(out), draft=args.draft, stop=stop, stats=st,
+                               mtp_cpu=where == "CPU")
+        print("MTP layer on the %s (%d drafts): %d tokens, %d/%d drafts accepted (%.0f%%), "
+              "%.2f tokens a round" % (
+                  where, args.draft, len(got), st["accepted"], st["drafted"],
+                  100 * st["accepted"] / max(1, st["drafted"]), len(got) / max(1, st["rounds"])))
+        print("  decode: %.2f tok/s; for each round: draft %.0f ms, verify %.0f ms" % (
+            (len(got) - 1) / st["decode_s"],
+            *(1e3 * st[k] / max(1, st["rounds"]) for k in ("draft", "verify"))))
+        same = next((i for i, (a, b) in enumerate(zip(got, out)) if a != b),
+                    min(len(got), len(out)))
+        print("  the same tokens as the GPU decode: the first %d of %d" % (same, len(out)))
     g.close()
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

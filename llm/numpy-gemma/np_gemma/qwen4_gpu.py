@@ -11,10 +11,17 @@ compile_qwen4_step. The design stays:
   CPU computes the other selected experts at the same time.
 - The head (Q8_0) runs on the GPU in its own program (one for each count
   of rows).
+- The MTP layer (when the model has it) is a program of its own
+  (compile_qwen4_step with mtp), with its cache on the GPU. Its experts
+  are split too, with its own slots (NP_GEMMA_GPU_MTP_SLOTS, or else
+  twice the slots of a layer, at most 0.5 GB; the budget of the hot
+  experts does not count them).
+- HotCache scores the steps, and also the tokens of an MTP verify group
+  that stay (commit) and each row of the MTP layer. A group copies the
+  selection of each layer to an array (sel_of) for that.
 
 The host makes the inputs of a run: the embeddings in each stream and the
-rows of the n-gram table. The MTP layer runs on the CPU (Qwen4CPU.mtp_step;
-3 ms), and its head on the GPU.
+rows of the n-gram table.
 
     m = Qwen4CPU(path, mtp=mtp_path)
     g = Qwen4GPU(m, hot_gb=1.0)
@@ -56,8 +63,11 @@ class _Emit4:
     def emit_moe4(self, prog, i, xb, idx, val, slog, scratch, out):
         if self.fetch:
             self.dev._moe_fetch(prog, i, xb["src"], idx, val, slog, out)
-        else:
-            self.dev._moe_split(prog, i, xb["src"], idx, val, slog, out)
+            return
+        if self.t > 1:
+            sel = self.dev.sel_of(self.t)
+            prog.emit(P.COPY, idx, sel[i], idx.nbytes)
+        self.dev._moe_split(prog, i, xb["src"], idx, val, slog, out)
 
     def emit_attn_qsa(self, prog, q, base, scores, out, t, pos, sel, cnt, maxsel):
         # One record for each query (the GPU kernels take one query).
@@ -70,13 +80,17 @@ class _Emit4:
 
 
 class _DevCache4(_DevCache):
-    """_DevCache with the state of the n-gram layer and of the indexer."""
+    """_DevCache with the state of the n-gram layer and of the indexer, and
+    the cache of the MTP layer."""
 
     def attach(self, cache):
         super().attach(cache)
+        self.add(list(cache.ple_conv.values()) + list(cache.idx_k.values())
+                 + list(cache.idx_blk.values()))
+
+    def add(self, arrays):
         from .gpu import Buffer
-        for a in (list(cache.ple_conv.values()) + list(cache.idx_k.values())
-                  + list(cache.idx_blk.values())):
+        for a in arrays:
             b = Buffer(a.nbytes)
             b.upload(np.ascontiguousarray(a))
             self.bufs[id(a)] = (a, b)
@@ -90,8 +104,48 @@ class Qwen4GPU(QwenGPU):
 
     def __init__(self, model, hot_gb=None, counts=None, graph=True):
         self.head_progs = {}
+        self.mtp_progs = {}
+        self.sel_bufs = {}
+        self.mcache = None
+        L = model.cfg.num_hidden_layers
+        self.has_mtp = "blk.%d.nextn.eh_proj.weight" % L in model.g.tensors
         super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph)
         self.cache_dev = _DevCache4()
+
+    def _more_stores(self):
+        if self.has_mtp:
+            L = self.cfg.num_hidden_layers
+            per = sum(self.model.M("layers.%d.mlp.switch_mlp.%s" % (L, x)).data.nbytes
+                      for x in ("gate_proj", "up_proj", "down_proj")) // self.E
+            n = int(os.environ.get("NP_GEMMA_GPU_MTP_SLOTS",
+                                   min(2 * self.n_slots, int(0.5e9 // per))))
+            st = self.stores[L] = self._store(L, np.arange(min(n, self.E)))
+            st["ip"] = np.zeros(2 * self.cfg.top_k + 1, np.int32)   # a step does not run it
+
+    def _before_hot(self):
+        if self.has_mtp:
+            self._mtp_group(1)
+
+    def sel_of(self, t):
+        """The selection of each layer of a group of t rows (layers + 1, t,
+        top_k), for HotCache."""
+        a = self.sel_bufs.get(t)
+        if a is None:
+            a = self.sel_bufs[t] = np.zeros((self.cfg.num_hidden_layers + 1, t, self.cfg.top_k),
+                                            np.int32)
+        return a
+
+    def _score(self, t, rows, layers):
+        """HotCache: score rows rows of the last group of t rows in layers."""
+        hc = self.hot_cache
+        if hc is None or rows == 0:
+            return
+        sel = self.sel_of(t)
+        self.g.mirror.buffer_of(sel).download(sel)
+        idx = [r for r, e in enumerate(hc.layers) if e["layer"] in layers]
+        lay = [hc.layers[r]["layer"] for r in idx]
+        for j in range(rows):
+            hc.score_rows(idx, sel[lay, j])
 
     def _dense_bytes(self):
         g = self.model.g
@@ -203,6 +257,63 @@ class Qwen4GPU(QwenGPU):
             c0 += n
         return np.concatenate(hs) if streams else h[-1:]
 
+    # ---- the MTP layer ----
+
+    def attach(self, cache):
+        """Copy the cache to the GPU, with a new cache of the MTP layer."""
+        super().attach(cache)
+        if self.has_mtp:
+            from .qwen4 import Qwen4MTPCache
+            self.mcache = Qwen4MTPCache(self.cfg, cache.max_len)
+            self.cache_dev.add(self.mcache.kv[self.cfg.num_hidden_layers])
+
+    def _mtp_group(self, t):
+        e = self.mtp_progs.get(t)
+        if e is None:
+            self._pool = {}
+            prog = _fuse(compile_qwen4_step(_Emit4(self, t, False, False), t, mtp=True), t)
+            e = self.mtp_progs[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
+        return e
+
+    def mtp(self, Hs, ids, pos):
+        """The MTP layer on rows j = the streams at pos + j - 1 (Hs, host
+        rows) and the token at pos + j. logits() then gives the drafts.
+        Return the streams of the layer (host rows)."""
+        cfg = self.cfg
+        t = len(ids)
+        size = next((s for s in (1, 2, 4, 8, 16, 64, 128, 256) if s >= t), None)
+        assert size is not None, "a group of the MTP layer has at most 256 rows"
+        prog, g = self._mtp_group(size)
+        if self.hot_cache is not None:
+            self.hot_cache.prepare()
+        e, h = prog.names["e"], prog.names["h"]
+        e[:t] = self.model.embed(ids)
+        e[t:] = 0.0
+        h[:t] = Hs.reshape(t, -1)
+        h[t:] = 0.0
+        g.upload("e")
+        g.upload("h")
+        L = cfg.num_hidden_layers
+        cos, sin = self.model.rope(np.arange(pos, pos + size))
+        kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos, np.float32),
+              "sin": np.ascontiguousarray(sin, np.float32),
+              "scores": np.empty(cfg.num_heads * (pos + size) + 64, np.float32)}
+        for nm, a in zip(("kq", "ks", "vq", "vs"), self.mcache.kv[L]):
+            kw["%s.%d" % (nm, L)] = a
+        g.bind(kw, self.cache_dev, scratch=("scores",))
+        g.run()
+        g.download("H")
+        if self.hot_cache is not None:
+            if size == 1:
+                k = cfg.top_k
+                r = [i for i, e2 in enumerate(self.hot_cache.layers) if e2["layer"] == L]
+                self.hot_cache.score_rows(r, self.stores[L]["ip"][None, k + 1:2 * k + 1])
+            else:
+                self._score(size, t, (L,))
+        self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * cfg.hidden_size * 4
+        self.rows = t
+        return prog.names["H"][:t].copy()
+
     def streams(self, rows):
         """The streams after the last layer of the last rows rows of the
         last run (the input of the MTP layer)."""
@@ -223,6 +334,7 @@ class Qwen4GPU(QwenGPU):
         prog, pos, ids, (ple_ids, ple_conv) = self._pending
         self._pending = (prog, pos)
         super().commit(n)
+        self._score(prog.tokens, n, range(self.cfg.num_hidden_layers))
         cfg = self.cfg
         ctx = cfg.ple_ngram - 1
         self.cache.ple_ids = np.concatenate([ple_ids, np.asarray(ids[:n], np.int64)])[-ctx:].copy()
@@ -266,20 +378,28 @@ class Qwen4GPU(QwenGPU):
         return out.copy() if rows > 1 else out[0].copy()
 
     def close(self):
-        for _p, g in self.head_progs.values():
+        for _p, g in list(self.head_progs.values()) + list(self.mtp_progs.values()):
             g.close()
-        self.head_progs = {}
+        self.head_progs, self.mtp_progs = {}, {}
         super().close()
 
 
-def generate_mtp_gpu(dev, prompt, n_new, draft=3, stop=None, stats=None):
-    """Greedy generation with MTP drafts: the model on the GPU (dev, a
-    Qwen4GPU with its cache attached), the MTP layer on the CPU, and its
-    head on the GPU (as Qwen4CPU.generate_mtp)."""
+def generate_mtp_gpu(dev, prompt, n_new, draft=3, stop=None, stats=None, mtp_cpu=False):
+    """Greedy generation with MTP drafts: the model and the MTP layer on the
+    GPU (dev, a Qwen4GPU with its cache attached), as Qwen4CPU.generate_mtp.
+    mtp_cpu runs the MTP layer on the CPU (Qwen4CPU.mtp_step)."""
     import time
     from .qwen4 import Qwen4MTPCache
     m, cfg = dev.model, dev.cfg
     mcache = Qwen4MTPCache(cfg, dev.cache.max_len)
+
+    def mtp_rows(Hs, ids, p):
+        """The MTP layer; return the logits of its last row and its streams."""
+        if mtp_cpu:
+            xm, hm = m.mtp_step(Hs, ids, mcache, p)
+            return dev.logits(x=xm[-1:]), hm
+        hm = dev.mtp(Hs, ids, p)
+        return dev.logits(), hm
     prompt = list(prompt)
     n = len(prompt)
     H = dev.prefill(prompt, streams=True)
@@ -293,15 +413,15 @@ def generate_mtp_gpu(dev, prompt, n_new, draft=3, stop=None, stats=None):
     t_start = time.time()
     while len(out) < n_new and (stop is None or tok not in stop):
         t0 = time.time()
-        for c0 in range(0, len(m_ids), m.CHUNK):
-            c1 = min(len(m_ids), c0 + m.CHUNK)
-            xm, hm = m.mtp_step(m_H[c0:c1], m_ids[c0:c1], mcache, m_pos + c0)
+        for c0 in range(0, len(m_ids), 256):
+            c1 = min(len(m_ids), c0 + 256)
+            lg, hm = mtp_rows(m_H[c0:c1], m_ids[c0:c1], m_pos + c0)
         drafts = []
         while True:
-            drafts.append(int(np.argmax(dev.logits(x=xm[-1:]))))
+            drafts.append(int(np.argmax(lg)))
             if len(drafts) == draft:
                 break
-            xm, hm = m.mtp_step(hm[-1:], drafts[-1:], mcache, pos + len(drafts))
+            lg, hm = mtp_rows(hm[-1:], drafts[-1:], pos + len(drafts))
         t1 = time.time()
         dev.verify([tok] + drafts, pos)
         best = np.argmax(dev.logits(rows=draft + 1), axis=1)

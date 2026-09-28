@@ -177,6 +177,7 @@ class QwenGPU:
             else:
                 init = np.arange(n)
             self.stores[i] = self._store(i, init)
+        self._more_stores()
         self.prog = self._compile(1)
         self.g = GPUProgram(self.prog, graph=graph)
         self.groups = {}        # (t, verify) -> (Program, GPUProgram)
@@ -189,16 +190,24 @@ class QwenGPU:
         self.rows = 1
         self.last = self.g.mirror.buffer_of(self.prog.names["xn"]).ptr
         self.hot_cache = None
+        self._before_hot()
         if os.environ.get("NP_GEMMA_GPU_HOT_DYN", "1") != "0":
             mir = self.g.mirror
             layers = []
             for i, st in sorted(self.stores.items()):
+                # step: the selection of a step (ip) counts for the layer.
                 layers.append(dict(
                     layer=i, slots=st["slots"], dslots=mir.buffer_of(st["slots"]).ptr,
                     parts=[(src.ctypes.data, nb, mir.buffer_of(dst).ptr)
                            for src, nb, dst in st["parts"]],
-                    ip=st["ip"]))
+                    ip=st.get("ip"), step=i < L))
             self.hot_cache = HotCache(self, layers=layers, top_k=cfg.top_k)
+
+    def _more_stores(self):
+        """Stores of other layers (the MTP layer of Qwen4GPU)."""
+
+    def _before_hot(self):
+        """Before HotCache: the programs that hold the other stores."""
 
     # ---- the weights ----
 

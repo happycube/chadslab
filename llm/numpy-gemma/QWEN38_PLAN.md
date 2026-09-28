@@ -384,8 +384,22 @@ Results (RTX 5060 Ti with 8 GB free; greedy decode after 100 tokens):
   layer). The CPU then gets far fewer experts, and the verify group costs
   less.
 
+- The MTP layer on the GPU is a program of its own, with its cache on the
+  GPU. Its experts are split, with its own slots (twice the slots of a
+  layer, at most 0.5 GB). One draft: 2.5 ms, and 2.1 ms for the head.
+- HotCache now also scores the tokens that a verify group keeps, and the
+  rows of the MTP layer (HotCache.score_rows). Each group copies the
+  selection of each layer to an array for that. Before, the hot experts
+  did not change during an MTP decode.
+- 300 tokens with 2 GB of hot experts: plain 19.8 tok/s. MTP: 20.1 tok/s
+  with the MTP layer on the GPU, 19.9 tok/s with it on the CPU. The verify group
+  (about 120 ms) reads about 5 GB of cold experts on the CPU. Thus on this
+  machine MTP gives about the rate of the plain decode.
+- The file builds for sm_86 (the 3090): the kernels have no
+  griddepcontrol there, and the graphs keep ordinary edges (about 4%
+  slower here).
+
 Next:
-- The MTP layer on the GPU (its dense part; its experts split).
 - The large groups of a prompt: their two copy buffers (3.1 GB) do not
   fit next to 2 GB of hot experts on this GPU.
 - The attention of a large group: one record for each query now.
