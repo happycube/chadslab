@@ -432,10 +432,26 @@ Mixed groups of a prompt (np_gemma/qwen4_gpu.py, _moe_mix):
       the experts on the GPU            0.71 s
       the attention (a record a query)  0.40 s
 
-Next:
-- The attention of a large group: one record for each query now.
-- The products of a large group (dense and experts) with the tensor
-  cores; now float32 tiles at 6 to 10 TFLOPS.
+The products and the attention of large groups (more than 16 rows):
+
+- The kernels k_kq_tc, k_qmoe_gu_tc, and k_qmoe_dn_tc (csrc/gpu.cu) use
+  mma.sync m16n8k32 on int8 values, as k_gemm_q8. x is int8, with a scale
+  for each 32 values. A block of 32 values of w gives int8 values, a scale
+  d, and a term mn. The sum of the block is xs d (the int32 sum) + mn xsum. The formats: Q8_R, Q8_0,
+  Q5_1, and Q4_K. The rest (F32, Q5_K, Q6_K) keeps the float32 tiles.
+  NP_GEMMA_GPU_KQTC=0 keeps the float32 tiles for all.
+- k_attn_qsa_mt: one record of ATTN_QSA for a large group. A block takes
+  one query, one key head, and 6 query heads; 4 warps split the keys,
+  with a softmax that runs. A group of at most 16 rows keeps one record
+  for each query (the bits of the steps).
+- A group of 1024 rows: 3.89 s before, 2.43 s now. The dense products
+  went from 772 to 314 ms, the experts from 715 to 326 ms, the attention
+  from 399 ms to a few ms.
+- The cost of a copied expert in MOE_PLAN is now 0.7 ms.
+- A document of 2936 tokens: 175 tok/s (before 147; split groups 91).
+  pp512 226, pp2048 392, pp4096 381 tok/s with random tokens. On this
+  GPU the buffer of the copies (about 100 experts) now limits the split.
+- The prompt of Qwen3.6 uses the same products (its dense part is Q8_R).
 
 ## Risks
 

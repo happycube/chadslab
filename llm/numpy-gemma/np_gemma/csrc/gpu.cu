@@ -1154,6 +1154,108 @@ __global__ void k_attn_fd_join(const gp_rec *r, const int64_t *e, const float *p
     }
 }
 
+
+/* GP_ATTN_QSA of a large group (t > 1): the operands of the CPU record
+ *
+ *     q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim (256), t,
+ *     pos, sel, cnt, maxsel
+ *
+ * Block (j, x): query j, key head x / hg, and query heads (x % hg) * R to
+ * + R - 1 of that key head (R = q_heads / kv_heads / hg, at most 8). The 4
+ * warps take every 4th key of the query (the rows of sel, or all the
+ * positions to pos + j) with a softmax that runs: lane l keeps values 8 l
+ * to 8 l + 7 of each head. Then the warps join in shared memory. */
+#define AQ_W 4
+template <int R>
+__global__ void __launch_bounds__(128) k_attn_qsa_mt(const gp_rec *r, const int64_t *e, int hg)
+{
+    PDL_START();
+    __shared__ __align__(16) float qs[R * 256];
+    __shared__ float wm[AQ_W][R], wl[AQ_W][R];
+    __shared__ float wacc[AQ_W][R][256];
+    int nq = DI(7), nk = DI(8), maxsel = DI(14);
+    int64_t pos = di(r, e, 11);
+    int j = blockIdx.x, kv = blockIdx.y / hg, qb = kv * (nq / nk) + (blockIdx.y % hg) * R;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float *q = DP(const float, 0) + ((size_t)j * nq + qb) * 256;
+    for (int i = threadIdx.x; i < R * 256; i += blockDim.x) {
+        qs[i] = q[i];
+    }
+    __syncthreads();
+    int c = DP(const int32_t, 13)[j];
+    int n = c < 0 ? (int)(pos + j + 1) : c;
+    const int32_t *rows = c < 0 ? NULL : DP(const int32_t, 12) + (size_t)j * maxsel;
+    const int16_t *kq = DP(const int16_t, 1), *vq = DP(const int16_t, 3);
+    const float *ks = DP(const float, 2), *vs = DP(const float, 4);
+    size_t rs = (size_t)nk * 256, off = (size_t)kv * 256 + 8 * lane;
+    float m[R], l[R], acc[R][8];
+    #pragma unroll
+    for (int h = 0; h < R; ++h) {
+        m[h] = -INFINITY;
+        l[h] = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            acc[h][u] = 0.f;
+        }
+    }
+    for (int x = warp; x < n; x += AQ_W) {
+        size_t o = (size_t)(rows ? rows[x] : x) * rs + off;
+        float kf[8], vf[8];
+        fd_i16x8(*(const uint4 *)(kq + o), kf);
+        fd_i16x8(*(const uint4 *)(vq + o), vf);
+        float ksc = ks[o / 32], vsc = vs[o / 32];
+        #pragma unroll
+        for (int h = 0; h < R; ++h) {
+            const float4 q0 = *(const float4 *)(qs + h * 256 + 8 * lane);
+            const float4 q1 = *(const float4 *)(qs + h * 256 + 8 * lane + 4);
+            /* the scale of the key is that of the 32 values of the lane: before the sum */
+            float d = (q0.x * kf[0] + q0.y * kf[1] + q0.z * kf[2] + q0.w * kf[3] +
+                       q1.x * kf[4] + q1.y * kf[5] + q1.z * kf[6] + q1.w * kf[7]) * ksc;
+            for (int o2 = 16; o2 > 0; o2 >>= 1) {
+                d += __shfl_xor_sync(0xffffffff, d, o2);
+            }
+            float sc = d;
+            float mn = fmaxf(m[h], sc);
+            float alpha = expf(m[h] - mn), p = expf(sc - mn);
+            l[h] = l[h] * alpha + p;
+            m[h] = mn;
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                acc[h][u] = acc[h][u] * alpha + p * vsc * vf[u];
+            }
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < R; ++h) {
+        if (lane == 0) {
+            wm[warp][h] = m[h];
+            wl[warp][h] = l[h];
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            wacc[warp][h][8 * lane + u] = acc[h][u];
+        }
+    }
+    __syncthreads();
+    float *out = DP(float, 6) + ((size_t)j * nq + qb) * 256;
+    for (int i = threadIdx.x; i < R * 256; i += blockDim.x) {
+        int h = i / 256, d = i % 256;
+        float M = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < AQ_W; ++w) {
+            M = fmaxf(M, wm[w][h]);
+        }
+        float num = 0.f, den = 0.f;
+        #pragma unroll
+        for (int w = 0; w < AQ_W; ++w) {
+            float f = wm[w][h] == -INFINITY ? 0.f : expf(wm[w][h] - M);
+            num += f * wacc[w][h][d];
+            den += f * wl[w][h];
+        }
+        out[i] = den > 0.f ? num / den : 0.f;
+    }
+}
+
 /* ---------- token groups: the prompt pass and the MTP group ----------
  * SPLIT_PLAN.md, phase 5. The program of a group of t tokens has the same
  * operations as the program of one token, in their group form. */
@@ -4839,6 +4941,287 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
     }
 }
 
+
+/* ---------- the products of large groups on the tensor cores (Qwen3.8) ----------
+ * QWEN38_PLAN.md, phase 5. As k_gemm_q8: x as int8 with a scale for each 32
+ * values (kq_quant_x: xs, and xsum = xs * the sum of the 32 int8 values),
+ * and mma.sync m16n8k32 on the int8 values of 32 columns. Each format of w
+ * gives, for each block of 32 values of a row, int8 values q, a scale d and
+ * a term mn with w = d q + (the same mn for all 32 values). So
+ *
+ *     sum over the block of w x = xs d (the int32 sum of q x) + mn xsum.
+ *
+ *     Q8_R   the rows of the GPU (int8 values, then float16 scales): mn = 0
+ *     Q8_0   blocks of 34 bytes: mn = 0
+ *     Q5_1   w = d q + m (q of 5 bits): mn = m
+ *     Q4_K   w = d sc q - dmin mb (sub-blocks of 32 of a block of 256)
+ *
+ * A tile is BM rows of x (tokens or pairs) by 128 rows of w, with 8 warps;
+ * the steps of 128 columns come to shared memory by cp.async in NS
+ * buffers. A step of a row of w holds its bytes for the 128 columns (the
+ * head of the block of 256 and 64 bytes of values for Q4_K). */
+#define KT_BN 128
+#define KT_K 128
+#define KT_RB 144                           /* the bytes of a row of w in a step (136 used) */
+enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3 };
+
+__host__ __device__ __forceinline__ int kt_format(int type)
+{
+    return type == KQ_Q8_R ? KT_Q8R : type == KQ_Q8_0 ? KT_Q80 : type == KQ_Q5_1 ? KT_Q51 :
+           type == KQ_Q4_K ? KT_Q4K : -1;
+}
+
+/* x (n rows of cols values) to int8, with xs and xsum for each block of 32. */
+__global__ void k_kq_quant_x(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
+{
+    PDL_START();
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t bi = tid / 8;
+    int sub = threadIdx.x % 8;
+    bool live = bi < blocks;
+    float4 v = live ? *(const float4 *)(x + bi * 32 + sub * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    for (int o = 4; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    }
+    float s2 = m / 127.0f;
+    int a = s2 > 0.f ? __float2int_rn(v.x / s2) : 0, b = s2 > 0.f ? __float2int_rn(v.y / s2) : 0;
+    int c = s2 > 0.f ? __float2int_rn(v.z / s2) : 0, d = s2 > 0.f ? __float2int_rn(v.w / s2) : 0;
+    int sum = a + b + c + d;
+    for (int o = 4; o > 0; o >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+    }
+    if (!live) {
+        return;
+    }
+    char4 c4;
+    c4.x = (signed char)a;
+    c4.y = (signed char)b;
+    c4.z = (signed char)c;
+    c4.w = (signed char)d;
+    *(char4 *)(q + bi * 32 + sub * 4) = c4;
+    if (sub == 0) {
+        xs[bi] = s2;
+        xsum[bi] = s2 * (float)sum;
+    }
+}
+
+/* Copy the bytes of row `row` of w for the step at column k0 to dst. */
+template <int F>
+__device__ __forceinline__ void kt_load_w(uint8_t *dst, const uint8_t *wrow, int cols, int k0)
+{
+    int lane = threadIdx.x % 32;       /* called by one warp for each row, lanes split the copies */
+    if (F == KT_Q8R) {
+        if (lane < 8) {
+            cp_async16(dst + 16 * lane, wrow + k0 + 16 * lane);
+        } else if (lane == 8) {
+            cp_async8(dst + 128, wrow + cols + k0 / 16);
+        }
+    } else if (F == KT_Q80) {
+        if (lane < 17) {
+            cp_async8(dst + 8 * lane, wrow + (size_t)(k0 / 32) * 34 + 8 * lane);
+        }
+    } else if (F == KT_Q51) {
+        if (lane < 6) {
+            cp_async16(dst + 16 * lane, wrow + (size_t)(k0 / 32) * 24 + 16 * lane);
+        }
+    } else {
+        const uint8_t *blk = wrow + (size_t)(k0 / 256) * 144;
+        if (lane == 0) {
+            cp_async16(dst, blk);
+        } else if (lane < 5) {
+            cp_async16(dst + 16 * lane, blk + 16 + 64 * ((k0 / 128) % 2) + 16 * (lane - 1));
+        }
+    }
+}
+
+__device__ __forceinline__ uint32_t kt_hi4(uint32_t h)
+{
+    return ((h & 1) << 4) | ((h & 2) << 11) | ((h & 4) << 18) | ((h & 8) << 25);
+}
+
+/* The two registers of the fragment of B (values 4c..4c+3 and 16+4c.. of
+ * block bk of the step) of a row in shared memory. */
+template <int F>
+__device__ __forceinline__ void kt_frag(const uint8_t *rp, int bk, int c, uint32_t *b)
+{
+    if (F == KT_Q8R) {
+        b[0] = *(const uint32_t *)(rp + bk * 32 + 4 * c);
+        b[1] = *(const uint32_t *)(rp + bk * 32 + 16 + 4 * c);
+    } else if (F == KT_Q80) {
+        const uint8_t *q = rp + bk * 34 + 2;
+        b[0] = (uint32_t)*(const uint16_t *)(q + 4 * c) | ((uint32_t)*(const uint16_t *)(q + 4 * c + 2) << 16);
+        b[1] = (uint32_t)*(const uint16_t *)(q + 16 + 4 * c) |
+               ((uint32_t)*(const uint16_t *)(q + 16 + 4 * c + 2) << 16);
+    } else if (F == KT_Q51) {
+        const uint8_t *blk = rp + bk * 24;
+        uint32_t qh = *(const uint32_t *)(blk + 4);
+        uint32_t u = *(const uint32_t *)(blk + 8 + 4 * c);
+        b[0] = (u & 0x0f0f0f0fu) | kt_hi4(qh >> (4 * c));
+        b[1] = ((u >> 4) & 0x0f0f0f0fu) | kt_hi4(qh >> (16 + 4 * c));
+    } else {
+        const uint8_t *qs = rp + 16 + 32 * (bk / 2);
+        int sh = 4 * (bk % 2);
+        b[0] = (*(const uint32_t *)(qs + 4 * c) >> sh) & 0x0f0f0f0fu;
+        b[1] = (*(const uint32_t *)(qs + 16 + 4 * c) >> sh) & 0x0f0f0f0fu;
+    }
+}
+
+/* The scale d and the term mn of block bk of the step at k0 of a row. */
+template <int F>
+__device__ __forceinline__ void kt_scale(const uint8_t *rp, int bk, int k0, float *d, float *mn)
+{
+    if (F == KT_Q8R) {
+        *d = __half2float(*(const __half *)(rp + 128 + 2 * bk));
+        *mn = 0.f;
+    } else if (F == KT_Q80) {
+        *d = kq_half(rp + bk * 34);
+        *mn = 0.f;
+    } else if (F == KT_Q51) {
+        *d = kq_half(rp + bk * 24);
+        *mn = kq_half(rp + bk * 24 + 2);
+    } else {
+        int sc, m;
+        kq_scale_min(rp + 4, 4 * ((k0 / 128) % 2) + bk, &sc, &m);
+        *d = kq_half(rp) * (float)sc;
+        *mn = -kq_half(rp + 2) * (float)m;
+    }
+}
+
+/* A tile: out[m * ostride + n] for m < mcount (rows of x: xmap[m], or m)
+ * and n0 <= n < n0 + 128 (n < rows) of w (rb bytes each). */
+template <int F, int BM, int NS>
+__device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
+                        const int8_t *xq, const float *xs, const float *xsum, const int *xmap,
+                        int mcount, float *out, size_t ostride, uint8_t *sm)
+{
+    const int MI = BM / 32;             /* the 16-row parts of a warp */
+    int8_t (*as_)[BM][KT_K + 16] = (int8_t (*)[BM][KT_K + 16])sm;
+    uint8_t (*bs)[KT_BN][KT_RB] = (uint8_t (*)[KT_BN][KT_RB])(sm + NS * BM * (KT_K + 16));
+    float (*ss)[BM][8] = (float (*)[BM][8])(sm + NS * (BM * (KT_K + 16) + KT_BN * KT_RB));
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int wm = (warp / 4) * (BM / 2), wn = (warp % 4) * 32;
+    int g = lane / 4, c = lane % 4;
+    int nb = cols / 32, steps = cols / KT_K;
+    float acc[MI][4][4];
+    #pragma unroll
+    for (int i = 0; i < MI; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+        }
+    }
+    auto xrow = [&](int m) {
+        int mm = m < mcount ? m : mcount - 1;
+        return xmap ? xmap[mm] : mm;
+    };
+    auto load = [&](int st, int b) {
+        int k0 = st * KT_K;
+        for (int e = threadIdx.x; e < BM * KT_K / 16; e += blockDim.x) {
+            int m = e / (KT_K / 16), kk = (e % (KT_K / 16)) * 16;
+            cp_async16(&as_[b][m][kk], xq + (size_t)xrow(m) * cols + k0 + kk);
+        }
+        for (int e = threadIdx.x; e < BM * 4; e += blockDim.x) {
+            int m = e / 4, bk = e % 4;
+            size_t o = (size_t)xrow(m) * nb + k0 / 32 + bk;
+            cp_async4(&ss[b][m][bk], xs + o);
+            cp_async4(&ss[b][m][4 + bk], xsum + o);
+        }
+        for (int n = warp; n < KT_BN; n += 8) {
+            int row = min(n0 + n, rows - 1);
+            kt_load_w<F>(bs[b][n], w + (size_t)row * rb, cols, k0);
+        }
+        cp_async_commit();
+    };
+    for (int st = 0; st < NS - 1; ++st) {
+        if (st < steps) {
+            load(st, st);
+        } else {
+            cp_async_commit();
+        }
+    }
+    for (int st = 0; st < steps; ++st) {
+        int b = st % NS;
+        if (NS == 2) {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        }
+        __syncthreads();
+        if (st + NS - 1 < steps) {
+            load(st + NS - 1, (st + NS - 1) % NS);
+        } else {
+            cp_async_commit();
+        }
+        int k0 = st * KT_K;
+        #pragma unroll
+        for (int bk = 0; bk < 4; ++bk) {
+            uint32_t bf[4][2];
+            float dw[4][2], mw[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                kt_frag<F>(bs[b][wn + j * 8 + g], bk, c, bf[j]);
+                kt_scale<F>(bs[b][wn + j * 8 + 2 * c], bk, k0, &dw[j][0], &mw[j][0]);
+                kt_scale<F>(bs[b][wn + j * 8 + 2 * c + 1], bk, k0, &dw[j][1], &mw[j][1]);
+            }
+            #pragma unroll
+            for (int i = 0; i < MI; ++i) {
+                int r0 = wm + i * 16, kk = bk * 32;
+                uint32_t a[4];
+                a[0] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c];
+                a[1] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c];
+                a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c + 16];
+                a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c + 16];
+                float s0 = ss[b][r0 + g][bk], s1 = ss[b][r0 + g + 8][bk];
+                float u0 = ss[b][r0 + g][4 + bk], u1 = ss[b][r0 + g + 8][4 + bk];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int ci[4] = {0, 0, 0, 0};
+                    mma16832(ci, a, bf[j]);
+                    acc[i][j][0] += i2f_exact(ci[0]) * s0 * dw[j][0] + u0 * mw[j][0];
+                    acc[i][j][1] += i2f_exact(ci[1]) * s0 * dw[j][1] + u0 * mw[j][1];
+                    acc[i][j][2] += i2f_exact(ci[2]) * s1 * dw[j][0] + u1 * mw[j][0];
+                    acc[i][j][3] += i2f_exact(ci[3]) * s1 * dw[j][1] + u1 * mw[j][1];
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < MI; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int n = n0 + wn + j * 8 + 2 * c;
+            int m = wm + i * 16 + g;
+            if (m < mcount) {
+                if (n < rows) out[(size_t)m * ostride + n] = acc[i][j][0];
+                if (n + 1 < rows) out[(size_t)m * ostride + n + 1] = acc[i][j][1];
+            }
+            if (m + 8 < mcount) {
+                if (n < rows) out[(size_t)(m + 8) * ostride + n] = acc[i][j][2];
+                if (n + 1 < rows) out[(size_t)(m + 8) * ostride + n + 1] = acc[i][j][3];
+            }
+        }
+    }
+}
+
+#define KT_SMEM(BM, NS) ((size_t)(NS) * ((BM) * (KT_K + 16) + KT_BN * KT_RB + (BM) * 8 * 4))
+
+/* GP_KQ_LINEAR of a large group on the tensor cores: blockIdx.x is the tile
+ * of 128 tokens, blockIdx.y the tile of 128 rows. xq, xs, xsum: the scratch. */
+template <int F>
+__global__ void __launch_bounds__(256) k_kq_tc(const gp_rec *r, const int64_t *e, const int8_t *xq,
+                                               const float *xs, const float *xsum)
+{
+    PDL_START();
+    extern __shared__ __align__(16) uint8_t ktsm[];
+    int rows = DI(6), cols = DI(7), t = DI(8), type = DI(5);
+    int m0 = blockIdx.x * 128;
+    kt_tile<F, 128, 2>(DP(const uint8_t, 4), kq_row_bytes(type, cols), rows, blockIdx.y * KT_BN, cols,
+                       xq + (size_t)m0 * cols, xs + (size_t)m0 * (cols / 32),
+                       xsum + (size_t)m0 * (cols / 32), NULL, min(128, t - m0),
+                       DP(float, 9) + (size_t)m0 * rows, (size_t)rows, ktsm);
+}
+
 /* GP_KQ_LINEAR of a large group (t > MT_MAX). */
 __global__ void __launch_bounds__(256) k_kq_gemm(const gp_rec *r, const int64_t *e)
 {
@@ -5005,6 +5388,66 @@ __global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
     DP(float, 22)[(size_t)tok * hidden + c] = acc;
 }
 
+
+/* GP_KQ_GROUP_MOE on the tensor cores: the tiles of k_qmoe_sort (at most
+ * KG_B pairs of one expert), 128 rows of w for each block. xq, xs, xsum:
+ * the int8 rows of h (gate and up) or of act2 (down). The shared expert
+ * (x == E) has the Q8_R rows of the GPU. */
+template <int KFG>
+__global__ void __launch_bounds__(256) k_qmoe_gu_tc(const gp_rec *r, const int64_t *e,
+                                                    const int8_t *xq, const float *xs,
+                                                    const float *xsum)
+{
+    PDL_START();
+    extern __shared__ __align__(16) uint8_t ktsm[];
+    qmoe_w w = qmoe_work(r, e);
+    int tile = blockIdx.y;
+    if (tile >= DP(const int, 18)[0]) {
+        return;
+    }
+    int x = w.tiles[3 * tile], p0 = w.tiles[3 * tile + 1], n = w.tiles[3 * tile + 2];
+    int E = DI(5), hidden = DI(6), inner = DI(7);
+    int row0 = blockIdx.x * KT_BN, up = row0 >= inner;
+    float *out = DP(float, 19) + (size_t)p0 * 2 * inner + (up ? inner : 0);
+    if (x < E) {
+        const uint8_t *W = (const uint8_t *)(intptr_t)DP(const int64_t, up ? 9 : 8)[x];
+        kt_tile<KFG, 64, 3>(W, kq_row_bytes(DI(11), hidden), inner, row0 - (up ? inner : 0), hidden,
+                           xq, xs, xsum, w.ptok + p0, n, out, (size_t)2 * inner, ktsm);
+    } else {
+        kt_tile<KT_Q8R, 64, 3>(DP(const uint8_t, up ? 14 : 13), kq_row_bytes(KQ_Q8_R, hidden), inner,
+                               row0 - (up ? inner : 0), hidden, xq, xs, xsum, w.ptok + p0, n, out,
+                               (size_t)2 * inner, ktsm);
+    }
+}
+
+template <int KFD>
+__global__ void __launch_bounds__(256) k_qmoe_dn_tc(const gp_rec *r, const int64_t *e,
+                                                    const int8_t *xq, const float *xs,
+                                                    const float *xsum)
+{
+    PDL_START();
+    extern __shared__ __align__(16) uint8_t ktsm[];
+    qmoe_w w = qmoe_work(r, e);
+    int tile = blockIdx.y;
+    if (tile >= DP(const int, 18)[0]) {
+        return;
+    }
+    int x = w.tiles[3 * tile], p0 = w.tiles[3 * tile + 1], n = w.tiles[3 * tile + 2];
+    int E = DI(5), hidden = DI(6), inner = DI(7);
+    float *out = DP(float, 21) + (size_t)p0 * hidden;
+    const int8_t *xr = xq + (size_t)p0 * inner;
+    const float *sr = xs + (size_t)p0 * (inner / 32), *ur = xsum + (size_t)p0 * (inner / 32);
+    if (x < E) {
+        const uint8_t *W = (const uint8_t *)(intptr_t)DP(const int64_t, 10)[x];
+        kt_tile<KFD, 64, 3>(W, kq_row_bytes(DI(12), inner), hidden, blockIdx.x * KT_BN, inner, xr, sr,
+                           ur, NULL, n, out, (size_t)hidden, ktsm);
+    } else {
+        kt_tile<KT_Q8R, 64, 3>(DP(const uint8_t, 15), kq_row_bytes(KQ_Q8_R, inner), hidden,
+                               blockIdx.x * KT_BN, inner, xr, sr, ur, NULL, n, out, (size_t)hidden,
+                               ktsm);
+    }
+}
+
 /* ---------- the host side ---------- */
 
 /* The runner of a CPU program: gemma_run of the CPU library. Python gives its
@@ -5032,6 +5475,8 @@ typedef struct {
     cudaEvent_t *ev;     /* the events of the GP_TO_HOST records */
     __half *xh;          /* the float16 copy of the input of a product */
     size_t xh_n;
+    int8_t *kqx;         /* the int8 rows of the products of large groups (k_kq_tc) */
+    size_t kqx_n;        /* its values; then xs and xsum, kqx_n / 32 floats each */
     int tc;              /* 1: the tensor cores for a large group */
 } gg_prog;
 
@@ -5497,6 +5942,44 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
 
 /* Launch the kernels of one record. Return 0, or -1 for an operation that
  * this file does not have or a size that is not a literal. */
+/* NP_GEMMA_GPU_KQTC=0 keeps the float32 tiles for the products of large
+ * groups of Qwen3.8 (a test). */
+static int kt_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_GPU_KQTC");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* The shared memory of the instances of the tensor-core kernels (once). */
+static void kt_attr(void)
+{
+    static int done = 0;
+    if (done) {
+        return;
+    }
+    done = 1;
+    int a = (int)KT_SMEM(128, 2), b = (int)KT_SMEM(64, 3);
+    cudaFuncSetAttribute(k_kq_tc<KT_Q8R>, cudaFuncAttributeMaxDynamicSharedMemorySize, a);
+#define KT_SET(F) \
+    cudaFuncSetAttribute(k_qmoe_gu_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b); \
+    cudaFuncSetAttribute(k_qmoe_dn_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K)
+#undef KT_SET
+}
+
+/* Quantize n values (a multiple of 32) at x to the int8 scratch of g. */
+static void kt_quant(const gg_prog *g, const float *x, size_t n)
+{
+    int8_t *xq = g->kqx;
+    float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+    k_kq_quant_x<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(x, xq, xs, xsum,
+                                                                                   n / 32);
+}
+
 static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const int64_t *denv)
 {
     int bad = 0;
@@ -5616,9 +6099,25 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
         }
         break;
+    case GP_ATTN_QSA:
+        if (hlit(r, 10, &bad) > 1) {
+            int64_t nq = hlit(r, 7, &bad), nk = hlit(r, 8, &bad), rep = nk > 0 ? nq / nk : 0;
+            int hg = rep == 12 ? 2 : (rep == 8 ? 1 : 0);
+            if (hlit(r, 9, &bad) != 256 || hg == 0 || nq % nk != 0) {
+                bad = 1;
+            } else if (hg == 2) {
+                k_attn_qsa_mt<6><<<dim3((unsigned)hlit(r, 10, &bad), (unsigned)(nk * hg)), 128, 0, s>>>(
+                    dr, denv, hg);
+            } else {
+                k_attn_qsa_mt<8><<<dim3((unsigned)hlit(r, 10, &bad), (unsigned)(nk * hg)), 128, 0, s>>>(
+                    dr, denv, hg);
+            }
+            break;
+        }
+        attn_launch(g, r, dr, denv, &bad);
+        break;
     case GP_ATTN_F32:
     case GP_ATTN_QC:
-    case GP_ATTN_QSA:
         attn_launch(g, r, dr, denv, &bad);
         break;
     case GP_HOT_SPLIT:
@@ -5752,7 +6251,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         /* The GPU products read the float rows (operand 3 of GP_KQ_LINEAR). */
         return 0;
     case GP_KQ_LINEAR:
-        if (hlit(r, 8, &bad) > MT_MAX) {
+        if (hlit(r, 8, &bad) > MT_MAX && kt_on() && g->tc &&
+            kt_format((int)hlit(r, 5, &bad)) == KT_Q8R && hlit(r, 7, &bad) % KT_K == 0 &&
+            (size_t)hlit(r, 8, &bad) * hlit(r, 7, &bad) <= g->kqx_n) {
+            /* The operand x (3) is a device address in the record on the device;
+             * the host copy of the record has it too. */
+            int64_t t = hlit(r, 8, &bad), cols = hlit(r, 7, &bad), rows = hlit(r, 6, &bad);
+            kt_attr();
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 3), (size_t)(t * cols));
+            float *xs = (float *)(g->kqx + g->kqx_n);
+            k_kq_tc<KT_Q8R><<<dim3((unsigned)cdiv(t, 128), (unsigned)cdiv(rows, KT_BN)), 256,
+                              KT_SMEM(128, 2), s>>>(dr, denv, g->kqx, xs, xs + g->kqx_n / 32);
+        } else if (hlit(r, 8, &bad) > MT_MAX) {
             if (hlit(r, 7, &bad) % KG_K != 0) {
                 bad = 1;
             }
@@ -5780,10 +6290,36 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (hidden % KG_B != 0 || inner % KG_B != 0) {
             bad = 1;
         }
+        int fg = kt_format((int)hlit(r, 11, &bad)), fd = kt_format((int)hlit(r, 12, &bad));
+        int64_t P = t * k + t;
         k_qmoe_sort<<<1, 32, 0, s>>>(dr, denv);
-        k_qmoe_gu<<<dim3((unsigned)(2 * inner / KG_B), tiles), 256, 0, s>>>(dr, denv);
-        k_qmoe_act<<<(unsigned)cdiv((t * k + t) * inner, T), T, 0, s>>>(dr, denv);
-        k_qmoe_dn<<<dim3((unsigned)(hidden / KG_B), tiles), 256, 0, s>>>(dr, denv);
+        if (kt_on() && g->tc && fg >= 0 && fd >= 0 && kt_format((int)hlit(r, 16, &bad)) == KT_Q8R &&
+            hidden % KT_K == 0 && inner % KT_K == 0 && (size_t)(t * hidden) <= g->kqx_n &&
+            (size_t)(P * inner) <= g->kqx_n) {
+            kt_attr();
+            float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+            size_t sm = KT_SMEM(64, 3);
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 0), (size_t)(t * hidden));
+            dim3 ggu((unsigned)(2 * inner / KT_BN), tiles), gdn((unsigned)(hidden / KT_BN), tiles);
+            switch (fg) {
+            case KT_Q8R: k_qmoe_gu_tc<KT_Q8R><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_Q80: k_qmoe_gu_tc<KT_Q80><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_Q51: k_qmoe_gu_tc<KT_Q51><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            default: k_qmoe_gu_tc<KT_Q4K><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            }
+            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv);
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 20), (size_t)(P * inner));
+            switch (fd) {
+            case KT_Q8R: k_qmoe_dn_tc<KT_Q8R><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_Q80: k_qmoe_dn_tc<KT_Q80><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_Q51: k_qmoe_dn_tc<KT_Q51><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            default: k_qmoe_dn_tc<KT_Q4K><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            }
+        } else {
+            k_qmoe_gu<<<dim3((unsigned)(2 * inner / KG_B), tiles), 256, 0, s>>>(dr, denv);
+            k_qmoe_act<<<(unsigned)cdiv((t * k + t) * inner, T), T, 0, s>>>(dr, denv);
+            k_qmoe_dn<<<dim3((unsigned)(hidden / KG_B), tiles), 256, 0, s>>>(dr, denv);
+        }
         k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
         break;
     }
@@ -6298,6 +6834,28 @@ void *gg_load(const int64_t *prog, int use_graph)
         return NULL;
     }
     g->xh_n = need;
+    /* The int8 scratch of the products of large groups on the tensor cores. */
+    size_t kneed = 0;
+    for (int pc = 0; pc < g->n_code; ++pc) {
+        const gp_rec *r = g->hcode + pc;
+        size_t n = 0;
+        if (r->op == GP_KQ_LINEAR && r->v[8] > MT_MAX) {
+            n = (size_t)r->v[8] * (size_t)r->v[7];
+        } else if (r->op == GP_KQ_GROUP_MOE) {
+            size_t t = (size_t)r->v[3], P = t * (size_t)r->v[4] + t;
+            n = t * (size_t)r->v[6];
+            n = P * (size_t)r->v[7] > n ? P * (size_t)r->v[7] : n;
+        }
+        kneed = n > kneed ? n : kneed;
+    }
+    if (kneed > 0) {
+        kneed = (kneed + 255) & ~(size_t)255;
+        if (cudaMalloc(&g->kqx, kneed + kneed / 32 * 8) != cudaSuccess) {
+            snprintf(gg_error, sizeof(gg_error), "gg_load: no memory for the int8 scratch");
+            return NULL;
+        }
+    }
+    g->kqx_n = kneed;
     g->ev = (cudaEvent_t *)calloc((size_t)g->n_ev + 1, sizeof(cudaEvent_t));
     for (int k = 0; k < g->n_ev; ++k) {
         if (cudaEventCreateWithFlags(&g->ev[k], cudaEventDisableTiming) != cudaSuccess) {
@@ -6426,6 +6984,7 @@ int gg_unload(void *handle)
     cudaFree(g->dcode);
     cudaFree(g->part);
     cudaFree(g->xh);
+    cudaFree(g->kqx);
     cudaFreeHost(g->henv);
     free(g->hcode);
     free(g);

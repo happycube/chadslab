@@ -56,7 +56,7 @@ MIX_MIN = int(os.environ.get("NP_GEMMA_GPU_MIX_MIN", "256"))  # the shortest pro
 # and for each of its tokens; for each expert that the GPU copies.
 MIX_CPU_A = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_A", "75000"))
 MIX_CPU_B = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_B", "15000"))
-MIX_GPU = int(os.environ.get("NP_GEMMA_GPU_MIX_GPU", "900000"))
+MIX_GPU = int(os.environ.get("NP_GEMMA_GPU_MIX_GPU", "700000"))
 # The free memory that the buffer of the copies leaves (the programs of the
 # decode, MTP, and the verify groups).
 MIX_KEEP = float(os.environ.get("NP_GEMMA_GPU_MIX_KEEP", "0.8e9"))
@@ -93,8 +93,13 @@ class _Emit4:
         self.dev._moe_split(prog, i, xb["src"], idx, val, slog, out)
 
     def emit_attn_qsa(self, prog, q, base, scores, out, t, pos, sel, cnt, maxsel):
-        # One record for each query (the GPU kernels take one query).
         cfg = self.m.cfg
+        if t > MT and os.environ.get("NP_GEMMA_GPU_ATTN_MT", "1") != "0":
+            # A large group: one record (k_attn_qsa_mt; NP_GEMMA_GPU_ATTN_MT=0 for a test).
+            prog.emit(P.ATTN_QSA, q, *base, scores, out, cfg.num_heads, cfg.num_kv_heads,
+                      cfg.head_dim, t, pos, sel, cnt, maxsel)
+            return
+        # One record for each query: the kernel of a step (the same bits).
         for j in range(t):
             pj = prog.temp()
             prog.emit(P.S_ADD, pj, pos, j)
