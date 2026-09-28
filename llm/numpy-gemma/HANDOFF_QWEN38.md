@@ -58,8 +58,9 @@ The main parts, and where they are:
   are BF16. The MTP layer is blk.48. The runtime maps the file; it does
   not repack the experts at each start. llama.cpp cannot read this file.
 - dense_mode: "q8" requantizes the BF16 matrices to Q8_0 at the first use,
-  for the CPU and the GPU (Qwen4CPU.K). NP_GEMMA_DENSE=auto|bf16|q8; auto
-  takes q8 with a GPU of little free memory (this machine).
+  for the CPU and the GPU (Qwen4CPU.K). The variable NP_GEMMA_DENSE takes
+  q8 (the default), bf16, or auto. The GPU is slower with bf16 here too.
+  With auto, a GPU of little free memory takes q8.
 - The CPU: KQ_Q8X16 (type 60, only in memory) packs the dense Q8_0
   matrices in groups of 16 rows; Qwen4CPU.KP makes it at the first use.
   NVFP4 has tiles of 4 rows by 4 tokens (kq_rows4_nv4). A group gives the
@@ -160,6 +161,11 @@ the machine, so a time can change by 15%:
         --hot-gb 0.5 -p 512,2048 -n 128 -r 2
     NP_GEMMA_DENSE=q8 python scripts/bench_qwen4.py -m $G/Qwen3.8-Flash-Next-NVFP4-bf16.gguf \
         -p 512 -n 64 -r 2
+
+The long-context test (128K tokens of the source, then questions with a
+long answer):
+
+    python scripts/long_qwen4.py [--tokens 131072] [--gen 4096] [--backend cpu]
 
 The switches for a comparison:
 

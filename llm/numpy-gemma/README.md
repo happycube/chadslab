@@ -1820,8 +1820,8 @@ context takes the room of the buffer of the expert copies.
     131072 tokens    13 GB free (cache 5.6 GB)      q8      424
 
 The buffer now keeps room for at least 64 experts (a group of 1024 at 32K:
-2.8 s, not 3.8 s). With much free memory, the "auto" dense mode takes
-bf16, which is slower here: use NP_GEMMA_DENSE=q8.
+2.8 s, not 3.8 s). The dense mode is q8 by default. The "auto" mode takes
+bf16 when the GPU has much free memory, and bf16 is slower here.
 
 - The GPU holds the dense part and 0.5 GB of hot experts. In the decode,
   the CPU computes the other experts. A prompt runs in mixed groups: the GPU
@@ -1842,6 +1842,16 @@ Run the checks and the measurement:
         --tok $G/tokenizer.json --layers 4 --gpu --hot-gb 0.5
     python scripts/bench_qwen4.py -m $G/Qwen3.8-Flash-Next-NVFP4-bf16.gguf --backend gpu \
         --hot-gb 0.5 -p 512,2048,4096 -n 128,512 -r 3
+
+A test of a long context has a prompt of about 128K tokens of the source
+of this project. Then it asks questions with a long answer (up to 4096 new
+tokens).
+The answer streams to the terminal, and the rates go to the end of
+long_qwen4_out.txt.
+
+    python scripts/long_qwen4.py                          # 128K on the GPU
+    python scripts/long_qwen4.py --tokens 32768 --gen 1024
+    python scripts/long_qwen4.py --question "What does csrc/moe.c do?" --gen 512
 
 ## Test results
 

@@ -12,3 +12,4 @@ models2/
 *.swo
 .fuse_hidden*
 scripts/membw
+long_qwen4_out.txt

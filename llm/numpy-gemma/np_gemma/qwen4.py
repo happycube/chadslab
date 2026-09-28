@@ -42,10 +42,13 @@ def dense_mode(g, dense=None):
     """The form of the large bfloat16 matrices of a model (the NVFP4
     checkpoint and its GGUF): "bf16" (as they are) or "q8" (requantized to
     Q8_0 at the first use: half the bytes to read, for the CPU and for a
-    GPU of little memory). dense, else NP_GEMMA_DENSE, else "auto": q8 when
-    a GPU is there and its free memory is less than the bfloat16 dense part,
-    the head, and 3 GB; else bf16."""
-    dense = dense or os.environ.get("NP_GEMMA_DENSE", "auto")
+    GPU of little memory). dense, else NP_GEMMA_DENSE, else "q8". q8 is
+    also faster on a GPU with room for bf16: the products of a prompt use
+    the tensor cores, and the buffer of the expert copies keeps more room
+    (a prompt of 32K: 351 tok/s with bf16; 131072 tokens: 424 with q8).
+    "auto": q8 when a GPU is there and its free memory is less than the
+    bfloat16 dense part, the head, and 3 GB; else bf16."""
+    dense = dense or os.environ.get("NP_GEMMA_DENSE", "q8")
     if dense != "auto":
         return dense
     from .gguf import tensor_bytes
