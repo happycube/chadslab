@@ -9,7 +9,7 @@ the same forms, so the runtime maps it and the pages come and go:
 - the names and the metadata of the GGUF files of llama.cpp (qwen4exp), with
   the MTP layer as blk.48; the value heads of the DeltaNet in the tiled
   order of llama.cpp (as the converter of llama.cpp does);
-- the routed experts in the rows of KQ_NV4 (type 50: NVFP4 as it is);
+- the routed experts in the rows of KQ_NV4 (type 51: NVFP4 as it is);
 - the n-gram table as rows of E4M3 codes (type 52) and the tensor
   per_layer_token_embd.scale (FP8 as it is);
 - the bfloat16 matrices as bfloat16 (--dense bf16, the default: the runtime
@@ -17,7 +17,7 @@ the same forms, so the runtime maps it and the pages come and go:
 - the MTP experts (FP8 blocks) as Q8_0; the small matrices and the norms as
   float32 (with the 1 of the norms).
 
-The types 50 and 52 are of this runtime only: llama.cpp cannot read the file.
+The types 51 and 52 are of this runtime only: llama.cpp cannot read the file.
 
     python scripts/convert_nvfp4_gguf.py models/Qwen3.8-Flash-Next-NVFP4 \\
         models2/Qwen3.8-Flash-Next-NVFP4-GGUF/Qwen3.8-Flash-Next-NVFP4-bf16.gguf

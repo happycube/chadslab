@@ -38,7 +38,7 @@ import numpy as np
 from . import cops
 from .st import SafeTensors
 
-KQ_F32, KQ_Q8_0, KQ_BF16, KQ_NV4 = 0, 8, 30, 50
+KQ_F32, KQ_Q8_0, KQ_BF16, KQ_NV4 = 0, 8, 30, 51
 MAIN = "model.language_model."
 
 

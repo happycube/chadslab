@@ -454,6 +454,18 @@ The products and the attention of large groups (more than 16 rows):
   GPU the buffer of the copies (about 100 experts) now limits the split.
 - The prompt of Qwen3.6 uses the same products (its dense part is Q8_R).
 
+The NVFP4 checkpoint of NVIDIA (np_gemma/st_qwen4.py,
+scripts/convert_nvfp4_gguf.py; HANDOFF_QWEN38.md has the numbers):
+
+- The experts are rows of type 51 (KQ_NV4). A row holds all the codes,
+  then the E4M3 scales, then the float32 scale of the matrix. Zeros fill
+  the row to a multiple of 16 bytes. The tensor cores load 4 codes with one
+  aligned load, and change them to int8 with prmt and a sign mask.
+- The tensor cores on NVFP4 agree with the float32 tiles to 1.5e-2 (8
+  layers, the same top token). The experts of a group of 1024 rows take
+  415 ms. The copies (1.75 s) and the CPU (1.41 s) set the time of the
+  group.
+
 ## Risks
 
 - The page cache: if the working set does not fit, the rate falls by a

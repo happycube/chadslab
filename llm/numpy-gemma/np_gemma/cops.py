@@ -732,7 +732,7 @@ def kq_rows(w, type_, cols, ids):
     return out
 
 
-KQ_Q8_0, KQ_BF16, KQ_NV4 = 8, 30, 50
+KQ_Q8_0, KQ_BF16, KQ_NV4 = 8, 30, 51
 
 
 def kq_to_q8_0(src, cols):
@@ -767,7 +767,9 @@ def kq_gather(addrs, nbytes):
 
 
 def kq_nv4_row_bytes(cols):
-    return 4 + cols // 32 * 18
+    """A KQ_NV4 row: the codes, the scales, the scale of the matrix, zeros to
+    a multiple of 16 bytes (csrc/kquants.c)."""
+    return (cols // 2 + cols // 16 + 4 + 15) // 16 * 16
 
 
 def kq_nv4_pack(ws, ss, gs, rows, cols, out):

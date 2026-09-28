@@ -31,12 +31,13 @@ IQ4_NL = 20
 BF16 = 30
 # The types of this runtime (not of ggml), in files of
 # scripts/convert_nvfp4_gguf.py: NVFP4 in the rows of KQ_NV4 (csrc/kquants.c:
-# the float32 scale of the matrix, then blocks of 32 values of 18 bytes), and
+# the codes, the scales, the float32 scale of the matrix, zeros to 16 bytes), and
 # rows of FP8 E4M3 codes (one byte for each value; the tensor <name>.scale
 # holds the scale).
-NV4 = 50
+NV4 = 51
 E4M3_ROWS = 52
-_ROW_BYTES = {NV4: lambda cols: 4 + cols // 32 * 18, E4M3_ROWS: lambda cols: cols}
+_ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
+              E4M3_ROWS: lambda cols: cols}
 
 
 def _e4m3_values():

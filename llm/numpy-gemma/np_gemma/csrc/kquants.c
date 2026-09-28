@@ -28,12 +28,16 @@
  *                  4k to 4k + 3 of the 16 rows (row r in bytes 4r to 4r + 3).
  *                  A lane of vpdpbusd is a row: no sums across lanes, and an
  *                  int32 sum for each block (see kq_x16_body).
- *     KQ_NV4  50   NVFP4 in rows for this runtime (np_gemma/st_qwen4.py
- *                  repacks the checkpoint of NVIDIA ModelOpt): a row is the
- *                  float32 scale of the matrix, then blocks of 32 values
- *                  (18 bytes): two E4M3 scales (values 0-15, 16-31), and
- *                  16 bytes of 4-bit E2M1 codes (value j in the low 4 bits
- *                  of byte j, value j + 16 in the high 4 bits). w = g * s *
+ *     KQ_NV4  51   NVFP4 in rows for this runtime (np_gemma/st_qwen4.py
+ *                  repacks the checkpoint of NVIDIA ModelOpt). A row: the
+ *                  4-bit E2M1 codes (cols / 2 bytes; block b of 32 values in
+ *                  bytes 16b .. 16b + 15, value j in the low 4 bits of byte
+ *                  j, value j + 16 in the high 4 bits), the E4M3 scales
+ *                  (cols / 16 bytes; 2 for each block: values 0-15, 16-31),
+ *                  the float32 scale of the matrix, and zeros to a multiple
+ *                  of 16 bytes. So the codes of a row start at a multiple of
+ *                  16 bytes, and the scales at a multiple of 4 (the loads of
+ *                  the GPU; kq_nv4_* give the places). w = g * s *
  *                  e2m1(code); 2 e2m1 is an integer (0, 1, 2, 3, 4, 6, 8,
  *                  12 and the negatives).
  *
@@ -62,7 +66,7 @@
 #define KQ_Q5_1 7
 #define KQ_IQ4_NL 20
 #define KQ_BF16 30
-#define KQ_NV4 50
+#define KQ_NV4 51
 #define KQ_Q8X16 60
 
 /* The bytes of one row of cols values. */
@@ -77,10 +81,29 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_Q5_K: return (size_t)cols / 256 * 176;
     case KQ_Q6_K: return (size_t)cols / 256 * 210;
     case KQ_BF16: return (size_t)cols * 2;
-    case KQ_NV4: return 4 + (size_t)cols / 32 * 18;
+    case KQ_NV4: return ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16;
     case KQ_Q8X16: return (size_t)cols / 32 * 36;      /* a group of 16 rows: 16 times this */
     }
     return 0;
+}
+
+/* The places in a KQ_NV4 row: the codes of block b, its two scales, and the
+ * scale of the matrix. */
+static inline const uint8_t *kq_nv4_codes(const uint8_t *w, int b)
+{
+    return w + (size_t)16 * b;
+}
+
+static inline const uint8_t *kq_nv4_scales(const uint8_t *w, int cols, int b)
+{
+    return w + (size_t)cols / 2 + 2 * (size_t)b;
+}
+
+static inline float kq_nv4_g(const uint8_t *w, int cols)
+{
+    float g;
+    memcpy(&g, w + (size_t)cols / 2 + (size_t)cols / 16, 4);
+    return g;
 }
 
 /* Twice the value of an E2M1 code (NVFP4): an integer. */
@@ -200,7 +223,7 @@ static inline int kq_block32(int type)
            type == KQ_NV4;
 }
 
-static void kq_block_values(int type, const uint8_t *row, int b, float *out)
+static void kq_block_values(int type, const uint8_t *row, int cols, int b, float *out)
 {
     if (type == KQ_BF16) {
         const uint16_t *h = (const uint16_t *)row + (size_t)b * 32;
@@ -208,13 +231,12 @@ static void kq_block_values(int type, const uint8_t *row, int b, float *out)
             out[i] = kq_bf16(h[i]);
         }
     } else if (type == KQ_NV4) {
-        float g;
-        memcpy(&g, row, 4);
-        const uint8_t *blk = row + 4 + (size_t)b * 18;
-        float s0 = 0.5f * g * kq_e4m3(blk[0]), s1 = 0.5f * g * kq_e4m3(blk[1]);
+        float g = kq_nv4_g(row, cols);
+        const uint8_t *q = kq_nv4_codes(row, b), *sc = kq_nv4_scales(row, cols, b);
+        float s0 = 0.5f * g * kq_e4m3(sc[0]), s1 = 0.5f * g * kq_e4m3(sc[1]);
         for (int j = 0; j < 16; ++j) {
-            out[j] = s0 * (float)kq_e2m1x2[blk[2 + j] & 15];
-            out[j + 16] = s1 * (float)kq_e2m1x2[blk[2 + j] >> 4];
+            out[j] = s0 * (float)kq_e2m1x2[q[j] & 15];
+            out[j + 16] = s1 * (float)kq_e2m1x2[q[j] >> 4];
         }
     } else if (type == KQ_Q5_1) {
         const uint8_t *blk = row + (size_t)b * 24;
@@ -708,8 +730,7 @@ static float kq_dot_bf16(const uint8_t *w, int cols, const int8_t *xq, const flo
  * scale and xs. */
 static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const float *xs)
 {
-    float g;
-    memcpy(&g, w, 4);
+    float g = kq_nv4_g(w, cols);
     const __m128i lut = _mm_loadu_si128((const __m128i *)kq_e2m1x2);
     const __m128i m4 = _mm_set1_epi8(15);
     const __m512i lut5 = _mm512_broadcast_i32x4(lut), m45 = _mm512_set1_epi8(15);
@@ -718,10 +739,8 @@ static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const floa
     __m512 acc5 = _mm512_setzero_ps();
     int nb = cols / 32, b = 0;
     for (; b + 2 <= nb; b += 2) {
-        const uint8_t *b0 = w + 4 + (size_t)b * 18, *b1 = b0 + 18;
-        __m256i q01 = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
-            _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+        const uint8_t *s0p = kq_nv4_scales(w, cols, b);
+        __m256i q01 = _mm256_loadu_si256((const __m256i *)kq_nv4_codes(w, b));
         /* lanes of 128 bits: the low codes of block 0, its high codes, the
          * low codes of block 1, its high codes (the order of x) */
         __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
@@ -733,22 +752,22 @@ static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const floa
         __mmask64 neg = _mm512_movepi8_mask(wv);
         __m512i sx = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
         __m512i is = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(wv), sx);
-        __m128 s4 = _mm_setr_ps(kq_e4m3_tab[b0[0]] * xs[b], kq_e4m3_tab[b0[1]] * xs[b],
-                                kq_e4m3_tab[b1[0]] * xs[b + 1], kq_e4m3_tab[b1[1]] * xs[b + 1]);
+        __m128 s4 = _mm_setr_ps(kq_e4m3_tab[s0p[0]] * xs[b], kq_e4m3_tab[s0p[1]] * xs[b],
+                                kq_e4m3_tab[s0p[2]] * xs[b + 1], kq_e4m3_tab[s0p[3]] * xs[b + 1]);
         __m512 sc = _mm512_permutexvar_ps(sidx, _mm512_castps128_ps512(s4));
         acc5 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), sc, acc5);
     }
     __m256 acc = _mm256_setzero_ps();
     for (; b < nb; ++b) {
-        const uint8_t *blk = w + 4 + (size_t)b * 18;
-        __m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+        const uint8_t *sp = kq_nv4_scales(w, cols, b);
+        __m128i q = _mm_loadu_si128((const __m128i *)kq_nv4_codes(w, b));
         __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(q, m4));
         __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
         __m256i wv = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
         __m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * b));
         __m256i sx = _mm256_sign_epi8(xv, wv);
         __m256i is = _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_abs_epi8(wv), sx);
-        float s0 = kq_e4m3_tab[blk[0]] * xs[b], s1 = kq_e4m3_tab[blk[1]] * xs[b];
+        float s0 = kq_e4m3_tab[sp[0]] * xs[b], s1 = kq_e4m3_tab[sp[1]] * xs[b];
         __m256 sc = _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1);
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is), sc, acc);
     }
@@ -797,7 +816,7 @@ static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, con
     int bv = kq_block32(type) ? 32 : 256;
     float v[256], s = 0.f;
     for (int b = 0; b < cols / bv; ++b) {
-        kq_block_values(type, w, b, v);
+        kq_block_values(type, w, cols, b, v);
         for (int i = 0; i < bv; ++i) {
             int c = b * bv + i;
             s += v[i] * xs[c / 32] * (float)xq[c];
@@ -818,17 +837,14 @@ static void kq_row_nv4(const uint8_t *w, int cols, const int8_t *xq, const float
     __attribute__((aligned(64))) int8_t aw[KQ_NV4_MAX];
     __attribute__((aligned(64))) float sc[KQ_NV4_MAX / 16];
     __mmask64 negs[KQ_NV4_MAX / 64];
-    float g;
-    memcpy(&g, w, 4);
+    float g = kq_nv4_g(w, cols);
     int nb = cols / 32;
     const __m512i lut5 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1x2));
     const __m512i m45 = _mm512_set1_epi8(15);
     for (int b = 0; b < nb; b += 2) {
         /* as kq_dot_nv4: two blocks to 64 int8 in the order of x */
-        const uint8_t *b0 = w + 4 + (size_t)b * 18, *b1 = b0 + 18;
-        __m256i q01 = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
-            _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+        const uint8_t *sp = kq_nv4_scales(w, cols, b);
+        __m256i q01 = _mm256_loadu_si256((const __m256i *)kq_nv4_codes(w, b));
         __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
         q = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 0, 1, 2, 3, 2, 3), q);
         __m512i codes = _mm512_and_si512(
@@ -836,10 +852,10 @@ static void kq_row_nv4(const uint8_t *w, int cols, const int8_t *xq, const float
         __m512i wv = _mm512_shuffle_epi8(lut5, codes);
         negs[b / 2] = _mm512_movepi8_mask(wv);
         _mm512_store_si512((void *)(aw + 32 * b), _mm512_abs_epi8(wv));
-        sc[2 * b] = kq_e4m3_tab[b0[0]];
-        sc[2 * b + 1] = kq_e4m3_tab[b0[1]];
-        sc[2 * b + 2] = kq_e4m3_tab[b1[0]];
-        sc[2 * b + 3] = kq_e4m3_tab[b1[1]];
+        sc[2 * b] = kq_e4m3_tab[sp[0]];
+        sc[2 * b + 1] = kq_e4m3_tab[sp[1]];
+        sc[2 * b + 2] = kq_e4m3_tab[sp[2]];
+        sc[2 * b + 3] = kq_e4m3_tab[sp[3]];
     }
     const __m512i sidx = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
     for (int j = 0; j < n; ++j) {
@@ -911,12 +927,10 @@ static void kq_rows4_nv4(const uint8_t *w, size_t rb, int cols, const int8_t *xq
     const __m512i m45 = _mm512_set1_epi8(15);
     for (int r = 0; r < 4; ++r) {
         const uint8_t *wr = w + (size_t)r * rb;
-        memcpy(&g[r], wr, 4);
+        g[r] = kq_nv4_g(wr, cols);
         for (int b = 0; b < nb; b += 2) {
-            const uint8_t *b0 = wr + 4 + (size_t)b * 18, *b1 = b0 + 18;
-            __m256i q01 = _mm256_inserti128_si256(
-                _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
-                _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+            const uint8_t *sp = kq_nv4_scales(wr, cols, b);
+            __m256i q01 = _mm256_loadu_si256((const __m256i *)kq_nv4_codes(wr, b));
             __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
             q = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 0, 1, 2, 3, 2, 3), q);
             __m512i codes = _mm512_and_si512(
@@ -924,8 +938,8 @@ static void kq_rows4_nv4(const uint8_t *w, size_t rb, int cols, const int8_t *xq
             __m512i wv = _mm512_shuffle_epi8(lut5, codes);
             negs[r][b / 2] = _mm512_movepi8_mask(wv);
             _mm512_store_si512((void *)(aw[r] + 32 * b), _mm512_abs_epi8(wv));
-            float s4[4] = {kq_e4m3_tab[b0[0]], kq_e4m3_tab[b0[1]], kq_e4m3_tab[b1[0]],
-                           kq_e4m3_tab[b1[1]]};
+            float s4[4] = {kq_e4m3_tab[sp[0]], kq_e4m3_tab[sp[1]], kq_e4m3_tab[sp[2]],
+                           kq_e4m3_tab[sp[3]]};
             for (int l = 0; l < 16; ++l) {
                 wsc[r][b / 2][l] = s4[l / 4];
             }
@@ -1185,16 +1199,16 @@ void kq_nv4_pack(const int64_t *wp, const int64_t *sp, const float *g, int n, in
         const uint8_t *w = (const uint8_t *)(intptr_t)wp[e] + (size_t)r * (cols / 2);
         const uint8_t *s = (const uint8_t *)(intptr_t)sp[e] + (size_t)r * (cols / 16);
         uint8_t *o = dst + (size_t)x * rb;
-        memcpy(o, &g[e], 4);
+        memset(o, 0, rb);
+        memcpy(o + (size_t)cols / 2, s, (size_t)cols / 16);       /* the scales, in order */
+        memcpy(o + (size_t)cols / 2 + (size_t)cols / 16, &g[e], 4);
         for (int b = 0; b < cols / 32; ++b) {
-            uint8_t *blk = o + 4 + (size_t)b * 18;
-            blk[0] = s[2 * b];
-            blk[1] = s[2 * b + 1];
             const uint8_t *src = w + (size_t)b * 16;     /* 32 values, 2 in each byte */
+            uint8_t *q = o + (size_t)16 * b;
             for (int j = 0; j < 16; ++j) {
                 int lo = (src[j / 2] >> (4 * (j % 2))) & 15;             /* value j */
                 int hi = (src[8 + j / 2] >> (4 * (j % 2))) & 15;         /* value j + 16 */
-                blk[2 + j] = (uint8_t)(lo | (hi << 4));
+                q[j] = (uint8_t)(lo | (hi << 4));
             }
         }
     }
@@ -1250,7 +1264,7 @@ void kq_rows(const uint8_t *w, int type, int cols, const int64_t *ids, int n, fl
             continue;
         }
         for (int b = 0; b < cols / bv; ++b) {
-            kq_block_values(type, row, b, out + (size_t)i * cols + (size_t)b * bv);
+            kq_block_values(type, row, cols, b, out + (size_t)i * cols + (size_t)b * bv);
         }
     }
 }

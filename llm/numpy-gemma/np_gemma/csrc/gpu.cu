@@ -3807,12 +3807,13 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
  * (32 bits), and the low 4 bits (value j < 16 in the low half of byte j,
  * value j + 16 in its high half). A value is d q + m. */
 #define KQ_Q5_1 7
-/* bfloat16 rows, and NVFP4 in the rows of csrc/kquants.c (KQ_NV4): the
- * float32 scale of the matrix, then blocks of 32 values of 18 bytes (two E4M3
- * scales, 16 bytes of E2M1 codes: value j low, j + 16 high). The
- * safetensors checkpoints (np_gemma/st_qwen4.py). */
+/* bfloat16 rows, and NVFP4 in the rows of csrc/kquants.c (KQ_NV4): the E2M1
+ * codes (cols / 2 bytes; 16 for each block of 32 values: value j low, j + 16
+ * high), the E4M3 scales (2 for each block), the float32 scale of the
+ * matrix, zeros to 16 bytes. The codes start at a multiple of 16 bytes: a
+ * fragment of the tensor cores is one aligned load. */
 #define KQ_BF16 30
-#define KQ_NV4 50
+#define KQ_NV4 51
 /* Q8_0 in rows for the GPU (np_gemma/qwen_gpu.py): the int8 values of the
  * row, then the float16 scale of each 32 values, then zeros to a multiple
  * of 16 bytes. Thus the values of each row start at a multiple of 16
@@ -3826,7 +3827,7 @@ __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
            type == KQ_Q8_0 ? (size_t)cols / 32 * 34 :
            type == KQ_Q5_1 ? (size_t)cols / 32 * 24 :
            type == KQ_BF16 ? (size_t)cols * 2 :
-           type == KQ_NV4 ? 4 + (size_t)cols / 32 * 18 :
+           type == KQ_NV4 ? ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16 :
            type == KQ_Q4_K ? (size_t)cols / 256 * 144 : type == KQ_Q5_K ? (size_t)cols / 256 * 176 :
            (size_t)cols / 256 * 210;
 }
@@ -3930,12 +3931,11 @@ __device__ float kq_row(int type, const uint8_t *w, const float *x, int cols)
         }
     } else if (type == KQ_NV4) {
         /* As Q8_0: lane l takes 4 values of block l / 8 of 4 blocks. */
-        float g = *(const float *)w;
+        float g = *(const float *)(w + cols / 2 + cols / 16);
         int o = 4 * (lane % 8);
         for (int b = lane / 8; b < cols / 32; b += 4) {
-            const uint8_t *blk = w + 4 + (size_t)b * 18;
-            float sc = 0.5f * g * kq_e4m3(blk[o < 16 ? 0 : 1]);
-            const uint8_t *q = blk + 2 + (o % 16);
+            float sc = 0.5f * g * kq_e4m3(w[cols / 2 + 2 * b + (o < 16 ? 0 : 1)]);
+            const uint8_t *q = w + 16 * b + (o % 16);
             int sh = o < 16 ? 0 : 4;
             float4 xv = *(const float4 *)(x + b * 32 + o);
             sum += sc * (kq_e2m1x2((q[0] >> sh) & 15) * xv.x + kq_e2m1x2((q[1] >> sh) & 15) * xv.y +
@@ -4960,12 +4960,12 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
             v[2 * u + 1] = kq_bf16((uint16_t)(qq[u] >> 16));
         }
     } else if (type == KQ_NV4) {
-        float g = *(const float *)w;
-        const uint8_t *blk = w + 4 + (size_t)(c0 / 32) * 18;
-        int j = c0 % 32, hi = j >= 16;
-        float sc = 0.5f * g * kq_e4m3(blk[hi]);
+        float g = *(const float *)(w + cols / 2 + cols / 16);
+        int b = c0 / 32, j = c0 % 32, hi = j >= 16;
+        float sc = 0.5f * g * kq_e4m3(w[cols / 2 + 2 * b + hi]);
+        const uint8_t *q = w + 16 * b + (j % 16);
         for (int u = 0; u < 8; ++u) {
-            v[u] = sc * kq_e2m1x2((blk[2 + (j % 16) + u] >> (hi ? 4 : 0)) & 15);
+            v[u] = sc * kq_e2m1x2((q[u] >> (hi ? 4 : 0)) & 15);
         }
     } else if (type == KQ_Q5_1) {
         const uint8_t *blk = w + (size_t)(c0 / 32) * 24;
@@ -5119,17 +5119,19 @@ __device__ __forceinline__ void mma16816s8(int *c, uint32_t a0, uint32_t a1, uin
         : "r"(a0), "r"(a1), "r"(b0));
 }
 
-/* 4 E2M1 codes (the low or the high 4 bits of 4 bytes) to 4 int8 (twice the values). */
-__device__ __forceinline__ uint32_t kt_e2m1x4(const uint8_t *q, int sh)
+/* 4 E2M1 codes (4 bytes of codes, the low 4 bits of each byte) to 4 int8
+ * (twice the values), as the dequantization of Marlin: prmt looks up the 4
+ * magnitudes in a table of 8 bytes (0 1 2 3 4 6 8 12) at once, and the sign
+ * bits negate the bytes (v ^ m) - m. */
+__device__ __forceinline__ uint32_t kt_e2m1x4(uint32_t q)
 {
-    uint32_t r = 0;
-    #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-        int c = (q[u] >> sh) & 15;
-        int v = (int)((0x0C08060403020100ull >> (8 * (c & 7))) & 0xff);
-        r |= (uint32_t)(uint8_t)(int8_t)((c & 8) ? -v : v) << (8 * u);
-    }
-    return r;
+    uint32_t c = q & 0x0f0f0f0fu;
+    uint32_t i = c & 0x07070707u;
+    uint32_t t = i | (i >> 4);                       /* bytes 0, 2: 2 indices of 4 bits */
+    uint32_t sel = (t & 0xffu) | ((t >> 8) & 0xff00u);
+    uint32_t mag = __byte_perm(0x03020100u, 0x0c080604u, sel);
+    uint32_t m = ((c >> 3) & 0x01010101u) * 0xffu;
+    return __vsub4(mag ^ m, m);
 }
 
 __host__ __device__ __forceinline__ int kt_format(int type)
@@ -5193,11 +5195,14 @@ __device__ __forceinline__ void kt_load_w(uint8_t *dst, const uint8_t *wrow, int
             cp_async16(dst + 16 * lane, wrow + (size_t)(k0 / 32) * 24 + 16 * lane);
         }
     } else if (F == KT_NV4) {
-        /* the scale of the matrix, then the 4 blocks (72 bytes) */
-        if (lane == 0) {
-            cp_async4(dst, wrow);
-        } else if (lane <= 18) {
-            cp_async4(dst + 4 * lane, wrow + 4 + (size_t)(k0 / 32) * 18 + 4 * (lane - 1));
+        /* the codes of the 4 blocks (64 bytes, 16-aligned), their 8 scales, the
+         * scale of the matrix: 64 + 8 + 4 bytes of shared memory */
+        if (lane < 4) {
+            cp_async16(dst + 16 * lane, wrow + k0 / 2 + 16 * lane);
+        } else if (lane == 4) {
+            cp_async8(dst + 64, wrow + cols / 2 + k0 / 16);
+        } else if (lane == 5) {
+            cp_async4(dst + 72, wrow + cols / 2 + cols / 16);
         }
     } else {
         const uint8_t *blk = wrow + (size_t)(k0 / 256) * 144;
@@ -5335,16 +5340,15 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
                 float dl[4][2], dh[4][2];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const uint8_t *rp = bs[b][wn + j * 8 + g];
-                    const uint8_t *q = rp + 4 + bk * 18 + 2 + 4 * c;
-                    bf[j][0] = kt_e2m1x4(q, 0);
-                    bf[j][1] = kt_e2m1x4(q, 4);
+                    uint32_t q = *(const uint32_t *)(bs[b][wn + j * 8 + g] + 16 * bk + 4 * c);
+                    bf[j][0] = kt_e2m1x4(q);
+                    bf[j][1] = kt_e2m1x4(q >> 4);
                     #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const uint8_t *rs = bs[b][wn + j * 8 + 2 * c + h];
-                        float gg = 0.5f * *(const float *)rs;
-                        dl[j][h] = gg * kq_e4m3(rs[4 + bk * 18]);
-                        dh[j][h] = gg * kq_e4m3(rs[4 + bk * 18 + 1]);
+                        float gg = 0.5f * *(const float *)(rs + 72);
+                        dl[j][h] = gg * kq_e4m3(rs[64 + 2 * bk]);
+                        dh[j][h] = gg * kq_e4m3(rs[64 + 2 * bk + 1]);
                     }
                 }
                 #pragma unroll
