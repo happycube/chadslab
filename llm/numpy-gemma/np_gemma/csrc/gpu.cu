@@ -4858,6 +4858,79 @@ __global__ void k_kq_multi(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* ---------- the products of a step and of a small group with int8 x ----------
+ * x as int8 with a scale for each 32 values (k_kq_quant_x, one time for a
+ * record), and __dp4a on the int8 values of Q8_R: a lane reads 16 bytes of w
+ * and 16 of x (not 64 of float32 x) and makes 4 dp4a and one float fma for
+ * 16 values. The other types read x as before. A token alone and in a group
+ * run the same code: the same bits. NP_GEMMA_GPU_I8X=0: float32 x for all. */
+__device__ float kq_row_i8(int type, const uint8_t *w, const float *x, const int8_t *xq,
+                           const float *xs, int cols)
+{
+    if (type != KQ_Q8_R || xq == NULL) {
+        return kq_row(type, w, x, cols);
+    }
+    int lane = threadIdx.x % 32;
+    const __half *d = (const __half *)(w + cols);
+    float sum = 0.f;
+    for (int c = 16 * lane; c < cols; c += 512) {
+        uint4 q = *(const uint4 *)(w + c);
+        uint4 xv = *(const uint4 *)(xq + c);
+        int si = __dp4a((int)q.x, (int)xv.x, 0);
+        si = __dp4a((int)q.y, (int)xv.y, si);
+        si = __dp4a((int)q.z, (int)xv.z, si);
+        si = __dp4a((int)q.w, (int)xv.w, si);
+        sum += (float)si * (__half2float(d[c / 32]) * xs[c / 32]);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+    }
+    return sum;
+}
+
+/* GP_KQ_LINEAR (t <= MT_MAX) with the int8 x of the scratch. */
+__global__ void k_kq_linear_i8(const gp_rec *r, const int64_t *e, const int8_t *xq, const float *xs)
+{
+    PDL_START();
+    int row = blockIdx.x * KQ_RPB + threadIdx.x / 32;
+    int rows = DI(6), cols = DI(7), type = DI(5), t = DI(8);
+    if (row >= rows) {
+        return;
+    }
+    const uint8_t *w = DP(const uint8_t, 4) + (size_t)row * kq_row_bytes(type, cols);
+    for (int j = 0; j < t; ++j) {
+        float v = kq_row_i8(type, w, DP(const float, 3) + (size_t)j * cols, xq + (size_t)j * cols,
+                            xs + (size_t)j * (cols / 32), cols);
+        if (threadIdx.x % 32 == 0) {
+            DP(float, 9)[(size_t)j * rows + row] = v;
+        }
+    }
+}
+
+/* GP_KQ_MULTI with the int8 x of the scratch. */
+__global__ void k_kq_multi_i8(const gp_rec *r, const int64_t *e, const int8_t *xq, const float *xs)
+{
+    PDL_START();
+    int row = blockIdx.x * KQ_RPB + threadIdx.x / 32;
+    int n = DI(3), cols = DI(1), t = DI(2), m = 0;
+    while (m < n && row >= DI(6 + 4 * m)) {
+        row -= DI(6 + 4 * m);
+        ++m;
+    }
+    if (m >= n) {
+        return;
+    }
+    int type = DI(5 + 4 * m), rows = DI(6 + 4 * m);
+    const uint8_t *w = DP(const uint8_t, 4 + 4 * m) + (size_t)row * kq_row_bytes(type, cols);
+    for (int j = 0; j < t; ++j) {
+        float v = kq_row_i8(type, w, DP(const float, 0) + (size_t)j * cols, xq + (size_t)j * cols,
+                            xs + (size_t)j * (cols / 32), cols);
+        if (threadIdx.x % 32 == 0) {
+            DP(float, 7 + 4 * m)[(size_t)j * rows + row] = v;
+        }
+    }
+}
+
 /* 8 values of a row from column c0 (a multiple of 8), as float32. */
 __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float *v)
 {
@@ -6087,6 +6160,16 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
  * this file does not have or a size that is not a literal. */
 /* NP_GEMMA_GPU_KQTC=0 keeps the float32 tiles for the products of large
  * groups of Qwen3.8 (a test). */
+static int i8x_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_GPU_I8X");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 static int kt_on(void)
 {
     static int on = -1;
@@ -6411,16 +6494,29 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             k_kq_gemm<<<dim3((unsigned)cdiv(hlit(r, 6, &bad), KG_B),
                              (unsigned)cdiv(hlit(r, 8, &bad), KG_B)), 256, 0, s>>>(dr, denv);
+        } else if (hlit(r, 5, &bad) == KQ_Q8_R && i8x_on() && hlit(r, 7, &bad) % 32 == 0 &&
+                   (size_t)(hlit(r, 8, &bad) * hlit(r, 7, &bad)) <= g->kqx_n) {
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 3),
+                     (size_t)(hlit(r, 8, &bad) * hlit(r, 7, &bad)));
+            k_kq_linear_i8<<<(unsigned)cdiv(hlit(r, 6, &bad), KQ_RPB), 32 * KQ_RPB, 0, s>>>(
+                dr, denv, g->kqx, (const float *)(g->kqx + g->kqx_n));
         } else {
             k_kq_linear<<<(unsigned)cdiv(hlit(r, 6, &bad), KQ_RPB), 32 * KQ_RPB, 0, s>>>(dr, denv);
         }
         break;
     case GP_KQ_MULTI: {
-        int64_t rows = 0;
+        int64_t rows = 0, q8r = 0, t = hlit(r, 2, &bad), cols = hlit(r, 1, &bad);
         for (int m = 0; m < hlit(r, 3, &bad); ++m) {
             rows += hlit(r, 6 + 4 * m, &bad);
+            q8r |= hlit(r, 5 + 4 * m, &bad) == KQ_Q8_R;
         }
-        k_kq_multi<<<(unsigned)cdiv(rows, KQ_RPB), 32 * KQ_RPB, 0, s>>>(dr, denv);
+        if (q8r && i8x_on() && cols % 32 == 0 && (size_t)(t * cols) <= g->kqx_n) {
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 0), (size_t)(t * cols));
+            k_kq_multi_i8<<<(unsigned)cdiv(rows, KQ_RPB), 32 * KQ_RPB, 0, s>>>(
+                dr, denv, g->kqx, (const float *)(g->kqx + g->kqx_n));
+        } else {
+            k_kq_multi<<<(unsigned)cdiv(rows, KQ_RPB), 32 * KQ_RPB, 0, s>>>(dr, denv);
+        }
         break;
     }
     case GP_ADD_RMS:
@@ -6984,8 +7080,10 @@ void *gg_load(const int64_t *prog, int use_graph)
     for (int pc = 0; pc < g->n_code; ++pc) {
         const gp_rec *r = g->hcode + pc;
         size_t n = 0;
-        if (r->op == GP_KQ_LINEAR && r->v[8] > MT_MAX) {
+        if (r->op == GP_KQ_LINEAR) {
             n = (size_t)r->v[8] * (size_t)r->v[7];
+        } else if (r->op == GP_KQ_MULTI) {
+            n = (size_t)r->v[2] * (size_t)r->v[1];
         } else if (r->op == GP_KQ_GROUP_MOE) {
             size_t t = (size_t)r->v[3], P = t * (size_t)r->v[4] + t;
             n = t * (size_t)r->v[6];
