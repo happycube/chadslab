@@ -116,8 +116,8 @@ free, PCIe Gen3 x8.
 
 The GGUF of this runtime, llama-bench method (scripts/bench_qwen4.py):
 
-    GPU (0.5 GB hot experts)   pp512 365   pp2048 518   pp4096 511   tg128 22.2   tg512 22.7 tok/s
-    CPU (dense q8)             pp512 81.7  tg64 7.3
+    GPU (0.5 GB hot experts)   pp512 327   pp2048 496   pp4096 493   tg128 22.8   tg512 23.2 tok/s
+    CPU (dense q8)             pp512 93.1  tg128 7.61
     type 51, the same code     GPU: pp512 305, pp2048 441, tg128 20.2; CPU: pp512 64.4, tg64 7.2
     llama.cpp CPU              pp512 27.9   tg128 5.0
     llama.cpp GPU (-ncmoe 48)  pp512 101    pp2048 101  tg128 18.3

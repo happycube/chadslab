@@ -10,6 +10,10 @@ model. That model comes from a compressed-tensors SafeTensors file or from the
 Q4_0 GGUF file of the same model. It adds Per-Layer Embeddings. Transformers
 appears only in the check scripts, where it builds the reference.
 
+It also runs Qwen3.8-Flash-Next (125B, 512 experts) from the NVFP4 checkpoint
+of NVIDIA, on the CPU or on a small GPU. See the section
+"Qwen3.8-Flash-Next".
+
 A C kernel reads the packed 4-bit and 2-bit weights in place. Thus the file
 layout is the runtime layout, and the model builds no float32 copy of a
 weight. See the section "Gemma 4 E4B".
@@ -1783,6 +1787,49 @@ comparison.
 The machine also carries a `scripts/serve.py` process for the 26B model from
 an earlier session. It uses about 160 per cent of one core, and two rounds of
 the same measurement differ by 5 to 10 per cent.
+
+## Qwen3.8-Flash-Next
+
+The model is nvidia/Qwen3.8-Flash-Next-NVFP4 (the llama.cpp name is
+qwen4exp). It has 48 layers of Gated DeltaNet and QSA attention, 512 experts
+(10 for each token), and an MTP layer. `scripts/convert_nvfp4_gguf.py` makes
+one GGUF file of this runtime (132 GB). The experts stay NVFP4 in groups of 16
+rows, one layout for the CPU and the GPU. QWEN38_PLAN.md has the plan and the
+history. HANDOFF_QWEN38.md has the state, the profiles, and the next steps.
+
+The speed (2026-09-28). The method is that of llama-bench: random tokens,
+one warm-up, 3 reps (`scripts/bench_qwen4.py`). The machine has a Xeon
+W-2295 (18 cores, 66 GB/s) and 188 GB of RAM. Its RTX 5060 Ti has about 8 GB
+free, on PCIe Gen3 x8. Other programs ran on the machine.
+
+    runtime                              pp512   pp2048  pp4096   tg128   tg512
+    this runtime, GPU (0.5 GB hot)       327     496     493      22.8    23.2
+    this runtime, CPU (dense q8)         93.1    -       -        7.61    -
+    llama.cpp, GPU (-ngl 99 -ncmoe 48)   101     101     -        18.3    -
+    llama.cpp, CPU                       27.9    -       -        5.0     -
+
+The rates are tokens a second. llama.cpp uses the Q4_K_XL GGUF file of
+Unsloth.
+
+- The GPU holds the dense part and 0.5 GB of hot experts. In the decode,
+  the CPU computes the other experts. A prompt runs in mixed groups: the GPU
+  copies the experts with the most tokens, and the CPU computes the others
+  at the same time.
+- MTP (3 drafts) on the CPU gives about 11.6 tok/s in place of 7.5. On this
+  GPU it gives about the rate of the plain decode.
+- A test of 32001 tokens of the source of this project ran on the GPU. The
+  prompt ran at 319 tok/s and the decode at 19.1 tok/s. The answers were
+  correct.
+
+Run the checks and the measurement:
+
+    G=models2/Qwen3.8-Flash-Next-NVFP4-GGUF
+    python scripts/convert_nvfp4_gguf.py models/Qwen3.8-Flash-Next-NVFP4 \
+        $G/Qwen3.8-Flash-Next-NVFP4-bf16.gguf
+    python scripts/check_qwen4_st.py --path $G/Qwen3.8-Flash-Next-NVFP4-bf16.gguf \
+        --tok $G/tokenizer.json --layers 4 --gpu --hot-gb 0.5
+    python scripts/bench_qwen4.py -m $G/Qwen3.8-Flash-Next-NVFP4-bf16.gguf --backend gpu \
+        --hot-gb 0.5 -p 512,2048,4096 -n 128,512 -r 3
 
 ## Test results
 
