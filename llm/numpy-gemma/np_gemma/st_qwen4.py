@@ -356,12 +356,32 @@ class NVFP4Source:
         n = self._ple_shards
         scale = self._ple_scale()
         k = np.searchsorted(self._ple_start, rows, side="right") - 1
-        out = np.empty((rows.size, self.tensors["per_layer_token_embd.weight"][0][0]), np.float32)
-        for s in np.unique(k):
-            sel = np.nonzero(k == s)[0]
-            a = self._get(n[s], dtype=None)
-            out[sel] = E4M3[a[rows[sel] - self._ple_start[s]]]
-        return out * scale
+        width = self.tensors["per_layer_token_embd.weight"][0][0]
+        base = self._cache.get("_ple_base")
+        if base is None:
+            base = self._cache["_ple_base"] = np.array(
+                [self._get(x, dtype=None).ctypes.data for x in n], dtype=np.int64)
+            self._ple_random()
+        # The address of each row in the maps; many threads read them (the
+        # rows are random, and most are not in the page cache).
+        addrs = base[k] + (rows - self._ple_start[k]) * width
+        raw = cops.kq_gather(addrs, width)
+        return E4M3[raw] * scale
+
+    def _ple_random(self):
+        """No read-ahead on the bytes of the n-gram table: a page fault of a
+        random row then reads one page, not a large window."""
+        import mmap
+        for f in {self.where[x] for x in self._ple_shards}:
+            st = self._files[f]
+            spans = [st.header[x]["data_offsets"] for x in self._ple_shards if self.where[x] == f]
+            lo = st._base + min(a for a, _b in spans)
+            hi = st._base + max(b for _a, b in spans)
+            lo -= lo % mmap.PAGESIZE
+            try:
+                st._mm.madvise(mmap.MADV_RANDOM, lo, hi - lo)
+            except (AttributeError, OSError, ValueError):
+                pass
 
     def _ple_scale(self):
         v = self._cache.get("_ple_scale")
@@ -389,6 +409,10 @@ class NVFP4Source:
         ids = (idx[:, None] * per + np.arange(per)[None, :]).reshape(-1)
         out = cops.kq_rows(mat, type_, cols, ids)
         return out.reshape((len(idx),) + shape[1:])
+
+    def file_bytes(self):
+        """The bytes of the safetensors files."""
+        return sum(os.path.getsize(os.path.join(self.path, f)) for f in set(self.where.values()))
 
     def close(self):
         for f in self._files.values():

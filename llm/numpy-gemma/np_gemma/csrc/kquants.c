@@ -90,6 +90,16 @@ static inline float kq_e4m3(uint8_t b)
     return (b & 0x80) ? -v : v;
 }
 
+/* The E4M3 values of the 256 codes (made when the library loads). */
+static float kq_e4m3_tab[256];
+
+__attribute__((constructor)) static void kq_e4m3_init(void)
+{
+    for (int b = 0; b < 256; ++b) {
+        kq_e4m3_tab[b] = kq_e4m3((uint8_t)b);
+    }
+}
+
 static inline float kq_bf16(uint16_t h)
 {
     uint32_t bits = (uint32_t)h << 16;
@@ -692,8 +702,34 @@ static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const floa
     memcpy(&g, w, 4);
     const __m128i lut = _mm_loadu_si128((const __m128i *)kq_e2m1x2);
     const __m128i m4 = _mm_set1_epi8(15);
+    const __m512i lut5 = _mm512_broadcast_i32x4(lut), m45 = _mm512_set1_epi8(15);
+    /* the scale of each of the 16 sums: 4 for each half block */
+    const __m512i sidx = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    __m512 acc5 = _mm512_setzero_ps();
+    int nb = cols / 32, b = 0;
+    for (; b + 2 <= nb; b += 2) {
+        const uint8_t *b0 = w + 4 + (size_t)b * 18, *b1 = b0 + 18;
+        __m256i q01 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
+            _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+        /* lanes of 128 bits: the low codes of block 0, its high codes, the
+         * low codes of block 1, its high codes (the order of x) */
+        __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
+        q = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 0, 1, 2, 3, 2, 3), q);
+        __m512i codes = _mm512_and_si512(
+            _mm512_mask_blend_epi64(0xcc, q, _mm512_srli_epi16(q, 4)), m45);
+        __m512i wv = _mm512_shuffle_epi8(lut5, codes);
+        __m512i xv = _mm512_loadu_si512((const void *)(xq + 32 * b));
+        __mmask64 neg = _mm512_movepi8_mask(wv);
+        __m512i sx = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
+        __m512i is = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(wv), sx);
+        __m128 s4 = _mm_setr_ps(kq_e4m3_tab[b0[0]] * xs[b], kq_e4m3_tab[b0[1]] * xs[b],
+                                kq_e4m3_tab[b1[0]] * xs[b + 1], kq_e4m3_tab[b1[1]] * xs[b + 1]);
+        __m512 sc = _mm512_permutexvar_ps(sidx, _mm512_castps128_ps512(s4));
+        acc5 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), sc, acc5);
+    }
     __m256 acc = _mm256_setzero_ps();
-    for (int b = 0; b < cols / 32; ++b) {
+    for (; b < nb; ++b) {
         const uint8_t *blk = w + 4 + (size_t)b * 18;
         __m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
         __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(q, m4));
@@ -702,15 +738,21 @@ static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const floa
         __m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * b));
         __m256i sx = _mm256_sign_epi8(xv, wv);
         __m256i is = _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_abs_epi8(wv), sx);
-        float s0 = kq_e4m3(blk[0]) * xs[b], s1 = kq_e4m3(blk[1]) * xs[b];
+        float s0 = kq_e4m3_tab[blk[0]] * xs[b], s1 = kq_e4m3_tab[blk[1]] * xs[b];
         __m256 sc = _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1);
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is), sc, acc);
     }
     __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
     r = _mm_hadd_ps(r, r);
     r = _mm_hadd_ps(r, r);
-    return 0.5f * g * _mm_cvtss_f32(r);
+    return 0.5f * g * (_mm_cvtss_f32(r) + _mm512_reduce_add_ps(acc5));
 }
+#endif
+
+#if defined(__AVX512VNNI__)
+#define KQ_NV4_MAX 4096
+static void kq_row_nv4(const uint8_t *w, int cols, const int8_t *xq, const float *xs, int n,
+                       float *out, size_t ostride);
 #endif
 
 static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
@@ -724,6 +766,8 @@ static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, con
         return kq_dot_bf16(w, cols, xq, xs);
     }
     if (type == KQ_NV4) {
+        /* With cols a multiple of 64, the sums and their order are those
+         * of kq_row_nv4 (a group): the same bits. */
         return kq_dot_nv4(w, cols, xq, xs);
     }
     if (kq_tiles(type, cols)) {
@@ -753,10 +797,69 @@ static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, con
 }
 
 /* One row on n tokens. out[j * ostride] gets token j. */
+#if defined(__AVX512VNNI__)
+/* NVFP4 on several tokens: the row to |w| (int8), its signs, and a scale for
+ * each 16 values, one time; then for each token 64 values at a time. The
+ * sums are those of kq_dot_nv4 (the same int32 sums of 16 values, the same
+ * scales), so a group gives the bits of steps. */
+static void kq_row_nv4(const uint8_t *w, int cols, const int8_t *xq, const float *xs, int n,
+                       float *out, size_t ostride)
+{
+    __attribute__((aligned(64))) int8_t aw[KQ_NV4_MAX];
+    __attribute__((aligned(64))) float sc[KQ_NV4_MAX / 16];
+    __mmask64 negs[KQ_NV4_MAX / 64];
+    float g;
+    memcpy(&g, w, 4);
+    int nb = cols / 32;
+    const __m512i lut5 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1x2));
+    const __m512i m45 = _mm512_set1_epi8(15);
+    for (int b = 0; b < nb; b += 2) {
+        /* as kq_dot_nv4: two blocks to 64 int8 in the order of x */
+        const uint8_t *b0 = w + 4 + (size_t)b * 18, *b1 = b0 + 18;
+        __m256i q01 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
+            _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+        __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
+        q = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 0, 1, 2, 3, 2, 3), q);
+        __m512i codes = _mm512_and_si512(
+            _mm512_mask_blend_epi64(0xcc, q, _mm512_srli_epi16(q, 4)), m45);
+        __m512i wv = _mm512_shuffle_epi8(lut5, codes);
+        negs[b / 2] = _mm512_movepi8_mask(wv);
+        _mm512_store_si512((void *)(aw + 32 * b), _mm512_abs_epi8(wv));
+        sc[2 * b] = kq_e4m3_tab[b0[0]];
+        sc[2 * b + 1] = kq_e4m3_tab[b0[1]];
+        sc[2 * b + 2] = kq_e4m3_tab[b1[0]];
+        sc[2 * b + 3] = kq_e4m3_tab[b1[1]];
+    }
+    const __m512i sidx = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    for (int j = 0; j < n; ++j) {
+        const int8_t *xr = xq + (size_t)j * cols;
+        const float *sr = xs + (size_t)j * nb;
+        __m512 acc = _mm512_setzero_ps();
+        for (int c = 0; c < cols; c += 64) {
+            __m512i xv = _mm512_loadu_si512((const void *)(xr + c));
+            __m512i sx = _mm512_mask_sub_epi8(xv, negs[c / 64], _mm512_setzero_si512(), xv);
+            __m512i is = _mm512_dpbusd_epi32(_mm512_setzero_si512(),
+                                             _mm512_load_si512((const void *)(aw + c)), sx);
+            int b = c / 32;
+            __m128 s4 = _mm_setr_ps(sc[2 * b] * sr[b], sc[2 * b + 1] * sr[b],
+                                    sc[2 * b + 2] * sr[b + 1], sc[2 * b + 3] * sr[b + 1]);
+            acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is),
+                                  _mm512_permutexvar_ps(sidx, _mm512_castps128_ps512(s4)), acc);
+        }
+        out[(size_t)j * ostride] = 0.5f * g * _mm512_reduce_add_ps(acc);
+    }
+}
+#endif
+
 static void kq_row(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
                    const float *xm, const float *x, int n, float *out, size_t ostride)
 {
 #if defined(__AVX512VNNI__)
+    if (type == KQ_NV4 && n > 1 && cols % 64 == 0 && cols <= KQ_NV4_MAX) {
+        kq_row_nv4(w, cols, xq, xs, n, out, ostride);
+        return;
+    }
     if (n > 1 && type != KQ_F32 && kq_tiles(type, cols)) {
         /* The scales of the row one time for all the tokens. */
         float ds[KQ_S], dm[KQ_S];
@@ -910,6 +1013,18 @@ void kq_nv4_pack(const int64_t *wp, const int64_t *sp, const float *g, int n, in
                 blk[2 + j] = (uint8_t)(lo | (hi << 4));
             }
         }
+    }
+}
+
+/* Copy n rows of bytes bytes from the addresses addrs (rows of a memory map
+ * of a file: the n-gram table of the safetensors checkpoint). Many threads
+ * take the page faults at the same time, so the disk has many reads in flight
+ * (a loop of one thread waits for each read). */
+void kq_gather(const int64_t *addrs, int64_t n, int bytes, uint8_t *out)
+{
+    #pragma omp parallel for num_threads(64) schedule(dynamic, 16)
+    for (int64_t i = 0; i < n; ++i) {
+        memcpy(out + (size_t)i * bytes, (const void *)(intptr_t)addrs[i], (size_t)bytes);
     }
 }
 

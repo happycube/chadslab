@@ -249,6 +249,8 @@ try:
         _lib.kq_to_q8_0.restype = None
         _lib.kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nv4_pack.restype = None
+        _lib.kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.kq_gather.restype = None
         _lib.kq_moe.argtypes = [_void_p] * 5 + [_int, _int, _int, _void_p, _void_p, _int, _int,
                                                  _void_p, _void_p]
         _lib.kq_moe.restype = None
@@ -739,6 +741,15 @@ def kq_to_q8_0(src, cols):
     out = np.empty(rows * (cols // 32) * 34, dtype=np.uint8)
     _lib.kq_to_q8_0(src.ctypes.data, 1 if src.dtype == np.uint16 else 0, rows, cols,
                     out.ctypes.data)
+    return out
+
+
+def kq_gather(addrs, nbytes):
+    """The rows of nbytes bytes at the addresses addrs (int64), read by many
+    threads at a time (rows of a memory map)."""
+    addrs = np.ascontiguousarray(addrs, dtype=np.int64)
+    out = np.empty((addrs.size, nbytes), dtype=np.uint8)
+    _lib.kq_gather(addrs.ctypes.data, addrs.size, nbytes, out.ctypes.data)
     return out
 
 

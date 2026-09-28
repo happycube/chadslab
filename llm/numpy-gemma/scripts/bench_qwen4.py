@@ -63,7 +63,7 @@ def main():
 
     libc = ctypes.CDLL("libc.so.6")
     m = Qwen4CPU(args.model)
-    n_vocab = int(m.g.meta["tokenizer.ggml.tokens"]["__array__"])
+    n_vocab = int(m.cfg.vocab_size)     # the tokens of llama-bench: rand() % n_vocab
     rand = lambda: libc.rand() % n_vocab  # noqa: E731
     g = None
     if args.backend == "gpu":
@@ -102,7 +102,10 @@ def main():
     tests += [("tg%d" % n, test_gen, n, 1) for n in args.n_gen if n > 0]
     backend = "GPU %s" % ("%.1f GB hot" % args.hot_gb if args.hot_gb is not None else
                           "%d hot/layer" % g.n_slots) if g is not None else "CPU"
-    size = sum(t[0].nbytes for t in (m.g.raw(n) for n in m.g.tensors)) / 2 ** 30
+    if hasattr(m.g, "file_bytes"):
+        size = m.g.file_bytes() / 2 ** 30         # the safetensors checkpoint
+    else:
+        size = sum(t[0].nbytes for t in (m.g.raw(n) for n in m.g.tensors)) / 2 ** 30
     print("| model                      |       size | backend          | threads |   test |"
           "              t/s |")
     print("| -------------------------- | ---------: | ---------------- | ------: | -----: |"

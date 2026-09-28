@@ -241,6 +241,10 @@ class Qwen4GPU(QwenGPU):
             per = sum(self.per)
             cap = int(min(self.E, max(0, mem_info()[0] - MIX_KEEP) // per))
             self.mix_cap = cap
+            if cap < 32:
+                import warnings
+                warnings.warn("the buffer of the copies of a prompt holds %d experts: the CPU takes "
+                              "almost all the experts of a prompt (less hot_gb gives it room)" % cap)
             self.mix_ring = [Buffer(max(1, cap * nb)) for nb in self.per]
             mir = self.g.mirror
             for i, desc in self.mix_desc.items():

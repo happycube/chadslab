@@ -3846,8 +3846,9 @@ __device__ __forceinline__ float kq_e4m3(uint8_t b)
 /* Twice the value of an E2M1 code. */
 __device__ __forceinline__ float kq_e2m1x2(int c)
 {
-    const float t[8] = {0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f};
-    return (c & 8) ? -t[c & 7] : t[c & 7];
+    /* the bytes of the constant: 0, 1, 2, 3, 4, 6, 8, 12 */
+    float v = (float)((0x0C08060403020100ull >> (8 * (c & 7))) & 0xff);
+    return (c & 8) ? -v : v;
 }
 
 __device__ __forceinline__ float kq_bf16(uint16_t h)
@@ -5032,12 +5033,36 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
 #define KT_BN 128
 #define KT_K 128
 #define KT_RB 144                           /* the bytes of a row of w in a step (136 used) */
-enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3 };
+enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4 };
+
+/* mma.sync m16n8k16 on int8 values: the two halves of a block of 32 of NVFP4
+ * (a scale for each 16 values) have sums of their own. */
+__device__ __forceinline__ void mma16816s8(int *c, uint32_t a0, uint32_t a1, uint32_t b0)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+}
+
+/* 4 E2M1 codes (the low or the high 4 bits of 4 bytes) to 4 int8 (twice the values). */
+__device__ __forceinline__ uint32_t kt_e2m1x4(const uint8_t *q, int sh)
+{
+    uint32_t r = 0;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        int c = (q[u] >> sh) & 15;
+        int v = (int)((0x0C08060403020100ull >> (8 * (c & 7))) & 0xff);
+        r |= (uint32_t)(uint8_t)(int8_t)((c & 8) ? -v : v) << (8 * u);
+    }
+    return r;
+}
 
 __host__ __device__ __forceinline__ int kt_format(int type)
 {
     return type == KQ_Q8_R ? KT_Q8R : type == KQ_Q8_0 ? KT_Q80 : type == KQ_Q5_1 ? KT_Q51 :
-           type == KQ_Q4_K ? KT_Q4K : -1;
+           type == KQ_Q4_K ? KT_Q4K : type == KQ_NV4 ? KT_NV4 : -1;
 }
 
 /* x (n rows of cols values) to int8, with xs and xsum for each block of 32. */
@@ -5093,6 +5118,13 @@ __device__ __forceinline__ void kt_load_w(uint8_t *dst, const uint8_t *wrow, int
     } else if (F == KT_Q51) {
         if (lane < 6) {
             cp_async16(dst + 16 * lane, wrow + (size_t)(k0 / 32) * 24 + 16 * lane);
+        }
+    } else if (F == KT_NV4) {
+        /* the scale of the matrix, then the 4 blocks (72 bytes) */
+        if (lane == 0) {
+            cp_async4(dst, wrow);
+        } else if (lane <= 18) {
+            cp_async4(dst + 4 * lane, wrow + 4 + (size_t)(k0 / 32) * 18 + 4 * (lane - 1));
         }
     } else {
         const uint8_t *blk = wrow + (size_t)(k0 / 256) * 144;
@@ -5223,6 +5255,48 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
             cp_async_commit();
         }
         int k0 = st * KT_K;
+        if (F == KT_NV4) {
+            #pragma unroll
+            for (int bk = 0; bk < 4; ++bk) {
+                uint32_t bf[4][2];
+                float dl[4][2], dh[4][2];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint8_t *rp = bs[b][wn + j * 8 + g];
+                    const uint8_t *q = rp + 4 + bk * 18 + 2 + 4 * c;
+                    bf[j][0] = kt_e2m1x4(q, 0);
+                    bf[j][1] = kt_e2m1x4(q, 4);
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const uint8_t *rs = bs[b][wn + j * 8 + 2 * c + h];
+                        float gg = 0.5f * *(const float *)rs;
+                        dl[j][h] = gg * kq_e4m3(rs[4 + bk * 18]);
+                        dh[j][h] = gg * kq_e4m3(rs[4 + bk * 18 + 1]);
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < MI; ++i) {
+                    int r0 = wm + i * 16, kk = bk * 32;
+                    uint32_t a[4];
+                    a[0] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c];
+                    a[1] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c];
+                    a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c + 16];
+                    a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c + 16];
+                    float s0 = ss[b][r0 + g][bk], s1 = ss[b][r0 + g + 8][bk];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        int cl[4] = {0, 0, 0, 0}, ch[4] = {0, 0, 0, 0};
+                        mma16816s8(cl, a[0], a[1], bf[j][0]);
+                        mma16816s8(ch, a[2], a[3], bf[j][1]);
+                        acc[i][j][0] += s0 * (i2f_exact(cl[0]) * dl[j][0] + i2f_exact(ch[0]) * dh[j][0]);
+                        acc[i][j][1] += s0 * (i2f_exact(cl[1]) * dl[j][1] + i2f_exact(ch[1]) * dh[j][1]);
+                        acc[i][j][2] += s1 * (i2f_exact(cl[2]) * dl[j][0] + i2f_exact(ch[2]) * dh[j][0]);
+                        acc[i][j][3] += s1 * (i2f_exact(cl[3]) * dl[j][1] + i2f_exact(ch[3]) * dh[j][1]);
+                    }
+                }
+            }
+            continue;
+        }
         #pragma unroll
         for (int bk = 0; bk < 4; ++bk) {
             uint32_t bf[4][2];
@@ -6036,7 +6110,7 @@ static void kt_attr(void)
 #define KT_SET(F) \
     cudaFuncSetAttribute(k_qmoe_gu_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b); \
     cudaFuncSetAttribute(k_qmoe_dn_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
-    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K)
+    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K) KT_SET(KT_NV4)
 #undef KT_SET
 }
 
@@ -6374,6 +6448,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             case KT_Q8R: k_qmoe_gu_tc<KT_Q8R><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q80: k_qmoe_gu_tc<KT_Q80><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q51: k_qmoe_gu_tc<KT_Q51><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_NV4: k_qmoe_gu_tc<KT_NV4><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             default: k_qmoe_gu_tc<KT_Q4K><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             }
             k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv);
@@ -6382,6 +6457,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             case KT_Q8R: k_qmoe_dn_tc<KT_Q8R><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q80: k_qmoe_dn_tc<KT_Q80><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q51: k_qmoe_dn_tc<KT_Q51><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_NV4: k_qmoe_dn_tc<KT_NV4><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             default: k_qmoe_dn_tc<KT_Q4K><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             }
         } else {
