@@ -426,7 +426,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
     keyn, qn, gated = f32(t, HD), f32(t, HD), f32(t, HD)
     mo, logits = f32(t, hid), f32(t, E)
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
-    scratch = cops.kq_moe_scratch(t, k, E, hid, inner)
+    scratch = model.moe_scratch4(t)
     gscr = f32(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0))
     prog.names.update(H=H, ple=ple, xn=xn)
     pos, cos, sin, scores = prog.slot("pos"), prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
@@ -436,10 +436,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.KQ_QUANT, src, t, cols, xq, xs, xm)
         cur["src"] = src
 
-    def lin(gname, out, src=None):
-        m = model.K(gname)
-        prog.emit(P.KQ_LINEAR, xq, xs, xm, cur["src"] if src is None else src, m.data, m.type,
-                  m.rows, m.cols, t, out)
+    def lin(gname, out, src=None, rows=t):
+        xb = {"xq": xq, "xs": xs, "xm": xm, "src": cur["src"] if src is None else src, "t": rows}
+        model.emit_lin4(prog, xb, gname, out)
 
     def scalar(op, a, b):
         r = prog.temp()
@@ -472,8 +471,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
         if ratio(i) == 0:
             # A dense layer (the MTP layer).
-            prog.emit(P.ATTN_QSA, qout, *base, scores, att, nq, nk, hd, t, pos, sel, dense,
-                      maxsel)
+            model.emit_attn_qsa(prog, qout, base, scores, att, t, pos, sel, dense, maxsel)
             prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
             lin(b + "attn_output.weight", o5)
@@ -486,7 +484,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
                   cos, sin, pos, t, cfg.indexer_heads, cfg.indexer_dim, ratio(i), budget(i),
                   cfg.rotary_dim, float(cfg.rope_theta), eps, sel, cnt, maxsel, qscr,
                   prog.slot("nbmax"))
-        prog.emit(P.ATTN_QSA, qout, *base, scores, att, nq, nk, hd, t, pos, sel, cnt, maxsel)
+        model.emit_attn_qsa(prog, qout, base, scores, att, t, pos, sel, cnt, maxsel)
         prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
         quant(att, nq * hd)
         lin(b + "attn_output.weight", o5)
@@ -521,8 +519,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.PLE_GATE, keyn, qn, o2, gated, t, hc, hid)
         prog.emit(P.HC_NORM, gated, model.F(b + "norm_conv.weight"), gn, t, hc, hid, eps)
         prog.names["gn.%d" % i] = gn
+        # nreal rows: the padding rows of a GPU group do not go to the state.
         prog.emit(P.PLE_CONV, gn, gated, H, prog.slot("pleconv.%d" % i),
-                  model.F(b + "conv1d.weight", (HD, cfg.ple_conv_kernel)), t, HD,
+                  model.F(b + "conv1d.weight", (HD, cfg.ple_conv_kernel)), prog.slot("nreal"), HD,
                   cfg.ple_conv_kernel, cfg.ple_ngram)
 
     layers, head = range(model.n_layers), "output_hc"
@@ -536,8 +535,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.HC_CAT, en, hn, cat, t, hc, hid)
         # eh_proj on each stream: t * hc rows of 2 hid values.
         prog.emit(P.KQ_QUANT, cat, t * hc, 2 * hid, xq, xs, xm)
-        m = model.K(b + "eh_proj.weight")
-        prog.emit(P.KQ_LINEAR, xq, xs, xm, cat, m.data, m.type, m.rows, m.cols, t * hc, H)
+        cur["src"] = cat
+        lin(b + "eh_proj.weight", H, rows=t * hc)
         layers, head = [L], b + "hc_head"
     for i in layers:
         b = "blk.%d." % i
@@ -555,12 +554,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         lin(b + "ffn_gate_inp.weight", logits)
         lin(b + "ffn_gate_inp_shexp.weight", slog)
         prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
-        mats = cops.kq_moe_mats(*(model.K(b + "ffn_%s_exps.weight" % n).c()
-                                  for n in ("gate", "up", "down")),
-                                [model.K(b + "ffn_%s_shexp.weight" % n).c()
-                                 for n in ("gate", "up", "down")])
-        prog.emit(P.KQ_MOE, xq, xs, xm, idx, val, t, k, E, mats, slog, hid, inner, scratch, mo)
-        prog.keep.append(mats)
+        xb = {"xq": xq, "xs": xs, "xm": xm, "src": mixed, "t": t}
+        model.emit_moe4(prog, i, xb, idx, val, slog, scratch, mo)
         prog.emit(P.HC_ADD, H, mo, inj, t, hc, hid, 1.0 / hc)
     hc_pre(head, xn, inject=False)
     prog.keep.append(dense)
@@ -591,6 +586,46 @@ class Qwen4CPU(Qwen4):
                 m.data, m.type = np.ascontiguousarray(a, np.float32).view(np.uint8).reshape(-1), 0
             self._k[gname] = m
         return m
+
+    def M(self, name, full=None):
+        """A matrix by its GGUF name, or by the name of the Qwen3.6 modules
+        (for np_gemma/qwen_gpu.py)."""
+        from .qwen import gguf_name
+        return self.K(name if name in self.g.tensors else gguf_name(name))
+
+    # ---- the records of the program (compile_qwen4_step); Qwen4GPU has
+    # its own ----
+
+    def emit_lin4(self, prog, xb, gname, out):
+        from . import program as P
+        m = self.K(gname)
+        prog.emit(P.KQ_LINEAR, xb["xq"], xb["xs"], xb["xm"], xb["src"], m.data, m.type, m.rows,
+                  m.cols, xb["t"], out)
+
+    def moe_scratch4(self, t):
+        from . import cops
+        cfg = self.cfg
+        return cops.kq_moe_scratch(t, cfg.top_k, cfg.num_experts, cfg.hidden_size,
+                                   cfg.moe_inter)
+
+    def emit_moe4(self, prog, i, xb, idx, val, slog, scratch, out):
+        from . import cops
+        from . import program as P
+        cfg = self.cfg
+        b = "blk.%d." % i
+        mats = cops.kq_moe_mats(*(self.K(b + "ffn_%s_exps.weight" % n).c()
+                                  for n in ("gate", "up", "down")),
+                                [self.K(b + "ffn_%s_shexp.weight" % n).c()
+                                 for n in ("gate", "up", "down")])
+        prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
+                  cfg.num_experts, mats, slog, cfg.hidden_size, cfg.moe_inter, scratch, out)
+        prog.keep.append(mats)
+
+    def emit_attn_qsa(self, prog, q, base, scores, out, t, pos, sel, cnt, maxsel):
+        from . import program as P
+        cfg = self.cfg
+        prog.emit(P.ATTN_QSA, q, *base, scores, out, cfg.num_heads, cfg.num_kv_heads,
+                  cfg.head_dim, t, pos, sel, cnt, maxsel)
 
     def F(self, gname, shape=None):
         a = self._f.get((gname, shape))

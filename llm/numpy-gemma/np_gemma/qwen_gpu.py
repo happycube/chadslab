@@ -216,15 +216,17 @@ class QwenGPU:
         """A copy of the blocks of a dense matrix, and its type. The GPU
         program holds its own copy of each array (np_gemma/gpu.py, Mirror),
         not a view into the memory map of the file. A Q8_0 matrix goes to
-        rows of int8 values and then their scales (type 100, Q8_R in
-        csrc/gpu.cu), for 16-byte loads."""
+        rows of int8 values, then their scales, then zeros to a multiple of
+        16 bytes (type 100, Q8_R in csrc/gpu.cu), for 16-byte loads."""
         e = self._dense.get(name)
         if e is None:
             m = self.model.M(name)
             if m.type == Q8_0:
                 b = m.data.reshape(m.rows, m.cols // 32, 34)
+                pad = -(m.cols // 32 * 34) % 16      # rows of a multiple of 16 bytes
                 a = np.concatenate([b[:, :, 2:].reshape(m.rows, m.cols),
-                                    b[:, :, :2].reshape(m.rows, m.cols // 16)], axis=1)
+                                    b[:, :, :2].reshape(m.rows, m.cols // 16),
+                                    np.zeros((m.rows, pad), np.uint8)], axis=1)
                 e = (np.ascontiguousarray(a).reshape(-1), Q8_R)
             else:
                 e = (np.array(m.data), m.type)

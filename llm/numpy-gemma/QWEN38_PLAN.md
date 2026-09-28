@@ -338,12 +338,57 @@ Status (the profile; gemma_profile, 18 threads):
 
 ### Phase 5: the GPU
 
-- The dense part, the attention, the DeltaNet, the gated residual, and the
-  head go on the GPU. The experts are split with HotCache
-  (np_gemma/qwen_gpu.py).
-- With 7.5 GB free: about 3.5 GB for the dense part and the head, and the
-  rest for hot experts (about 2.9 MB each).
-- The drafter on the GPU (its dense part), with its experts split too.
+Status (a first form; np_gemma/qwen4_gpu.py, scripts/check_qwen4_gpu.py):
+
+- Qwen4GPU is QwenGPU with the program of compile_qwen4_step. Methods of
+  the model emit the products, the experts, and the attention
+  (emit_lin4, emit_moe4, emit_attn_qsa). Qwen4GPU has its own methods.
+- New kernels in csrc/gpu.cu:
+  - HC_NORM, HC_ACT, HC_MIX, HC_ADD, PLE_GATE, PLE_CONV, and HC_CAT.
+    Against the CPU records, the max rel error is below 1e-6.
+  - QSA_SELECT: the raw keys, the key of each complete block, and one
+    block of 1024 threads for each query. The top 512 blocks come from a
+    radix select on the keys (score bits, then the block), with the tie
+    rule of the CPU. For a context of 2600 rows, the rows are those of the
+    CPU for each query.
+  - ATTN_QSA: k_attn_part reads the rows of the selection. The 12 query
+    heads of a key head go in 2 groups of 6 (the kernel takes at most 8).
+  - Q5_1 in the products and the experts (the down matrices).
+- Q8_R (the GPU form of Q8_0) pads each row to 16 bytes: rows of 320 or 640
+  values were not aligned.
+- PLE_CONV takes its count of rows from the slot nreal. The extra rows of
+  a group (after the tokens) do not go into the state.
+- The head (Q8_0) is a small program for each count of rows. The MTP layer
+  runs on the CPU; its drafts use the head on the GPU.
+
+Results (RTX 5060 Ti with 8 GB free; greedy decode after 100 tokens):
+
+    hot experts     plain decode   MTP (3 drafts)
+    1 GB (5 each)   18.3 tok/s     18.0 tok/s
+    2 GB (10)       19.5 tok/s     19.5 tok/s
+    3 GB (15)       20.9 tok/s     19.6 tok/s
+
+    llama.cpp, the GPU split: 17.8 tok/s.
+
+- The tokens are those of the CPU program: 48 of 48 on the chat prompt,
+  and 40 of 40 after a prompt of 2936 tokens (QSA drops blocks there). A
+  verify group and commit give the same bits as steps (with the hot
+  experts fixed).
+- A prompt of 2936 tokens in groups of 256: 66 tok/s (the CPU: 37).
+- The step (2 GB hot): the CPU computes the cold experts, 38 of 64 ms
+  (profile). The hot experts get only 19% of the selected experts. For
+  each layer, 9 cold experts take 0.53 ms alone and 0.79 ms in the step.
+- MTP gives no gain here. A verify group of 4 tokens sends up to 40
+  experts to the CPU (about 115 ms against 50 ms for a step).
+- With a 3090 (24 GB), about 17 GB of hot experts fit (about 115 in each
+  layer). The CPU then gets far fewer experts, and the verify group costs
+  less.
+
+Next:
+- The MTP layer on the GPU (its dense part; its experts split).
+- The large groups of a prompt: their two copy buffers (3.1 GB) do not
+  fit next to 2 GB of hot experts on this GPU.
+- The attention of a large group: one record for each query now.
 
 ## Risks
 

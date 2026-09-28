@@ -81,6 +81,9 @@ enum {
     GP_ROUTER_TOPK = 103, GP_GDN = 104, GP_ATTN_PREP = 105, GP_SIGMUL = 106,
     GP_KQ_QUANT = 107, GP_KQ_LINEAR = 108, GP_KQ_HOT_MOE = 110, GP_KQ_MULTI = 111,
     GP_ADD_RMS = 112, GP_KQ_GROUP_MOE = 113,
+    /* Qwen3.8 (QWEN38_PLAN.md, phase 5; csrc/hyperconn.c has the CPU forms) */
+    GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
+    GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121, GP_HC_CAT = 122,
 };
 
 static cudaStream_t gg_stream;
@@ -607,6 +610,7 @@ struct attn_d {
     int qh, kvh, hd, n, window, i16;
     int64_t kp0, p;              /* the position of key row 0, and of the query */
     size_t hstride, rstride;     /* the distance of two heads and of two rows */
+    const int32_t *rows;         /* GP_ATTN_QSA: the rows of the keys, or null */
 };
 
 /* GP_ATTN_F32H reads the E4B cache, which has the shape (heads, positions,
@@ -631,13 +635,21 @@ struct attn_d {
  *     q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, n
  *
  * The pointers point at the first key row. Every one of the n rows is in
- * the window of the query. */
+ * the window of the query.
+ *
+ * GP_ATTN_QSA (Qwen3.8, csrc/qsa.c) reads the int16 cache on the rows that
+ * QSA_SELECT gave. On the GPU, a record has one query (t = 1):
+ *
+ *     q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, 1, pos,
+ *     sel, cnt, maxsel
+ *
+ * cnt[0] is the count of the rows in sel, or -1 for the pos + 1 rows. */
 __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
 {
     attn_d a;
     memset(&a, 0, sizeof(a));
     a.q = DP(const float, 0);
-    if (r->op == GP_ATTN_QC) {
+    if (r->op == GP_ATTN_QC || r->op == GP_ATTN_QSA) {
         a.i16 = 1;
         a.kq = DP(const int16_t, 1);
         a.ks = DP(const float, 2);
@@ -652,6 +664,12 @@ __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
         a.window = 0;
         a.kp0 = 0;
         a.p = a.n;
+        if (r->op == GP_ATTN_QSA) {
+            int c = DP(const int32_t, 13)[0];
+            a.p = di(r, e, 11);
+            a.n = c < 0 ? (int)(a.p + 1) : c;
+            a.rows = c < 0 ? NULL : DP(const int32_t, 12);
+        }
         a.hstride = (size_t)a.hd;
         a.rstride = (size_t)a.kvh * a.hd;
         return a;
@@ -693,7 +711,7 @@ __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
 __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j, int i,
                                          float *out)
 {
-    size_t o = (size_t)j * a.rstride + (size_t)kv * a.hstride + i;
+    size_t o = (size_t)(a.rows ? a.rows[j] : j) * a.rstride + (size_t)kv * a.hstride + i;
     if (a.i16) {
         const int16_t *q = key ? a.kq : a.vq;
         float sc = (key ? a.ks : a.vs)[o / 32];
@@ -712,23 +730,27 @@ __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j
     }
 }
 
-/* The block has 256 threads. head_dim must be 256 or 512. */
-__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
+/* The block has 256 threads. head_dim must be 256 or 512. The query heads
+ * of a key head come in hg groups of at most ATTN_REP (12 heads of Qwen3.8:
+ * 2 groups of 6); block x takes group x % hg of key head x / hg. qb is the
+ * first query head of the block. */
+__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int hg)
 {
     PDL_START();
     __shared__ float qs[ATTN_REP * 512];
     __shared__ float ps[ATTN_REP * ATTN_TILE];
     __shared__ float red[ATTN_REP * 512];
     attn_d a = attn_get(r, e);
-    int kv = blockIdx.x, c = blockIdx.y;
-    int n = a.n, hd = a.hd, rep = a.qh / a.kvh;
+    int kv = blockIdx.x / hg, c = blockIdx.y;
+    int n = a.n, hd = a.hd, rep = a.qh / a.kvh / hg;
+    int qb = kv * (a.qh / a.kvh) + (blockIdx.x % hg) * rep;
     int len = attn_len(n);
     int j0 = c * len, j1 = min(n, j0 + len);
     if (j0 >= n) {
         return;
     }
     for (int i = threadIdx.x; i < rep * hd; i += blockDim.x) {
-        qs[i] = a.q[(size_t)kv * rep * hd + i];
+        qs[i] = a.q[(size_t)qb * hd + i];
         red[i] = 0.f;
     }
     __syncthreads();
@@ -800,9 +822,9 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
         {
             int kk = lane / ATTN_REP, h = lane % ATTN_REP, j = jb + kk;
             if (h < rep && j < j1) {
-                int64_t kp = a.kp0 + j;
+                int64_t kp = a.rows ? a.rows[j] : a.kp0 + j;
                 bool masked = kp > a.p || (a.window > 0 && a.p - kp >= a.window);
-                a.sc[(size_t)(kv * rep + h) * n + j] = masked ? -INFINITY : v[0];
+                a.sc[(size_t)(qb + h) * n + j] = masked ? -INFINITY : v[0];
             }
         }
     }
@@ -815,7 +837,7 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
         if (h >= rep) {
             continue;
         }
-        float *sc = a.sc + (size_t)(kv * rep + h) * n;
+        float *sc = a.sc + (size_t)(qb + h) * n;
         float mh = -INFINITY;
         for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
             mh = fmaxf(mh, sc[j]);
@@ -849,7 +871,7 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
         int tn = min(ATTN_TILE, j1 - t0);
         for (int x = threadIdx.x; x < rep * tn; x += blockDim.x) {
             int h = x / tn, jj = x % tn;
-            ps[h * ATTN_TILE + jj] = a.sc[(size_t)(kv * rep + h) * n + t0 + jj];
+            ps[h * ATTN_TILE + jj] = a.sc[(size_t)(qb + h) * n + t0 + jj];
         }
         __syncthreads();
         #pragma unroll 8
@@ -888,13 +910,13 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part)
     }
     for (int x = threadIdx.x; x < rep * hd; x += blockDim.x) {
         int h = x / hd, i = x % hd;
-        part[((size_t)(kv * rep + h) * ATTN_CHUNKS + c) * (hd + 2) + i] = red[x];
+        part[((size_t)(qb + h) * ATTN_CHUNKS + c) * (hd + 2) + i] = red[x];
     }
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int h = 0; h < ATTN_REP; ++h) {
             if (h < rep) {
-                float *o = part + ((size_t)(kv * rep + h) * ATTN_CHUNKS + c) * (hd + 2);
+                float *o = part + ((size_t)(qb + h) * ATTN_CHUNKS + c) * (hd + 2);
                 o[hd] = m[h];
                 o[hd + 1] = l[h];
             }
@@ -3672,15 +3694,22 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
 #define KQ_Q4_K 12
 #define KQ_Q5_K 13
 #define KQ_Q6_K 14
+/* Q5_1: blocks of 32 values, 24 bytes: d, m (float16), the high bits
+ * (32 bits), and the low 4 bits (value j < 16 in the low half of byte j,
+ * value j + 16 in its high half). A value is d q + m. */
+#define KQ_Q5_1 7
 /* Q8_0 in rows for the GPU (np_gemma/qwen_gpu.py): the int8 values of the
- * row, then the float16 scale of each 32 values. The rows have the size of
- * Q8_0 rows, and the values start at a multiple of 16 bytes. */
+ * row, then the float16 scale of each 32 values, then zeros to a multiple
+ * of 16 bytes. Thus the values of each row start at a multiple of 16
+ * bytes. */
 #define KQ_Q8_R 100
 
 __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
 {
     return type == KQ_F32 ? (size_t)cols * 4 :
-           (type == KQ_Q8_0 || type == KQ_Q8_R) ? (size_t)cols / 32 * 34 :
+           type == KQ_Q8_R ? ((size_t)cols / 32 * 34 + 15) / 16 * 16 :
+           type == KQ_Q8_0 ? (size_t)cols / 32 * 34 :
+           type == KQ_Q5_1 ? (size_t)cols / 32 * 24 :
            type == KQ_Q4_K ? (size_t)cols / 256 * 144 : type == KQ_Q5_K ? (size_t)cols / 256 * 176 :
            (size_t)cols / 256 * 210;
 }
@@ -3747,6 +3776,20 @@ __device__ float kq_row(int type, const uint8_t *w, const float *x, int cols)
                                    (float)(int8_t)(a >> 8) * xv.y +
                                    (float)(int8_t)(c & 255) * xv.z +
                                    (float)(int8_t)(c >> 8) * xv.w);
+        }
+    } else if (type == KQ_Q5_1) {
+        /* As Q8_0: lane l takes 4 values of block l / 8 of 4 blocks. */
+        int o = 4 * (lane % 8);
+        for (int b = lane / 8; b < cols / 32; b += 4) {
+            const uint8_t *blk = w + (size_t)b * 24;
+            uint32_t qh = *(const uint32_t *)(blk + 4);
+            uint32_t qs = *(const uint32_t *)(blk + 8 + o % 16);
+            uint32_t q = o < 16 ? qs & 0x0f0f0f0fu : (qs >> 4) & 0x0f0f0f0fu;
+            uint32_t h = qh >> o;
+            q |= ((h & 1) << 4) | ((h & 2) << 11) | ((h & 4) << 18) | ((h & 8) << 25);
+            float4 xv = *(const float4 *)(x + b * 32 + o);
+            sum += kq_half(blk) * kq_dot4(q, xv) +
+                   kq_half(blk + 2) * (xv.x + xv.y + xv.z + xv.w);
         }
     } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
         /* lane l: 4 bytes of the part pair c = l / 8: 4 values of part 2c
@@ -4272,6 +4315,361 @@ __global__ void k_add_rms(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* ---------- the gated residual and the n-gram layer of Qwen3.8 ----------
+ * The records of csrc/hyperconn.c; the operands are the same. */
+
+__device__ __forceinline__ float hc_sig(float v)
+{
+    return 1.f / (1.f + expf(-v));
+}
+
+/* GP_HC_NORM: x, w, out, t, groups, hid, eps. A block for each group of
+ * each row. */
+__global__ void k_hc_norm(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int groups = DI(4), hid = DI(5);
+    size_t o = (size_t)blockIdx.x * hid;
+    const float *x = DP(const float, 0) + o;
+    const float *w = DP(const float, 1) + (size_t)(blockIdx.x % groups) * hid;
+    float *out = DP(float, 2) + o;
+    float ss = 0.f;
+    for (int c = threadIdx.x; c < hid; c += blockDim.x) {
+        ss += x[c] * x[c];
+    }
+    ss = block_sum(ss);
+    float inv = 1.f / sqrtf(ss / (float)hid + df(r, e, 6));
+    for (int c = threadIdx.x; c < hid; c += blockDim.x) {
+        out[c] = x[c] * inv * w[c];
+    }
+}
+
+/* GP_HC_ACT: x, out, n, scale. out = silu(x * scale). */
+__global__ void k_hc_act(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < di(r, e, 2)) {
+        float v = DP(const float, 0)[i] * df(r, e, 3);
+        DP(float, 1)[i] = v * hc_sig(v);
+    }
+}
+
+/* GP_HC_MIX: hn, g, out, t, hc, hid. A thread for each value of out. */
+__global__ void k_hc_mix(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int hc = DI(4), hid = DI(5);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)DI(3) * hid) {
+        return;
+    }
+    int64_t j = i / hid, c = i % hid;
+    const float *hn = DP(const float, 0), *g = DP(const float, 1);
+    float s = 0.f;
+    for (int k = 0; k < hc; ++k) {
+        size_t x = ((size_t)j * hc + k) * hid + c;
+        s += hc_sig(g[x]) * hn[x];
+    }
+    DP(float, 2)[i] = s / (float)hc;
+}
+
+/* GP_HC_ADD: H, out, inject, t, hc, hid, scale. A thread for each value of
+ * H. */
+__global__ void k_hc_add(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int hc = DI(4), hid = DI(5);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)DI(3) * hc * hid) {
+        return;
+    }
+    int64_t rg = i / hid, j = rg / hc, c = i % hid;
+    float w = 2.f * hc_sig(DP(const float, 2)[rg] * df(r, e, 6));
+    DP(float, 0)[i] += DP(const float, 1)[j * hid + c] * w;
+}
+
+/* GP_PLE_GATE: keyn, qn, value, gated, t, hc, hid. A block for each stream
+ * of each row. */
+__global__ void k_ple_gate(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int hc = DI(5), hid = DI(6);
+    size_t o = (size_t)blockIdx.x * hid;
+    const float *k = DP(const float, 0) + o, *q = DP(const float, 1) + o;
+    float s = 0.f;
+    for (int c = threadIdx.x; c < hid; c += blockDim.x) {
+        s += k[c] * q[c];
+    }
+    s = block_sum(s) / sqrtf((float)hid);
+    float mag = sqrtf(fabsf(s) > 1e-6f ? fabsf(s) : 1e-6f);
+    float g = hc_sig(s < 0.f ? -mag : (s > 0.f ? mag : 0.f));
+    const float *v = DP(const float, 2) + (size_t)(blockIdx.x / hc) * hid;
+    float *out = DP(float, 3) + o;
+    for (int c = threadIdx.x; c < hid; c += blockDim.x) {
+        out[c] = g * v[c];
+    }
+}
+
+/* GP_PLE_CONV: gn, gated, H, state, w, t, channels, kernel, dilation. A
+ * thread for each channel: the rows in order, then the new state. */
+__global__ void k_ple_conv(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int t = DI(5), channels = DI(6), kernel = DI(7), dil = DI(8);
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) {
+        return;
+    }
+    const float *gn = DP(const float, 0), *gated = DP(const float, 1), *w = DP(const float, 4);
+    float *H = DP(float, 2), *state = DP(float, 3);
+    int hist = (kernel - 1) * dil;
+    for (int j = 0; j < t; ++j) {
+        float v = 0.f;
+        for (int k = 0; k < kernel; ++k) {
+            int rr = j - (kernel - 1 - k) * dil;
+            float x = rr >= 0 ? gn[(size_t)rr * channels + c]
+                              : state[(size_t)(hist + rr) * channels + c];
+            v += w[(size_t)c * kernel + k] * x;
+        }
+        size_t i = (size_t)j * channels + c;
+        H[i] += gated[i] + v * hc_sig(v);
+    }
+    for (int rr = 0; rr < hist; ++rr) {
+        int src = t - hist + rr;
+        state[(size_t)rr * channels + c] = src >= 0 ? gn[(size_t)src * channels + c]
+                                                    : state[(size_t)(hist + src) * channels + c];
+    }
+}
+
+/* GP_HC_CAT: e, hn, out, t, hc, hid. For each stream: the row of e, then
+ * the stream. */
+__global__ void k_hc_cat(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int hc = DI(4), hid = DI(5);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)DI(3) * hc * 2 * hid) {
+        return;
+    }
+    int64_t rg = i / (2 * hid), c = i % (2 * hid);
+    DP(float, 2)[i] = c < hid ? DP(const float, 0)[(rg / hc) * hid + c]
+                              : DP(const float, 1)[rg * hid + c - hid];
+}
+
+/* ---------- QSA (Qwen3.8): the selection of the keys (csrc/qsa.c) ----------
+ * GP_QSA_SELECT: iq, ik, idxk, blk, qn, kn, cos, sin, pos, t, heads, d,
+ * ratio, budget, rot, theta, eps, sel, cnt, maxsel, scratch, nbmax. Three
+ * kernels: the raw keys to idxk; the key of each block that is complete now;
+ * the selection of each query (one block of QSA_T threads for each query;
+ * scratch has nbmax 64-bit keys for each query). */
+#define QSA_T 1024
+
+/* RMS norm of d values (d <= 256) times w, then RoPE on the first rot
+ * values; x in shared memory, the threads of the block (or of one warp: the
+ * sums use the threads that call). */
+__device__ void qsa_norm_rope_block(float *x, const float *w, int d, float eps, int rot,
+                                    const float *c, const float *sn)
+{
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        ss += x[i] * x[i];
+    }
+    ss = block_sum(ss);
+    float inv = 1.f / sqrtf(ss / (float)d + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        x[i] = x[i] * inv * w[i];
+    }
+    __syncthreads();
+    int half = rot / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float a = x[i], b = x[i + half];
+        x[i] = a * c[i] - b * sn[i];
+        x[i + half] = b * c[i + half] + a * sn[i + half];
+    }
+    __syncthreads();
+}
+
+__global__ void k_qsa_copy(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int d = DI(11);
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (int64_t)DI(9) * d) {
+        DP(float, 2)[di(r, e, 8) * d + i] = DP(const float, 1)[i];
+    }
+}
+
+/* Block x makes the key of block pos / ratio + x, if it is complete. */
+__global__ void k_qsa_blocks(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    __shared__ float x[256], c[256], sn[256];
+    int64_t pos = di(r, e, 8), n = pos + DI(9);
+    int d = DI(11), ratio = DI(12), rot = DI(14);
+    int64_t b = pos / ratio + blockIdx.x;
+    if (b >= n / ratio) {
+        return;
+    }
+    const float *idxk = DP(const float, 2);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float sum = 0.f;
+        for (int q = 0; q < ratio; ++q) {
+            sum += idxk[(size_t)(b * ratio + q) * d + i];
+        }
+        x[i] = sum / (float)ratio;
+    }
+    double theta = (double)df(r, e, 15);
+    for (int i = threadIdx.x; i < rot / 2; i += blockDim.x) {
+        double f = (double)(b * ratio) / pow(theta, (double)(2 * i) / (double)rot);
+        c[i] = c[i + rot / 2] = (float)cos(f);
+        sn[i] = sn[i + rot / 2] = (float)sin(f);
+    }
+    __syncthreads();
+    qsa_norm_rope_block(x, DP(const float, 5), d, df(r, e, 16), rot, c, sn);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        DP(float, 3)[(size_t)b * d + i] = x[i];
+    }
+}
+
+/* The inclusive prefix sum of v over the block (QSA_T threads). */
+__device__ int qsa_scan(int v, int *tmp)
+{
+    int lane = threadIdx.x % 32, w = threadIdx.x / 32;
+    for (int o = 1; o < 32; o <<= 1) {
+        int y = __shfl_up_sync(0xffffffff, v, o);
+        v += lane >= o ? y : 0;
+    }
+    __syncthreads();
+    if (lane == 31) {
+        tmp[w] = v;
+    }
+    __syncthreads();
+    if (w == 0) {
+        int t = lane < QSA_T / 32 ? tmp[lane] : 0;
+        for (int o = 1; o < 32; o <<= 1) {
+            int y = __shfl_up_sync(0xffffffff, t, o);
+            t += lane >= o ? y : 0;
+        }
+        tmp[lane] = t;
+    }
+    __syncthreads();
+    return v + (w > 0 ? tmp[w - 1] : 0);
+}
+
+/* Block j selects the keys of query j (the method of qsa_select_body: the
+ * scores of the blocks as keys (score bits << 32 | block), the top budget
+ * keys by a radix select of 8 bits at a time, then the positions in order). */
+__global__ void __launch_bounds__(QSA_T) k_qsa_query(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    __shared__ float q[8 * 256];
+    __shared__ int hist[256];
+    __shared__ int tmp[32];
+    __shared__ uint64_t prefix_s;
+    __shared__ int need_s;
+    int j = blockIdx.x, heads = DI(10), d = DI(11), ratio = DI(12), budget = DI(13);
+    int rot = DI(14), maxsel = DI(19);
+    int64_t pj = di(r, e, 8) + j, nb = (pj + 1) / ratio;
+    int32_t *cnt = DP(int32_t, 18);
+    if (nb <= budget) {
+        if (threadIdx.x == 0) {
+            cnt[j] = -1;
+        }
+        return;
+    }
+    const float *iq = DP(const float, 0) + (size_t)j * heads * d;
+    for (int i = threadIdx.x; i < heads * d; i += blockDim.x) {
+        q[i] = iq[i];
+    }
+    __syncthreads();
+    const float *cs = DP(const float, 6) + (size_t)j * rot, *sn = DP(const float, 7) + (size_t)j * rot;
+    for (int h = 0; h < heads; ++h) {
+        qsa_norm_rope_block(q + h * d, DP(const float, 4), d, df(r, e, 16), rot, cs, sn);
+    }
+    uint64_t *keys = (uint64_t *)DP(uint8_t, 20) + (size_t)j * di(r, e, 21);
+    const float *blk = DP(const float, 3);
+    float scale = 1.f / sqrtf((float)d);
+    /* one warp for each block key: the lanes split the values */
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int64_t b = warp; b < nb; b += QSA_T / 32) {
+        const float *kb = blk + (size_t)b * d;
+        float score = 0.f;
+        for (int h = 0; h < heads; ++h) {
+            float dot = 0.f;
+            for (int i = lane; i < d; i += 32) {
+                dot += q[h * d + i] * kb[i];
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                dot += __shfl_xor_sync(0xffffffff, dot, o);
+            }
+            score += dot > 0.f ? dot : 0.f;
+        }
+        if (lane == 0) {
+            score *= scale;
+            keys[b] = ((uint64_t)__float_as_uint(score) << 32) | (uint64_t)b;
+        }
+    }
+    __syncthreads();
+    /* The budget-th largest key: 8 bits at a time from the top. */
+    if (threadIdx.x == 0) {
+        prefix_s = 0;
+        need_s = budget;
+    }
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            hist[i] = 0;
+        }
+        __syncthreads();
+        uint64_t prefix = prefix_s, mask = shift == 56 ? 0 : ~0ull << (shift + 8);
+        for (int64_t b = threadIdx.x; b < nb; b += blockDim.x) {
+            uint64_t k = keys[b];
+            if ((k & mask) == prefix) {
+                atomicAdd(&hist[(k >> shift) & 255], 1);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int need = need_s, digit = 255;
+            while (hist[digit] < need) {
+                need -= hist[digit];
+                --digit;
+            }
+            need_s = need;
+            prefix_s = prefix | ((uint64_t)digit << shift);
+        }
+        __syncthreads();
+    }
+    uint64_t thr = prefix_s;            /* the keys >= thr are the budget best */
+    int32_t *out = DP(int32_t, 17) + (size_t)j * maxsel;
+    int base = 0;
+    for (int64_t b0 = 0; b0 < nb; b0 += blockDim.x) {
+        int64_t b = b0 + threadIdx.x;
+        int keep = b < nb && keys[b] >= thr;
+        int incl = qsa_scan(keep, tmp);
+        if (keep) {
+            for (int q2 = 0; q2 < ratio; ++q2) {
+                out[(base + incl - 1) * ratio + q2] = (int32_t)(b * ratio + q2);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == blockDim.x - 1) {
+            tmp[0] = incl;
+        }
+        __syncthreads();
+        base += tmp[0];
+        __syncthreads();
+    }
+    int c2 = base * ratio;
+    for (int64_t p = nb * ratio + threadIdx.x; p <= pj; p += blockDim.x) {
+        out[c2 + (p - nb * ratio)] = (int32_t)p;
+    }
+    if (threadIdx.x == 0) {
+        cnt[j] = (int32_t)(c2 + (pj + 1 - nb * ratio));
+    }
+}
+
 /* GP_KQ_MULTI: x, cols, t, n, then (w, type, rows, out) for n matrices on
  * the same rows of x: GP_KQ_LINEAR of each, in one launch. */
 __global__ void k_kq_multi(const gp_rec *r, const int64_t *e)
@@ -4316,6 +4714,15 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
         float d = kq_half(blk);
         for (int u = 0; u < 8; ++u) {
             v[u] = d * (float)(int8_t)blk[2 + c0 % 32 + u];
+        }
+    } else if (type == KQ_Q5_1) {
+        const uint8_t *blk = w + (size_t)(c0 / 32) * 24;
+        float d = kq_half(blk), m = kq_half(blk + 2);
+        uint32_t qh = *(const uint32_t *)(blk + 4);
+        for (int u = 0; u < 8; ++u) {
+            int j = c0 % 32 + u;
+            int q = j < 16 ? blk[8 + j] & 15 : blk[8 + j - 16] >> 4;
+            v[u] = d * (float)(q | (((qh >> j) & 1) << 4)) + m;
         }
     } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
         int five = type == KQ_Q5_K;
@@ -4867,10 +5274,15 @@ static int fd_on(void)
 static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                        const int64_t *denv, int *bad)
 {
-    int o = r->op == GP_ATTN_QC ? 7 : 5;     /* the operand of q_heads */
+    int o = (r->op == GP_ATTN_QC || r->op == GP_ATTN_QSA) ? 7 : 5;  /* the operand of q_heads */
     int64_t qh = hlit(r, o, bad), kvh = hlit(r, o + 1, bad), hd = hlit(r, o + 2, bad);
+    int hg = qh % kvh == 0 ? (int)cdiv(qh / kvh, ATTN_REP) : 1;
+    while (qh % kvh == 0 && (qh / kvh) % hg != 0) {
+        ++hg;
+    }
     if ((size_t)qh * ATTN_CHUNKS * (size_t)(hd + 2) > GG_PART_FLOATS ||
-        qh % kvh != 0 || qh / kvh > ATTN_REP || (hd != 256 && hd != 512)) {
+        qh % kvh != 0 || qh / kvh / hg > ATTN_REP || (hd != 256 && hd != 512) ||
+        (r->op == GP_ATTN_QSA && hlit(r, 10, bad) != 1)) {
         *bad = 1;
         return 0;
     }
@@ -4880,7 +5292,8 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         k_attn_fd_join<<<dim3((unsigned)qh, 2), 128, 0, gg_stream>>>(dr, denv, g->part);
         return 0;
     }
-    k_attn_part<<<dim3((unsigned)kvh, ATTN_CHUNKS), 256, 0, gg_stream>>>(dr, denv, g->part);
+    k_attn_part<<<dim3((unsigned)(kvh * hg), ATTN_CHUNKS), 256, 0, gg_stream>>>(dr, denv, g->part,
+                                                                              hg);
     k_attn_join<<<dim3((unsigned)qh, (unsigned)cdiv(hd, 128)), 128, 0, gg_stream>>>(
         dr, denv, g->part);
     return 0;
@@ -5162,6 +5575,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     case GP_ATTN_F32:
     case GP_ATTN_QC:
+    case GP_ATTN_QSA:
         attn_launch(g, r, dr, denv, &bad);
         break;
     case GP_HOT_SPLIT:
@@ -5330,6 +5744,39 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
         break;
     }
+    case GP_QSA_SELECT: {
+        int64_t t = hlit(r, 9, &bad), d = hlit(r, 11, &bad), ratio = hlit(r, 12, &bad);
+        if (d > 256 || hlit(r, 10, &bad) * d > 8 * 256 || ratio < 1) {
+            bad = 1;
+        }
+        k_qsa_copy<<<(unsigned)cdiv(t * d, T), T, 0, s>>>(dr, denv);
+        k_qsa_blocks<<<(unsigned)(t / (ratio > 0 ? ratio : 1) + 1), 128, 0, s>>>(dr, denv);
+        k_qsa_query<<<(unsigned)t, QSA_T, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_HC_NORM:
+        k_hc_norm<<<(unsigned)(hlit(r, 3, &bad) * hlit(r, 4, &bad)), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_HC_ACT:
+        k_hc_act<<<(unsigned)cdiv(hlit(r, 2, &bad), T), T, 0, s>>>(dr, denv);
+        break;
+    case GP_HC_MIX:
+        k_hc_mix<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 5, &bad), T), T, 0, s>>>(dr, denv);
+        break;
+    case GP_HC_ADD:
+        k_hc_add<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad) * hlit(r, 5, &bad), T), T,
+                   0, s>>>(dr, denv);
+        break;
+    case GP_PLE_GATE:
+        k_ple_gate<<<(unsigned)(hlit(r, 4, &bad) * hlit(r, 5, &bad)), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_PLE_CONV:
+        k_ple_conv<<<(unsigned)cdiv(hlit(r, 6, &bad), T), T, 0, s>>>(dr, denv);
+        break;
+    case GP_HC_CAT:
+        k_hc_cat<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad) * 2 * hlit(r, 5, &bad), T),
+                   T, 0, s>>>(dr, denv);
+        break;
     case GP_SIGMUL:
         k_sigmul<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
         break;
