@@ -21,6 +21,12 @@ np_gemma/server.py. This file gives it the Qwen parts:
   with the last prompt (the next turn of an agent, whose earlier answer
   comes back in the form of the template) reads only the tokens after it.
   Any other prompt starts again at position 0.
+- one thread for all the work of the model (the load, the prompts, the
+  steps): the CPU part of a step runs in the thread that runs the step, and
+  each thread has a team of OpenMP threads of its own. With a team for each
+  request as well as that of the load and that of GP_CPU_START, libgomp has
+  more threads than CPUs, and its barriers sleep and wake (a step of 58 ms,
+  not 46).
 
 --thinking opens the think part by default; a request can set "thinking".
 """
@@ -29,8 +35,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import uuid
 
@@ -236,6 +244,32 @@ class QwenBackend(Backend):
         return self.model.logits(self.model.forward([token], self.cache, start_pos=pos))[0]
 
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
+        """The tokens of _generate, from the model thread. A caller that
+        stops early stops the generation."""
+        q, stop = queue.Queue(), threading.Event()
+
+        def job():
+            try:
+                for token in self._generate(prompt_ids, max_tokens, sampler, eos_ids):
+                    q.put(("token", token))
+                    if stop.is_set():
+                        break
+                q.put(("end", None))
+            except BaseException as exc:
+                q.put(("error", exc))
+        self.jobs.put(job)
+        try:
+            while True:
+                kind, value = q.get()
+                if kind == "end":
+                    return
+                if kind == "error":
+                    raise value
+                yield value
+        finally:
+            stop.set()
+
+    def _generate(self, prompt_ids, max_tokens, sampler, eos_ids):
         n = len(prompt_ids)
         if n + 1 > self.ctx:
             raise ValueError("the prompt has %d tokens; the context is %d" % (n, self.ctx))
@@ -302,26 +336,43 @@ def main():
     if not os.path.exists(template):
         template = os.path.join(root, "models/Qwen3.8-Flash-Next-NVFP4/chat_template.jinja")
     tok = QwenTok(args.tok or os.path.join(os.path.dirname(path), "tokenizer.json"), template)
-    print("loading %s ..." % path, flush=True)
-    t0 = time.time()
-    model = Qwen4CPU(path)
-    dev = None
-    if args.backend == "gpu":
-        from np_gemma.qwen4_gpu import Qwen4GPU
-        dev = Qwen4GPU(model, hot_gb=args.hot_gb)
-    backend = QwenBackend(model, dev, tok, args.ctx, model_id=args.model_id,
-                          thinking=args.thinking, max_tokens=args.max_tokens,
-                          temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
-    # the cache and the programs of a prompt now, so the first request does
-    # not wait for them and a context that does not fit fails here
-    backend._fresh()
-    if dev is not None:
-        backend._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
-        backend._fresh()
-    print("ready in %.0f s: dense %s, context %d%s; sampling temperature=%s top_k=%s top_p=%s" % (
-        time.time() - t0, model.dense, args.ctx,
-        ", %d hot experts in each layer" % dev.n_slots if dev else "",
-        args.temperature, args.top_k, args.top_p), flush=True)
+    jobs, ready = queue.Queue(), queue.Queue()
+
+    def model_thread():
+        """The load, the warm-up, and then the jobs of generate."""
+        try:
+            print("loading %s ..." % path, flush=True)
+            t0 = time.time()
+            model = Qwen4CPU(path)
+            dev = None
+            if args.backend == "gpu":
+                from np_gemma.qwen4_gpu import Qwen4GPU
+                dev = Qwen4GPU(model, hot_gb=args.hot_gb)
+            backend = QwenBackend(model, dev, tok, args.ctx, model_id=args.model_id,
+                                  thinking=args.thinking, max_tokens=args.max_tokens,
+                                  temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
+            backend.jobs = jobs
+            # the cache and the programs of a prompt now, so the first request
+            # does not wait for them and a context that does not fit fails here
+            backend._fresh()
+            if dev is not None:
+                backend._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
+                backend._fresh()
+            print("ready in %.0f s: dense %s, context %d%s; sampling temperature=%s top_k=%s "
+                  "top_p=%s" % (time.time() - t0, model.dense, args.ctx,
+                                ", %d hot experts in each layer" % dev.n_slots if dev else "",
+                                args.temperature, args.top_k, args.top_p), flush=True)
+            ready.put(backend)
+        except BaseException as exc:
+            ready.put(exc)
+            return
+        while True:
+            jobs.get()()
+
+    threading.Thread(target=model_thread, daemon=True).start()
+    backend = ready.get()
+    if isinstance(backend, BaseException):
+        raise backend
     serve(backend, host=args.host, port=args.port, quiet=args.quiet)
     return 0
 

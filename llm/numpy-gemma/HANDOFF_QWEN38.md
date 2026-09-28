@@ -167,6 +167,11 @@ long answer):
 
     python scripts/long_qwen4.py [--tokens 131072] [--gen 4096] [--backend cpu]
 
+The server (scripts/serve_qwen4.py) runs all the work of the model in one
+thread. The CPU part of a step runs in the thread of the step, with an
+OpenMP team of its own. With a team for each request, libgomp had more
+threads than CPUs, and its barriers slept: 17 tok/s, not 22.
+
 The switches for a comparison:
 
     NP_GEMMA_GPU_KQTC=0     no tensor cores
