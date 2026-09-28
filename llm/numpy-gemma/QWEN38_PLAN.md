@@ -405,8 +405,34 @@ Results (RTX 5060 Ti with 8 GB free; greedy decode after 100 tokens):
   A model of 8 layers has room for the buffers. On it, a prompt of 1100
   tokens with a large group gives the logits of split groups within 6e-3.
 
+Mixed groups of a prompt (np_gemma/qwen4_gpu.py, _moe_mix):
+
+- A part of a prompt of at least 256 tokens runs in groups of 1024 rows.
+  In each layer, after the router, the record MOE_PLAN (csrc/moe.c) on the
+  host splits the experts. The GPU takes the experts with the most tokens:
+  a worker copies them to one buffer (the free memory less 0.8 GB). The
+  CPU takes the other experts at the same time, on a helper thread
+  (CPU_START, CPU_WAIT). The hot experts stay on the GPU.
+- The model of the costs: 0.9 ms for each copied expert (the copy and its
+  work on the GPU); 75 us for each expert on the CPU, and 15 us for each
+  of its tokens. The split makes the two times about equal.
+- The copies read the map of the file at 6.8 GB/s (PCIe Gen3 x8 here).
+- On a model of 8 layers, 1100 tokens: 304 tok/s in split groups, 881
+  tok/s in mixed groups.
+- The whole model (0.5 GB of hot experts): pp512 156, pp2048 289, pp4096
+  241 tok/s with random tokens (split groups: about 98). A document of
+  2936 tokens: 147 tok/s (split groups: 91). The text uses more experts
+  than random tokens: about 350 in each layer, 77 of them copied. The
+  answer and 40 tokens of a summary are those of split groups and of the
+  CPU program.
+- The profile of a group of 1024 rows (records one at a time): the wait
+  for the copies 0.91 s, the dense products 0.77 s, the experts on the GPU
+  0.71 s, the attention 0.40 s (one record for each query).
+
 Next:
 - The attention of a large group: one record for each query now.
+- The products of a large group (dense and experts) with the tensor
+  cores; now float32 tiles at 6 to 10 TFLOPS.
 
 ## Risks
 

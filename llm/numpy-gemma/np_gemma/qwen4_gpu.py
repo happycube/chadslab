@@ -20,6 +20,14 @@ compile_qwen4_step. The design stays:
   that stay (commit) and each row of the MTP layer. A group copies the
   selection of each layer to an array (sel_of) for that.
 
+- A prompt of at least MIX_MIN tokens runs in mixed groups of MIX_SIZE
+  rows (NP_GEMMA_GPU_MIX, NP_GEMMA_GPU_MIX_MIN). In each layer, after the
+  router, GP_MOE_PLAN (csrc/moe.c) splits the experts: the GPU takes the
+  experts with the most tokens, and a worker thread copies them to one
+  buffer (as much as the free memory holds); the CPU takes the rest at the
+  same time (GP_CPU_START); the hot experts stay on the GPU. The split keeps
+  the time of the copies and the time of the CPU about equal.
+
 The host makes the inputs of a run: the embeddings in each stream and the
 rows of the n-gram table.
 
@@ -36,17 +44,29 @@ import os
 
 import numpy as np
 
+from . import cops
 from . import program as P
-from .gpu import GPUProgram, _check, lib
+from .gpu import Buffer, GPUProgram, _check, lib, mem_info, pinned
 from .qwen_gpu import MT, QwenGPU, _DevCache, _fuse
 from .qwen4 import compile_qwen4_step
+
+MIX_SIZE = int(os.environ.get("NP_GEMMA_GPU_MIX", "1024"))    # the rows of a mixed group
+MIX_MIN = int(os.environ.get("NP_GEMMA_GPU_MIX_MIN", "256"))  # the shortest prompt part for one
+# The model of the costs of GP_MOE_PLAN, in ns: for each expert on the CPU,
+# and for each of its tokens; for each expert that the GPU copies.
+MIX_CPU_A = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_A", "75000"))
+MIX_CPU_B = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_B", "15000"))
+MIX_GPU = int(os.environ.get("NP_GEMMA_GPU_MIX_GPU", "900000"))
+# The free memory that the buffer of the copies leaves (the programs of the
+# decode, MTP, and the verify groups).
+MIX_KEEP = float(os.environ.get("NP_GEMMA_GPU_MIX_KEEP", "0.8e9"))
 
 
 class _Emit4:
     """The model as compile_qwen4_step sees it for a GPU program."""
 
-    def __init__(self, dev, t, verify, fetch):
-        self.dev, self.m, self.t, self.fetch = dev, dev.model, t, fetch
+    def __init__(self, dev, t, verify, fetch, mix=False):
+        self.dev, self.m, self.t, self.fetch, self.mix = dev, dev.model, t, fetch, mix
 
     def __getattr__(self, name):
         return getattr(self.m, name)
@@ -63,6 +83,9 @@ class _Emit4:
     def emit_moe4(self, prog, i, xb, idx, val, slog, scratch, out):
         if self.fetch:
             self.dev._moe_fetch(prog, i, xb["src"], idx, val, slog, out)
+            return
+        if self.mix:
+            self.dev._moe_mix(prog, i, xb["src"], idx, val, slog, out)
             return
         if self.t > 1:
             sel = self.dev.sel_of(self.t)
@@ -105,6 +128,11 @@ class Qwen4GPU(QwenGPU):
     def __init__(self, model, hot_gb=None, counts=None, graph=True):
         self.head_progs = {}
         self.mtp_progs = {}
+        self.mix_progs = {}
+        self.mix_ring = None
+        self.mix_desc = {}          # layer -> the desc of GP_MOE_PLAN
+        self.mix_stats = {}         # layer -> the stats of its last plan
+        self._nreal_h = np.zeros(1, np.int64)
         self.sel_bufs = {}
         self.mcache = None
         L = model.cfg.num_hidden_layers
@@ -125,6 +153,119 @@ class Qwen4GPU(QwenGPU):
     def _before_hot(self):
         if self.has_mtp:
             self._mtp_group(1)
+
+    # ---- the mixed groups of a prompt ----
+
+    def _moe_mix(self, prog, i, h, idx, val, slog, out):
+        """The experts of layer i of a mixed group (see the module text)."""
+        cfg = self.cfg
+        st = self.stores[i]
+        k, E, hidden, inner = cfg.top_k, cfg.num_experts, cfg.hidden_size, cfg.moe_inter
+        t = h.shape[0]
+        z = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
+        hp = self._buf("hp", lambda: pinned((t, hidden)))
+        vp = self._buf("vp", lambda: pinned((t, k)))
+        ip = self._buf("ip", lambda: pinned((t, k), np.int32))
+        ev = self.n_events
+        self.n_events += 1
+        prog.emit(P.TO_HOST, h, hp, hp.nbytes, val, vp, vp.nbytes, idx, ip, ip.nbytes, ev)
+        # The plan, on the host.
+        tab_h = self._buf("tab_h", lambda: pinned((3 * E,), np.int64))
+        gidx_h = self._buf("gidx_h", lambda: pinned((t, k), np.int32))
+        cidx = self._buf("cidx", lambda: np.zeros((t, k), np.int32))
+        ranges = self._buf("ranges", lambda: np.zeros((3 * E, 3), np.int64))
+        desc = self.mix_desc.setdefault(i, np.zeros(13, np.int64))
+        stats = self.mix_stats.setdefault(i, np.zeros(5, np.int64))
+        pc = P.Program()
+        pc.emit(P.MOE_PLAN, ip, self._nreal_h, t, k, E, st["slots"], desc, MIX_CPU_A, MIX_CPU_B,
+                MIX_GPU, tab_h, gidx_h, cidx, ranges, stats)
+        plan = pc.finish()
+        self.cpu_progs.append(plan)
+        prog.emit(P.CPU_START, plan.buf, ev)
+        prog.emit(P.CPU_WAIT)
+        tab_d = self._buf("tab_d", lambda: np.zeros(3 * E, np.int64))
+        gidx_d = self._buf("gidx_d", lambda: np.zeros((t, k), np.int32))
+        prog.emit(P.TO_DEV, tab_h, tab_d, tab_d.nbytes)
+        prog.emit(P.TO_DEV, gidx_h, gidx_d, gidx_d.nbytes)
+        prog.emit(P.FETCH, ranges, 3 * E, i, 0)
+        # The experts of the CPU, on a helper thread, while the copies go on.
+        cc = P.Program()
+        xq = self._buf("xq", lambda: np.zeros((t, hidden), np.int8))
+        xs, xm = self._buf("xs", lambda: z(t, hidden // 32)), self._buf("xm", lambda: z(t, hidden // 16))
+        cc.emit(P.KQ_QUANT, hp, t, hidden, xq, xs, xm)
+        mats = cops.kq_moe_mats(*(m.c() for m in st["mats"]), None)
+        host_out = self._buf("host_out", lambda: z(t, hidden))
+        cc.emit(P.KQ_MOE, xq, xs, xm, cidx, vp, t, k, E, mats, None, hidden, inner,
+                self._buf("cpu_scratch", lambda: cops.kq_moe_scratch(t, k, E, hidden, inner)),
+                host_out, None)
+        cc.keep.append(mats)
+        cpu = cc.finish()
+        self.cpu_progs.append(cpu)
+        prog.emit(P.CPU_START, cpu.buf, ev)
+        # The experts of the GPU (hot and copied) and the shared expert.
+        P_ = t * k + t
+        s = "layers.%d.mlp.shared_expert." % i
+        gm, _um, dm = st["mats"]
+        tiles = -(-P_ // 64) + E + 1
+        work = self._buf("work", lambda: np.zeros(8 + 2 * (E + 2) + 2 * P_ + 3 * tiles, np.int32))
+        gpu_part = self._buf("gpu_part", lambda: z(t, hidden))
+        prog.emit(P.FETCH_WAIT, i)
+        prog.emit(P.KQ_GROUP_MOE, h, val, gidx_d, t, k, E, hidden, inner, tab_d[:E], tab_d[E:2 * E],
+                  tab_d[2 * E:], gm.type, dm.type, self.dense(s + "gate_proj")[0],
+                  self.dense(s + "up_proj")[0], self.dense(s + "down_proj")[0],
+                  self.dense(s + "gate_proj")[1], slog, work,
+                  self._buf("act", lambda: z(P_, 2 * inner)), self._buf("act2", lambda: z(P_, inner)),
+                  self._buf("de", lambda: z(P_, hidden)), gpu_part, prog.slot("nreal"))
+        prog.emit(P.FETCH_DONE, 0)
+        prog.emit(P.CPU_WAIT)
+        part = self._buf("part", lambda: z(t, hidden))
+        prog.emit(P.TO_DEV, host_out, part, part.nbytes)
+        prog.emit(P.ADD, gpu_part, part, out, t * hidden)
+
+    def _mix_group(self, t):
+        """The program of a mixed group of t rows, and the buffer of the
+        copies: the free memory less MIX_KEEP, made once after the first
+        program and the head."""
+        e = self.mix_progs.get(t)
+        if e is None:
+            self._pool = {}
+            prog = _fuse(compile_qwen4_step(_Emit4(self, t, False, False, mix=True), t), t)
+            e = self.mix_progs[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
+        if self.mix_ring is None:
+            self._head(1)
+            per = sum(self.per)
+            cap = int(min(self.E, max(0, mem_info()[0] - MIX_KEEP) // per))
+            self.mix_cap = cap
+            self.mix_ring = [Buffer(max(1, cap * nb)) for nb in self.per]
+            mir = self.g.mirror
+            for i, desc in self.mix_desc.items():
+                st = self.stores[i]
+                for p, key in enumerate(("gate", "up", "down")):
+                    src, nb, dst = st["parts"][p]
+                    desc[p] = mir.buffer_of(dst).ptr
+                    desc[3 + p] = nb
+                    desc[6 + p] = src.ctypes.data
+                    desc[9 + p] = self.mix_ring[p].ptr
+                desc[12] = cap
+        return e
+
+    def mix(self, tokens, pos, size):
+        """Run tokens from position pos as one mixed group of size rows.
+        Return the input of the head of each token."""
+        t = len(tokens)
+        prog, g = self._mix_group(size)
+        if self.hot_cache is not None:
+            self.hot_cache.prepare(wait=True)      # the plan reads the slots
+        self._nreal_h[0] = t
+        self._inputs(prog, g, list(tokens))
+        g.bind(self._params(pos, size, t), self.cache_dev, scratch=("scores", "qsa_scratch"))
+        g.run()
+        g.download("xn")
+        self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * self.cfg.hidden_size * 4
+        self.last_prog = (prog, g)
+        self.rows = t
+        self.cache.n = pos + t
+        return prog.names["xn"][:t].copy()
 
     def sel_of(self, t):
         """The selection of each layer of a group of t rows (layers + 1, t,
@@ -250,7 +391,15 @@ class Qwen4GPU(QwenGPU):
         c0, h, hs = 0, None, []
         room = self.cache.max_len
         while c0 < len(ids):
-            size, n, fetch = self._sizes(len(ids) - c0, room - pos - c0)
+            rem = len(ids) - c0
+            if MIX_SIZE > 0 and rem >= MIX_MIN and room - pos - c0 >= MIX_SIZE:
+                n = min(rem, MIX_SIZE)
+                h = self.mix(ids[c0:c0 + n], pos + c0, MIX_SIZE)
+                if streams:
+                    hs.append(self.streams(n))
+                c0 += n
+                continue
+            size, n, fetch = self._sizes(rem, room - pos - c0)
             h = self.group(ids[c0:c0 + n], pos + c0, size, fetch=fetch)
             if streams:
                 hs.append(self.streams(n))
@@ -345,14 +494,11 @@ class Qwen4GPU(QwenGPU):
             new = np.ascontiguousarray(np.concatenate([old, gn[:n]])[-old.shape[0]:])
             self.cache_dev.buffer(self.cache.ple_conv[i]).upload(new)
 
-    def logits(self, rows=1, x=None):
-        """The logits of the last rows rows of the last run, or of the rows
-        of x (host arrays: the drafts of the MTP layer)."""
-        cfg = self.cfg
-        if x is not None:
-            rows = x.shape[0]
+    def _head(self, rows):
+        """The program of the head for rows rows (made once)."""
         e = self.head_progs.get(rows)
         if e is None:
+            cfg = self.cfg
             m = self.model.K("output.weight")
             w, type_ = self.dense("output.weight")
             hp = P.Program()
@@ -361,7 +507,15 @@ class Qwen4GPU(QwenGPU):
             hp.emit(P.KQ_LINEAR, None, None, None, hx, w, type_, m.rows, m.cols, rows, out)
             hp = hp.finish()
             e = self.head_progs[rows] = (hp, GPUProgram(hp, graph=self.graph, mirror=self.g.mirror))
-        hp, hg = e
+        return e
+
+    def logits(self, rows=1, x=None):
+        """The logits of the last rows rows of the last run, or of the rows
+        of x (host arrays: the drafts of the MTP layer)."""
+        cfg = self.cfg
+        if x is not None:
+            rows = x.shape[0]
+        hp, hg = self._head(rows)
         if x is not None:
             hp.names["x"][:] = x
             hg.upload("x")
@@ -378,9 +532,13 @@ class Qwen4GPU(QwenGPU):
         return out.copy() if rows > 1 else out[0].copy()
 
     def close(self):
-        for _p, g in list(self.head_progs.values()) + list(self.mtp_progs.values()):
+        for _p, g in (list(self.head_progs.values()) + list(self.mtp_progs.values())
+                      + list(self.mix_progs.values())):
             g.close()
-        self.head_progs, self.mtp_progs = {}, {}
+        self.head_progs, self.mtp_progs, self.mix_progs = {}, {}, {}
+        for b in self.mix_ring or ():
+            b.free()
+        self.mix_ring = None
         super().close()
 
 

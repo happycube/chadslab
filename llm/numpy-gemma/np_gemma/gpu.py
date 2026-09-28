@@ -59,7 +59,8 @@ _error = None
 SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.INT4_LINEAR_MT: (2,), P.INT4_MULTI4_MT: (4, 8, 12, 16),
         P.RMS_NORM_MULTI4: (6, 10, 14, 18), P.GELU_MUL_INT4: (5,),
-        P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,)}
+        P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,),
+        P.CPU_START: (0,)}
 
 
 def _nvcc():

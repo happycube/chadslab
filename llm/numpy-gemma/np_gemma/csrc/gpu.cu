@@ -84,6 +84,7 @@ enum {
     /* Qwen3.8 (QWEN38_PLAN.md, phase 5; csrc/hyperconn.c has the CPU forms) */
     GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
     GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121, GP_HC_CAT = 122,
+    GP_CPU_START = 124, GP_CPU_WAIT = 125,
 };
 
 static cudaStream_t gg_stream;
@@ -4891,7 +4892,9 @@ __global__ void k_qmoe_sort(const gp_rec *r, const int64_t *e)
         w.cnt[x] = 0;
     }
     for (int q = 0; q < nr * k; ++q) {
-        w.cnt[idx[q]]++;
+        if (idx[q] >= 0) {          /* -1: an expert of the CPU (GP_MOE_PLAN) */
+            w.cnt[idx[q]]++;
+        }
     }
     w.cnt[E] = nr;
     int a = 0, nt = 0;
@@ -4908,7 +4911,7 @@ __global__ void k_qmoe_sort(const gp_rec *r, const int64_t *e)
     }
     w.start[E + 1] = a;
     for (int q = 0; q < t * k; ++q) {
-        if (q / k >= nr) {
+        if (q / k >= nr || idx[q] < 0) {
             w.pof[q] = -1;
             continue;
         }
@@ -4994,7 +4997,9 @@ __global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
         acc = de[(size_t)ps * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
         for (int s2 = 0; s2 < k; ++s2) {
             int p = w.pof[tok * k + s2];
-            acc += val[tok * k + s2] * de[(size_t)p * hidden + c];
+            if (p >= 0) {           /* -1: an expert of the CPU (GP_MOE_PLAN) */
+                acc += val[tok * k + s2] * de[(size_t)p * hidden + c];
+            }
         }
     }
     DP(float, 22)[(size_t)tok * hidden + c] = acc;
@@ -5037,7 +5042,39 @@ typedef struct {
 static int is_boundary(int op)
 {
     return op == GP_TO_HOST || op == GP_CPU_JOIN || op == GP_TO_DEV || op == GP_FETCH ||
-           op == GP_FETCH_WAIT || op == GP_FETCH_DONE;
+           op == GP_FETCH_WAIT || op == GP_FETCH_DONE || op == GP_CPU_START ||
+           op == GP_CPU_WAIT;
+}
+
+/* ---------- a CPU program on a thread of its own ----------
+ * GP_CPU_START (program, event): wait for the event, then a helper thread
+ * runs the CPU program while the runner goes on (the copies of GP_FETCH,
+ * the launches of the GPU). GP_CPU_WAIT: wait for the program. One program
+ * at a time. */
+static pthread_mutex_t gg_hmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gg_hcv = PTHREAD_COND_INITIALIZER;
+static const int64_t *gg_hjob;
+static int gg_hbusy, gg_hfail, gg_hon;
+
+static void *gg_helper(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&gg_hmu);
+        while (gg_hjob == NULL) {
+            pthread_cond_wait(&gg_hcv, &gg_hmu);
+        }
+        const int64_t *prog = gg_hjob;
+        pthread_mutex_unlock(&gg_hmu);
+        int rc = gg_cpu_run == NULL ? -1 : gg_cpu_run(prog, -1);
+        pthread_mutex_lock(&gg_hmu);
+        gg_hjob = NULL;
+        gg_hbusy = 0;
+        gg_hfail |= rc != 0;
+        pthread_cond_broadcast(&gg_hcv);
+        pthread_mutex_unlock(&gg_hmu);
+    }
+    return NULL;
 }
 
 /* ---------- the copy of the weights of the experts ----------
@@ -5899,6 +5936,41 @@ static int gg_boundary(gg_prog *g, const gp_rec *r)
         CK(cudaMemcpyAsync((void *)(intptr_t)r->v[1], (const void *)(intptr_t)r->v[0],
                            (size_t)r->v[2], cudaMemcpyHostToDevice, gg_stream));
         return 0;
+    case GP_CPU_START:
+        CK(cudaEventSynchronize(g->ev[r->v[1]]));
+        pthread_mutex_lock(&gg_hmu);
+        if (!gg_hon) {
+            pthread_t th;
+            if (pthread_create(&th, NULL, gg_helper, NULL) != 0) {
+                pthread_mutex_unlock(&gg_hmu);
+                snprintf(gg_error, sizeof(gg_error), "no helper thread for GP_CPU_START");
+                return -1;
+            }
+            pthread_detach(th);
+            gg_hon = 1;
+        }
+        while (gg_hbusy) {
+            pthread_cond_wait(&gg_hcv, &gg_hmu);
+        }
+        gg_hbusy = 1;
+        gg_hjob = (const int64_t *)(intptr_t)r->v[0];
+        pthread_cond_broadcast(&gg_hcv);
+        pthread_mutex_unlock(&gg_hmu);
+        return 0;
+    case GP_CPU_WAIT: {
+        pthread_mutex_lock(&gg_hmu);
+        while (gg_hbusy) {
+            pthread_cond_wait(&gg_hcv, &gg_hmu);
+        }
+        int bad = gg_hfail;
+        gg_hfail = 0;
+        pthread_mutex_unlock(&gg_hmu);
+        if (bad) {
+            snprintf(gg_error, sizeof(gg_error), "the CPU program of a GP_CPU_START failed");
+            return -1;
+        }
+        return 0;
+    }
     default:
         return -1;
     }
