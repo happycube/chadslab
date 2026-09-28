@@ -399,9 +399,13 @@ Results (RTX 5060 Ti with 8 GB free; greedy decode after 100 tokens):
   griddepcontrol there, and the graphs keep ordinary edges (about 4%
   slower here).
 
+- A large group of a prompt runs only if the two buffers of its copies
+  fit (QwenGPU._fetch_fits); else the prompt runs in split groups. Here
+  they need 4.1 GB, and 3.2 GB is free even with 0.3 GB of hot experts.
+  On a model of 8 layers (room for the buffers), a prompt of 1100 tokens
+  with a large group gives the logits of split groups within 6e-3.
+
 Next:
-- The large groups of a prompt: their two copy buffers (3.1 GB) do not
-  fit next to 2 GB of hot experts on this GPU.
 - The attention of a large group: one record for each query now.
 
 ## Risks

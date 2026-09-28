@@ -511,10 +511,19 @@ class QwenGPU:
         self.cache.n = pos + n
         self._pending = None
 
+    def _fetch_fits(self):
+        """The two buffers of the copies of a large group exist, or fit in
+        the free memory of the GPU with 0.5 GB left."""
+        if self.stage is not None:
+            return True
+        need = 2 * (self.E - self.n_slots) * sum(self.per)
+        return mem_info()[0] >= need + 0.5e9
+
     def _sizes(self, rem, room):
         """The next group of a prompt with rem tokens left and room rows
-        left in the cache: (size, tokens, fetch)."""
-        if rem >= FETCH_MIN:
+        left in the cache: (size, tokens, fetch). A large group runs only if
+        the buffers of its copies fit."""
+        if rem >= FETCH_MIN and self._fetch_fits():
             for s in sorted(FETCH_SIZES, reverse=True):
                 if s <= room and (rem >= s or s == min(FETCH_SIZES)):
                     return s, min(rem, s), True
