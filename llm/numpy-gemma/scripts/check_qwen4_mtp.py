@@ -40,13 +40,14 @@ def rel(a, b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--path", default=PATH)
-    ap.add_argument("--mtp", default=MTP)
+    ap.add_argument("--mtp", default=MTP, help='the MTP file ("": the MTP layer of --path)')
     ap.add_argument("--tok", default=TOK)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--draft", type=int, default=3)
     ap.add_argument("--prompt", default=PROMPT)
     args = ap.parse_args()
+    args.mtp = args.mtp or None
     tok = QwenTokenizer(args.tok)
     ok = True
     if args.layers:

@@ -9,8 +9,8 @@ QWEN38_PLAN.md has the full plan and the history of each phase.
 - The work is on master in the repo chadslab. Do not push. Commit with the
   lines of the session at the end (see the git log).
 - The routed experts of the GGUF are in groups of 16 rows (type 53,
-  KQ_NVX; section 4). The code still reads type 51 (the file
-  ...-bf16-nv4.gguf, kept for a comparison).
+  KQ_NVX; section 4). The code still reads type 51 (the file of type 51 is
+  deleted; the converter makes it with --experts nv4).
 - Do not stop serve.py (port 8080). The user runs other programs on this
   machine; the numbers change with that load.
 - Do not use git stash in this repo. It took the changes of the user in
@@ -20,8 +20,8 @@ QWEN38_PLAN.md has the full plan and the history of each phase.
 ## 2. The models and the files on disk
 
     models/Qwen3.8-Flash-Next-NVFP4/          the checkpoint of NVIDIA ModelOpt (124 GiB)
-    models2/Qwen3.8-Flash-Next-NVFP4-GGUF/    the GGUF of this runtime (132 GB, type 53),
-                                              ...-bf16-nv4.gguf (133 GB, type 51), tokenizer.json
+    models2/Qwen3.8-Flash-Next-NVFP4-GGUF/    the GGUF of this runtime (132 GB, type 53) and
+                                              tokenizer.json
     models2/Qwen3.8-Flash-Next-GGUF/          the GGUF of Unsloth (UD-Q4_K_XL), moved here
                                               by the user (it was in /spaceu1, and in models/)
     llama.cpp-qwen4exp/build-cuda, build-cpu  llama.cpp (qwen4exp branch); build-cpu has no CUDA
@@ -139,10 +139,10 @@ the machine, so a time can change by 15%:
     CPU, a prompt of 512 (dense q8, 6.1 s)   the experts 1.8 s (about 43 GB/s: the memory),
                                              the dense products 1.9 s, GDN 1.1 s, HC_MIX 0.43 s,
                                              ATTN_QSA 0.36 s, KQ_QUANT 0.31 s
-    CPU, a decode step (124 ms)              the dense products 75 ms (51 to 58 GB/s; the
-                                             matrices of 320 rows or columns 40 to 47 GB/s),
-                                             the experts 37 ms (43 GB/s). About 5.8 GB for each
-                                             token: 47 GB/s, 71% of the 66 GB/s of the memory.
+    CPU, a decode step (119 ms)              the dense products 72 ms (51 to 64 GB/s; 320 x
+                                             10240 about 52 GB/s), the experts 35 ms (45
+                                             GB/s). About 5.8 GB for each token: 49 GB/s, 74%
+                                             of the 66 GB/s of the memory.
     GPU, a group of 1024 (1.88 s; 2.67 s     FETCH_WAIT 0.43 s (the copies, 6.8 GB/s), the dense
     with type 51)                            products 0.32 s, the experts on the GPU 0.28 s,
                                              CPU_WAIT 0.17 s, GDN 0.12 s. MOE_PLAN: 27 of 171
@@ -171,16 +171,16 @@ The switches for a comparison:
 
 ## 7. The next steps
 
-1. Remove the file of type 51 when the comparisons are done (133 GB).
-2. The 8-bit dense products of 320 rows (hc_*_down: 20 groups for 18
-   threads) and 320 columns: 40 to 47 GB/s in a decode step, not 57.
-3. The GPU decode of dense matrices with short rows (hc_*_up: 320 values):
+1. The 8-bit product of 320 rows (hc_*_down, 20 groups for 18 threads)
+   gives about 52 GB/s in a decode step, not 64. Two halves of the columns
+   as tasks were not faster (section 8).
+2. The GPU decode of dense matrices with short rows (hc_*_up: 320 values):
    a lane for each row. A GPU kernel that reads KQ_Q8X16 can be a test.
-4. Memory: in q8 mode, the Q8_0 copy stays next to KQ_Q8X16 (3.9 GB more);
+3. Memory: in q8 mode, the Q8_0 copy stays next to KQ_Q8X16 (3.9 GB more);
    drop it when no GPU uses it.
-5. The 3090 (sm_86, 24 GB, PCIe 3.0 x16): check the build and the hot
+4. The 3090 (sm_86, 24 GB, PCIe 3.0 x16): check the build and the hot
    budget. MTP and the prompt copies can be faster there.
-6. The minimum size of the copy buffer of a prompt (a warning now when it is
+5. The minimum size of the copy buffer of a prompt (a warning now when it is
    less than 32 experts).
 
 ## 8. The CPU layouts of float32 and bfloat16 (types 61 and 62)
@@ -210,3 +210,17 @@ The switches for a comparison:
       dense q8, a prompt of 512      the float32 matrices 0.93 s -> 0.31 s
       dense bf16, a prompt of 512    15.8 s -> 9.9 s (the dense products 10.7 s -> 4.5 s)
       decode steps                   no change (q8 124 ms; bf16 about 185 ms, 5% of noise)
+
+The 8-bit products (KQ_Q8X16), a step or a verify group:
+
+- A record took about 13 us more than its work: a malloc and 4 barriers
+  for x + 128. Now each thread makes x + 128 on its stack (x of at most
+  96 KB), and the record has one barrier: about 3 us.
+- The tokens go in batches of 8, 4, 2, and 1, with counts fixed at compile
+  time. With a variable count, 4 tokens on 10240 x 320 took 132 us, not 64
+  us. A token has the same operations in all the batches: the same bits
+  (check_qwen4_mtp: the verify group equals the steps).
+- A decode step (the profile): the dense products 75.3 ms -> 71.6 ms, the
+  step 124 ms -> 119 ms. 320 x 10240: 8.5 ms -> 8.3 ms; 10240 x 320: 7.2 ms
+  -> 6.3 ms.
+- check_qwen4_mtp --mtp "" takes the MTP layer of the GGUF file.

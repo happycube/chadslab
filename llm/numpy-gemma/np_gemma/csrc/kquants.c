@@ -1063,8 +1063,8 @@ static void kq_rows4(const uint8_t *w, size_t rb, int type, int cols, const int8
 /* out (t x rows) = x W^T, inside a parallel region. x is the float input
  * (for F32), and xq, xs, xm its quantization (kq_quant_body). */
 #if defined(__AVX512VNNI__)
-#define KQ_X16_TB 8
 #define KQ_X16_BB 576
+#define KQ_X16_XL 98304                  /* the bytes of a small x (kq_x16_body) */
 /* KQ_Q8X16: rows g * 16 .. + 15 (the group at wg) on the tokens j0 .. j1 - 1,
  * 8 tokens at a time. xu is x as uint8 (x + 128). vpdpbusd (u8 x s8) on x + 128
  * and w gives sum(x w) + 128 sum(w): the int32 sum of a block starts at
@@ -1073,41 +1073,75 @@ static void kq_rows4(const uint8_t *w, size_t rb, int type, int cols, const int8
  * for each token, 8 vpdpbusd with 4 values of x in each lane, then the scales
  * of the 16 rows times xs. out gets the 16 rows of each token (a stride of
  * rows). */
+/* NT tokens from j (a count fixed at compile time: the sums stay in
+ * registers). */
+#define KQ_X16_NT(NT)                                                                             \
+static inline void kq_x16_tok##NT(const uint8_t *wg, int nb, int cols, const uint8_t *xu,        \
+                                  const float *xs, int j, float *out, size_t rows)               \
+{                                                                                                 \
+    __m512 f[NT];                                                                                 \
+    for (int tt = 0; tt < NT; ++tt) {                                                             \
+        f[tt] = _mm512_setzero_ps();                                                              \
+    }                                                                                             \
+    for (int b = 0; b < nb; ++b) {                                                                \
+        const uint8_t *blk = wg + (size_t)b * KQ_X16_BB;                                          \
+        __m512 d = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)blk));                     \
+        __m512i c0 = _mm512_slli_epi32(_mm512_cvtepi16_epi32(                                     \
+            _mm256_sub_epi16(_mm256_setzero_si256(), _mm256_loadu_si256((const __m256i *)(blk + 32)))), 7); \
+        __m512i W[8];                                                                             \
+        for (int k = 0; k < 8; ++k) {                                                             \
+            W[k] = _mm512_loadu_si512((const void *)(blk + 64 + 64 * k));                         \
+        }                                                                                         \
+        _Pragma("GCC unroll 8")                                                                   \
+        for (int tt = 0; tt < NT; ++tt) {                                                         \
+            const uint8_t *xb = xu + (size_t)(j + tt) * cols + 32 * b;                            \
+            __m512i acc = c0;                                                                     \
+            for (int k = 0; k < 8; ++k) {                                                         \
+                int32_t x4;                                                                       \
+                memcpy(&x4, xb + 4 * k, 4);                                                       \
+                acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(x4), W[k]);                      \
+            }                                                                                     \
+            f[tt] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc),                                      \
+                                    _mm512_mul_ps(d, _mm512_set1_ps(xs[(size_t)(j + tt) * nb + b])), \
+                                    f[tt]);                                                       \
+        }                                                                                         \
+    }                                                                                             \
+    for (int tt = 0; tt < NT; ++tt) {                                                             \
+        _mm512_storeu_ps(out + (size_t)(j + tt) * rows, f[tt]);                                   \
+    }                                                                                             \
+}
+KQ_X16_NT(8)
+KQ_X16_NT(4)
+KQ_X16_NT(2)
+KQ_X16_NT(1)
+
+/* KQ_Q8X16: rows g * 16 .. + 15 (the group at wg) on the tokens j0 .. j1 - 1,
+ * 8 tokens at a time, then 4, 2, 1 (counts fixed at compile time: a
+ * variable count made 4 tokens on 10240 x 320 take 1.9 times 1 token). xu
+ * is x as uint8 (x + 128). vpdpbusd (u8 x s8) on x + 128 and w gives sum(x
+ * w) + 128 sum(w): the int32 sum of a block starts at -128 times the sums
+ * of the rows (made when the rows were packed), the same for all the
+ * tokens. For each block: the 8 steps of the group in registers; for each
+ * token, 8 vpdpbusd with 4 values of x in each lane, then the scales of the
+ * 16 rows times xs. out gets the 16 rows of each token (a stride of rows).
+ * Each token has the same operations in all the counts: the same bits. */
 static void kq_x16_group(const uint8_t *wg, int cols, const uint8_t *xu, const float *xs, int j0,
                          int j1, float *out, size_t rows)
 {
-    int nb = cols / 32;
-    for (int j = j0; j < j1; j += KQ_X16_TB) {
-        int nt = j1 - j < KQ_X16_TB ? j1 - j : KQ_X16_TB;
-        __m512 f[KQ_X16_TB];
-        for (int tt = 0; tt < KQ_X16_TB; ++tt) {
-            f[tt] = _mm512_setzero_ps();
-        }
-        for (int b = 0; b < nb; ++b) {
-            const uint8_t *blk = wg + (size_t)b * KQ_X16_BB;
-            __m512 d = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)blk));
-            __m512i c0 = _mm512_slli_epi32(_mm512_cvtepi16_epi32(
-                _mm256_sub_epi16(_mm256_setzero_si256(), _mm256_loadu_si256((const __m256i *)(blk + 32)))), 7);
-            __m512i W[8];
-            for (int k = 0; k < 8; ++k) {
-                W[k] = _mm512_loadu_si512((const void *)(blk + 64 + 64 * k));
-            }
-            for (int tt = 0; tt < nt; ++tt) {
-                const uint8_t *xb = xu + (size_t)(j + tt) * cols + 32 * b;
-                __m512i acc = c0;
-                for (int k = 0; k < 8; ++k) {
-                    int32_t x4;
-                    memcpy(&x4, xb + 4 * k, 4);
-                    acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(x4), W[k]);
-                }
-                f[tt] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc),
-                                        _mm512_mul_ps(d, _mm512_set1_ps(xs[(size_t)(j + tt) * nb + b])),
-                                        f[tt]);
-            }
-        }
-        for (int tt = 0; tt < nt; ++tt) {
-            _mm512_storeu_ps(out + (size_t)(j + tt) * rows, f[tt]);
-        }
+    int nb = cols / 32, j = j0;
+    for (; j + 8 <= j1; j += 8) {
+        kq_x16_tok8(wg, nb, cols, xu, xs, j, out, rows);
+    }
+    if (j + 4 <= j1) {
+        kq_x16_tok4(wg, nb, cols, xu, xs, j, out, rows);
+        j += 4;
+    }
+    if (j + 2 <= j1) {
+        kq_x16_tok2(wg, nb, cols, xu, xs, j, out, rows);
+        j += 2;
+    }
+    if (j < j1) {
+        kq_x16_tok1(wg, nb, cols, xu, xs, j, out, rows);
     }
 }
 
@@ -1118,8 +1152,31 @@ static void kq_x16_group(const uint8_t *wg, int cols, const uint8_t *xu, const f
 static void kq_x16_body(const uint8_t *w, int rows, int cols, const int8_t *xq, const float *xs,
                         int t, float *out)
 {
-    uint8_t *xu = NULL;
     size_t n = (size_t)t * cols;
+    size_t gb = (size_t)cols / 32 * KQ_X16_BB;
+    if (n <= KQ_X16_XL) {
+        /* a small x (a step, a verify group): each thread makes x + 128 on
+         * its stack, so the record has one barrier, not four (and no
+         * malloc). Two halves of the columns as tasks, for a matrix of few
+         * groups (hc_*_down: 20 groups for 18 threads), were not faster. */
+        __attribute__((aligned(64))) uint8_t xl[KQ_X16_XL];
+        for (size_t i = 0; i < n; i += 64) {
+            if (i + 64 <= n) {
+                __m512i v = _mm512_loadu_si512((const void *)(xq + i));
+                _mm512_store_si512((void *)(xl + i), _mm512_xor_si512(v, _mm512_set1_epi8((char)0x80)));
+            } else {
+                for (size_t k = i; k < n; ++k) {
+                    xl[k] = (uint8_t)xq[k] ^ 0x80;
+                }
+            }
+        }
+        #pragma omp for schedule(static)
+        for (int g = 0; g < rows / 16; ++g) {
+            kq_x16_group(w + (size_t)g * gb, cols, xl, xs, 0, t, out + 16 * g, (size_t)rows);
+        }
+        return;
+    }
+    uint8_t *xu = NULL;
     #pragma omp single copyprivate(xu)
     xu = (uint8_t *)aligned_alloc(64, (n + 63) / 64 * 64);
     #pragma omp for schedule(static)
@@ -1133,7 +1190,6 @@ static void kq_x16_body(const uint8_t *w, int rows, int cols, const int8_t *xq, 
             }
         }
     }
-    size_t gb = (size_t)cols / 32 * KQ_X16_BB;
     for (int j0 = 0; j0 < t; j0 += MA_TB) {
         int j1 = t - j0 < MA_TB ? t : j0 + MA_TB;
         #pragma omp for schedule(static) nowait
