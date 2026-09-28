@@ -435,11 +435,12 @@ Mixed groups of a prompt (np_gemma/qwen4_gpu.py, _moe_mix):
 The products and the attention of large groups (more than 16 rows):
 
 - The kernels k_kq_tc, k_qmoe_gu_tc, and k_qmoe_dn_tc (csrc/gpu.cu) use
-  mma.sync m16n8k32 on int8 values, as k_gemm_q8. x is int8, with a scale
-  for each 32 values. A block of 32 values of w gives int8 values, a scale
-  d, and a term mn. The sum of the block is xs d (the int32 sum) + mn xsum. The formats: Q8_R, Q8_0,
-  Q5_1, and Q4_K. The rest (F32, Q5_K, Q6_K) keeps the float32 tiles.
-  NP_GEMMA_GPU_KQTC=0 keeps the float32 tiles for all.
+  mma.sync m16n8k32 on int8 values (as k_gemm_q8). The rows of x are
+  int8, with a scale for each 32 values.
+- A block of 32 values of w gives int8 values, a scale d, and a term mn.
+  The sum of the block is xs d (the int32 sum) + mn xsum. The formats:
+  Q8_R, Q8_0, Q5_1, and Q4_K. The rest (F32, Q5_K, Q6_K) keeps the
+  float32 tiles. NP_GEMMA_GPU_KQTC=0 keeps the float32 tiles for all.
 - k_attn_qsa_mt: one record of ATTN_QSA for a large group. A block takes
   one query, one key head, and 6 query heads; 4 warps split the keys,
   with a softmax that runs. A group of at most 16 rows keeps one record
