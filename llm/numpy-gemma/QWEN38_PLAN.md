@@ -400,10 +400,10 @@ Results (RTX 5060 Ti with 8 GB free; greedy decode after 100 tokens):
   slower here).
 
 - A large group of a prompt runs only if the two buffers of its copies
-  fit (QwenGPU._fetch_fits); else the prompt runs in split groups. Here
+  fit (QwenGPU._fetch_fits). Else the prompt runs in split groups. Here
   they need 4.1 GB, and 3.2 GB is free even with 0.3 GB of hot experts.
-  On a model of 8 layers (room for the buffers), a prompt of 1100 tokens
-  with a large group gives the logits of split groups within 6e-3.
+  A model of 8 layers has room for the buffers. On it, a prompt of 1100
+  tokens with a large group gives the logits of split groups within 6e-3.
 
 Next:
 - The attention of a large group: one record for each query now.
