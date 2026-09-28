@@ -1811,6 +1811,18 @@ free, on PCIe Gen3 x8. Other programs ran on the machine.
 The rates are tokens a second. llama.cpp uses the Q4_K_XL GGUF file of
 Unsloth.
 
+The long prompts depend on the free memory of the GPU. The cache of a long
+context takes the room of the buffer of the expert copies.
+
+    prompt           GPU memory                     dense   tok/s
+    32768 tokens     about 8 GB free                q8      253 (a buffer of 0 to 3 experts)
+    32768 tokens     13 GB free                     bf16    351
+    131072 tokens    13 GB free (cache 5.6 GB)      q8      424
+
+The buffer now keeps room for at least 64 experts (a group of 1024 at 32K:
+2.8 s, not 3.8 s). With much free memory, the "auto" dense mode takes
+bf16, which is slower here: use NP_GEMMA_DENSE=q8.
+
 - The GPU holds the dense part and 0.5 GB of hot experts. In the decode,
   the CPU computes the other experts. A prompt runs in mixed groups: the GPU
   copies the experts with the most tokens, and the CPU computes the others

@@ -70,6 +70,12 @@ MIX_GPU = int(os.environ.get("NP_GEMMA_GPU_MIX_GPU", "700000"))
 # The free memory that the buffer of the copies leaves (the programs of the
 # decode, MTP, and the verify groups).
 MIX_KEEP = float(os.environ.get("NP_GEMMA_GPU_MIX_KEEP", "0.8e9"))
+# A long context (its cache on the GPU) can leave no room for the buffer:
+# then the free memory kept goes down to MIX_KEEP_MIN, for a buffer of
+# MIX_RING_MIN experts. A group copies about 28 experts in each layer; at
+# 32K, a buffer of 0 to 3 experts gave 267 tok/s, one of 189 367 tok/s.
+MIX_KEEP_MIN = float(os.environ.get("NP_GEMMA_GPU_MIX_KEEP_MIN", "0.3e9"))
+MIX_RING_MIN = int(os.environ.get("NP_GEMMA_GPU_MIX_RING_MIN", "64"))
 
 
 class _Emit4:
@@ -258,7 +264,10 @@ class Qwen4GPU(QwenGPU):
         if self.mix_ring is None:
             self._head(1)
             per = sum(self.per)
-            cap = int(min(self.E, max(0, mem_info()[0] - MIX_KEEP) // per))
+            free = mem_info()[0]
+            cap = int(min(self.E, max(0, free - MIX_KEEP) // per))
+            if cap < MIX_RING_MIN:
+                cap = int(min(MIX_RING_MIN, max(0, free - MIX_KEEP_MIN) // per))
             self.mix_cap = cap
             if cap < 32:
                 import warnings
