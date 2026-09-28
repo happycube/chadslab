@@ -353,16 +353,19 @@ class GGUF:
         return np.frombuffer(self._mm, dtype=dt, count=n, offset=self._base + off), dims, t
 
     def advise_random(self, gname):
-        """No read-ahead on the bytes of a tensor (random rows: the n-gram
-        table)."""
+        """No read-ahead and no huge pages on the bytes of a tensor (random
+        rows: the n-gram table). With the huge pages of __init__, a fault of
+        one row of 160 bytes reads 2 MB: 512 tokens read 3 to 5 GB."""
         dims, t, off = self.tensors[gname]
         raw, _d, _t = self.raw(gname)
         lo = self._base + off
         lo -= lo % mmap.PAGESIZE
-        try:
-            self._mm.madvise(mmap.MADV_RANDOM, lo, self._base + off + raw.nbytes - lo)
-        except (AttributeError, OSError, ValueError):
-            pass
+        n = self._base + off + raw.nbytes - lo
+        for adv in ("MADV_NOHUGEPAGE", "MADV_RANDOM"):
+            try:
+                self._mm.madvise(getattr(mmap, adv), lo, n)
+            except (AttributeError, OSError, ValueError):
+                pass
 
     def dequant(self, gname, rows=None):
         """float32 values of a tensor by GGUF name, in the shape of NumPy

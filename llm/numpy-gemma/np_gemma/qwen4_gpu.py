@@ -407,9 +407,13 @@ class Qwen4GPU(QwenGPU):
         room = self.cache.max_len
         while c0 < len(ids):
             rem = len(ids) - c0
-            if MIX_SIZE > 0 and rem >= MIX_MIN and room - pos - c0 >= MIX_SIZE:
-                n = min(rem, MIX_SIZE)
-                h = self.mix(ids[c0:c0 + n], pos + c0, MIX_SIZE)
+            # The mixed group: MIX_SIZE rows, or the smallest of 256, 512, ...
+            # that holds the rest and fits in the cache.
+            size = next((sz for sz in (256, 512, 1024, 2048, 4096)
+                         if sz <= MIX_SIZE and sz >= min(rem, MIX_SIZE) and sz <= room - pos - c0), 0)
+            if MIX_SIZE > 0 and rem >= MIX_MIN and size:
+                n = min(rem, size)
+                h = self.mix(ids[c0:c0 + n], pos + c0, size)
                 if streams:
                     hs.append(self.streams(n))
                 c0 += n

@@ -347,10 +347,11 @@ class NVFP4Source:
             lo = st._base + min(a for a, _b in spans)
             hi = st._base + max(b for _a, b in spans)
             lo -= lo % mmap.PAGESIZE
-            try:
-                st._mm.madvise(mmap.MADV_RANDOM, lo, hi - lo)
-            except (AttributeError, OSError, ValueError):
-                pass
+            for adv in ("MADV_NOHUGEPAGE", "MADV_RANDOM"):    # no 2 MB reads for a row
+                try:
+                    st._mm.madvise(getattr(mmap, adv), lo, hi - lo)
+                except (AttributeError, OSError, ValueError):
+                    pass
 
     def _ple_scale(self):
         v = self._cache.get("_ple_scale")
