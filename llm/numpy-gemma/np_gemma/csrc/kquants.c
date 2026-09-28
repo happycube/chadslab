@@ -883,11 +883,96 @@ static void kq_row(const uint8_t *w, int type, int cols, const int8_t *xq, const
 /* Rows r .. r + 3 (at w, rb bytes each) on n tokens: tiles of 4 tokens for
  * n >= 4, else one row at a time. out[i + j * ostride] gets row r + i,
  * token j. */
+#if defined(__AVX512VNNI__)
+/* NVFP4, rows r .. r + 3 on n tokens (the experts of a group): the 4 rows
+ * to |w| (int8), the signs, and the E4M3 scales in the order of the 16 sums
+ * of a chunk of 64 values, one time; then tiles of 4 rows by 4 tokens, so a
+ * chunk of a row and of a token is loaded one time for 4 products. The sums,
+ * the scales, and their order are those of kq_dot_nv4: the bits of steps. */
+static void kq_rows4_nv4(const uint8_t *w, size_t rb, int cols, const int8_t *xq,
+                         const float *xs, int n, float *out, size_t ostride)
+{
+    __attribute__((aligned(64))) int8_t aw[4][KQ_NV4_MAX];
+    __attribute__((aligned(64))) float wsc[4][KQ_NV4_MAX / 64][16];
+    __mmask64 negs[4][KQ_NV4_MAX / 64];
+    float g[4];
+    int nb = cols / 32, nc = cols / 64;
+    const __m512i lut5 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1x2));
+    const __m512i m45 = _mm512_set1_epi8(15);
+    for (int r = 0; r < 4; ++r) {
+        const uint8_t *wr = w + (size_t)r * rb;
+        memcpy(&g[r], wr, 4);
+        for (int b = 0; b < nb; b += 2) {
+            const uint8_t *b0 = wr + 4 + (size_t)b * 18, *b1 = b0 + 18;
+            __m256i q01 = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(b0 + 2))),
+                _mm_loadu_si128((const __m128i *)(b1 + 2)), 1);
+            __m512i q = _mm512_inserti64x4(_mm512_castsi256_si512(q01), q01, 1);
+            q = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 0, 1, 2, 3, 2, 3), q);
+            __m512i codes = _mm512_and_si512(
+                _mm512_mask_blend_epi64(0xcc, q, _mm512_srli_epi16(q, 4)), m45);
+            __m512i wv = _mm512_shuffle_epi8(lut5, codes);
+            negs[r][b / 2] = _mm512_movepi8_mask(wv);
+            _mm512_store_si512((void *)(aw[r] + 32 * b), _mm512_abs_epi8(wv));
+            float s4[4] = {kq_e4m3_tab[b0[0]], kq_e4m3_tab[b0[1]], kq_e4m3_tab[b1[0]],
+                           kq_e4m3_tab[b1[1]]};
+            for (int l = 0; l < 16; ++l) {
+                wsc[r][b / 2][l] = s4[l / 4];
+            }
+        }
+    }
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        __m512 acc[4][4];
+        for (int r = 0; r < 4; ++r) {
+            for (int t = 0; t < 4; ++t) {
+                acc[r][t] = _mm512_setzero_ps();
+            }
+        }
+        for (int c = 0; c < nc; ++c) {
+            __m512i xv[4];
+            __m512 xsv[4];
+            for (int t = 0; t < 4; ++t) {
+                const float *sr = xs + (size_t)(j + t) * nb;
+                xv[t] = _mm512_loadu_si512((const void *)(xq + (size_t)(j + t) * cols + 64 * c));
+                xsv[t] = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(sr[2 * c]),
+                                              _mm512_set1_ps(sr[2 * c + 1]));
+            }
+            for (int r = 0; r < 4; ++r) {
+                __m512i wa = _mm512_load_si512((const void *)(aw[r] + 64 * c));
+                __m512 ws = _mm512_load_ps(wsc[r][c]);
+                for (int t = 0; t < 4; ++t) {
+                    __m512i sx = _mm512_mask_sub_epi8(xv[t], negs[r][c], _mm512_setzero_si512(), xv[t]);
+                    __m512i is = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wa, sx);
+                    acc[r][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), _mm512_mul_ps(ws, xsv[t]),
+                                                acc[r][t]);
+                }
+            }
+        }
+        for (int r = 0; r < 4; ++r) {
+            for (int t = 0; t < 4; ++t) {
+                out[(size_t)(j + t) * ostride + r] = 0.5f * g[r] * _mm512_reduce_add_ps(acc[r][t]);
+            }
+        }
+    }
+    for (; j < n; ++j) {                    /* the last tokens: one at a time */
+        for (int r = 0; r < 4; ++r) {
+            out[(size_t)j * ostride + r] = kq_dot_nv4(w + (size_t)r * rb, cols, xq + (size_t)j * cols,
+                                                      xs + (size_t)j * nb);
+        }
+    }
+}
+#endif
+
 static void kq_rows4(const uint8_t *w, size_t rb, int type, int cols, const int8_t *xq,
                      const float *xs, const float *xm, const float *x, int n, float *out,
                      size_t ostride)
 {
 #if defined(__AVX512VNNI__)
+    if (type == KQ_NV4 && n > 1 && cols % 64 == 0 && cols <= KQ_NV4_MAX) {
+        kq_rows4_nv4(w, rb, cols, xq, xs, n, out, ostride);
+        return;
+    }
     if (n >= 4 && kq_tiles(type, cols)) {
         const uint8_t *wr[4] = {w, w + rb, w + 2 * rb, w + 3 * rb};
         float ds[4][KQ_S], dm[4][KQ_S];

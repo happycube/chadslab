@@ -230,8 +230,12 @@ class QwenGPU:
         e = self._dense.get(name)
         if e is None:
             m = self.model.M(name)
-            if m.type == Q8_0:
-                b = m.data.reshape(m.rows, m.cols // 32, 34)
+            data, type_ = m.data, m.type
+            if type_ == 30 and getattr(self, "dense_q8", False) and m.cols % 32 == 0 and m.rows > 1:
+                # bfloat16 to Q8_0 for a GPU of little memory (Qwen4GPU)
+                data, type_ = cops.kq_to_q8_0(data.view(np.uint16), m.cols), Q8_0
+            if type_ == Q8_0:
+                b = data.reshape(m.rows, m.cols // 32, 34)
                 pad = -(m.cols // 32 * 34) % 16      # rows of a multiple of 16 bytes
                 a = np.concatenate([b[:, :, 2:].reshape(m.rows, m.cols),
                                     b[:, :, :2].reshape(m.rows, m.cols // 16),

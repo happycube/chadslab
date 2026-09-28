@@ -142,6 +142,8 @@ class Qwen4GPU(QwenGPU):
         self.mcache = None
         L = model.cfg.num_hidden_layers
         self.has_mtp = "blk.%d.nextn.eh_proj.weight" % L in model.g.tensors
+        self.model = model
+        self.dense_q8 = self._dense_mode()
         super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph)
         self.cache_dev = _DevCache4()
 
@@ -297,16 +299,36 @@ class Qwen4GPU(QwenGPU):
         for j in range(rows):
             hc.score_rows(idx, sel[lay, j])
 
-    def _dense_bytes(self):
+    def _dense_bytes(self, bf16_as_q8=None):
+        """The bytes of the dense tensors on the GPU (bfloat16 counts as Q8_0
+        when dense_q8)."""
+        from .gguf import tensor_bytes
         g = self.model.g
+        q8 = self.dense_q8 if bf16_as_q8 is None else bf16_as_q8
         n = 0
-        skip = ("token_embd.weight", "output.weight", "per_layer_token_embd.weight")
-        L = self.cfg.num_hidden_layers
-        for name in g.tensors:
+        skip = ("token_embd.weight", "output.weight", "per_layer_token_embd.weight",
+                "per_layer_token_embd.scale")
+        L = self.model.cfg.num_hidden_layers
+        for name, (dims, t, _o) in g.tensors.items():
             if "_exps" in name or name in skip or name.startswith("blk.%d." % L):
                 continue
-            n += g.raw(name)[0].nbytes
+            n += tensor_bytes(dims, 8 if (t == 30 and q8) else t)
         return n
+
+    def _dense_mode(self):
+        """True: the bfloat16 matrices go to the GPU as Q8_0 (NP_GEMMA_GPU_DENSE
+        q8), else as they are (bf16). auto: q8 when the free memory is less
+        than the bfloat16 dense part, the head, and 3 GB."""
+        mode = os.environ.get("NP_GEMMA_GPU_DENSE", "auto")
+        if mode != "auto":
+            return mode == "q8"
+        from .gguf import tensor_bytes
+        g = self.model.g
+        if not any(t == 30 for _d, t, _o in g.tensors.values()):
+            return False
+        dims, t, _o = g.tensors["output.weight"]
+        need = self._dense_bytes(bf16_as_q8=False) + tensor_bytes(dims, t) + 3e9
+        return mem_info()[0] < need
 
     def _compile(self, t, verify=False, fetch=False):
         self._pool = {}

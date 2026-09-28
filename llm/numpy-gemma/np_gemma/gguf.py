@@ -29,6 +29,24 @@ Q5_0, Q5_1, Q8_0, Q8_1 = 6, 7, 8, 9
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K = 10, 11, 12, 13, 14, 15
 IQ4_NL = 20
 BF16 = 30
+# The types of this runtime (not of ggml), in files of
+# scripts/convert_nvfp4_gguf.py: NVFP4 in the rows of KQ_NV4 (csrc/kquants.c:
+# the float32 scale of the matrix, then blocks of 32 values of 18 bytes), and
+# rows of FP8 E4M3 codes (one byte for each value; the tensor <name>.scale
+# holds the scale).
+NV4 = 50
+E4M3_ROWS = 52
+_ROW_BYTES = {NV4: lambda cols: 4 + cols // 32 * 18, E4M3_ROWS: lambda cols: cols}
+
+
+def _e4m3_values():
+    b = np.arange(256)
+    e, m = (b >> 3) & 15, b & 7
+    v = np.where(e == 0, m / 512.0, (1 + m / 8) * 2.0 ** (e - 7))
+    return np.where(b & 128, -v, v).astype(np.float32)
+
+
+E4M3_VALUES = _e4m3_values()
 
 # The 16 values of the 4-bit codes of IQ4_NL (ggml kvalues_iq4nl).
 _IQ4_NL_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89,
@@ -44,7 +62,7 @@ _BLOCK = {
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
-    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL",
+    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", NV4: "NV4", E4M3_ROWS: "E4M3_ROWS",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -324,6 +342,9 @@ class GGUF:
         """The blocks of a tensor by its GGUF name, as a structured array
         (a view of the map), with its dims (ggml order) and type."""
         dims, t, off = self.tensors[gname]
+        if t in _ROW_BYTES:
+            n = _ROW_BYTES[t](int(dims[0])) * int(np.prod(dims[1:]))
+            return np.frombuffer(self._mm, dtype=np.uint8, count=n, offset=self._base + off), dims, t
         dt = _BLOCK_DT.get(t)
         if dt is None:
             raise ValueError("type %s is not implemented" % _TYPE_NAME.get(t, t))
@@ -331,12 +352,26 @@ class GGUF:
         n = int(np.prod(dims)) // bv
         return np.frombuffer(self._mm, dtype=dt, count=n, offset=self._base + off), dims, t
 
+    def advise_random(self, gname):
+        """No read-ahead on the bytes of a tensor (random rows: the n-gram
+        table)."""
+        dims, t, off = self.tensors[gname]
+        raw, _d, _t = self.raw(gname)
+        lo = self._base + off
+        lo -= lo % mmap.PAGESIZE
+        try:
+            self._mm.madvise(mmap.MADV_RANDOM, lo, self._base + off + raw.nbytes - lo)
+        except (AttributeError, OSError, ValueError):
+            pass
+
     def dequant(self, gname, rows=None):
         """float32 values of a tensor by GGUF name, in the shape of NumPy
         (dims reversed). rows selects rows of a 2-D tensor (or the first
         index of a 3-D one)."""
         raw, dims, t = self.raw(gname)
         shape = tuple(reversed(dims))
+        if t in _ROW_BYTES:
+            return self._dequant_rows(gname, raw, dims, t, rows)
         if rows is None:
             return _dequant(raw, t, int(np.prod(dims))).reshape(shape)
         bv, _bb = _BLOCK[t]
@@ -344,6 +379,21 @@ class GGUF:
         rows = np.asarray(rows).reshape(-1)
         blocks = raw.reshape(-1, per)[rows].reshape(-1)
         return _dequant(blocks, t, len(rows) * per * bv).reshape((len(rows),) + shape[1:])
+
+    def _dequant_rows(self, gname, raw, dims, t, rows):
+        """dequant of the row types of this runtime (NV4, E4M3_ROWS)."""
+        shape = tuple(int(d) for d in reversed(dims))
+        cols = shape[-1]
+        per = int(np.prod(shape[1:-1])) if len(shape) > 2 else 1    # the rows of one index
+        idx = np.arange(shape[0]) if rows is None else np.asarray(rows, dtype=np.int64).reshape(-1)
+        ids = (idx[:, None] * per + np.arange(per)[None, :]).reshape(-1)
+        if t == E4M3_ROWS:
+            scale = self.dequant(gname.replace(".weight", ".scale")).reshape(-1)[0]
+            out = E4M3_VALUES[raw.reshape(-1, cols)[ids]] * scale
+        else:
+            from . import cops
+            out = cops.kq_rows(raw, t, cols, ids)
+        return out.reshape((len(idx),) + shape[1:])
 
     def _gguf(self, hf_name):
         try:
@@ -726,3 +776,93 @@ def open_gguf(path):
     if re.search(r"-\d{5}-of-\d{5}\.gguf$", path):
         return GGUFSplit(path)
     return GGUF(path)
+
+
+# ---- the writer ----
+
+_W_SCALAR = {int: 11, float: 6, bool: 7}
+
+
+def _w_string(f, s):
+    b = s.encode("utf-8")
+    f.write(struct.pack("<Q", len(b)))
+    f.write(b)
+
+
+def _w_value(f, v):
+    """A metadata value: its type, then the value. int is int64, float is
+    float32; a list has one type for all its items."""
+    if isinstance(v, str):
+        f.write(struct.pack("<I", _STRING))
+        _w_string(f, v)
+    elif isinstance(v, bool):
+        f.write(struct.pack("<IB", 7, int(v)))
+    elif isinstance(v, int):
+        f.write(struct.pack("<Iq", 11, v))
+    elif isinstance(v, float):
+        f.write(struct.pack("<If", 6, v))
+    elif isinstance(v, (list, tuple)):
+        f.write(struct.pack("<I", _ARRAY))
+        if v and isinstance(v[0], str):
+            f.write(struct.pack("<IQ", _STRING, len(v)))
+            for x in v:
+                _w_string(f, x)
+        elif v and isinstance(v[0], float):
+            f.write(struct.pack("<IQ", 6, len(v)))
+            f.write(np.asarray(v, dtype="<f4").tobytes())
+        else:
+            f.write(struct.pack("<IQ", 11, len(v)))
+            f.write(np.asarray(v, dtype="<i8").tobytes())
+    else:
+        raise TypeError("metadata value %r" % (v,))
+
+
+def tensor_bytes(dims, t):
+    """The bytes of a tensor of dims (ggml order) and type t."""
+    if t in _ROW_BYTES:
+        return _ROW_BYTES[t](int(dims[0])) * int(np.prod(dims[1:]))
+    bv, bb = _BLOCK[t]
+    return int(np.prod(dims)) // bv * bb
+
+
+def write_gguf(path, meta, tensors, align=32, progress=None):
+    """Write a GGUF file (version 3). meta is a list of (key, value).
+    tensors is a list of (name, dims (ggml order), type, make): make() gives
+    the data (a NumPy array, or a list of arrays written in turn) when the
+    writer comes to the tensor, so one tensor at a time is in memory."""
+    meta = list(meta) + [("general.alignment", align)]
+    infos, off = [], 0
+    for name, dims, t, _make in tensors:
+        infos.append((name, dims, t, off))
+        off += (tensor_bytes(dims, t) + align - 1) // align * align
+    with open(path, "wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<IQQ", 3, len(tensors), len(meta)))
+        for k, v in meta:
+            _w_string(f, k)
+            if k == "general.alignment":
+                f.write(struct.pack("<II", 4, int(v)))
+            else:
+                _w_value(f, v)
+        for name, dims, t, o in infos:
+            _w_string(f, name)
+            f.write(struct.pack("<I", len(dims)))
+            f.write(struct.pack("<%dQ" % len(dims), *[int(d) for d in dims]))
+            f.write(struct.pack("<IQ", t, o))
+        pad = (-f.tell()) % align
+        f.write(b"\0" * pad)
+        base = f.tell()
+        for (name, dims, t, make), (_n, _d, _t, o) in zip(tensors, infos):
+            assert f.tell() == base + o, name
+            data = make()
+            parts = data if isinstance(data, list) else [data]
+            n = 0
+            for a in parts:
+                b = memoryview(np.ascontiguousarray(a)).cast("B")
+                f.write(b)
+                n += len(b)
+            if n != tensor_bytes(dims, t):
+                raise ValueError("%s: %d bytes, not %d" % (name, n, tensor_bytes(dims, t)))
+            f.write(b"\0" * ((-n) % align))
+            if progress is not None:
+                progress(name, n)

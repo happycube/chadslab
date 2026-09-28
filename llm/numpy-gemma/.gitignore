@@ -6,6 +6,7 @@ _libs/
 *.so
 .cache/
 models/
+models2/
 *.gguf
 *.swp
 *.swo

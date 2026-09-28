@@ -668,6 +668,17 @@ class Qwen4CPU(Qwen4):
         if hasattr(self.g, "ple_rows"):
             return self.g.ple_rows(rows.reshape(-1)).reshape(len(ids), -1)
         m = self.K("per_layer_token_embd.weight")
+        if m.type == 52:
+            # FP8 E4M3 rows (scripts/convert_nvfp4_gguf.py): many threads read
+            # the random rows, with no read-ahead.
+            from .gguf import E4M3_VALUES
+            if not getattr(self, "_ple_advised", False):
+                self.g.advise_random("per_layer_token_embd.weight")
+                self._ple_scale = float(self.g.dequant("per_layer_token_embd.scale").reshape(-1)[0])
+                self._ple_advised = True
+            r = rows.reshape(-1).astype(np.int64)
+            raw = cops.kq_gather(m.data.ctypes.data + r * m.cols, m.cols)
+            return (E4M3_VALUES[raw] * self._ple_scale).reshape(len(ids), -1)
         return cops.kq_rows(m.data, m.type, m.cols, rows.reshape(-1)).reshape(len(ids), -1)
 
     def program(self, t, kind=None):
