@@ -38,6 +38,32 @@ from .qwen import QwenCache, QwenConfig, QwenGGUF, kv_rows, kv_store, rms_norm, 
 
 
 
+def dense_mode(g, dense=None):
+    """The form of the large bfloat16 matrices of a model (the NVFP4
+    checkpoint and its GGUF): "bf16" (as they are) or "q8" (requantized to
+    Q8_0 at the first use: half the bytes to read, for the CPU and for a
+    GPU of little memory). dense, else NP_GEMMA_DENSE, else "auto": q8 when
+    a GPU is there and its free memory is less than the bfloat16 dense part,
+    the head, and 3 GB; else bf16."""
+    dense = dense or os.environ.get("NP_GEMMA_DENSE", "auto")
+    if dense != "auto":
+        return dense
+    from .gguf import tensor_bytes
+    big = [(n, d) for n, (d, t, _o) in g.tensors.items()
+           if t == 30 and len(d) == 2 and d[1] > 1 and n != "token_embd.weight"]
+    if not big:
+        return "bf16"
+    try:
+        from . import gpu
+        if not gpu.available():
+            return "bf16"
+        free = gpu.mem_info()[0]
+    except Exception:
+        return "bf16"
+    need = sum(tensor_bytes(d, 30) for _n, d in big) + 3e9
+    return "q8" if free < need else "bf16"
+
+
 def config_from_gguf(g):
     """The QwenConfig of a qwen4exp file, with the fields of the new parts."""
     cfg = QwenConfig.from_gguf(g)
@@ -576,8 +602,9 @@ class Qwen4CPU(Qwen4):
 
     CHUNK = 512
 
-    def __init__(self, path, cfg=None, layers=None, mtp=None):
+    def __init__(self, path, cfg=None, layers=None, mtp=None, dense=None):
         super().__init__(path, cfg, layers, mtp)
+        self.dense = dense_mode(self.g, dense)
         self._k = {}
         self._f = {}
         self.programs = {}
@@ -587,7 +614,13 @@ class Qwen4CPU(Qwen4):
         m = self._k.get(gname)
         if m is None:
             m = KMat(self.g, gname)
-            if m.type == 30 and ".indexer." in gname:
+            if m.type == 30 and self.dense == "q8" and ".indexer." not in gname and \
+                    gname != "token_embd.weight" and m.rows > 1 and m.cols % 32 == 0:
+                # A large bfloat16 matrix to Q8_0 (dense_mode): for the CPU and
+                # for the GPU (Qwen4GPU takes the matrices of the model).
+                from . import cops
+                m.data, m.type = cops.kq_to_q8_0(m.data.view(np.uint16), m.cols), 8
+            elif m.type == 30 and ".indexer." in gname:
                 # BF16 (the indexer of the GGUF file): the products take it as F32.
                 a = self.G(gname)
                 m.data, m.type = np.ascontiguousarray(a, np.float32).view(np.uint8).reshape(-1), 0

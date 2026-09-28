@@ -11,7 +11,7 @@
    tokens, not on all).
 
     python scripts/check_qwen4_st.py --layers 4 --gpu
-    NP_GEMMA_ST_DENSE=q8 python scripts/check_qwen4_st.py --layers 0 --gpu
+    NP_GEMMA_DENSE=q8 python scripts/check_qwen4_st.py --layers 0 --gpu
 """
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def main():
 
     t0 = time.time()
     m = Qwen4CPU(args.path)
-    print("Qwen4CPU: dense %s" % getattr(m.g, "dense", "as in the file"))
+    print("Qwen4CPU: dense %s" % m.dense)
     ids = tok.encode(PROMPT)
     cache = Qwen4Cache(m.cfg, len(ids) + args.tokens + 8)
     h = m.forward(ids, cache)

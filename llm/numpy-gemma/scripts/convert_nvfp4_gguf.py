@@ -98,7 +98,7 @@ def main():
     ap.add_argument("out", help="the GGUF file to write")
     ap.add_argument("--dense", choices=("bf16", "q8"), default="bf16")
     args = ap.parse_args()
-    src = NVFP4Source(args.src, dense=args.dense)
+    src = NVFP4Source(args.src)
     cfg = src.config()
     hk, hv, dk, dv = cfg.lin_k_heads, cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim
     rep = hv // hk
@@ -126,11 +126,18 @@ def main():
             return make
         if kind == "f32":
             return lambda: tiled(gname, src._make(gname))
+        if kind in ("dense", "ehproj") and args.dense == "q8":
+            def make_q8():
+                h = np.asarray(src._make(gname))
+                return cops.kq_to_q8_0(h, h.shape[1])
+            return make_q8
         return lambda: src._make(gname)
 
     tensors = []
     for gname, (kind, s) in src._map.items():
         dims, t, _ = src.tensors[gname]
+        if kind in ("dense", "ehproj") and args.dense == "q8":
+            t = Q8_0
         if kind == "ple":
             shards = src._ple_shards
             tensors.append((gname, dims, E4M3_ROWS,

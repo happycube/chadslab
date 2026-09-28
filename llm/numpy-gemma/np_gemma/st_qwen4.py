@@ -11,10 +11,8 @@ and makes the forms at startup:
   matrix, in the rows of KQ_NV4 (csrc/kquants.c). The file keeps all the
   codes of a shard together, then all the scales, in the order of the names
   (expert 0, 1, 10, 100, ...), so the kernels cannot read it in place;
-- the large bfloat16 matrices: as they are (KQ_BF16), or requantized to
-  Q8_0 (dense="q8"): half the bytes, for a GPU with little free memory. The
-  default "auto" takes q8 when a GPU is there and its free memory is less
-  than the bfloat16 dense part, the head, and 3 GB. NP_GEMMA_ST_DENSE sets it;
+- the large bfloat16 matrices: as they are (KQ_BF16). The model can
+  requantize them to Q8_0 (Qwen4CPU dense, qwen4.dense_mode);
 - the small matrices (the routers, the gates, the inject weights, the
   indexer): float32;
 - the norms: float32, plus 1 where the converter of llama.cpp adds it (the
@@ -61,7 +59,7 @@ E4M3 = _e4m3_table()
 class NVFP4Source:
     """The GGUF view of the checkpoint (see the module text)."""
 
-    def __init__(self, path, dense=None, headers=None):
+    def __init__(self, path, headers=None):
         """headers (a test): a dict of the safetensors headers of all the
         files, for the shapes before the files are all there."""
         self.path = path
@@ -73,7 +71,6 @@ class NVFP4Source:
         self._cache = {}
         self.L = int(self.hf["num_hidden_layers"])
         self.E = int(self.hf["num_experts"])
-        self.dense = self._dense_mode(dense)
         self.meta = {"general.architecture": "qwen4exp"}
         self.tensors = {}           # GGUF name -> (dims (ggml order), type, 0)
         self._map = {}              # GGUF name -> (kind, source)
@@ -101,28 +98,6 @@ class NVFP4Source:
 
     # ---- the choices ----
 
-    def _dense_bytes_bf16(self):
-        n = 0
-        for name in self.where:
-            if name.startswith(MAIN + "layers.") and ".mlp.experts." not in name and \
-                    "ngram_embedding" not in name:
-                n += int(np.prod(self._shape(name))) * 2
-        return n
-
-    def _dense_mode(self, dense):
-        dense = dense or os.environ.get("NP_GEMMA_ST_DENSE", "auto")
-        if dense != "auto":
-            return dense
-        try:
-            from . import gpu
-            if not gpu.available():
-                return "bf16"
-            free = gpu.mem_info()[0]
-        except Exception:
-            return "bf16"
-        head = int(np.prod(self._shape("lm_head.weight"))) * 2
-        return "q8" if free < self._dense_bytes_bf16() + head + 3e9 else "bf16"
-
     # ---- the map of the names ----
 
     def _add(self, gname, kind, src, dims, type_):
@@ -131,7 +106,7 @@ class NVFP4Source:
 
     def _dense_mat(self, gname, hf):
         rows, cols = self._shape(hf)
-        self._add(gname, "dense", hf, (cols, rows), KQ_Q8_0 if self.dense == "q8" else KQ_BF16)
+        self._add(gname, "dense", hf, (cols, rows), KQ_BF16)
 
     def _f32(self, gname, hf, fn=None, dims=None):
         shape = self._shape(hf)
@@ -224,8 +199,7 @@ class NVFP4Source:
             self._layer(L, "mtp.layers.0.", mtp=True)
             b = "blk.%d.nextn." % L
             rows, cols = self._shape("mtp.fc_embedding.weight")
-            self._add(b + "eh_proj.weight", "ehproj", None, (2 * cols, rows),
-                      KQ_Q8_0 if self.dense == "q8" else KQ_BF16)
+            self._add(b + "eh_proj.weight", "ehproj", None, (2 * cols, rows), KQ_BF16)
             self._f32(b + "enorm.weight", "mtp.pre_fc_norm_embedding.weight", lambda a: a + 1.0)
             self._f32(b + "hnorm.weight", "mtp.pre_fc_norm_hidden.weight", lambda a: a + 1.0)
             self._f32(b + "hc_head_norm.weight", "mtp.hyper_connection_mixer.hc_norm.weight",
@@ -302,15 +276,10 @@ class NVFP4Source:
         if kind == "bf16":
             return self._bf16(src)
         if kind == "dense":
-            h = self._bf16(src)
-            if self.dense == "q8":
-                return cops.kq_to_q8_0(h, h.shape[1])
-            return h
+            return self._bf16(src)
         if kind == "ehproj":
             e, hd = self._get("mtp.fc_embedding.weight"), self._get("mtp.fc_hidden.weight")
             w = np.concatenate([e, hd], axis=1)           # embedding first (the graph of llama.cpp)
-            if self.dense == "q8":
-                return cops.kq_to_q8_0(np.ascontiguousarray(w, np.float32), w.shape[1])
             return (np.ascontiguousarray(w, np.float32).view(np.uint32) >> 16).astype(np.uint16)
         if kind == "nv4exps":
             m, x = src
