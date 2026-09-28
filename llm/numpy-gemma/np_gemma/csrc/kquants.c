@@ -40,6 +40,18 @@
  *                  the GPU; kq_nv4_* give the places). w = g * s *
  *                  e2m1(code); 2 e2m1 is an integer (0, 1, 2, 3, 4, 6, 8,
  *                  12 and the negatives).
+ *     KQ_NVX  53   NVFP4 in groups of 16 rows (this runtime; the GGUF of
+ *                  scripts/convert_nvfp4_gguf.py; kq_nvx_pack). A group: 16
+ *                  bytes (the float32 scale of the matrix, zeros), then for
+ *                  each block of 32 columns 288 bytes: 8 steps of 32 bytes
+ *                  and 32 E4M3 scales. Step s holds values 4s to 4s + 3 of
+ *                  the 16 rows: byte 4r + u (r < 8) has value 4s + u of row
+ *                  r in its low 4 bits, and that of row r + 8 in its high 4
+ *                  bits. The scales: values 0-15 of rows 0 to 15, then
+ *                  values 16-31. The CPU: a step is one vpdpbusd, a lane for
+ *                  each row (kq_nvx_rows). The GPU: the 4 bytes of a lane
+ *                  are a fragment of the tensor cores for 2 rows. A "row" is
+ *                  cols / 32 * 18 + 1 bytes (a group is 16 of them).
  *
  * The products quantize x to int8 in its natural order, with one scale xs
  * for each 32 values and xm, xs times the sum of the int8 values of each 16
@@ -68,6 +80,8 @@
 #define KQ_BF16 30
 #define KQ_NV4 51
 #define KQ_Q8X16 60
+#define KQ_NVX 53
+#define KQ_NVX_BB 288
 
 /* The bytes of one row of cols values. */
 static inline size_t kq_row_bytes(int type, int cols)
@@ -83,6 +97,7 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_BF16: return (size_t)cols * 2;
     case KQ_NV4: return ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16;
     case KQ_Q8X16: return (size_t)cols / 32 * 36;      /* a group of 16 rows: 16 times this */
+    case KQ_NVX: return (size_t)cols / 32 * 18 + 1;    /* a group of 16 rows: 16 times this */
     }
     return 0;
 }
@@ -130,6 +145,23 @@ __attribute__((constructor)) static void kq_e4m3_init(void)
 {
     for (int b = 0; b < 256; ++b) {
         kq_e4m3_tab[b] = kq_e4m3((uint8_t)b);
+    }
+}
+
+/* The float values of row rin (0 to 15) of the KQ_NVX group at wg. */
+static void kq_nvx_values(const uint8_t *wg, int rin, int cols, float *out)
+{
+    static const int8_t e2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    float g;
+    memcpy(&g, wg, 4);
+    int sh = rin < 8 ? 0 : 4, r8 = rin % 8;
+    for (int b = 0; b < cols / 32; ++b) {
+        const uint8_t *blk = wg + 16 + (size_t)b * KQ_NVX_BB;
+        for (int v = 0; v < 32; ++v) {
+            int c = (blk[32 * (v / 4) + 4 * r8 + v % 4] >> sh) & 15;
+            float sc = kq_e4m3_tab[blk[256 + 16 * (v / 16) + rin]];
+            out[32 * b + v] = 0.5f * g * sc * (float)e2[c];
+        }
     }
 }
 
@@ -1103,9 +1135,154 @@ static void kq_x16_body(const uint8_t *w, int rows, int cols, const int8_t *xq, 
 }
 #endif
 
+/* KQ_NVX: -12 times the sum of each 16 int8 values of n rows of x (the
+ * term of the codes + 12 of kq_nvx_rows). */
+static void kq_nvx_xsum(const int8_t *xq, int n, int cols, int32_t *xn)
+{
+    for (int j = 0; j < n; ++j) {
+        for (int h = 0; h < cols / 16; ++h) {
+            const int8_t *p = xq + (size_t)j * cols + 16 * h;
+            int32_t sum = 0;
+            for (int u = 0; u < 16; ++u) {
+                sum += p[u];
+            }
+            xn[(size_t)j * (cols / 16) + h] = -12 * sum;
+        }
+    }
+}
+
+#if defined(__AVX512VNNI__)
+/* E2M1 codes to twice their values plus 12 (0 to 24: the unsigned operand
+ * of vpdpbusd). */
+static const uint8_t kq_e2m1u[16] = {12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0};
+
+/* 16 E4M3 scales as float32 times 2^-8: the bits go to float16 as they are
+ * (the exponent bias of float16 is 8 more), exact for all the codes. */
+static inline __m512 kq_e4m3x16(const uint8_t *p)
+{
+    __m256i b = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p));
+    __m256i h = _mm256_or_si256(_mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x7f)), 7),
+                                _mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x80)), 8));
+    return _mm512_cvtph_ps(h);
+}
+
+/* The 16 rows of the KQ_NVX group at wg on n tokens: out[j * ostride + r]
+ * gets row r, token j. xn: kq_nvx_xsum of the tokens. For each block, 8
+ * tokens at a time: the 8 steps to u8 (codes + 12) in registers; for each
+ * token, 4 vpdpbusd for each half (a lane is a row; x broadcast, signed),
+ * from -12 sum(x), which removes the 12. A token alone and in a group has
+ * the same operations: the same bits. */
+static void kq_nvx_rows(const uint8_t *wg, int cols, const int8_t *xq, const float *xs,
+                        const int32_t *xn, int n, float *out, size_t ostride)
+{
+    int nb = cols / 32, nh = cols / 16;
+    float g;
+    memcpy(&g, wg, 4);
+    const __m512 gs = _mm512_set1_ps(128.f * g);        /* 0.5 g, and 2^8 of kq_e4m3x16 */
+    const __m512i lut = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1u));
+    const __m256i m4 = _mm256_set1_epi8(15);
+    for (int j = 0; j < n; j += KQ_X16_TB) {
+        int nt = n - j < KQ_X16_TB ? n - j : KQ_X16_TB;
+        __m512 f[KQ_X16_TB];
+        for (int tt = 0; tt < KQ_X16_TB; ++tt) {
+            f[tt] = _mm512_setzero_ps();
+        }
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t *blk = wg + 16 + (size_t)b * KQ_NVX_BB;
+            __m512i W[8];
+            for (int k = 0; k < 8; ++k) {
+                __m256i q = _mm256_loadu_si256((const __m256i *)(blk + 32 * k));
+                __m256i lo = _mm256_and_si256(q, m4), hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+                W[k] = _mm512_shuffle_epi8(lut, _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1));
+            }
+            __m512 s0 = kq_e4m3x16(blk + 256), s1 = kq_e4m3x16(blk + 272);
+            for (int tt = 0; tt < nt; ++tt) {
+                const int8_t *xb = xq + (size_t)(j + tt) * cols + 32 * b;
+                const int32_t *nx = xn + (size_t)(j + tt) * nh + 2 * b;
+                __m512i a0 = _mm512_set1_epi32(nx[0]), a1 = _mm512_set1_epi32(nx[1]);
+                for (int k = 0; k < 4; ++k) {
+                    int32_t x0, x1;
+                    memcpy(&x0, xb + 4 * k, 4);
+                    memcpy(&x1, xb + 16 + 4 * k, 4);
+                    a0 = _mm512_dpbusd_epi32(a0, W[k], _mm512_set1_epi32(x0));
+                    a1 = _mm512_dpbusd_epi32(a1, W[4 + k], _mm512_set1_epi32(x1));
+                }
+                __m512 p = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a1), s1,
+                                           _mm512_mul_ps(_mm512_cvtepi32_ps(a0), s0));
+                f[tt] = _mm512_fmadd_ps(p, _mm512_set1_ps(xs[(size_t)(j + tt) * nb + b]), f[tt]);
+            }
+        }
+        for (int tt = 0; tt < nt; ++tt) {
+            _mm512_storeu_ps(out + (size_t)(j + tt) * ostride, _mm512_mul_ps(f[tt], gs));
+        }
+    }
+}
+#else
+/* Without VNNI: the same sums in C (not the bits of the VNNI path). */
+static void kq_nvx_rows(const uint8_t *wg, int cols, const int8_t *xq, const float *xs,
+                        const int32_t *xn, int n, float *out, size_t ostride)
+{
+    static const int8_t e2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    int nb = cols / 32;
+    float g;
+    memcpy(&g, wg, 4);
+    (void)xn;
+    for (int j = 0; j < n; ++j) {
+        for (int r = 0; r < 16; ++r) {
+            float f = 0.f;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t *blk = wg + 16 + (size_t)b * KQ_NVX_BB;
+                float p = 0.f;
+                for (int h = 0; h < 2; ++h) {
+                    int32_t a = 0;
+                    for (int v = 16 * h; v < 16 * h + 16; ++v) {
+                        int c = (blk[32 * (v / 4) + 4 * (r % 8) + v % 4] >> (r < 8 ? 0 : 4)) & 15;
+                        a += e2[c] * xq[(size_t)j * cols + 32 * b + v];
+                    }
+                    p += (float)a * kq_e4m3_tab[blk[256 + 16 * h + r]];
+                }
+                f += p * xs[(size_t)j * nb + b];
+            }
+            out[(size_t)j * ostride + r] = 0.5f * g * f;
+        }
+    }
+}
+#endif
+
+/* KQ_NVX: out (t x rows), inside a parallel region; blocks of MA_TB tokens
+ * with the groups of 16 rows over the threads. */
+static void kq_nvx_body(const uint8_t *w, int rows, int cols, const int8_t *xq, const float *xs,
+                        int t, float *out)
+{
+    int32_t *xn = NULL;
+    size_t gb = 16 * kq_row_bytes(KQ_NVX, cols);
+    #pragma omp single copyprivate(xn)
+    xn = (int32_t *)malloc((size_t)t * (cols / 16) * 4);
+    #pragma omp for schedule(static)
+    for (int j = 0; j < t; ++j) {
+        kq_nvx_xsum(xq + (size_t)j * cols, 1, cols, xn + (size_t)j * (cols / 16));
+    }
+    for (int j0 = 0; j0 < t; j0 += MA_TB) {
+        int nt = t - j0 < MA_TB ? t - j0 : MA_TB;
+        #pragma omp for schedule(static) nowait
+        for (int g = 0; g < rows / 16; ++g) {
+            kq_nvx_rows(w + (size_t)g * gb, cols, xq + (size_t)j0 * cols, xs + (size_t)j0 * (cols / 32),
+                        xn + (size_t)j0 * (cols / 16), nt, out + (size_t)j0 * rows + 16 * g,
+                        (size_t)rows);
+        }
+    }
+    #pragma omp barrier
+    #pragma omp single
+    free(xn);
+}
+
 static void kq_linear_body(const uint8_t *w, int type, int rows, int cols, const int8_t *xq,
                            const float *xs, const float *xm, const float *x, int t, float *out)
 {
+    if (type == KQ_NVX) {
+        kq_nvx_body(w, rows, cols, xq, xs, t, out);
+        return;
+    }
     size_t rb = kq_row_bytes(type, cols);
 #if defined(__AVX512VNNI__)
     if (type == KQ_Q8X16) {
@@ -1214,6 +1391,37 @@ void kq_nv4_pack(const int64_t *wp, const int64_t *sp, const float *g, int n, in
     }
 }
 
+/* The NVFP4 matrices of n experts (as kq_nv4_pack; rows a multiple of 16)
+ * to KQ_NVX groups: dst gets n matrices of rows / 16 groups. */
+void kq_nvx_pack(const int64_t *wp, const int64_t *sp, const float *g, int n, int rows, int cols,
+                 uint8_t *dst)
+{
+    size_t gb = 16 * kq_row_bytes(KQ_NVX, cols);
+    int ng = rows / 16;
+    #pragma omp parallel for schedule(static)
+    for (int64_t x = 0; x < (int64_t)n * ng; ++x) {
+        int e = (int)(x / ng), g0 = 16 * (int)(x % ng);
+        const uint8_t *w = (const uint8_t *)(intptr_t)wp[e];
+        const uint8_t *s = (const uint8_t *)(intptr_t)sp[e];
+        uint8_t *o = dst + (size_t)x * gb;
+        memset(o, 0, gb);
+        memcpy(o, &g[e], 4);
+        for (int b = 0; b < cols / 32; ++b) {
+            uint8_t *blk = o + 16 + (size_t)b * KQ_NVX_BB;
+            for (int r = 0; r < 16; ++r) {
+                const uint8_t *wr = w + (size_t)(g0 + r) * (cols / 2) + 16 * b;
+                for (int v = 0; v < 32; ++v) {
+                    int c = (wr[v / 2] >> (4 * (v % 2))) & 15;      /* value 2i: the low 4 bits */
+                    blk[32 * (v / 4) + 4 * (r % 8) + v % 4] |= (uint8_t)(c << (r < 8 ? 0 : 4));
+                }
+                const uint8_t *sr = s + (size_t)(g0 + r) * (cols / 16) + 2 * b;
+                blk[256 + r] = sr[0];
+                blk[272 + r] = sr[1];
+            }
+        }
+    }
+}
+
 /* Copy n rows of bytes bytes from the addresses addrs (rows of a memory map
  * of a file: the n-gram table of the safetensors checkpoint). Many threads
  * take the page faults at the same time, so the disk has many reads in flight
@@ -1259,6 +1467,11 @@ void kq_rows(const uint8_t *w, int type, int cols, const int64_t *ids, int n, fl
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i) {
         const uint8_t *row = w + (size_t)ids[i] * rb;
+        if (type == KQ_NVX) {
+            kq_nvx_values(w + (size_t)(ids[i] & ~(int64_t)15) * rb, (int)(ids[i] & 15), cols,
+                          out + (size_t)i * cols);
+            continue;
+        }
         if (type == KQ_F32) {
             memcpy(out + (size_t)i * cols, row, (size_t)cols * 4);
             continue;
@@ -1280,7 +1493,24 @@ size_t kq_moe_scratch(int t, int k, int experts, int hidden, int inner)
     n += P * 2 * inner * 4;                            /* gate and up */
     n += P * inner + P * (inner / 32) * 4 + P * (inner / 16) * 4;
     n += P * hidden * 4;                               /* down outputs */
+    n += P * (hidden / 16) * 4 + P * (inner / 16) * 4;  /* the sums of KQ_NVX */
     return n + 64 * 16;
+}
+
+/* rows rows (a multiple of 16) from row r of a matrix on n tokens, as
+ * kq_rows4: KQ_NVX in groups of 16 (xn: kq_nvx_xsum of the tokens), the
+ * other types 4 rows at a time. */
+static void kq_rows_n(const uint8_t *w, size_t rb, int type, int nr, int cols, const int8_t *xq,
+                      const float *xs, const float *xm, const int32_t *xn, int n, float *out,
+                      size_t ostride)
+{
+    for (int i = 0; i < nr; i += type == KQ_NVX ? 16 : 4) {
+        if (type == KQ_NVX) {
+            kq_nvx_rows(w + (size_t)i * rb, cols, xq, xs, xn, n, out + i, ostride);
+        } else {
+            kq_rows4(w + (size_t)i * rb, rb, type, cols, xq, xs, xm, NULL, n, out + i, ostride);
+        }
+    }
 }
 
 /* One matrix of the MoE: data and type. */
@@ -1333,6 +1563,10 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
     float *as = (float *)ma_take(&p, (size_t)P * npi * 4);
     float *am = (float *)ma_take(&p, (size_t)P * npi * 2 * 4);
     float *de = (float *)ma_take(&p, (size_t)P * hidden * 4);
+    int32_t *xn = (int32_t *)ma_take(&p, (size_t)P * (hidden / 16) * 4);
+    int32_t *an = (int32_t *)ma_take(&p, (size_t)P * (inner / 16) * 4);
+    /* KQ_NVX: tasks of 16 rows (a group) for all the matrices of the layer */
+    int ngu = G.type == KQ_NVX ? 16 : 4, ndn = D.type == KQ_NVX ? 16 : 4;
     moe_sort_pairs(ids, t, k, experts, shared, cnt, start, used, pair_tok, pair_of, nused_p);
     int nu = *nused_p;
     P = start[ne];          /* the pairs with an expert */
@@ -1342,6 +1576,9 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         memcpy(xq + (size_t)q * hidden, hq + (size_t)j * hidden, (size_t)hidden);
         memcpy(xs + (size_t)q * nph, hs + (size_t)j * nph, (size_t)nph * 4);
         memcpy(xm + (size_t)q * 2 * nph, hm + (size_t)j * 2 * nph, (size_t)nph * 8);
+        if (ngu == 16) {
+            kq_nvx_xsum(xq + (size_t)q * hidden, 1, hidden, xn + (size_t)q * (hidden / 16));
+        }
     }
     /* A group: the experts have different counts of tokens, so the tasks
      * go to the threads as they finish. With a static split, the threads
@@ -1349,19 +1586,20 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
      * task, a static split. Each thread sets the schedule of its own
      * loops. */
     omp_set_schedule(t > 1 ? omp_sched_dynamic : omp_sched_static, t > 1 ? 8 : 0);
-    /* Gate and up: 2 * inner rows of each used expert, in tasks of 4 rows. */
+    /* Gate and up: 2 * inner rows of each used expert, in tasks of 4 rows
+     * (16 for KQ_NVX). */
     #pragma omp for schedule(runtime)
-    for (int x = 0; x < nu * 2 * inner / 4; ++x) {
-        int e = used[x / (2 * inner / 4)], rr = (x % (2 * inner / 4)) * 4, isup = rr >= inner;
+    for (int x = 0; x < nu * 2 * inner / ngu; ++x) {
+        int e = used[x / (2 * inner / ngu)], rr = (x % (2 * inner / ngu)) * ngu, isup = rr >= inner;
         int r = rr % inner;
         kq_mat m = e < experts ? (isup ? U : G) : (isup ? SU : SG);
         size_t rb = kq_row_bytes(m.type, hidden);
         const uint8_t *w = m.w + (e < experts ? (size_t)e * inner * rb : 0);
         int s0 = start[e];
         int n = start[e + 1] - s0;
-        kq_rows4(w + (size_t)r * rb, rb, m.type, hidden, xq + (size_t)s0 * hidden,
-                 xs + (size_t)s0 * nph, xm + (size_t)s0 * 2 * nph, NULL, n,
-                 act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
+        kq_rows_n(w + (size_t)r * rb, rb, m.type, ngu, hidden, xq + (size_t)s0 * hidden,
+                  xs + (size_t)s0 * nph, xm + (size_t)s0 * 2 * nph, xn + (size_t)s0 * (hidden / 16), n,
+                  act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
     }
     /* silu(gate) * up, and its quantization for down. */
     #pragma omp for schedule(static)
@@ -1374,19 +1612,23 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
             kq_quant_part(a, g, aq + (size_t)q * inner, as + (size_t)q * npi,
                           am + (size_t)q * 2 * npi);
         }
+        if (ndn == 16) {
+            kq_nvx_xsum(aq + (size_t)q * inner, 1, inner, an + (size_t)q * (inner / 16));
+        }
     }
-    /* Down: hidden rows of each used expert, in tasks of 4 rows. */
+    /* Down: hidden rows of each used expert, in tasks of 4 rows (16 for
+     * KQ_NVX). */
     #pragma omp for schedule(runtime)
-    for (int x = 0; x < nu * hidden / 4; ++x) {
-        int e = used[x / (hidden / 4)], r = (x % (hidden / 4)) * 4;
+    for (int x = 0; x < nu * hidden / ndn; ++x) {
+        int e = used[x / (hidden / ndn)], r = (x % (hidden / ndn)) * ndn;
         kq_mat m = e < experts ? D : SD;
         size_t rb = kq_row_bytes(m.type, inner);
         const uint8_t *w = m.w + (e < experts ? (size_t)e * hidden * rb : 0);
         int s0 = start[e];
         int n = start[e + 1] - s0;
-        kq_rows4(w + (size_t)r * rb, rb, m.type, inner, aq + (size_t)s0 * inner,
-                 as + (size_t)s0 * npi, am + (size_t)s0 * 2 * npi, NULL, n,
-                 de + (size_t)s0 * hidden + r, (size_t)hidden);
+        kq_rows_n(w + (size_t)r * rb, rb, m.type, ndn, inner, aq + (size_t)s0 * inner,
+                  as + (size_t)s0 * npi, am + (size_t)s0 * 2 * npi, an + (size_t)s0 * (inner / 16), n,
+                  de + (size_t)s0 * hidden + r, (size_t)hidden);
     }
     moe_combine(de, pair_of, val, shared_logit, shared, t, k, hidden, out);
 }

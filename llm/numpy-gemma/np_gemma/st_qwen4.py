@@ -8,7 +8,8 @@ and makes the forms at startup:
 
 - the routed experts (NVFP4: 4-bit E2M1 codes, an E4M3 scale for each 16
   values, a float32 scale for each matrix): one stack for each layer and
-  matrix, in the rows of KQ_NV4 (csrc/kquants.c). The file keeps all the
+  matrix, in the groups of 16 rows of KQ_NVX (csrc/kquants.c; experts="nv4":
+  the rows of KQ_NV4). The file keeps all the
   codes of a shard together, then all the scales, in the order of the names
   (expert 0, 1, 10, 100, ...), so the kernels cannot read it in place;
 - the large bfloat16 matrices: as they are (KQ_BF16). The model can
@@ -38,7 +39,7 @@ import numpy as np
 from . import cops
 from .st import SafeTensors
 
-KQ_F32, KQ_Q8_0, KQ_BF16, KQ_NV4 = 0, 8, 30, 51
+KQ_F32, KQ_Q8_0, KQ_BF16, KQ_NV4, KQ_NVX = 0, 8, 30, 51, 53
 MAIN = "model.language_model."
 
 
@@ -59,10 +60,13 @@ E4M3 = _e4m3_table()
 class NVFP4Source:
     """The GGUF view of the checkpoint (see the module text)."""
 
-    def __init__(self, path, headers=None):
+    def __init__(self, path, headers=None, experts="nvx"):
         """headers (a test): a dict of the safetensors headers of all the
-        files, for the shapes before the files are all there."""
+        files, for the shapes before the files are all there. experts: the
+        form of the routed experts, "nvx" (KQ_NVX) or "nv4" (KQ_NV4)."""
+        assert experts in ("nvx", "nv4")
         self.path = path
+        self.xtype = KQ_NVX if experts == "nvx" else KQ_NV4
         self._headers = headers
         cfg = json.load(open(os.path.join(path, "config.json")))
         self.hf = cfg.get("text_config", cfg)
@@ -135,7 +139,7 @@ class NVFP4Source:
             else:
                 rows, half = self._shape(e0)
                 self._add(b + "ffn_%s_exps.weight" % x, "nv4exps", (m, x), (half * 2, rows, self.E),
-                          KQ_NV4)
+                          self.xtype)
         a = base + "self_attn."
         if a + "q_proj.weight" in self.where:
             for x, g in (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v"), ("o", "attn_output")):
@@ -292,8 +296,12 @@ class NVFP4Source:
                 ws.append(self._get(p + "weight", dtype=None))
                 ss.append(self._get(p + "weight_scale", dtype=None))
                 gs.append(float(np.asarray(self._get(p + "weight_scale_2")).reshape(-1)[0]))
-            out = np.empty(self.E * rows * cops.kq_nv4_row_bytes(cols), np.uint8)
-            cops.kq_nv4_pack(ws, ss, gs, rows, cols, out)
+            if self.xtype == KQ_NVX:
+                out = np.empty(self.E * rows * cops.kq_nvx_row_bytes(cols), np.uint8)
+                cops.kq_nvx_pack(ws, ss, gs, rows, cols, out)
+            else:
+                out = np.empty(self.E * rows * cops.kq_nv4_row_bytes(cols), np.uint8)
+                cops.kq_nv4_pack(ws, ss, gs, rows, cols, out)
             return out
         if kind == "fp8exps":
             m, x = src
@@ -391,4 +399,4 @@ class NVFP4Source:
 
 def cops_row_bytes(type_, cols):
     return {KQ_F32: 4 * cols, KQ_Q8_0: cols // 32 * 34, KQ_BF16: 2 * cols,
-            KQ_NV4: cops.kq_nv4_row_bytes(cols)}[type_]
+            KQ_NV4: cops.kq_nv4_row_bytes(cols), KQ_NVX: cops.kq_nvx_row_bytes(cols)}[type_]

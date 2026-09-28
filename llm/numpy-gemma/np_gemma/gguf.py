@@ -31,13 +31,16 @@ IQ4_NL = 20
 BF16 = 30
 # The types of this runtime (not of ggml), in files of
 # scripts/convert_nvfp4_gguf.py: NVFP4 in the rows of KQ_NV4 (csrc/kquants.c:
-# the codes, the scales, the float32 scale of the matrix, zeros to 16 bytes), and
-# rows of FP8 E4M3 codes (one byte for each value; the tensor <name>.scale
-# holds the scale).
+# the codes, the scales, the float32 scale of the matrix, zeros to 16 bytes),
+# NVFP4 in groups of 16 rows (KQ_NVX; 16 "rows" of cols / 32 * 18 + 1 bytes
+# are a group), and rows of FP8 E4M3 codes (one byte for each value; the
+# tensor <name>.scale holds the scale).
 NV4 = 51
 E4M3_ROWS = 52
+NVX = 53
 _ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
-              E4M3_ROWS: lambda cols: cols}
+              E4M3_ROWS: lambda cols: cols,
+              NVX: lambda cols: cols // 32 * 18 + 1}
 
 
 def _e4m3_values():
@@ -63,7 +66,7 @@ _BLOCK = {
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
-    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", NV4: "NV4", E4M3_ROWS: "E4M3_ROWS",
+    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
 }
 
 # The NumPy dtype of one block for the implemented types.

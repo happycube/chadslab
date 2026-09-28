@@ -8,10 +8,9 @@ QWEN38_PLAN.md has the full plan and the history of each phase.
 
 - The work is on master in the repo chadslab. Do not push. Commit with the
   lines of the session at the end (see the git log).
-- WORK THAT IS NOT COMMITTED (section 4): the new NVFP4 layout (type 51).
-  The GGUF file in models2 already has type 51. The code at HEAD reads type
-  50 only. Thus, with HEAD, the file does not load. Commit the work of
-  section 4, or make the file again with the code of HEAD.
+- The routed experts of the GGUF are in groups of 16 rows (type 53,
+  KQ_NVX; section 4). The code still reads type 51 (the file
+  ...-bf16-nv4.gguf, kept for a comparison).
 - Do not stop serve.py (port 8080). The user runs other programs on this
   machine; the numbers change with that load.
 - Do not use git stash in this repo. It took the changes of the user in
@@ -21,7 +20,8 @@ QWEN38_PLAN.md has the full plan and the history of each phase.
 ## 2. The models and the files on disk
 
     models/Qwen3.8-Flash-Next-NVFP4/          the checkpoint of NVIDIA ModelOpt (124 GiB)
-    models2/Qwen3.8-Flash-Next-NVFP4-GGUF/    the GGUF of this runtime (133 GB) and tokenizer.json
+    models2/Qwen3.8-Flash-Next-NVFP4-GGUF/    the GGUF of this runtime (132 GB, type 53),
+                                              ...-bf16-nv4.gguf (133 GB, type 51), tokenizer.json
     models2/Qwen3.8-Flash-Next-GGUF/          the GGUF of Unsloth (UD-Q4_K_XL), moved here
                                               by the user (it was in /spaceu1, and in models/)
     llama.cpp-qwen4exp/build-cuda, build-cpu  llama.cpp (qwen4exp branch); build-cpu has no CUDA
@@ -77,38 +77,37 @@ The main parts, and where they are:
   are slow.
 - The file builds for sm_86 (the 3090): no griddepcontrol there.
 
-## 4. The work that is not committed: the NVFP4 layout for the GPU
+## 4. The layouts of the NVFP4 experts
 
-The changes: np_gemma/csrc/kquants.c, gpu.cu, cops.py, gguf.py,
-st_qwen4.py, scripts/convert_nvfp4_gguf.py.
-
-- Type 51 in place of type 50. A row holds all the codes first (16 bytes
-  for each block of 32 values). Then it holds all the E4M3 scales (2 for
-  each block) and the float32 scale of the matrix. Zeros fill the row to a
-  multiple of 16 bytes. Thus the codes start at a multiple of 16 bytes.
-- The GPU tensor cores load a fragment with one aligned 32-bit load. The
-  function kt_e2m1x4 changes 4 codes to int8 with prmt (a table of 8 bytes)
-  and a sign mask (as the dequantization of Marlin). Before, it was a loop
-  of bytes.
-- The CPU kernels and kq_nv4_pack use the new layout. The helpers are
-  kq_nv4_codes, kq_nv4_scales and kq_nv4_g.
-- The GGUF in models2 was made again with type 51 (201 s).
-- Checked:
-  - The rows of the pack equal a NumPy decode of the checkpoint.
-  - The GPU products (t = 1, 4, 32) agree with the exact values to 1e-6.
-  - The CPU on 4 layers gives 100% of the top tokens of NumPy. A group
-    gives the same bits as the steps.
-  - The tensor cores on NVFP4 (8 layers) against the float32 tiles: max
-    rel 1.5e-2 (prompt), 3.7e-2 (step), the same top token. With the
-    tensor cores, a prompt of 8 layers takes 0.79 s (0.94 s without).
-- The speed did not change: the experts of a mixed group of 1024 rows take
-  415 ms (408 ms before). The group takes 2.67 s. Of this, FETCH_WAIT
-  takes 1.75 s and CPU_WAIT takes 1.41 s. Thus the copies and the CPU set
-  the time, not the GPU kernels.
-- The change is correct, but it gives no speed now. It can help when the
-  copies are faster (the 3090). Commit it, and put type 51 in
-  QWEN38_PLAN.md. The alternative is to revert it and make the GGUF again
-  with the code of HEAD (201 s).
+- Type 51 (KQ_NV4): a row holds all its codes (16 bytes for each block of
+  32 values). Then come its E4M3 scales and the float32 scale of the
+  matrix, padded to 16 bytes. The GPU loads a fragment with one aligned 32-bit
+  load. kt_e2m1x4 changes 4 codes to int8 with prmt and a sign mask (as
+  Marlin).
+- Type 53 (KQ_NVX, the GGUF now): groups of 16 rows. A group holds 16 bytes
+  (the scale of the matrix), then 288 bytes for each block of 32 columns: 8
+  steps of 32 bytes and 32 scales. Step s holds values 4s to 4s + 3 of the
+  16 rows. Byte 4r + u has row r in its low 4 bits and row r + 8 in its
+  high 4 bits.
+  - The CPU (kq_nvx_rows): one vpdpbusd for each step, a lane for each row.
+    The codes become the value times 2, plus 12 (unsigned). The sum starts
+    at -12 times the sum of x of each 16 values.
+  - The GPU: the 4 bytes at 32 s + 4 r are the tensor-core fragments of
+    rows r and r + 8. A step of a tile is 8 contiguous groups. The step
+    kernel of the hot experts uses a warp for each group.
+- Checked: the dequant of type 53 equals that of type 51. All the GPU paths
+  (tensor cores, float32 tiles, the step kernel) have the same errors
+  against the CPU for the two types. A token alone and in a group gives the
+  same bits on the CPU. check_qwen4_st: PASS, and the GPU gives the 48
+  tokens of the CPU.
+- One layer of experts: the CPU with 512 tokens takes 33 ms (type 51: 75
+  ms). The GPU tensor cores with 1024 tokens (16 experts) take 6.2 ms
+  (8.9 ms). The GPU step kernel is 2.3 to 3 times faster.
+- MOE_PLAN gives the CPU more experts for type 53 (qwen4_gpu.mix_cpu_cost:
+  50 us for each expert and 5 us for each token; 75 and 15 for the other
+  types).
+- scripts/convert_nvfp4_gguf.py writes type 53 (--experts nv4: type 51), in
+  197 s.
 
 ## 5. The numbers
 
@@ -117,11 +116,17 @@ free, PCIe Gen3 x8.
 
 The GGUF of this runtime, llama-bench method (scripts/bench_qwen4.py):
 
-    GPU (0.5 GB hot experts)   pp512 248   pp2048 304   pp4096 385   tg128 19.5   tg512 19.7 tok/s
-    CPU (dense q8)             tg128 6.9 tok/s; a prompt of 512: 68 tok/s (warm)
+    GPU (0.5 GB hot experts)   pp512 365   pp2048 518   pp4096 511   tg128 22.2   tg512 22.7 tok/s
+    CPU (dense q8)             pp512 81.7  tg64 7.3
+    type 51, the same code     GPU: pp512 305, pp2048 441, tg128 20.2; CPU: pp512 64.4, tg64 7.2
     llama.cpp CPU              pp512 27.9   tg128 5.0
     llama.cpp GPU (-ncmoe 48)  pp512 101    pp2048 101  tg128 18.3
 
+- A test of 32001 tokens: the source of program.py, qwen4_gpu.py, and a
+  part of qwen4.py, then 3 questions. On the GPU with 0.5 GB hot, the
+  prompt takes 100 s (319 tok/s), and the decode gives 19.1 tok/s. The 3 answers
+  are correct (MOE_PLAN is 123, MIX_SIZE is 1024, and the split of the
+  experts).
 - The int8 x of the GPU steps: decode from 16.1 to 19.1 tok/s (one run).
 - KQ_Q8X16 on the CPU: the dense products of a prompt of 512 from 5.5 s to
   2.55 s (1.19 T multiply-adds/s against 0.38).
@@ -129,8 +134,7 @@ The GGUF of this runtime, llama-bench method (scripts/bench_qwen4.py):
   - The GPU decode waits for the CPU. With 0.5 GB, only about 3 experts of
     each layer are hot; the CPU computes the cold experts.
   - The GPU prompt waits for the copies (6.8 GB/s over PCIe).
-  - The CPU prompt is limited by compute. Of 7.6 s, the experts take 2.8 s
-    and the DeltaNet takes 1.0 s.
+  - The CPU prompt is limited by compute (the experts and the DeltaNet).
 
 ## 6. How to run the checks
 
@@ -152,9 +156,9 @@ The switches for a comparison:
 
 ## 7. The next steps
 
-1. Finish section 4: commit it (or revert it).
-2. The CPU experts of a prompt take 2.8 s of 7.6 s. Use the row interleave
-   of KQ_Q8X16 for NVFP4 (16 rows, a lane for each row).
+1. Remove the file of type 51 when the comparisons are done (133 GB).
+2. kq_nvx_rows decodes a block again for each 8 tokens. An expert of a
+   prompt has about 10 tokens: a batch of 16 tokens can help.
 3. The GPU decode of dense matrices with short rows (hc_*_up: 320 values):
    a lane for each row. A GPU kernel that reads KQ_Q8X16 can be a test.
 4. Memory: in q8 mode, the Q8_0 copy stays next to KQ_Q8X16 (3.9 GB more);

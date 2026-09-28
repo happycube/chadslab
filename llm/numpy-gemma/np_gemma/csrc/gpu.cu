@@ -3814,6 +3814,15 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
  * fragment of the tensor cores is one aligned load. */
 #define KQ_BF16 30
 #define KQ_NV4 51
+/* NVFP4 in groups of 16 rows (KQ_NVX of csrc/kquants.c): a group is 16
+ * bytes (the float32 scale of the matrix, zeros), then 288 bytes for each
+ * block of 32 columns: 8 steps of 32 bytes (step s: values 4s .. 4s + 3;
+ * byte 4r + u: row r in the low 4 bits, row r + 8 in the high 4 bits) and
+ * 32 E4M3 scales (values 0-15 of the 16 rows, then values 16-31). The 4
+ * bytes at 32 s + 4 r are the fragments of the tensor cores for rows r and
+ * r + 8. A "row" is cols / 32 * 18 + 1 bytes. */
+#define KQ_NVX 53
+#define KQ_NVX_BB 288
 /* Q8_0 in rows for the GPU (np_gemma/qwen_gpu.py): the int8 values of the
  * row, then the float16 scale of each 32 values, then zeros to a multiple
  * of 16 bytes. Thus the values of each row start at a multiple of 16
@@ -3828,6 +3837,7 @@ __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
            type == KQ_Q5_1 ? (size_t)cols / 32 * 24 :
            type == KQ_BF16 ? (size_t)cols * 2 :
            type == KQ_NV4 ? ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16 :
+           type == KQ_NVX ? (size_t)cols / 32 * 18 + 1 :
            type == KQ_Q4_K ? (size_t)cols / 256 * 144 : type == KQ_Q5_K ? (size_t)cols / 256 * 176 :
            (size_t)cols / 256 * 210;
 }
@@ -3850,6 +3860,82 @@ __device__ __forceinline__ float kq_e2m1x2(int c)
     /* the bytes of the constant: 0, 1, 2, 3, 4, 6, 8, 12 */
     float v = (float)((0x0C08060403020100ull >> (8 * (c & 7))) & 0xff);
     return (c & 8) ? -v : v;
+}
+
+/* 4 E2M1 codes (4 bytes of codes, the low 4 bits of each byte) to 4 int8
+ * (twice the values), as the dequantization of Marlin: prmt looks up the 4
+ * magnitudes in a table of 8 bytes (0 1 2 3 4 6 8 12) at once, and the sign
+ * bits negate the bytes (v ^ m) - m. */
+__device__ __forceinline__ uint32_t kt_e2m1x4(uint32_t q)
+{
+    uint32_t c = q & 0x0f0f0f0fu;
+    uint32_t i = c & 0x07070707u;
+    uint32_t t = i | (i >> 4);                       /* bytes 0, 2: 2 indices of 4 bits */
+    uint32_t sel = (t & 0xffu) | ((t >> 8) & 0xff00u);
+    uint32_t mag = __byte_perm(0x03020100u, 0x0c080604u, sel);
+    uint32_t m = ((c >> 3) & 0x01010101u) * 0xffu;
+    return __vsub4(mag ^ m, m);
+}
+
+/* An E4M3 scale times 2^-8, with no branch: its bits go to float16 as they
+ * are (the exponent bias of float16 is 8 more). */
+__device__ __forceinline__ float kq_e4m3s(uint32_t b)
+{
+    return __half2float(__ushort_as_half((uint16_t)(((b & 0x7f) << 7) | ((b & 0x80) << 8))));
+}
+
+/* The sum of 4 int8 (a) times 4 floats. */
+__device__ __forceinline__ float kq_dot4s8(uint32_t a, float4 x)
+{
+    return (float)(int8_t)(a & 255) * x.x + (float)(int8_t)((a >> 8) & 255) * x.y +
+           (float)(int8_t)((a >> 16) & 255) * x.z + (float)(int8_t)(a >> 24) * x.w;
+}
+
+/* The 16 rows of the KQ_NVX group at wg with x (cols values), by a warp.
+ * Lane l reads 8 bytes of each block: step l / 4, rows 2q, 2q + 1 (low 4
+ * bits) and 2q + 8, 2q + 9 (high), q = l % 4. The lanes of each q add
+ * their sums; lane q < 4 gets rows 2q, 2q + 1, 2q + 8, 2q + 9 in v. */
+__device__ void kq_nvx_group(const uint8_t *wg, const float *x, int cols, float *v)
+{
+    int lane = threadIdx.x % 32, st = lane / 4, q = lane % 4, h = st / 4;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int b = 0; b < cols / 32; ++b) {
+        const uint8_t *blk = wg + 16 + (size_t)b * KQ_NVX_BB;
+        uint2 c = *(const uint2 *)(blk + 8 * lane);
+        float4 xv = *(const float4 *)(x + 32 * b + 4 * st);
+        uint32_t s01 = *(const uint16_t *)(blk + 256 + 16 * h + 2 * q);
+        uint32_t s89 = *(const uint16_t *)(blk + 256 + 16 * h + 8 + 2 * q);
+        acc[0] += kq_e4m3s(s01 & 255) * kq_dot4s8(kt_e2m1x4(c.x), xv);
+        acc[1] += kq_e4m3s(s01 >> 8) * kq_dot4s8(kt_e2m1x4(c.y), xv);
+        acc[2] += kq_e4m3s(s89 & 255) * kq_dot4s8(kt_e2m1x4(c.x >> 4), xv);
+        acc[3] += kq_e4m3s(s89 >> 8) * kq_dot4s8(kt_e2m1x4(c.y >> 4), xv);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        for (int o = 4; o < 32; o <<= 1) {
+            acc[i] += __shfl_xor_sync(0xffffffff, acc[i], o);
+        }
+    }
+    float gs = 128.f * *(const float *)wg;           /* 0.5 g, and the 2^8 of kq_e4m3s */
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = gs * acc[i];
+    }
+}
+
+/* 8 values of row rin of the KQ_NVX group at wg from column c0 (a multiple
+ * of 8), as float32. */
+__device__ void kq_dequant8_nvx(const uint8_t *wg, int rin, int c0, float *v)
+{
+    const uint8_t *blk = wg + 16 + (size_t)(c0 / 32) * KQ_NVX_BB;
+    int j = c0 % 32, sh = rin < 8 ? 0 : 4;
+    float sc = 128.f * *(const float *)wg * kq_e4m3s(blk[256 + 16 * (j / 16) + rin]);
+    uint32_t a = kt_e2m1x4(*(const uint32_t *)(blk + 32 * (j / 4) + 4 * (rin % 8)) >> sh);
+    uint32_t b = kt_e2m1x4(*(const uint32_t *)(blk + 32 * (j / 4 + 1) + 4 * (rin % 8)) >> sh);
+    for (int u = 0; u < 4; ++u) {
+        v[u] = sc * (float)(int8_t)((a >> (8 * u)) & 255);
+        v[4 + u] = sc * (float)(int8_t)((b >> (8 * u)) & 255);
+    }
 }
 
 __device__ __forceinline__ float kq_bf16(uint16_t h)
@@ -4394,6 +4480,23 @@ __global__ void k_kqh_gu(const gp_rec *r, const int64_t *e)
     const uint8_t *w = shared ? DP(const uint8_t, up ? 18 : 17)
                               : DP(const uint8_t, up ? 5 : 4) + (size_t)slot * inner * rb;
     int tok = shared ? j - tk : j / k;
+    if (type == KQ_NVX) {
+        /* a warp for each group of 16 rows (row counts the groups) */
+        if (row >= inner / 16) {
+            return;
+        }
+        float v[4];
+        kq_nvx_group(w + (size_t)16 * row * rb, DP(const float, 0) + (size_t)tok * hidden, hidden, v);
+        int l = threadIdx.x % 32;
+        if (l < 4) {
+            float *o = DP(float, 7) + (size_t)j * 2 * inner + up * inner + 16 * row;
+            o[2 * l] = v[0];
+            o[2 * l + 1] = v[1];
+            o[2 * l + 8] = v[2];
+            o[2 * l + 9] = v[3];
+        }
+        return;
+    }
     float v = kq_row(type, w + (size_t)row * rb, DP(const float, 0) + (size_t)tok * hidden, hidden);
     if (threadIdx.x % 32 == 0) {
         DP(float, 7)[(size_t)j * 2 * inner + up * inner + row] = v;
@@ -4428,6 +4531,22 @@ __global__ void k_kqh_dn(const gp_rec *r, const int64_t *e)
     size_t rb = kq_row_bytes(type, inner);
     const uint8_t *w = shared ? DP(const uint8_t, 19)
                               : DP(const uint8_t, 6) + (size_t)slot * hidden * rb;
+    if (type == KQ_NVX) {
+        if (row >= hidden / 16) {
+            return;
+        }
+        float v[4];
+        kq_nvx_group(w + (size_t)16 * row * rb, DP(const float, 8) + (size_t)j * inner, inner, v);
+        int l = threadIdx.x % 32;
+        if (l < 4) {
+            float *o = DP(float, 9) + (size_t)j * hidden + 16 * row;
+            o[2 * l] = v[0];
+            o[2 * l + 1] = v[1];
+            o[2 * l + 8] = v[2];
+            o[2 * l + 9] = v[3];
+        }
+        return;
+    }
     float v = kq_row(type, w + (size_t)row * rb, DP(const float, 8) + (size_t)j * inner, inner);
     if (threadIdx.x % 32 == 0) {
         DP(float, 9)[(size_t)j * hidden + row] = v;
@@ -5031,7 +5150,10 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
     }
     for (int k0 = 0; k0 < cols; k0 += KG_K) {
         float v[8];
-        if (wrow != NULL) {
+        if (wrow != NULL && type == KQ_NVX) {
+            int row = r0 + lr;
+            kq_dequant8_nvx(W + (size_t)(row & ~15) * rb, row & 15, k0 + lc, v);
+        } else if (wrow != NULL) {
             kq_dequant8(type, wrow, cols, k0 + lc, v);
         } else {
             for (int u = 0; u < 8; ++u) {
@@ -5106,7 +5228,10 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
 #define KT_BN 128
 #define KT_K 128
 #define KT_RB 144                           /* the bytes of a row of w in a step (136 used) */
-enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4 };
+enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4, KT_NVX = 5 };
+/* KT_NVX: a step of a tile holds the 8 groups of its 128 rows, each the 16
+ * bytes of its head and the 4 blocks of the step (KT_GB bytes). */
+#define KT_GB (16 + 4 * KQ_NVX_BB)
 
 /* mma.sync m16n8k16 on int8 values: the two halves of a block of 32 of NVFP4
  * (a scale for each 16 values) have sums of their own. */
@@ -5119,25 +5244,10 @@ __device__ __forceinline__ void mma16816s8(int *c, uint32_t a0, uint32_t a1, uin
         : "r"(a0), "r"(a1), "r"(b0));
 }
 
-/* 4 E2M1 codes (4 bytes of codes, the low 4 bits of each byte) to 4 int8
- * (twice the values), as the dequantization of Marlin: prmt looks up the 4
- * magnitudes in a table of 8 bytes (0 1 2 3 4 6 8 12) at once, and the sign
- * bits negate the bytes (v ^ m) - m. */
-__device__ __forceinline__ uint32_t kt_e2m1x4(uint32_t q)
-{
-    uint32_t c = q & 0x0f0f0f0fu;
-    uint32_t i = c & 0x07070707u;
-    uint32_t t = i | (i >> 4);                       /* bytes 0, 2: 2 indices of 4 bits */
-    uint32_t sel = (t & 0xffu) | ((t >> 8) & 0xff00u);
-    uint32_t mag = __byte_perm(0x03020100u, 0x0c080604u, sel);
-    uint32_t m = ((c >> 3) & 0x01010101u) * 0xffu;
-    return __vsub4(mag ^ m, m);
-}
-
 __host__ __device__ __forceinline__ int kt_format(int type)
 {
     return type == KQ_Q8_R ? KT_Q8R : type == KQ_Q8_0 ? KT_Q80 : type == KQ_Q5_1 ? KT_Q51 :
-           type == KQ_Q4_K ? KT_Q4K : type == KQ_NV4 ? KT_NV4 : -1;
+           type == KQ_Q4_K ? KT_Q4K : type == KQ_NV4 ? KT_NV4 : type == KQ_NVX ? KT_NVX : -1;
 }
 
 /* x (n rows of cols values) to int8, with xs and xsum for each block of 32. */
@@ -5306,9 +5416,21 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
             cp_async4(&ss[b][m][bk], xs + o);
             cp_async4(&ss[b][m][4 + bk], xsum + o);
         }
-        for (int n = warp; n < KT_BN; n += 8) {
-            int row = min(n0 + n, rows - 1);
-            kt_load_w<F>(bs[b][n], w + (size_t)row * rb, cols, k0);
+        if (F == KT_NVX) {
+            /* 8 groups: the head, then the 4 blocks of the step */
+            uint8_t *gs = &bs[b][0][0];
+            for (int e = threadIdx.x; e < 8 * (KT_GB / 16); e += blockDim.x) {
+                int gi = e / (KT_GB / 16), ch = e % (KT_GB / 16);
+                int grp = min(n0 / 16 + gi, rows / 16 - 1);
+                const uint8_t *src = w + (size_t)grp * 16 * rb +
+                                     (ch == 0 ? 0 : 16 + (size_t)(k0 / 32) * KQ_NVX_BB + 16 * (ch - 1));
+                cp_async16(gs + gi * KT_GB + 16 * ch, src);
+            }
+        } else {
+            for (int n = warp; n < KT_BN; n += 8) {
+                int row = min(n0 + n, rows - 1);
+                kt_load_w<F>(bs[b][n], w + (size_t)row * rb, cols, k0);
+            }
         }
         cp_async_commit();
     };
@@ -5333,22 +5455,48 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
             cp_async_commit();
         }
         int k0 = st * KT_K;
-        if (F == KT_NV4) {
+        if (F == KT_NV4 || F == KT_NVX) {
             #pragma unroll
             for (int bk = 0; bk < 4; ++bk) {
                 uint32_t bf[4][2];
                 float dl[4][2], dh[4][2];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    uint32_t q = *(const uint32_t *)(bs[b][wn + j * 8 + g] + 16 * bk + 4 * c);
-                    bf[j][0] = kt_e2m1x4(q);
-                    bf[j][1] = kt_e2m1x4(q >> 4);
+                if (F == KT_NVX) {
+                    /* rows wn .. wn + 31: 2 groups; a group gives the
+                     * fragments of rows g and g + 8 from 2 loads */
                     #pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const uint8_t *rs = bs[b][wn + j * 8 + 2 * c + h];
-                        float gg = 0.5f * *(const float *)(rs + 72);
-                        dl[j][h] = gg * kq_e4m3(rs[64 + 2 * bk]);
-                        dh[j][h] = gg * kq_e4m3(rs[64 + 2 * bk + 1]);
+                    for (int jg = 0; jg < 2; ++jg) {
+                        const uint8_t *gb = &bs[b][0][0] + (wn / 16 + jg) * KT_GB;
+                        const uint8_t *blk = gb + 16 + KQ_NVX_BB * bk;
+                        float gg = 128.f * *(const float *)gb;
+                        uint32_t qa = *(const uint32_t *)(blk + 32 * c + 4 * g);
+                        uint32_t qb = *(const uint32_t *)(blk + 32 * (4 + c) + 4 * g);
+                        bf[2 * jg][0] = kt_e2m1x4(qa);
+                        bf[2 * jg][1] = kt_e2m1x4(qb);
+                        bf[2 * jg + 1][0] = kt_e2m1x4(qa >> 4);
+                        bf[2 * jg + 1][1] = kt_e2m1x4(qb >> 4);
+                        #pragma unroll
+                        for (int sb = 0; sb < 2; ++sb) {
+                            #pragma unroll
+                            for (int h = 0; h < 2; ++h) {
+                                int rr = 8 * sb + 2 * c + h;
+                                dl[2 * jg + sb][h] = gg * kq_e4m3s(blk[256 + rr]);
+                                dh[2 * jg + sb][h] = gg * kq_e4m3s(blk[272 + rr]);
+                            }
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        uint32_t q = *(const uint32_t *)(bs[b][wn + j * 8 + g] + 16 * bk + 4 * c);
+                        bf[j][0] = kt_e2m1x4(q);
+                        bf[j][1] = kt_e2m1x4(q >> 4);
+                        #pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const uint8_t *rs = bs[b][wn + j * 8 + 2 * c + h];
+                            float gg = 0.5f * *(const float *)(rs + 72);
+                            dl[j][h] = gg * kq_e4m3(rs[64 + 2 * bk]);
+                            dh[j][h] = gg * kq_e4m3(rs[64 + 2 * bk + 1]);
+                        }
                     }
                 }
                 #pragma unroll
@@ -6197,7 +6345,7 @@ static void kt_attr(void)
 #define KT_SET(F) \
     cudaFuncSetAttribute(k_qmoe_gu_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b); \
     cudaFuncSetAttribute(k_qmoe_dn_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
-    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K) KT_SET(KT_NV4)
+    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K) KT_SET(KT_NV4) KT_SET(KT_NVX)
 #undef KT_SET
 }
 
@@ -6549,6 +6697,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             case KT_Q80: k_qmoe_gu_tc<KT_Q80><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q51: k_qmoe_gu_tc<KT_Q51><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_NV4: k_qmoe_gu_tc<KT_NV4><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_NVX: k_qmoe_gu_tc<KT_NVX><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             default: k_qmoe_gu_tc<KT_Q4K><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             }
             k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv);
@@ -6558,6 +6707,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             case KT_Q80: k_qmoe_dn_tc<KT_Q80><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_Q51: k_qmoe_dn_tc<KT_Q51><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             case KT_NV4: k_qmoe_dn_tc<KT_NV4><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
+            case KT_NVX: k_qmoe_dn_tc<KT_NVX><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             default: k_qmoe_dn_tc<KT_Q4K><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum); break;
             }
         } else {

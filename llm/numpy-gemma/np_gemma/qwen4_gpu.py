@@ -53,9 +53,19 @@ from .qwen4 import compile_qwen4_step
 MIX_SIZE = int(os.environ.get("NP_GEMMA_GPU_MIX", "1024"))    # the rows of a mixed group
 MIX_MIN = int(os.environ.get("NP_GEMMA_GPU_MIX_MIN", "256"))  # the shortest prompt part for one
 # The model of the costs of GP_MOE_PLAN, in ns: for each expert on the CPU,
-# and for each of its tokens; for each expert that the GPU copies.
-MIX_CPU_A = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_A", "75000"))
-MIX_CPU_B = int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_B", "15000"))
+# and for each of its tokens; for each expert that the GPU copies. The
+# experts in groups of 16 rows (KQ_NVX, 53) are faster on the CPU.
+MIX_CPU = {53: (50000, 5000)}
+MIX_CPU_DEFAULT = (75000, 15000)
+
+
+def mix_cpu_cost(xtype):
+    """(for each expert, for each token) of the CPU for experts of xtype."""
+    a, b = MIX_CPU.get(xtype, MIX_CPU_DEFAULT)
+    return (int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_A", a)),
+            int(os.environ.get("NP_GEMMA_GPU_MIX_CPU_B", b)))
+
+
 MIX_GPU = int(os.environ.get("NP_GEMMA_GPU_MIX_GPU", "700000"))
 # The free memory that the buffer of the copies leaves (the programs of the
 # decode, MTP, and the verify groups).
@@ -183,8 +193,9 @@ class Qwen4GPU(QwenGPU):
         desc = self.mix_desc.setdefault(i, np.zeros(13, np.int64))
         stats = self.mix_stats.setdefault(i, np.zeros(5, np.int64))
         pc = P.Program()
-        pc.emit(P.MOE_PLAN, ip, self._nreal_h, t, k, E, st["slots"], desc, MIX_CPU_A, MIX_CPU_B,
-                MIX_GPU, tab_h, gidx_h, cidx, ranges, stats)
+        ca, cb = mix_cpu_cost(st["mats"][0].type)
+        pc.emit(P.MOE_PLAN, ip, self._nreal_h, t, k, E, st["slots"], desc, ca, cb, MIX_GPU,
+                tab_h, gidx_h, cidx, ranges, stats)
         plan = pc.finish()
         self.cpu_progs.append(plan)
         prog.emit(P.CPU_START, plan.buf, ev)

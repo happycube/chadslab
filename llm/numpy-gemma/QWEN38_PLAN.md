@@ -466,6 +466,27 @@ scripts/convert_nvfp4_gguf.py; HANDOFF_QWEN38.md has the numbers):
   415 ms. The copies (1.75 s) and the CPU (1.41 s) set the time of the
   group.
 
+The experts in groups of 16 rows (type 53, KQ_NVX). The GGUF now has this
+type; --experts nv4 of the converter keeps type 51.
+
+- A group holds 16 bytes (the scale of the matrix), then 288 bytes for
+  each block of 32 columns. Step s (32 bytes) holds values 4s to 4s + 3 of
+  the 16 rows. Byte 4r + u has row r in its low 4 bits and row r + 8 in its
+  high 4 bits. Then come the 32 E4M3 scales of the 16 rows.
+- The CPU (kq_nvx_rows): a step is one vpdpbusd, with a lane for each row.
+  The codes go to the E2M1 value times 2, plus 12 (an unsigned byte). The
+  sum starts at -12 times the sum of x of each 16 values. A token alone and
+  in a group gives the same bits.
+- The GPU: the 4 bytes at 32 s + 4 r are the tensor-core fragments of rows
+  r and r + 8. A step of a tile is 8 contiguous groups (cp.async of 16
+  bytes). The step kernel of the hot experts uses a warp for each group.
+- The results equal those of type 51 (the GPU against the CPU: the same
+  errors in all the paths).
+- One layer of experts on the CPU (512 experts, 10 for each token): 512
+  tokens take 33 ms in place of 75 ms. On the GPU (16 experts): 1024
+  tokens on the tensor cores take 6.2 ms in place of 8.9 ms. The step
+  kernel is 2.3 to 3 times faster.
+
 ## Risks
 
 - The page cache: if the working set does not fit, the rate falls by a

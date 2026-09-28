@@ -249,6 +249,8 @@ try:
         _lib.kq_to_q8_0.restype = None
         _lib.kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nv4_pack.restype = None
+        _lib.kq_nvx_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
+        _lib.kq_nvx_pack.restype = None
         _lib.kq_pack_q8x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.kq_pack_q8x16.restype = None
         _lib.kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
@@ -732,7 +734,7 @@ def kq_rows(w, type_, cols, ids):
     return out
 
 
-KQ_Q8_0, KQ_BF16, KQ_NV4 = 8, 30, 51
+KQ_Q8_0, KQ_BF16, KQ_NV4, KQ_NVX = 8, 30, 51, 53
 
 
 def kq_to_q8_0(src, cols):
@@ -770,6 +772,23 @@ def kq_nv4_row_bytes(cols):
     """A KQ_NV4 row: the codes, the scales, the scale of the matrix, zeros to
     a multiple of 16 bytes (csrc/kquants.c)."""
     return (cols // 2 + cols // 16 + 4 + 15) // 16 * 16
+
+
+def kq_nvx_row_bytes(cols):
+    """A "row" of KQ_NVX: a group of 16 rows is 16 times this (csrc/kquants.c)."""
+    return cols // 32 * 18 + 1
+
+
+def kq_nvx_pack(ws, ss, gs, rows, cols, out):
+    """As kq_nv4_pack, to KQ_NVX groups of 16 rows (out: n x rows x
+    kq_nvx_row_bytes(cols) bytes)."""
+    assert rows % 16 == 0 and cols % 32 == 0
+    n = len(ws)
+    wp = np.array([w.ctypes.data for w in ws], dtype=np.int64)
+    sp = np.array([x.ctypes.data for x in ss], dtype=np.int64)
+    g = np.ascontiguousarray(gs, dtype=np.float32)
+    assert out.nbytes >= n * rows * kq_nvx_row_bytes(cols)
+    _lib.kq_nvx_pack(wp.ctypes.data, sp.ctypes.data, g.ctypes.data, n, rows, cols, out.ctypes.data)
 
 
 def kq_nv4_pack(ws, ss, gs, rows, cols, out):
