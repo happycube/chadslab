@@ -636,9 +636,28 @@ class Qwen4CPU(Qwen4):
     # ---- the records of the program (compile_qwen4_step); Qwen4GPU has
     # its own ----
 
+    def KP(self, gname):
+        """The matrix for the CPU products: a Q8_0 matrix of 16 n rows as
+        KQ_Q8X16 (rows in groups of 16; csrc/kquants.c), made at the first
+        use (NP_GEMMA_X16=0: as it is). The GPU takes K()."""
+        m = self._kp.get(gname) if hasattr(self, "_kp") else None
+        if m is None:
+            if not hasattr(self, "_kp"):
+                self._kp = {}
+            m = self.K(gname)
+            if m.type == 8 and m.rows % 16 == 0 and m.cols % 32 == 0 and \
+                    os.environ.get("NP_GEMMA_X16", "1") != "0":
+                from . import cops
+                from .qwen import KMat
+                p = KMat.__new__(KMat)
+                p.data, p.type, p.rows, p.cols = cops.kq_pack_q8x16(m.data, m.rows, m.cols), 60, m.rows, m.cols
+                m = p
+            self._kp[gname] = m
+        return m
+
     def emit_lin4(self, prog, xb, gname, out):
         from . import program as P
-        m = self.K(gname)
+        m = self.KP(gname)
         prog.emit(P.KQ_LINEAR, xb["xq"], xb["xs"], xb["xm"], xb["src"], m.data, m.type, m.rows,
                   m.cols, xb["t"], out)
 
@@ -689,7 +708,7 @@ class Qwen4CPU(Qwen4):
     def logits(self, h, chunk=None):
         from . import cops
         from .qwen import KX
-        m, qx = self.K("output.weight"), KX(h)
+        m, qx = self.KP("output.weight"), KX(h)
         out = np.empty((qx.t, m.rows), np.float32)
         cops.kq_linear(m.data, m.type, m.rows, m.cols, qx.xq, qx.xs, qx.xm, qx.x, qx.t, out)
         return out

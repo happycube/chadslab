@@ -249,6 +249,8 @@ try:
         _lib.kq_to_q8_0.restype = None
         _lib.kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nv4_pack.restype = None
+        _lib.kq_pack_q8x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.kq_pack_q8x16.restype = None
         _lib.kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.kq_gather.restype = None
         _lib.kq_moe.argtypes = [_void_p] * 5 + [_int, _int, _int, _void_p, _void_p, _int, _int,
@@ -741,6 +743,17 @@ def kq_to_q8_0(src, cols):
     out = np.empty(rows * (cols // 32) * 34, dtype=np.uint8)
     _lib.kq_to_q8_0(src.ctypes.data, 1 if src.dtype == np.uint16 else 0, rows, cols,
                     out.ctypes.data)
+    return out
+
+
+KQ_Q8X16 = 60
+
+
+def kq_pack_q8x16(q8, rows, cols):
+    """Q8_0 rows (uint8; rows a multiple of 16) to KQ_Q8X16 (csrc/kquants.c)."""
+    assert rows % 16 == 0 and cols % 32 == 0
+    out = np.empty(rows * (cols // 32) * 36, dtype=np.uint8)
+    _lib.kq_pack_q8x16(np.ascontiguousarray(q8).ctypes.data, rows, cols, out.ctypes.data)
     return out
 
 
