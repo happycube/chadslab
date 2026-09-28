@@ -21,6 +21,9 @@ _NP = {
     "I64": np.int64, "I32": np.int32, "I16": np.int16, "I8": np.int8,
     "U64": np.uint64, "U32": np.uint32, "U16": np.uint16, "U8": np.uint8,
     "BOOL": np.bool_,
+    # FP8 (the NVFP4 scales, the n-gram table of Qwen3.8): the raw bytes;
+    # np_gemma/st_qwen4.py decodes them.
+    "F8_E4M3": np.uint8,
 }
 
 

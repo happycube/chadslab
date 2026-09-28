@@ -245,6 +245,10 @@ try:
         _lib.kq_linear.restype = None
         _lib.kq_rows.argtypes = [_void_p, _int, _int, _void_p, _int, _void_p]
         _lib.kq_rows.restype = None
+        _lib.kq_to_q8_0.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
+        _lib.kq_to_q8_0.restype = None
+        _lib.kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
+        _lib.kq_nv4_pack.restype = None
         _lib.kq_moe.argtypes = [_void_p] * 5 + [_int, _int, _int, _void_p, _void_p, _int, _int,
                                                  _void_p, _void_p]
         _lib.kq_moe.restype = None
@@ -722,6 +726,36 @@ def kq_rows(w, type_, cols, ids):
     out = np.empty((ids.size, cols), dtype=np.float32)
     _lib.kq_rows(w.ctypes.data, type_, cols, ids.ctypes.data, ids.size, out.ctypes.data)
     return out
+
+
+KQ_Q8_0, KQ_BF16, KQ_NV4 = 8, 30, 50
+
+
+def kq_to_q8_0(src, cols):
+    """Q8_0 blocks (uint8, rows x cols / 32 * 34) of a matrix: bfloat16 as
+    uint16, or float32."""
+    rows = src.size // cols
+    src = np.ascontiguousarray(src)
+    out = np.empty(rows * (cols // 32) * 34, dtype=np.uint8)
+    _lib.kq_to_q8_0(src.ctypes.data, 1 if src.dtype == np.uint16 else 0, rows, cols,
+                    out.ctypes.data)
+    return out
+
+
+def kq_nv4_row_bytes(cols):
+    return 4 + cols // 32 * 18
+
+
+def kq_nv4_pack(ws, ss, gs, rows, cols, out):
+    """The NVFP4 matrices of ModelOpt (ws: uint8 rows x cols / 2; ss: E4M3
+    rows x cols / 16; gs: the float32 scales) to KQ_NV4 rows in out (uint8,
+    n x rows x kq_nv4_row_bytes(cols))."""
+    n = len(ws)
+    wp = np.array([w.ctypes.data for w in ws], dtype=np.int64)
+    sp = np.array([x.ctypes.data for x in ss], dtype=np.int64)
+    g = np.ascontiguousarray(gs, dtype=np.float32)
+    assert out.nbytes >= n * rows * kq_nv4_row_bytes(cols)
+    _lib.kq_nv4_pack(wp.ctypes.data, sp.ctypes.data, g.ctypes.data, n, rows, cols, out.ctypes.data)
 
 
 def kq_moe_mats(gate, up, down, shared):

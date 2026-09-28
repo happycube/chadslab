@@ -3807,6 +3807,12 @@ __global__ void k_q6k_head(const uint8_t *w, const float *x, float *out, int row
  * (32 bits), and the low 4 bits (value j < 16 in the low half of byte j,
  * value j + 16 in its high half). A value is d q + m. */
 #define KQ_Q5_1 7
+/* bfloat16 rows, and NVFP4 in the rows of csrc/kquants.c (KQ_NV4): the
+ * float32 scale of the matrix, then blocks of 32 values of 18 bytes (two E4M3
+ * scales, 16 bytes of E2M1 codes: value j low, j + 16 high). The
+ * safetensors checkpoints (np_gemma/st_qwen4.py). */
+#define KQ_BF16 30
+#define KQ_NV4 50
 /* Q8_0 in rows for the GPU (np_gemma/qwen_gpu.py): the int8 values of the
  * row, then the float16 scale of each 32 values, then zeros to a multiple
  * of 16 bytes. Thus the values of each row start at a multiple of 16
@@ -3819,6 +3825,8 @@ __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
            type == KQ_Q8_R ? ((size_t)cols / 32 * 34 + 15) / 16 * 16 :
            type == KQ_Q8_0 ? (size_t)cols / 32 * 34 :
            type == KQ_Q5_1 ? (size_t)cols / 32 * 24 :
+           type == KQ_BF16 ? (size_t)cols * 2 :
+           type == KQ_NV4 ? 4 + (size_t)cols / 32 * 18 :
            type == KQ_Q4_K ? (size_t)cols / 256 * 144 : type == KQ_Q5_K ? (size_t)cols / 256 * 176 :
            (size_t)cols / 256 * 210;
 }
@@ -3826,6 +3834,25 @@ __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
 __device__ __forceinline__ float kq_half(const uint8_t *p)
 {
     return __half2float(__ushort_as_half((uint16_t)(p[0] | (p[1] << 8))));
+}
+
+__device__ __forceinline__ float kq_e4m3(uint8_t b)
+{
+    int e = (b >> 3) & 15, m = b & 7;
+    float v = e == 0 ? (float)m * (1.f / 512.f) : __uint_as_float(((uint32_t)(e + 120) << 23) | ((uint32_t)m << 20));
+    return (b & 0x80) ? -v : v;
+}
+
+/* Twice the value of an E2M1 code. */
+__device__ __forceinline__ float kq_e2m1x2(int c)
+{
+    const float t[8] = {0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f};
+    return (c & 8) ? -t[c & 7] : t[c & 7];
+}
+
+__device__ __forceinline__ float kq_bf16(uint16_t h)
+{
+    return __uint_as_float((uint32_t)h << 16);
 }
 
 __device__ __forceinline__ void kq_scale_min(const uint8_t *q, int j, int *sc, int *m)
@@ -3885,6 +3912,33 @@ __device__ float kq_row(int type, const uint8_t *w, const float *x, int cols)
                                    (float)(int8_t)(a >> 8) * xv.y +
                                    (float)(int8_t)(c & 255) * xv.z +
                                    (float)(int8_t)(c >> 8) * xv.w);
+        }
+    } else if (type == KQ_BF16) {
+        const uint16_t *h = (const uint16_t *)w;
+        for (int c = 8 * lane; c < cols; c += 256) {
+            uint4 q = *(const uint4 *)(h + c);
+            uint32_t qq[4] = {q.x, q.y, q.z, q.w};
+            const float4 *x4 = (const float4 *)(x + c);
+            float4 a = x4[0], b = x4[1];
+            float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                sum += kq_bf16((uint16_t)(qq[u] & 0xffff)) * xv[2 * u] +
+                       kq_bf16((uint16_t)(qq[u] >> 16)) * xv[2 * u + 1];
+            }
+        }
+    } else if (type == KQ_NV4) {
+        /* As Q8_0: lane l takes 4 values of block l / 8 of 4 blocks. */
+        float g = *(const float *)w;
+        int o = 4 * (lane % 8);
+        for (int b = lane / 8; b < cols / 32; b += 4) {
+            const uint8_t *blk = w + 4 + (size_t)b * 18;
+            float sc = 0.5f * g * kq_e4m3(blk[o < 16 ? 0 : 1]);
+            const uint8_t *q = blk + 2 + (o % 16);
+            int sh = o < 16 ? 0 : 4;
+            float4 xv = *(const float4 *)(x + b * 32 + o);
+            sum += sc * (kq_e2m1x2((q[0] >> sh) & 15) * xv.x + kq_e2m1x2((q[1] >> sh) & 15) * xv.y +
+                         kq_e2m1x2((q[2] >> sh) & 15) * xv.z + kq_e2m1x2((q[3] >> sh) & 15) * xv.w);
         }
     } else if (type == KQ_Q5_1) {
         /* As Q8_0: lane l takes 4 values of block l / 8 of 4 blocks. */
@@ -4823,6 +4877,21 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
         float d = kq_half(blk);
         for (int u = 0; u < 8; ++u) {
             v[u] = d * (float)(int8_t)blk[2 + c0 % 32 + u];
+        }
+    } else if (type == KQ_BF16) {
+        uint4 q = *(const uint4 *)((const uint16_t *)w + c0);
+        uint32_t qq[4] = {q.x, q.y, q.z, q.w};
+        for (int u = 0; u < 4; ++u) {
+            v[2 * u] = kq_bf16((uint16_t)(qq[u] & 0xffff));
+            v[2 * u + 1] = kq_bf16((uint16_t)(qq[u] >> 16));
+        }
+    } else if (type == KQ_NV4) {
+        float g = *(const float *)w;
+        const uint8_t *blk = w + 4 + (size_t)(c0 / 32) * 18;
+        int j = c0 % 32, hi = j >= 16;
+        float sc = 0.5f * g * kq_e4m3(blk[hi]);
+        for (int u = 0; u < 8; ++u) {
+            v[u] = sc * kq_e2m1x2((blk[2 + (j % 16) + u] >> (hi ? 4 : 0)) & 15);
         }
     } else if (type == KQ_Q5_1) {
         const uint8_t *blk = w + (size_t)(c0 / 32) * 24;

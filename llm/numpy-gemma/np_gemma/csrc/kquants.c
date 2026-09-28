@@ -19,6 +19,15 @@
  *     KQ_Q6_K 14   blocks of 256 (210 bytes): 128 bytes of the low 4 bits,
  *                  64 bytes of the high 2 bits, 16 int8 scales (one for
  *                  each 16 values), d. w = d * sc * (q - 32).
+ *     KQ_BF16 30   bfloat16 rows (the safetensors checkpoints).
+ *     KQ_NV4  50   NVFP4 in rows for this runtime (np_gemma/st_qwen4.py
+ *                  repacks the checkpoint of NVIDIA ModelOpt): a row is the
+ *                  float32 scale of the matrix, then blocks of 32 values
+ *                  (18 bytes): two E4M3 scales (values 0-15, 16-31), and
+ *                  16 bytes of 4-bit E2M1 codes (value j in the low 4 bits
+ *                  of byte j, value j + 16 in the high 4 bits). w = g * s *
+ *                  e2m1(code); 2 e2m1 is an integer (0, 1, 2, 3, 4, 6, 8,
+ *                  12 and the negatives).
  *
  * The products quantize x to int8 in its natural order, with one scale xs
  * for each 32 values and xm, xs times the sum of the int8 values of each 16
@@ -44,6 +53,8 @@
 #define KQ_Q6_K 14
 #define KQ_Q5_1 7
 #define KQ_IQ4_NL 20
+#define KQ_BF16 30
+#define KQ_NV4 50
 
 /* The bytes of one row of cols values. */
 static inline size_t kq_row_bytes(int type, int cols)
@@ -56,8 +67,35 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_Q4_K: return (size_t)cols / 256 * 144;
     case KQ_Q5_K: return (size_t)cols / 256 * 176;
     case KQ_Q6_K: return (size_t)cols / 256 * 210;
+    case KQ_BF16: return (size_t)cols * 2;
+    case KQ_NV4: return 4 + (size_t)cols / 32 * 18;
     }
     return 0;
+}
+
+/* Twice the value of an E2M1 code (NVFP4): an integer. */
+static const int8_t kq_e2m1x2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+/* An FP8 E4M3 value (the scales of NVFP4). */
+static inline float kq_e4m3(uint8_t b)
+{
+    int e = (b >> 3) & 15, m = b & 7;
+    float v;
+    if (e == 0) {
+        v = (float)m * (1.f / 512.f);          /* m / 8 * 2^-6 */
+    } else {
+        uint32_t bits = ((uint32_t)(e - 7 + 127) << 23) | ((uint32_t)m << 20);
+        memcpy(&v, &bits, 4);
+    }
+    return (b & 0x80) ? -v : v;
+}
+
+static inline float kq_bf16(uint16_t h)
+{
+    uint32_t bits = (uint32_t)h << 16;
+    float v;
+    memcpy(&v, &bits, 4);
+    return v;
 }
 
 static inline float kq_h(const uint8_t *p)
@@ -138,12 +176,27 @@ static const int8_t kq_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, 
 /* The values of a block of 32 of a type of blocks of 32. */
 static inline int kq_block32(int type)
 {
-    return type == KQ_Q8_0 || type == KQ_Q5_1 || type == KQ_IQ4_NL;
+    return type == KQ_Q8_0 || type == KQ_Q5_1 || type == KQ_IQ4_NL || type == KQ_BF16 ||
+           type == KQ_NV4;
 }
 
 static void kq_block_values(int type, const uint8_t *row, int b, float *out)
 {
-    if (type == KQ_Q5_1) {
+    if (type == KQ_BF16) {
+        const uint16_t *h = (const uint16_t *)row + (size_t)b * 32;
+        for (int i = 0; i < 32; ++i) {
+            out[i] = kq_bf16(h[i]);
+        }
+    } else if (type == KQ_NV4) {
+        float g;
+        memcpy(&g, row, 4);
+        const uint8_t *blk = row + 4 + (size_t)b * 18;
+        float s0 = 0.5f * g * kq_e4m3(blk[0]), s1 = 0.5f * g * kq_e4m3(blk[1]);
+        for (int j = 0; j < 16; ++j) {
+            out[j] = s0 * (float)kq_e2m1x2[blk[2 + j] & 15];
+            out[j + 16] = s1 * (float)kq_e2m1x2[blk[2 + j] >> 4];
+        }
+    } else if (type == KQ_Q5_1) {
         const uint8_t *blk = row + (size_t)b * 24;
         float d = kq_h(blk), m = kq_h(blk + 2);
         uint32_t qh;
@@ -584,7 +637,8 @@ static void kq_tile4(const uint8_t *const wr[4], float ds[4][KQ_S], float dm[4][
 static inline int kq_tiles(int type, int cols)
 {
     int parts = type == KQ_Q6_K ? cols / 16 : cols / 32;
-    return type != KQ_F32 && type != KQ_IQ4_NL && parts <= KQ_S - 16 &&
+    return type != KQ_F32 && type != KQ_IQ4_NL && type != KQ_BF16 && type != KQ_NV4 &&
+           parts <= KQ_S - 16 &&
            (!kq_block32(type) || cols % 64 == 0);
 }
 #endif
@@ -607,12 +661,70 @@ static float kq_dot_scaled(const uint8_t *w, int type, int cols, const float *ds
 #endif
 
 /* One row of type type on one token: xq, xs, xm (quantized), or x for F32. */
+#if defined(__AVX512VNNI__)
+/* BF16 row, int8 x: sum over the blocks of xs * sum(w * xq). */
+static float kq_dot_bf16(const uint8_t *w, int cols, const int8_t *xq, const float *xs)
+{
+    const uint16_t *h = (const uint16_t *)w;
+    __m512 acc = _mm512_setzero_ps();
+    for (int b = 0; b < cols / 32; ++b) {
+        __m512i hw = _mm512_loadu_si512((const void *)(h + 32 * b));
+        __m512 w0 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(hw)), 16));
+        __m512 w1 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(hw, 1)), 16));
+        __m128i xa = _mm_loadu_si128((const __m128i *)(xq + 32 * b));
+        __m128i xb = _mm_loadu_si128((const __m128i *)(xq + 32 * b + 16));
+        __m512 x0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(xa));
+        __m512 x1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(xb));
+        __m512 p = _mm512_fmadd_ps(w1, x1, _mm512_mul_ps(w0, x0));
+        acc = _mm512_fmadd_ps(p, _mm512_set1_ps(xs[b]), acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+/* NVFP4 row (KQ_NV4), int8 x. For each block: the codes to int8 (twice the
+ * values), vpdpbusd with |w| and x with the sign of w (8 sums of 4 values:
+ * the first 4 of values 0-15, the last 4 of 16-31), each half times its
+ * scale and xs. */
+static float kq_dot_nv4(const uint8_t *w, int cols, const int8_t *xq, const float *xs)
+{
+    float g;
+    memcpy(&g, w, 4);
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kq_e2m1x2);
+    const __m128i m4 = _mm_set1_epi8(15);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < cols / 32; ++b) {
+        const uint8_t *blk = w + 4 + (size_t)b * 18;
+        __m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+        __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(q, m4));
+        __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+        __m256i wv = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+        __m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * b));
+        __m256i sx = _mm256_sign_epi8(xv, wv);
+        __m256i is = _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_abs_epi8(wv), sx);
+        float s0 = kq_e4m3(blk[0]) * xs[b], s1 = kq_e4m3(blk[1]) * xs[b];
+        __m256 sc = _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is), sc, acc);
+    }
+    __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    r = _mm_hadd_ps(r, r);
+    r = _mm_hadd_ps(r, r);
+    return 0.5f * g * _mm_cvtss_f32(r);
+}
+#endif
+
 static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
                      const float *xm, const float *x)
 {
 #if defined(__AVX512VNNI__)
     if (type == KQ_F32) {
         return kq_dot_f32((const float *)w, cols, x);
+    }
+    if (type == KQ_BF16) {
+        return kq_dot_bf16(w, cols, xq, xs);
+    }
+    if (type == KQ_NV4) {
+        return kq_dot_nv4(w, cols, xq, xs);
     }
     if (kq_tiles(type, cols)) {
         float ds[KQ_S], dm[KQ_S];
@@ -725,6 +837,80 @@ void kq_linear(const uint8_t *w, int type, int rows, int cols, const int8_t *xq,
 {
     #pragma omp parallel
     kq_linear_body(w, type, rows, cols, xq, xs, xm, x, t, out);
+}
+
+/* ---------- the conversions of the safetensors loader (np_gemma/st_qwen4.py) ---------- */
+
+/* One row of cols float values to Q8_0 blocks (as quantize_row_q8_0 of ggml). */
+static void kq_row_to_q8_0(const float *x, int cols, uint8_t *dst)
+{
+    for (int b = 0; b < cols / 32; ++b) {
+        const float *v = x + 32 * b;
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) {
+            amax = fabsf(v[i]) > amax ? fabsf(v[i]) : amax;
+        }
+        float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+        uint8_t *blk = dst + (size_t)b * 34;
+        uint16_t hd = _cvtss_sh(d, 0);
+        memcpy(blk, &hd, 2);
+        for (int i = 0; i < 32; ++i) {
+            blk[2 + i] = (uint8_t)(int8_t)lrintf(v[i] * id);
+        }
+    }
+}
+
+/* rows x cols values (bf16 if bf16, else float32) to Q8_0 rows. */
+void kq_to_q8_0(const void *src, int bf16, int64_t rows, int cols, uint8_t *dst)
+{
+    #pragma omp parallel
+    {
+        float *tmp = (float *)malloc((size_t)cols * 4);
+        #pragma omp for schedule(static)
+        for (int64_t r = 0; r < rows; ++r) {
+            const float *x;
+            if (bf16) {
+                const uint16_t *h = (const uint16_t *)src + (size_t)r * cols;
+                for (int c = 0; c < cols; ++c) {
+                    tmp[c] = kq_bf16(h[c]);
+                }
+                x = tmp;
+            } else {
+                x = (const float *)src + (size_t)r * cols;
+            }
+            kq_row_to_q8_0(x, cols, dst + (size_t)r * kq_row_bytes(KQ_Q8_0, cols));
+        }
+        free(tmp);
+    }
+}
+
+/* The NVFP4 matrices of n experts (ModelOpt: w, rows x cols / 2 bytes, value
+ * 2i in the low 4 bits of byte i; s, rows x cols / 16 E4M3 scales; g, the
+ * float32 scale) to KQ_NV4 rows: dst gets n matrices of rows rows. wp and sp
+ * hold the addresses of w and s of each expert. */
+void kq_nv4_pack(const int64_t *wp, const int64_t *sp, const float *g, int n, int rows, int cols,
+                 uint8_t *dst)
+{
+    size_t rb = kq_row_bytes(KQ_NV4, cols);
+    #pragma omp parallel for schedule(static)
+    for (int64_t x = 0; x < (int64_t)n * rows; ++x) {
+        int e = (int)(x / rows), r = (int)(x % rows);
+        const uint8_t *w = (const uint8_t *)(intptr_t)wp[e] + (size_t)r * (cols / 2);
+        const uint8_t *s = (const uint8_t *)(intptr_t)sp[e] + (size_t)r * (cols / 16);
+        uint8_t *o = dst + (size_t)x * rb;
+        memcpy(o, &g[e], 4);
+        for (int b = 0; b < cols / 32; ++b) {
+            uint8_t *blk = o + 4 + (size_t)b * 18;
+            blk[0] = s[2 * b];
+            blk[1] = s[2 * b + 1];
+            const uint8_t *src = w + (size_t)b * 16;     /* 32 values, 2 in each byte */
+            for (int j = 0; j < 16; ++j) {
+                int lo = (src[j / 2] >> (4 * (j % 2))) & 15;             /* value j */
+                int hi = (src[8 + j / 2] >> (4 * (j % 2))) & 15;         /* value j + 16 */
+                blk[2 + j] = (uint8_t)(lo | (hi << 4));
+            }
+        }
+    }
 }
 
 /* The float values of rows ids of a matrix (the embeddings). */

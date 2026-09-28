@@ -123,12 +123,19 @@ class Qwen4(QwenGGUF):
     """
 
     def __init__(self, path, cfg=None, layers=None, mtp=None):
+        from .st_qwen4 import NVFP4Source, is_checkpoint
         self.path = path
-        self.g = open_gguf(path)
-        if mtp is not None:
-            # The MTP layer (blk.<layers>) is in its own file.
-            self.g.attach(mtp)
-        self.cfg = cfg or config_from_gguf(self.g)
+        if is_checkpoint(path):
+            # The safetensors checkpoint of ModelOpt (np_gemma/st_qwen4.py); it
+            # has the MTP layer.
+            self.g = NVFP4Source(path)
+            self.cfg = cfg or self.g.config()
+        else:
+            self.g = open_gguf(path)
+            if mtp is not None:
+                # The MTP layer (blk.<layers>) is in its own file.
+                self.g.attach(mtp)
+            self.cfg = cfg or config_from_gguf(self.g)
         self.n_layers = layers or self.cfg.num_hidden_layers
         self._deq = {}
 
@@ -580,8 +587,8 @@ class Qwen4CPU(Qwen4):
         m = self._k.get(gname)
         if m is None:
             m = KMat(self.g, gname)
-            if m.type == 30:
-                # BF16 (the indexer): the products take it as F32.
+            if m.type == 30 and ".indexer." in gname:
+                # BF16 (the indexer of the GGUF file): the products take it as F32.
                 a = self.G(gname)
                 m.data, m.type = np.ascontiguousarray(a, np.float32).view(np.uint8).reshape(-1), 0
             self._k[gname] = m
@@ -658,6 +665,8 @@ class Qwen4CPU(Qwen4):
         """The 16 rows of the n-gram table of each token (t x hid)."""
         from . import cops
         rows = self.ple_ids(ids, cache)
+        if hasattr(self.g, "ple_rows"):
+            return self.g.ple_rows(rows.reshape(-1)).reshape(len(ids), -1)
         m = self.K("per_layer_token_embd.weight")
         return cops.kq_rows(m.data, m.type, m.cols, rows.reshape(-1)).reshape(len(ids), -1)
 
