@@ -637,21 +637,29 @@ class Qwen4CPU(Qwen4):
     # its own ----
 
     def KP(self, gname):
-        """The matrix for the CPU products: a Q8_0 matrix of 16 n rows as
-        KQ_Q8X16 (rows in groups of 16; csrc/kquants.c), made at the first
-        use (NP_GEMMA_X16=0: as it is). The GPU takes K()."""
+        """The matrix for the CPU products, in groups of 16 rows (csrc/
+        kquants.c), made at the first use: Q8_0 (16 n rows) as KQ_Q8X16,
+        float32 as KQ_F32X16, bfloat16 as KQ_BF16X16 (the last two take x
+        as float32; 64 rows or more: the smaller ones take the threads with
+        their tokens). NP_GEMMA_X16=0: as it is. The GPU takes K()."""
         m = self._kp.get(gname) if hasattr(self, "_kp") else None
         if m is None:
             if not hasattr(self, "_kp"):
                 self._kp = {}
             m = self.K(gname)
-            if m.type == 8 and m.rows % 16 == 0 and m.cols % 32 == 0 and \
-                    os.environ.get("NP_GEMMA_X16", "1") != "0":
+            if os.environ.get("NP_GEMMA_X16", "1") != "0":
                 from . import cops
                 from .qwen import KMat
-                p = KMat.__new__(KMat)
-                p.data, p.type, p.rows, p.cols = cops.kq_pack_q8x16(m.data, m.rows, m.cols), 60, m.rows, m.cols
-                m = p
+                data = None
+                if m.type == 8 and m.rows % 16 == 0 and m.cols % 32 == 0:
+                    data, t = cops.kq_pack_q8x16(m.data, m.rows, m.cols), 60
+                elif m.type in (0, 30) and m.rows >= 64:
+                    data = cops.kq_pack_x16f(m.data, m.type == 30, m.rows, m.cols)
+                    t = 61 if m.type == 30 else 62
+                if data is not None:
+                    p = KMat.__new__(KMat)
+                    p.data, p.type, p.rows, p.cols = data, t, m.rows, m.cols
+                    m = p
             self._kp[gname] = m
         return m
 

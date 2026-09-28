@@ -40,6 +40,14 @@
  *                  the GPU; kq_nv4_* give the places). w = g * s *
  *                  e2m1(code); 2 e2m1 is an integer (0, 1, 2, 3, 4, 6, 8,
  *                  12 and the negatives).
+ *     KQ_BF16X16 61, KQ_F32X16 62  bfloat16 or float32 in groups of 16 rows
+ *                  (this runtime, only in memory; kq_pack_x16f makes them
+ *                  for the CPU): for each column, the values of the 16 rows
+ *                  (32 or 64 bytes). The rows go to a multiple of 16 with
+ *                  zeros. A lane is a row, x is float32 (not int8), and a
+ *                  step is one fma for each token (kq_x16f_body). Only for
+ *                  64 rows or more (Qwen4CPU.KP): the smaller matrices stay
+ *                  in rows, on tasks of a row and 16 tokens.
  *     KQ_NVX  53   NVFP4 in groups of 16 rows (this runtime; the GGUF of
  *                  scripts/convert_nvfp4_gguf.py; kq_nvx_pack). A group: 16
  *                  bytes (the float32 scale of the matrix, zeros), then for
@@ -81,6 +89,8 @@
 #define KQ_NV4 51
 #define KQ_Q8X16 60
 #define KQ_NVX 53
+#define KQ_BF16X16 61
+#define KQ_F32X16 62
 #define KQ_NVX_BB 288
 
 /* The bytes of one row of cols values. */
@@ -98,6 +108,8 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_NV4: return ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16;
     case KQ_Q8X16: return (size_t)cols / 32 * 36;      /* a group of 16 rows: 16 times this */
     case KQ_NVX: return (size_t)cols / 32 * 18 + 1;    /* a group of 16 rows: 16 times this */
+    case KQ_BF16X16: return (size_t)cols * 2;          /* a group: 16 times this */
+    case KQ_F32X16: return (size_t)cols * 4;
     }
     return 0;
 }
@@ -1154,6 +1166,9 @@ static void kq_nvx_xsum(const int8_t *xq, int n, int cols, int32_t *xn)
 #if defined(__AVX512VNNI__)
 /* E2M1 codes to twice their values plus 12 (0 to 24: the unsigned operand
  * of vpdpbusd). */
+/* 16 tokens for each decode of a block (8: 1.5% slower at 512 tokens, 7% at
+ * 2048; the experts of a prompt are near the rate of the memory). */
+#define KQ_NVX_TB 16
 static const uint8_t kq_e2m1u[16] = {12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0};
 
 /* 16 E4M3 scales as float32 times 2^-8: the bits go to float16 as they are
@@ -1181,10 +1196,10 @@ static void kq_nvx_rows(const uint8_t *wg, int cols, const int8_t *xq, const flo
     const __m512 gs = _mm512_set1_ps(128.f * g);        /* 0.5 g, and 2^8 of kq_e4m3x16 */
     const __m512i lut = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1u));
     const __m256i m4 = _mm256_set1_epi8(15);
-    for (int j = 0; j < n; j += KQ_X16_TB) {
-        int nt = n - j < KQ_X16_TB ? n - j : KQ_X16_TB;
-        __m512 f[KQ_X16_TB];
-        for (int tt = 0; tt < KQ_X16_TB; ++tt) {
+    for (int j = 0; j < n; j += KQ_NVX_TB) {
+        int nt = n - j < KQ_NVX_TB ? n - j : KQ_NVX_TB;
+        __m512 f[KQ_NVX_TB];
+        for (int tt = 0; tt < KQ_NVX_TB; ++tt) {
             f[tt] = _mm512_setzero_ps();
         }
         for (int b = 0; b < nb; ++b) {
@@ -1276,9 +1291,171 @@ static void kq_nvx_body(const uint8_t *w, int rows, int cols, const int8_t *xq, 
     free(xn);
 }
 
+#if defined(__AVX512F__)
+#ifndef KQ_X16F_GB
+#define KQ_X16F_GB 4
+#endif
+
+/* ng (at most 4) groups of 16 rows (gb bytes apart; the last has nr rows)
+ * on at most 4 tokens j0 .. j1 - 1: the groups give independent sums, so
+ * the fma of a token do not wait on each other (one group on one token
+ * waits 4 cycles for each column). A missing group repeats group 0 and is
+ * not stored. For each row and token: one fma for each column, in order, as
+ * kq_x16f_group16: the same bits. */
+static void kq_x16f_groups4(const uint8_t *wg, size_t gb, int ng, int nr, int bf, int cols,
+                            size_t xstride, const float *x, int j0, int j1, float *out,
+                            size_t ostride)
+{
+    int nt = j1 - j0;
+    const uint8_t *gp[4];
+    for (int g = 0; g < 4; ++g) {
+        gp[g] = wg + (g < ng ? g : 0) * gb;
+    }
+    __m512 f[4][4];
+    for (int g = 0; g < 4; ++g) {
+        for (int tt = 0; tt < 4; ++tt) {
+            f[g][tt] = _mm512_setzero_ps();
+        }
+    }
+    const float *xr = x + (size_t)j0 * xstride;
+    for (int c = 0; c < cols; ++c) {
+        __m512 wv[4];
+        #pragma GCC unroll 4
+        for (int g = 0; g < 4; ++g) {
+            wv[g] = bf ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                             _mm256_loadu_si256((const __m256i *)(gp[g] + (size_t)32 * c))), 16))
+                       : _mm512_loadu_ps((const float *)(gp[g] + (size_t)64 * c));
+        }
+        #pragma GCC unroll 4
+        for (int tt = 0; tt < 4; ++tt) {
+            if (tt < nt) {
+                __m512 xv = _mm512_set1_ps(xr[(size_t)tt * xstride + c]);
+                #pragma GCC unroll 4
+                for (int g = 0; g < 4; ++g) {
+                    f[g][tt] = _mm512_fmadd_ps(wv[g], xv, f[g][tt]);
+                }
+            }
+        }
+    }
+    for (int tt = 0; tt < nt; ++tt) {
+        for (int g = 0; g < ng; ++g) {
+            int n = g == ng - 1 ? nr : 16;
+            __mmask16 mk = (__mmask16)(n >= 16 ? 0xffff : (1u << n) - 1);
+            _mm512_mask_storeu_ps(out + (size_t)(j0 + tt) * ostride + 16 * g, mk, f[g][tt]);
+        }
+    }
+}
+
+/* One group of 16 rows on tokens j0 .. j1 - 1, 16 tokens at a time, with
+ * loops of fixed counts (the 16 sums stay in registers; each broadcast is
+ * an operand of its fma). A batch of fewer than 16 tokens repeats its last
+ * token and does not store it. */
+static void kq_x16f_group16(const uint8_t *wg, int bf, int cols, size_t xstride, const float *x,
+                            int j0, int j1, int nr, float *out, size_t ostride)
+{
+    __mmask16 mk = (__mmask16)(nr >= 16 ? 0xffff : (1u << nr) - 1);
+    for (int j = j0; j < j1; j += 16) {
+        int nt = j1 - j < 16 ? j1 - j : 16;
+        const float *xp[16];
+        for (int tt = 0; tt < 16; ++tt) {
+            xp[tt] = x + (size_t)(j + (tt < nt ? tt : nt - 1)) * xstride;
+        }
+        __m512 f[16];
+        for (int tt = 0; tt < 16; ++tt) {
+            f[tt] = _mm512_setzero_ps();
+        }
+        for (int c = 0; c < cols; ++c) {
+            __m512 wv = bf ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                                 _mm256_loadu_si256((const __m256i *)(wg + (size_t)32 * c))), 16))
+                           : _mm512_loadu_ps((const float *)(wg + (size_t)64 * c));
+            #pragma GCC unroll 16
+            for (int tt = 0; tt < 16; ++tt) {
+                f[tt] = _mm512_fmadd_ps(wv, _mm512_set1_ps(xp[tt][c]), f[tt]);
+            }
+        }
+        #pragma GCC unroll 16
+        for (int tt = 0; tt < 16; ++tt) {
+            if (tt < nt) {
+                _mm512_mask_storeu_ps(out + (size_t)(j + tt) * ostride, mk, f[tt]);
+            }
+        }
+    }
+}
+#else
+/* Without AVX-512: the same sums in C (not the bits of the AVX-512 path). */
+static void kq_x16f_group(const uint8_t *wg, int bf, int cols, size_t xstride, const float *x,
+                          int j0, int j1, int nr, float *out, size_t ostride)
+{
+    for (int j = j0; j < j1; ++j) {
+        for (int r = 0; r < nr; ++r) {
+            float s = 0.f;
+            for (int c = 0; c < cols; ++c) {
+                float v;
+                if (bf) {
+                    uint32_t u = (uint32_t)((const uint16_t *)wg)[16 * c + r] << 16;
+                    memcpy(&v, &u, 4);
+                } else {
+                    v = ((const float *)wg)[16 * c + r];
+                }
+                s += v * x[(size_t)j * xstride + c];
+            }
+            out[(size_t)j * ostride + r] = s;
+        }
+    }
+}
+#endif
+
+/* out (t x rows) of a KQ_BF16X16 or KQ_F32X16 matrix, inside a parallel
+ * region. A task: at most 4 tokens, 4 groups or 1 (kq_x16f_groups4); more
+ * tokens, KQ_X16F_GB groups on 16 tokens, so x comes from the cache of the
+ * core for all of them (kq_x16f_group16). Tiles of 4 groups by 64 tokens in
+ * chunks of 256 columns, with x as [column][token], were slower (44 to 48
+ * ms, not 28, for 10240 x 2560 on 512 tokens). */
+static void kq_x16f_body(const uint8_t *w, int type, int rows, int cols, const float *x, int t,
+                         float *out)
+{
+    int ng = (rows + 15) / 16, bf = type == KQ_BF16X16;
+    size_t gb = (size_t)16 * kq_row_bytes(type, cols);
+    int u = 1, tk = 16;
+#if defined(__AVX512F__)
+    if (t <= 4) {
+        /* 4 groups in a task when there are enough for all the threads */
+        u = ng >= 4 * omp_get_num_threads() ? 4 : 1, tk = 4;
+    } else {
+        u = KQ_X16F_GB;
+    }
+#endif
+    int nu = (ng + u - 1) / u, nj = (t + tk - 1) / tk;
+    #pragma omp for schedule(static)
+    for (int e = 0; e < nu * nj; ++e) {
+        int g = u * (e / nj), j0 = tk * (e % nj), j1 = j0 + tk < t ? j0 + tk : t;
+        int n = ng - g < u ? ng - g : u;                   /* the groups of the task */
+        int last = rows - 16 * (g + n - 1);                /* the rows of its last group */
+        last = last < 16 ? last : 16;
+        const uint8_t *wg = w + (size_t)g * gb;
+        float *o = out + (size_t)16 * g;
+#if defined(__AVX512F__)
+        if (t <= 4) {
+            kq_x16f_groups4(wg, gb, n, last, bf, cols, (size_t)cols, x, j0, j1, o, (size_t)rows);
+            continue;
+        }
+        for (int gi = 0; gi < n; ++gi) {
+            kq_x16f_group16(wg + gi * gb, bf, cols, (size_t)cols, x, j0, j1, gi == n - 1 ? last : 16,
+                            o + 16 * gi, (size_t)rows);
+        }
+#else
+        kq_x16f_group(wg, bf, cols, (size_t)cols, x, j0, j1, last, o, (size_t)rows);
+#endif
+    }
+}
+
 static void kq_linear_body(const uint8_t *w, int type, int rows, int cols, const int8_t *xq,
                            const float *xs, const float *xm, const float *x, int t, float *out)
 {
+    if (type == KQ_BF16X16 || type == KQ_F32X16) {
+        kq_x16f_body(w, type, rows, cols, x, t, out);
+        return;
+    }
     if (type == KQ_NVX) {
         kq_nvx_body(w, rows, cols, xq, xs, t, out);
         return;
@@ -1304,6 +1481,20 @@ static void kq_linear_body(const uint8_t *w, int type, int rows, int cols, const
         return;
     }
 #endif
+    if (rows < 64 && t > 1) {
+        /* few rows (the small float32 matrices): tasks of a row and 16
+         * tokens, so the tokens take the threads; the sums of each token
+         * are those of kq_row */
+        int nj = (t + 15) / 16;
+        #pragma omp for schedule(static)
+        for (int e = 0; e < rows * nj; ++e) {
+            int r = e / nj, j0 = 16 * (e % nj), n = t - j0 < 16 ? t - j0 : 16;
+            kq_row(w + (size_t)r * rb, type, cols, xq + (size_t)j0 * cols,
+                   xs + (size_t)j0 * (cols / 32), xm + (size_t)j0 * (cols / 16),
+                   x ? x + (size_t)j0 * cols : NULL, n, out + (size_t)j0 * rows + r, (size_t)rows);
+        }
+        return;
+    }
     #pragma omp for schedule(static)
     for (int r = 0; r < rows; ++r) {
         kq_row(w + (size_t)r * rb, type, cols, xq, xs, xm, x, t, out + r, (size_t)rows);
@@ -1431,6 +1622,28 @@ void kq_gather(const int64_t *addrs, int64_t n, int bytes, uint8_t *out)
     #pragma omp parallel for num_threads(64) schedule(dynamic, 16)
     for (int64_t i = 0; i < n; ++i) {
         memcpy(out + (size_t)i * bytes, (const void *)(intptr_t)addrs[i], (size_t)bytes);
+    }
+}
+
+/* float32 or bfloat16 rows (bf) to KQ_F32X16 or KQ_BF16X16: dst gets
+ * (rows + 15) / 16 groups; the rows past rows are zeros. */
+void kq_pack_x16f(const uint8_t *src, int bf, int64_t rows, int cols, uint8_t *dst)
+{
+    int es = bf ? 2 : 4;
+    int64_t ng = (rows + 15) / 16;
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < ng; ++g) {
+        uint8_t *o = dst + (size_t)g * 16 * cols * es;
+        for (int r = 0; r < 16; ++r) {
+            int64_t row = 16 * g + r;
+            for (int c = 0; c < cols; ++c) {
+                if (row < rows) {
+                    memcpy(o + ((size_t)16 * c + r) * es, src + ((size_t)row * cols + c) * es, es);
+                } else {
+                    memset(o + ((size_t)16 * c + r) * es, 0, es);
+                }
+            }
+        }
     }
 }
 

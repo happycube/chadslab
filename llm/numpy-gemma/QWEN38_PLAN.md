@@ -335,6 +335,12 @@ Status (the profile; gemma_profile, 18 threads):
   them.
 - The verify group reads the experts of 4 tokens (up to 40 for each
   layer). That is the most part of the cost of a round.
+- The float32 matrices (the routers, the inject weights, the gates of the
+  DeltaNet) took 0.93 s of a prompt of 512. They had a dot product for each
+  token and row, on few rows. The matrices of 64 rows or more are now in groups
+  of 16 rows (KQ_F32X16; bfloat16: KQ_BF16X16, for dense bf16), with a
+  lane for each row and x as float32. The smaller ones take tasks of a row
+  and 16 tokens. They now take 0.31 s (HANDOFF_QWEN38.md, section 8).
 
 ### Phase 5: the GPU
 

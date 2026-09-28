@@ -130,11 +130,26 @@ The GGUF of this runtime, llama-bench method (scripts/bench_qwen4.py):
 - The int8 x of the GPU steps: decode from 16.1 to 19.1 tok/s (one run).
 - KQ_Q8X16 on the CPU: the dense products of a prompt of 512 from 5.5 s to
   2.55 s (1.19 T multiply-adds/s against 0.38).
-- The limits now:
-  - The GPU decode waits for the CPU. With 0.5 GB, only about 3 experts of
-    each layer are hot; the CPU computes the cold experts.
-  - The GPU prompt waits for the copies (6.8 GB/s over PCIe).
-  - The CPU prompt is limited by compute (the experts and the DeltaNet).
+- The float32 and bfloat16 matrices of the CPU (types 61, 62): see
+  section 8.
+
+The time of each part (the profiles of 2026-09-28). Other programs ran on
+the machine, so a time can change by 15%:
+
+    CPU, a prompt of 512 (dense q8, 6.1 s)   the experts 1.8 s (about 43 GB/s: the memory),
+                                             the dense products 1.9 s, GDN 1.1 s, HC_MIX 0.43 s,
+                                             ATTN_QSA 0.36 s, KQ_QUANT 0.31 s
+    CPU, a decode step (124 ms)              the dense products 75 ms (51 to 58 GB/s; the
+                                             matrices of 320 rows or columns 40 to 47 GB/s),
+                                             the experts 37 ms (43 GB/s). About 5.8 GB for each
+                                             token: 47 GB/s, 71% of the 66 GB/s of the memory.
+    GPU, a group of 1024 (1.88 s; 2.67 s     FETCH_WAIT 0.43 s (the copies, 6.8 GB/s), the dense
+    with type 51)                            products 0.32 s, the experts on the GPU 0.28 s,
+                                             CPU_WAIT 0.17 s, GDN 0.12 s. MOE_PLAN: 27 of 171
+                                             experts copied, 183 on the CPU, in each layer.
+    GPU, a decode step (47 ms)               CPU_JOIN 22 ms (the cold experts on the CPU: about
+                                             0.9 GB at 43 GB/s), the dense products 15 ms (3.9
+                                             GB: 260 GB/s, 58% of the GPU), the hot experts 3.6 ms.
 
 ## 6. How to run the checks
 
@@ -150,15 +165,15 @@ The switches for a comparison:
 
     NP_GEMMA_GPU_KQTC=0     no tensor cores
     NP_GEMMA_GPU_I8X=0      float32 x in steps
-    NP_GEMMA_X16=0          no Q8X16 on the CPU
+    NP_GEMMA_X16=0          no groups of 16 rows on the CPU (types 60, 61, 62)
     NP_GEMMA_GPU_ATTN_MT=0  the attention of each query
     NP_GEMMA_GPU_MIX=0      no mixed groups
 
 ## 7. The next steps
 
 1. Remove the file of type 51 when the comparisons are done (133 GB).
-2. kq_nvx_rows decodes a block again for each 8 tokens. An expert of a
-   prompt has about 10 tokens: a batch of 16 tokens can help.
+2. The 8-bit dense products of 320 rows (hc_*_down: 20 groups for 18
+   threads) and 320 columns: 40 to 47 GB/s in a decode step, not 57.
 3. The GPU decode of dense matrices with short rows (hc_*_up: 320 values):
    a lane for each row. A GPU kernel that reads KQ_Q8X16 can be a test.
 4. Memory: in q8 mode, the Q8_0 copy stays next to KQ_Q8X16 (3.9 GB more);
@@ -167,3 +182,31 @@ The switches for a comparison:
    budget. MTP and the prompt copies can be faster there.
 6. The minimum size of the copy buffer of a prompt (a warning now when it is
    less than 32 experts).
+
+## 8. The CPU layouts of float32 and bfloat16 (types 61 and 62)
+
+- Qwen4CPU.KP packs a float32 or bfloat16 matrix of 64 rows or more in
+  groups of 16 rows (only in memory). For each column, a group holds the
+  values of its 16 rows. A lane is a row, x is float32, and each column is one fma for each
+  token (kq_x16f_body).
+  - At most 4 tokens: a task has 4 groups, so the sums do not wait on each
+    other. With too few groups for the threads, a task has 1 group.
+  - More tokens: a task has 4 groups on 16 tokens, with loops of fixed
+    counts. A variable count made the compiler keep the sums in memory
+    (57 ms, not 28 ms, for 10240 x 2560 on 512 tokens).
+- A matrix of fewer than 64 rows stays in rows. Its tasks are a row and 16
+  tokens, so the tokens take the threads (4 x 10240 on 512 tokens: 0.33 ms,
+  not 1.07 ms).
+- A token alone and in a group gives the same bits. The results agree with
+  float64 to 3e-6.
+- Memory: the packed copies stay in RAM. In dense bf16 mode that is all the
+  dense matrices and the head (about 8 GB); the file pages of the
+  originals can go.
+- NVX (the experts): tokens in batches of 16 (not 8). The gain is 1.5% at
+  512 tokens and 7% at 2048: the experts of a prompt are near the rate of
+  the memory.
+- The results (the same profile program):
+
+      dense q8, a prompt of 512      the float32 matrices 0.93 s -> 0.31 s
+      dense bf16, a prompt of 512    15.8 s -> 9.9 s (the dense products 10.7 s -> 4.5 s)
+      decode steps                   no change (q8 124 ms; bf16 about 185 ms, 5% of noise)

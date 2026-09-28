@@ -251,6 +251,8 @@ try:
         _lib.kq_nv4_pack.restype = None
         _lib.kq_nvx_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nvx_pack.restype = None
+        _lib.kq_pack_x16f.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
+        _lib.kq_pack_x16f.restype = None
         _lib.kq_pack_q8x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.kq_pack_q8x16.restype = None
         _lib.kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
@@ -756,6 +758,18 @@ def kq_pack_q8x16(q8, rows, cols):
     assert rows % 16 == 0 and cols % 32 == 0
     out = np.empty(rows * (cols // 32) * 36, dtype=np.uint8)
     _lib.kq_pack_q8x16(np.ascontiguousarray(q8).ctypes.data, rows, cols, out.ctypes.data)
+    return out
+
+
+KQ_BF16X16, KQ_F32X16 = 61, 62
+
+
+def kq_pack_x16f(a, bf, rows, cols):
+    """float32 (bf False) or bfloat16 (as uint16) rows to KQ_F32X16 or
+    KQ_BF16X16: groups of 16 rows, the rows past rows zeros (csrc/kquants.c)."""
+    out = np.empty(((rows + 15) // 16) * 16 * cols * (2 if bf else 4), dtype=np.uint8)
+    _lib.kq_pack_x16f(np.ascontiguousarray(a).ctypes.data, 1 if bf else 0, rows, cols,
+                      out.ctypes.data)
     return out
 
 
