@@ -230,10 +230,17 @@ class Qwen4GPU(QwenGPU):
 
     def _mix_group(self, t):
         """The program of a mixed group of t rows, and the buffer of the
-        copies: the free memory less MIX_KEEP, made once after the first
-        program and the head."""
+        copies: the free memory less MIX_KEEP, made after the programs and
+        the head (made again when a program of a new size comes)."""
         e = self.mix_progs.get(t)
         if e is None:
+            if self.mix_ring is not None:
+                # A group of another size: its program first, then the buffer
+                # again with the memory that is left (the plans read its
+                # address and places from desc, not from the programs).
+                for buf in self.mix_ring:
+                    buf.free()
+                self.mix_ring = None
             self._pool = {}
             prog = _fuse(compile_qwen4_step(_Emit4(self, t, False, False, mix=True), t), t)
             e = self.mix_progs[t] = (prog, GPUProgram(prog, graph=self.graph, mirror=self.g.mirror))
