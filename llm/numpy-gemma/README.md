@@ -1854,7 +1854,9 @@ long_qwen4_out.txt.
     python scripts/long_qwen4.py --question "What does csrc/moe.c do?" --gen 512
 
 The OpenAI compatible server uses the HTTP part of np_gemma/server.py. It
-adds the chat template of Qwen, and gives the <think> part as the reasoning:
+renders the chat template of the model (chat_template.jinja), with the tools.
+It gives the <think> part as the reasoning. It gives the tool calls of the
+model as the tool_calls of the API:
 
     python scripts/serve_qwen4.py --ctx 98304 --port 8081     # http://127.0.0.1:8081/v1
 

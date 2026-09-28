@@ -165,9 +165,9 @@ def main():
     tmp = args.out + ".part"
     write_gguf(tmp, metadata(cfg, src), tensors, progress=progress)
     os.replace(tmp, args.out)
-    tok = os.path.join(args.src, "tokenizer.json")
-    if os.path.exists(tok):
-        shutil.copy(tok, os.path.join(os.path.dirname(os.path.abspath(args.out)), "tokenizer.json"))
+    for f in ("tokenizer.json", "chat_template.jinja"):
+        if os.path.exists(os.path.join(args.src, f)):
+            shutil.copy(os.path.join(args.src, f), os.path.join(os.path.dirname(os.path.abspath(args.out)), f))
     print("done: %.0f s" % (time.time() - t0))
     return 0
 

@@ -7,23 +7,32 @@ scripts/convert_nvfp4_gguf.py) on the GPU, or on the CPU.
 Point an OpenAI client at http://127.0.0.1:8081/v1 . The HTTP part is that of
 np_gemma/server.py. This file gives it the Qwen parts:
 
-- the chat template of Qwen (ChatML), and the stop tokens <|im_end|> and
-  <|endoftext|>;
+- the chat template of the model (chat_template.jinja, with jinja2): the
+  tools, the tool results, and the tool calls of the earlier turns; the stop
+  tokens <|im_end|> and <|endoftext|>;
 - the <think> part of the answer as the reasoning (reasoning_content): the
   text goes to the channel form of the Gemma output that the parser reads;
+- the tool calls of the answer (<tool_call><function=NAME><parameter=P>
+  value</parameter>...) as the tool_calls of the OpenAI API, with the types
+  of the schema of each tool;
 - one cache of --ctx tokens. A prompt that starts with all the tokens in the
-  cache (the next turn of the same chat) reads only its new tokens; any other
-  prompt starts again at position 0.
+  cache reads only its new tokens. At the end of each prompt the server keeps
+  the recurrent state (DeltaNet, the n-gram layer): a prompt that starts
+  with the last prompt (the next turn of an agent, whose earlier answer
+  comes back in the form of the template) reads only the tokens after it.
+  Any other prompt starts again at position 0.
 
-Tools are not supported. --thinking opens the think part by default; a
-request can set "thinking".
+--thinking opens the think part by default; a request can set "thinking".
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
+import uuid
 
 import numpy as np
 
@@ -31,19 +40,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from np_gemma.qwen4 import Qwen4Cache, Qwen4CPU  # noqa: E402
 from np_gemma.qwen_tok import QwenTokenizer  # noqa: E402
-from np_gemma.server import Backend, content_text, serve  # noqa: E402
+from np_gemma import server as S  # noqa: E402
+from np_gemma.chat import parse_output as gemma_parse_output  # noqa: E402
+from np_gemma.server import Backend, serve  # noqa: E402
 
 MODEL = "models2/Qwen3.8-Flash-Next-NVFP4-GGUF/Qwen3.8-Flash-Next-NVFP4-bf16.gguf"
-EMPTY_THINK = "<think>\n\n</think>\n\n"
 
 
 class QwenTok:
-    """The tokenizer interface of np_gemma/server.py on QwenTokenizer."""
+    """The tokenizer interface of np_gemma/server.py on QwenTokenizer, with
+    the chat template of the model."""
 
-    def __init__(self, path):
+    def __init__(self, path, template):
+        import jinja2
         self.t = QwenTokenizer(path)
         self.stop_ids = list(self.t.stop_ids)
         self.think_open = False     # the prompt of the request ends in <think>
+        env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
+                                 extensions=["jinja2.ext.loopcontrols"])
+        env.filters["tojson"] = lambda x, **kw: json.dumps(x, ensure_ascii=False)
+        env.filters["items"] = lambda d: list(d.items()) if isinstance(d, dict) else []
+
+        def raise_exception(msg):
+            raise ValueError(msg)
+        env.globals["raise_exception"] = raise_exception
+        self.template = env.from_string(open(template, encoding="utf-8").read())
 
     def encode(self, text):
         return self.t.encode(text)
@@ -59,18 +80,79 @@ class QwenTok:
 
     def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False,
                             tools=None, empty_thought_block=True):
-        out = []
-        for m in messages:
-            role, content = m["role"], m["content"] or ""
-            if role == "assistant":
-                # the form of the answers of this server (no think part), so
-                # the next turn starts with the tokens of the cache
-                content = EMPTY_THINK + content
-            out.append("<|im_start|>%s\n%s<|im_end|>\n" % (role, content))
-        if add_generation_prompt:
-            out.append("<|im_start|>assistant\n" + ("<think>\n" if thinking else EMPTY_THINK))
+        text = self.template.render(messages=messages, tools=tools or None,
+                                    add_generation_prompt=add_generation_prompt,
+                                    enable_thinking=bool(thinking))
         self.think_open = bool(thinking)
-        return "".join(out)
+        return text
+
+
+# The tool calls of the answer (the form of the template).
+TOOLS = {}      # the tools of the request: name -> the properties of its parameters
+CALL = re.compile(r"<tool_call>\s*<function=([^>\s]+)>(.*?)</function>\s*</tool_call>", re.S)
+PARAM = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.S)
+OPEN = "<tool_call>"
+
+
+def _value(text, prop):
+    """A parameter in the type of the schema: a string as it is, else JSON."""
+    if (prop or {}).get("type") == "string":
+        return text
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def qwen_parse_output(text):
+    """parse_output of np_gemma/chat.py (the reasoning), and the tool calls of
+    Qwen. A tool call that is not complete is pending: a stream holds it."""
+    p = gemma_parse_output(text)
+    calls = []
+
+    def call(m):
+        name, props = m.group(1), TOOLS.get(m.group(1), {})
+        args = {k: _value(v, props.get(k)) for k, v in PARAM.findall(m.group(2))}
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        return ""
+    body = CALL.sub(call, p["content"])
+    pending = ""
+    i = body.find(OPEN)
+    if i >= 0:
+        body, pending = body[:i], body[i:]
+    else:
+        for k in range(min(len(body), len(OPEN) - 1), 0, -1):
+            if OPEN.startswith(body[-k:]):
+                body, pending = body[:-k], body[-k:]
+                break
+    return {"reasoning": p["reasoning"], "content": body.strip(),
+            "tool_calls": p["tool_calls"] + calls, "pending": pending}
+
+
+# np_gemma/server.py calls these by name
+S.parse_output = qwen_parse_output
+S.tool_done = lambda text: False
+
+
+def _message(m):
+    """A message of the request for the template: the arguments of a tool
+    call as a dict."""
+    msg = dict(m)
+    msg["role"] = m.get("role", "user")
+    calls = []
+    for c in m.get("tool_calls") or []:
+        c = json.loads(json.dumps(c))
+        f = c.get("function", c)
+        if isinstance(f.get("arguments"), str):
+            try:
+                f["arguments"] = json.loads(f["arguments"]) if f["arguments"].strip() else {}
+            except ValueError:
+                f["arguments"] = {}
+        calls.append(c)
+    if calls:
+        msg["tool_calls"] = calls
+    return msg
 
 
 class QwenBackend(Backend):
@@ -82,12 +164,18 @@ class QwenBackend(Backend):
         self.ctx = ctx
         self.cache = None
         self.ids = []           # the tokens in the cache
+        self.snap_ids = None    # the last prompt, and the recurrent state after it
+        self.snap = None
 
     def prompt_ids(self, messages, thinking=None, tools=None):
-        msgs = [{"role": m.get("role", "user"), "content": content_text(m.get("content"))}
-                for m in messages]
+        TOOLS.clear()
+        for tl in tools or []:
+            f = tl.get("function", tl)
+            TOOLS[f.get("name")] = (f.get("parameters") or {}).get("properties") or {}
         think = self.thinking if thinking is None else bool(thinking)
-        return self.tokenizer.encode(self.tokenizer.apply_chat_template(msgs, thinking=think))
+        text = self.tokenizer.apply_chat_template([_message(m) for m in messages], thinking=think,
+                                                  tools=tools)
+        return self.tokenizer.encode(text)
 
     def completion_ids(self, prompt):
         self.tokenizer.think_open = False
@@ -98,6 +186,37 @@ class QwenBackend(Backend):
         if self.dev is not None:
             self.dev.attach(self.cache)
         self.ids = []
+        self.snap_ids = self.snap = None
+
+    def _state(self):
+        """The arrays of the recurrent state: DeltaNet (conv, state) and the
+        convolution of the n-gram layer. The keys and values and the keys of
+        the indexer are per position: a later prompt writes them again."""
+        c = self.cache
+        return list(c.conv.values()) + list(c.state.values()) + list(c.ple_conv.values())
+
+    def _save(self, ids, logits):
+        snap = []
+        for a in self._state():
+            h = np.empty_like(a)
+            if self.dev is not None:
+                self.dev.cache_dev.bufs[id(a)][1].download(h)
+            else:
+                h[...] = a
+            snap.append(h)
+        self.snap, self.snap_ids = (snap, self.cache.ple_ids.copy(), logits.copy()), list(ids)
+
+    def _restore(self):
+        snap, ple_ids, logits = self.snap
+        for a, h in zip(self._state(), snap):
+            if self.dev is not None:
+                self.dev.cache_dev.bufs[id(a)][1].upload(h)
+            else:
+                a[...] = h
+        self.cache.ple_ids = ple_ids.copy()
+        self.cache.n = len(self.snap_ids)
+        self.ids = list(self.snap_ids)
+        return logits
 
     def _prompt(self, ids, pos):
         """Read ids from pos. Return the logits of the last token."""
@@ -122,13 +241,21 @@ class QwenBackend(Backend):
             raise ValueError("the prompt has %d tokens; the context is %d" % (n, self.ctx))
         max_tokens = min(max_tokens, self.ctx - n - 1)
         k = len(self.ids)
-        if self.cache is None or k == 0 or k >= n or prompt_ids[:k] != self.ids:
+        s = len(self.snap_ids) if self.snap_ids is not None else 0
+        if self.cache is not None and 0 < k < n and prompt_ids[:k] == self.ids:
+            pass                                            # the cache as it is
+        elif self.cache is not None and 0 < s <= n and prompt_ids[:s] == self.snap_ids:
+            logits = self._restore()                        # the state after the last prompt
+            k = s
+        else:
             self._fresh()
             k = 0
         t0 = time.time()
-        logits = self._prompt(prompt_ids[k:], k)
+        if k < n:
+            logits = self._prompt(prompt_ids[k:], k)
+            self.ids = list(prompt_ids)
+            self._save(prompt_ids, logits)
         dt = time.time() - t0
-        self.ids = list(prompt_ids)
         print("[qwen4] reuse=%d new=%d prompt %.1f s (%.0f tok/s)" % (
             k, n - k, dt, (n - k) / max(dt, 1e-9)), file=sys.stderr, flush=True)
         sampler.reset(prompt_ids)
@@ -153,6 +280,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-m", "--model", default=MODEL)
     ap.add_argument("--tok", default=None, help="tokenizer.json (default: next to the model)")
+    ap.add_argument("--template", default=None,
+                    help="chat_template.jinja (default: next to the model, else in the checkpoint)")
     ap.add_argument("--ctx", type=int, default=98304, help="the tokens of the context")
     ap.add_argument("--backend", choices=("gpu", "cpu"), default="gpu")
     ap.add_argument("--hot-gb", type=float, default=0.5, help="gpu: GB of hot experts")
@@ -169,7 +298,10 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path = args.model if os.path.isabs(args.model) else os.path.join(root, args.model)
 
-    tok = QwenTok(args.tok or os.path.join(os.path.dirname(path), "tokenizer.json"))
+    template = args.template or os.path.join(os.path.dirname(path), "chat_template.jinja")
+    if not os.path.exists(template):
+        template = os.path.join(root, "models/Qwen3.8-Flash-Next-NVFP4/chat_template.jinja")
+    tok = QwenTok(args.tok or os.path.join(os.path.dirname(path), "tokenizer.json"), template)
     print("loading %s ..." % path, flush=True)
     t0 = time.time()
     model = Qwen4CPU(path)
