@@ -163,10 +163,16 @@ __device__ float block_max(float v)
  * kernel waits for the data of the kernels before it (griddepcontrol.wait),
  * then lets the next kernel start (griddepcontrol.launch_dependents). The
  * next kernel starts only when every block of this kernel has passed that
- * point. Outside such a graph the two instructions do nothing. */
+ * point. Outside such a graph the two instructions do nothing. The
+ * instructions need sm_90 or later; an older GPU (the 3090 is sm_86) runs
+ * the graphs with ordinary edges (gg_pdl_on). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define PDL_START()                                                           \
     asm volatile("griddepcontrol.wait;\n" ::: "memory");                      \
     asm volatile("griddepcontrol.launch_dependents;\n" :::)
+#else
+#define PDL_START() do { } while (0)
+#endif
 
 
 /* The norm of each row of cols values: out = x s w, where s = 1 / sqrt(mean
@@ -5914,13 +5920,17 @@ static int gg_launch_seg(gg_prog *g, const gg_seg *sg)
 #define GG_SEG_FIRST 32
 #define GG_SEG_MAX 160
 
-/* NP_GEMMA_GPU_PDL=0 keeps the ordinary edges, for a test. */
+/* NP_GEMMA_GPU_PDL=0 keeps the ordinary edges, for a test. A GPU before
+ * sm_90 has no programmatic edges. */
 static int gg_pdl_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("NP_GEMMA_GPU_PDL");
-        on = !(v && v[0] == '0');
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        on = !(v && v[0] == '0') && major >= 9;
     }
     return on;
 }
