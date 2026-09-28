@@ -13,3 +13,4 @@ models2/
 .fuse_hidden*
 scripts/membw
 long_qwen4_out.txt
+serve_qwen4.log

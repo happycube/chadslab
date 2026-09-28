@@ -1853,6 +1853,11 @@ long_qwen4_out.txt.
     python scripts/long_qwen4.py --tokens 32768 --gen 1024
     python scripts/long_qwen4.py --question "What does csrc/moe.c do?" --gen 512
 
+The OpenAI compatible server uses the HTTP part of np_gemma/server.py. It
+adds the chat template of Qwen, and gives the <think> part as the reasoning:
+
+    python scripts/serve_qwen4.py --ctx 98304 --port 8081     # http://127.0.0.1:8081/v1
+
 ## Test results
 
     Test                                      Result
