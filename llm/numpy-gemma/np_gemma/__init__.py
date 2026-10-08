@@ -50,6 +50,33 @@ _os.environ.setdefault("OMP_NUM_THREADS", str(_default_threads()))
 # by less than the noise. Set the variables yourself to override the values.
 _os.environ.setdefault("OMP_PLACES", "cores")
 _os.environ.setdefault("OMP_PROC_BIND", "close")
+# The CPUs of the process before any thread is pinned (the main thread is
+# pinned later): the GPU library takes the CPU of its copy workers from them
+# (gpu.cu gg_worker_bind: the last of the node of the GPU, outside the teams).
+try:
+    _os.environ.setdefault("NP_GEMMA_START_CPUS",
+                           ",".join(str(c) for c in sorted(_os.sched_getaffinity(0))))
+except (AttributeError, OSError):
+    pass
+
+
+def _no_numa_balancing():
+    """numa.no_numa_balancing before NumPy and OpenMP make their threads (a
+    thread takes the memory policy of the thread that makes it)."""
+    import ctypes
+    import glob
+    import platform
+    if _os.environ.get("NP_GEMMA_NUMA_BALANCE") == "1" or _os.environ.get("NP_GEMMA_NUMA") == "0":
+        return
+    if platform.machine() != "x86_64" or len(glob.glob("/sys/devices/system/node/node[0-9]*")) < 2:
+        return
+    try:
+        ctypes.CDLL(None, use_errno=True).syscall(238, 4, None, ctypes.c_ulong(0))  # MPOL_LOCAL
+    except (AttributeError, OSError):
+        pass
+
+
+_no_numa_balancing()
 
 from .config import Config
 from .st import SafeTensors

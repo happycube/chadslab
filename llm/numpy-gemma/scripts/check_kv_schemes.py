@@ -7,7 +7,7 @@ from np_gemma.gguf import GGUF
 from np_gemma.chat import render_chat
 import np_gemma.ops as ops
 
-g = GGUF('models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf')
+g = GGUF('models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf')
 tok = Tokenizer.from_gguf(g)
 cfg = Config({'text_config': g.text_config()})
 m = Model(g, cfg).load_all(dtype='int4')
@@ -26,7 +26,7 @@ def pr(self, layer, end):
 def pa(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n, *a, **k):
     L = cap['cur']
     cap.setdefault('q', {})[L] = np.array(q)
-    cap.setdefault('meta', {})[L] = (q_heads, kv_heads, head_dim, n, getattr(s.cache, 'attn_min'))
+    cap.setdefault('meta', {})[L] = (q_heads, kv_heads, head_dim, n, 1)
     return orig_attn(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n, *a, **k)
 KVCache.read_qc = pr
 ops.attn_decode = pa
@@ -55,8 +55,8 @@ allk = []
 for layer in sorted(cap['q']):
     q_heads, kv_heads, hd, n, amin = cap['meta'][layer]
     n_rep = q_heads // kv_heads
-    K = s.cache.k[layer][:n].astype(np.float64)
-    V = s.cache.v[layer][:n].astype(np.float64)
+    K, V, _ = s.cache.read(layer, s.cache.base[layer] + n)   # dequantized rows
+    K, V = K.astype(np.float64), V.astype(np.float64)
     q = cap['q'][layer][0].astype(np.float64)
     k = K[:, 0, :]
     v = V[:, 0, :]

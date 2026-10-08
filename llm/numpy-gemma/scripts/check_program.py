@@ -19,6 +19,11 @@ Run it with NP_GEMMA_ATTN=0 as well, for the float cache.
 """
 from __future__ import annotations
 
+import os
+# The records of this check read the int4 matrices of the model: the parts
+# split them (np_gemma/parts.py), and the Python interpreter of the program
+# has no KQ_Q4X. The KQ_Q4X copies stay off (NP_GEMMA_Q4X, np_gemma/ops.py).
+os.environ["NP_GEMMA_Q4X"] = "0"
 import argparse
 import time
 
@@ -28,24 +33,24 @@ import np_gemma.model as model_mod
 from np_gemma import KVCache, Model, ops
 from np_gemma.config import Config
 from np_gemma.gguf import GGUF
-from np_gemma.program import bind_step, compile_layers, format_form, layer_form
+from np_gemma.program import bind_step, compile_layers, format_form, layer_form, ready
 from np_gemma.tokenizer import Tokenizer
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
-PARTS = ("k", "v", "kq", "ks", "vq", "vs")
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+PARTS = ("kq", "ks", "vq", "vs")
 
 
 def snap(cache, i):
     s = {n: None if getattr(cache, n)[i] is None else getattr(cache, n)[i].copy()
          for n in PARTS}
-    s.update(base=cache.base[i], end=cache.end[i], qc=cache._qc_on[i])
+    s.update(base=cache.base[i], end=cache.end[i])
     return s
 
 
 def restore(cache, i, s):
     for n in PARTS:
         getattr(cache, n)[i] = None if s[n] is None else s[n].copy()
-    cache.base[i], cache.end[i], cache._qc_on[i] = s["base"], s["end"], s["qc"]
+    cache.base[i], cache.end[i] = s["base"], s["end"]
 
 
 def rows(cache, i, pos):
@@ -154,7 +159,8 @@ def main():
         print(format_form(layer_form(model, layers[0])))
         print(compile_layers(model, [layers[0]]).dump())
 
-    attn = "qc" if ops.attn_ready() else "f32"
+    # the mode of the form of the cache (KVCache keeps only quantized rows)
+    attn = ready(model, KVCache(cfg, max_len=16))
     print("attention mode:", attn)
     ok = True
     progs = {i: compile_layers(model, [i], attn) for i in layers}

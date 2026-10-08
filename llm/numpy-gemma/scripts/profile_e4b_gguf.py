@@ -24,7 +24,8 @@ to --memory-bw. Run this script with the thread settings of the model:
 
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=18 OMP_WAIT_POLICY=ACTIVE \
         PYTHONPATH=. $PY scripts/profile_e4b_gguf.py \
-        --gguf ~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf --memory-bw 59.8
+        --gguf models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf \
+        --memory-bw 59.8
 """
 from __future__ import annotations
 

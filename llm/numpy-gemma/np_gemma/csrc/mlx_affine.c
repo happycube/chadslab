@@ -82,6 +82,41 @@ void ma_quant_x(const float *x, int t, int cols, int bits, int8_t *xq, float *xs
     ma_quant_rows(x, t, cols, bits, xq, xs, xsum);
 }
 
+/* The count of parts of 32 values of x up to which one thread quantizes x
+ * (ma_quant_body, kq_quant_body). When the threads of the team write the
+ * parts, the products after it read lines that many cores wrote. Each
+ * product was slower by about 200 us on the E4B (gate 10240 x 2560 Q4_K:
+ * 418 us, 245 us with one thread). One thread does 80 groups (2560 values)
+ * in about 2 us. NP_GEMMA_QUANT_SINGLE sets it (0: the team always). */
+static int quant_single_max(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *v = getenv("NP_GEMMA_QUANT_SINGLE");
+        n = v ? atoi(v) : 512;
+    }
+    return n;
+}
+
+/* ma_quant_body on one thread. */
+static void ma_quant_rows2(const float *x, int t, int cols, int8_t *xq4, int8_t *xq8, float *xs,
+                           float *xsum)
+{
+    int ng = cols / MA_G;
+    for (int x2 = 0; x2 < t * ng; ++x2) {
+        int r = x2 / ng, g = x2 % ng;
+        const float *xr = x + (size_t)r * cols;
+        if (xq4 != NULL) {
+            ma_quant_group(xr, g, 4, xq4 + (size_t)r * cols, xs + (size_t)r * ng,
+                           xsum + (size_t)r * ng);
+        }
+        if (xq8 != NULL) {
+            ma_quant_group(xr, g, 8, xq8 + (size_t)r * cols, xs + (size_t)r * ng,
+                           xsum + (size_t)r * ng);
+        }
+    }
+}
+
 /* The quantization of t rows of x for 4 bits (xq4) and for 8 bits (xq8),
  * inside a parallel region. A null xq4 or xq8 skips that order. xs and xsum
  * are the same for both. */
@@ -89,6 +124,11 @@ static void ma_quant_body(const float *x, int t, int cols, int8_t *xq4, int8_t *
                           float *xsum)
 {
     int ng = cols / MA_G;
+    if (t * (cols / 32) <= quant_single_max()) {
+        #pragma omp single
+        ma_quant_rows2(x, t, cols, xq4, xq8, xs, xsum);
+        return;
+    }
     /* One group for each step, so one row uses all the threads. */
     #pragma omp for schedule(static)
     for (int x2 = 0; x2 < t * ng; ++x2) {

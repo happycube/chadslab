@@ -239,7 +239,7 @@ class Tokenizer:
     # ---- chat --------------------------------------------------------------
     def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False,
                             tools=None, preserve_thinking=False,
-                            empty_thought_block=True):
+                            empty_thought_block=True, media=None):
         """Build the chat prompt from the message list.
 
         Use the canonical Gemma 4 template of np_gemma/chat_template.jinja. Give
@@ -256,4 +256,4 @@ class Tokenizer:
                            add_generation_prompt=add_generation_prompt,
                            enable_thinking=thinking,
                            preserve_thinking=preserve_thinking,
-                           empty_thought_block=empty_thought_block)
+                           empty_thought_block=empty_thought_block, media=media)

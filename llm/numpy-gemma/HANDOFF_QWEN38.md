@@ -1,4 +1,4 @@
-# Handoff: Qwen3.8-Flash-Next in this runtime (2026-09-28)
+# Handoff: Qwen3.8-Flash-Next in this runtime
 
 This file gives the state of the work on Qwen3.8-Flash-Next (qwen4exp). It
 tells what works, the numbers, the files, the open work, and the next steps.
@@ -134,7 +134,7 @@ The GGUF of this runtime, llama-bench method (scripts/bench_qwen4.py):
 - The float32 and bfloat16 matrices of the CPU (types 61, 62): see
   section 8.
 
-The time of each part (the profiles of 2026-09-28). Other programs ran on
+The time of each part (the profiles). Other programs ran on
 the machine, so a time can change by 15%:
 
     CPU, a prompt of 512 (dense q8, 6.1 s)   the experts 1.8 s (about 43 GB/s: the memory),

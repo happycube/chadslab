@@ -21,6 +21,7 @@ import hashlib
 import os
 import platform
 import subprocess
+import time
 import sys
 from pathlib import Path
 from shutil import which
@@ -31,13 +32,18 @@ _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "csrc" / "bf16_linear.c"
 # The files that bf16_linear.c includes; the hash of the library covers them.
 _SOURCES = [_SRC] + [_HERE / "csrc" / n for n in ("moe.c", "mlx_affine.c", "kquants.c", "deltanet.c",
-                                                 "hyperconn.c", "qsa.c")]
+                                                 "hyperconn.c", "qsa.c", "tq6_tables.h")]
 _LIB_DIR = _HERE / "_libs"
 # The code builds three libraries. The first library uses an AVX2 baseline. The
 # second library uses an AVX-512 baseline. The third adds the VNNI
 # instruction. The code loads the fastest library that the CPU gives.
-_FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC", "-lm"]
-_FLAGS = _FLAGS_COMMON + ["-mavx2", "-mfma"]
+# --wrap=GOMP_parallel: every parallel region passes __wrap_GOMP_parallel
+# (csrc/bf16_linear.c), which reports the teams outside the planned ones
+# (team_warn)
+_FLAGS_COMMON = ["-O3", "-funroll-loops", "-fopenmp", "-shared", "-fPIC", "-lm",
+                 "-Wl,--wrap=GOMP_parallel"]
+# F16C: every CPU with AVX2 has it, and the float16 scales use it.
+_FLAGS = _FLAGS_COMMON + ["-mavx2", "-mfma", "-mf16c"]
 _FLAGS_AVX512 = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl", "-mfma", "-mf16c"]
 _FLAGS_VNNI = _FLAGS_COMMON + ["-mavx512f", "-mavx512bw", "-mavx512vl",
                                "-mavx512vnni", "-mfma", "-mf16c"]
@@ -88,6 +94,53 @@ def have_vnni():
         return False
 
 
+def lib_ready(lib):
+    """lib exists: mark it used now (its mtime orders the sweep). Return True
+    when it exists."""
+    try:
+        os.utime(lib)
+        return True
+    except OSError:
+        return False
+
+
+def sweep_libs(lib, prefix, keep):
+    """Keep the newest keep libraries of the prefix next to lib
+    (NP_GEMMA_LIBS_KEEP, else keep; lib always stays), and remove the
+    temporary files of more than an hour. A process that loaded a removed
+    library keeps its mapping."""
+    keep = int(os.environ.get("NP_GEMMA_LIBS_KEEP", keep))
+    try:
+        libs = sorted((p for p in lib.parent.glob(prefix + "*.so")
+                       if p.name[len(prefix):-3].isalnum() and len(p.name) == len(lib.name)),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in libs[keep:]:
+            if p != lib:
+                p.unlink()
+        now = time.time()
+        for p in lib.parent.glob("*.tmp"):
+            if now - p.stat().st_mtime > 3600:
+                p.unlink()
+    except OSError:
+        pass
+
+
+def build_lib(cmd_of, lib, prefix, keep):
+    """Build lib with the command cmd_of(tmp) and return it. The temporary
+    file has the pid in its name, so two processes that build the same lib
+    do not write one file; the rename is atomic. Then sweep_libs."""
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    tmp = lib.with_name("%s.%d.tmp" % (lib.name, os.getpid()))
+    try:
+        subprocess.run(cmd_of(tmp), check=True, capture_output=True)
+        os.replace(tmp, lib)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    sweep_libs(lib, prefix, keep)
+    return lib
+
+
 def _build(flags=None):
     """Build the shared library when necessary. Return the library path.
 
@@ -108,14 +161,10 @@ def _build(flags=None):
          + " ".join(flags)).encode()
     ).hexdigest()[:16]
     lib = _LIB_DIR / ("libgemma_" + key + ".so")
-    if lib.exists():
+    if lib_ready(lib):
         return lib
-    _LIB_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = lib.with_suffix(".so.tmp")
-    cmd = [cc] + flags + ["-o", str(tmp), str(_SRC)]
-    subprocess.run(cmd, check=True, capture_output=True)
-    tmp.replace(lib)
-    return lib
+    # three builds (AVX2, AVX-512, VNNI) for each version of the sources
+    return build_lib(lambda tmp: [cc] + flags + ["-o", str(tmp), str(_SRC)], lib, "libgemma_", 24)
 
 
 # NP_GEMMA_ARCH=avx2 or avx512 forces one library. The default detects the CPU.
@@ -224,6 +273,10 @@ try:
         _lib.gemma_q6k_linear.restype = None
         _lib.gemma_q6k_rows.argtypes = [_void_p, _void_p, _int, _int, _void_p]
         _lib.gemma_q6k_rows.restype = None
+        _lib.gemma_kq45_rows.argtypes = [_void_p, _void_p, _int, _int, _int, _void_p]
+        _lib.gemma_kq45_rows.restype = None
+        _lib.gemma_q4_0_rows.argtypes = [_void_p, _void_p, _int, _int, _void_p]
+        _lib.gemma_q4_0_rows.restype = None
         _lib.gemma_argmax.argtypes = [_void_p, ctypes.c_int64]
         _lib.gemma_profile.argtypes = [_void_p, _void_p]
         _lib.ma_quant_x.argtypes = [_void_p, _int, _int, _int, _void_p, _void_p, _void_p]
@@ -247,16 +300,39 @@ try:
         _lib.kq_rows.restype = None
         _lib.kq_to_q8_0.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
         _lib.kq_to_q8_0.restype = None
+        _lib.kq_to_q6_k.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
+        _lib.kq_to_q6_k.restype = None
+        _lib.kq_bf16_to_bf12.argtypes = [_void_p, ctypes.c_int64, _int, _void_p, _void_p]
+        _lib.kq_bf16_to_bf12.restype = None
+        _lib.kq_bf12_to_bf16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.kq_bf12_to_bf16.restype = None
+        _lib.kq_pack_bf12x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.kq_pack_bf12x16.restype = None
         _lib.kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nv4_pack.restype = None
         _lib.kq_nvx_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.kq_nvx_pack.restype = None
         _lib.kq_pack_x16f.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
         _lib.kq_pack_x16f.restype = None
+        _lib.kq_q4x_pack.argtypes = [_void_p, _void_p, ctypes.c_int64, _int, _void_p]
+        _lib.kq_q4x_pack.restype = _int
+        _lib.kq_moe_act.argtypes = [_void_p] * 5 + [_int] * 3 + [_void_p, _void_p, _int, _int,
+                                                                _void_p, _void_p, _int, _void_p]
+        _lib.kq_moe_act.restype = None
         _lib.kq_pack_q8x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.kq_pack_q8x16.restype = None
         _lib.kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.kq_gather.restype = None
+        _lib.kq_memcpy_par.argtypes = [_void_p, _void_p, ctypes.c_int64]
+        _lib.kq_memcpy_par.restype = None
+        _lib.kq_set_node0_share.argtypes = [ctypes.c_float]
+        _lib.kq_set_node0_share.restype = None
+        _lib.kq_set_moe_rot.argtypes = [ctypes.c_int]
+        _lib.kq_set_moe_rot.restype = None
+        _lib.kq_get_node0_share.argtypes = []
+        _lib.kq_get_node0_share.restype = ctypes.c_float
+        _lib.kq_calib_nodes.argtypes = [_void_p, _void_p] + [_int] * 7 + [_void_p]
+        _lib.kq_calib_nodes.restype = None
         _lib.kq_moe.argtypes = [_void_p] * 5 + [_int, _int, _int, _void_p, _void_p, _int, _int,
                                                  _void_p, _void_p]
         _lib.kq_moe.restype = None
@@ -320,6 +396,20 @@ try:
         _lib.gemma_attn_decode_f32s.restype = None
         _lib.gemma_quantize_i16_groups.argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
         _lib.gemma_quantize_i16_groups.restype = None
+        _lib.gemma_quantize_i8_groups.argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
+        _lib.gemma_quantize_i8_groups.restype = None
+        _lib.gemma_dequantize_i8_groups.argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
+        _lib.gemma_dequantize_i8_groups.restype = None
+        for nm in ("gemma_tq6_quantize", "gemma_tq6_dequantize_rotated"):
+            getattr(_lib, nm).argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
+            getattr(_lib, nm).restype = None
+        _lib.gemma_tq6_rotate.argtypes = [_void_p, ctypes.c_long, _int]
+        _lib.gemma_tq6_rotate.restype = None
+        _lib.gemma_attn_decode_q8.argtypes = [_void_p] * 7 + [_int] * 3 + [_void_p, _void_p,
+                                                                         _int, _int, _int]
+        _lib.gemma_attn_decode_q8.restype = _int
+        _lib.gemma_dequantize_i16_groups.argtypes = [_void_p, _void_p, _void_p, ctypes.c_long]
+        _lib.gemma_dequantize_i16_groups.restype = None
         _lib.gemma_attn_decode_i16.argtypes = [_void_p] * 7 + [_int] * 4
         _lib.gemma_attn_decode_i16.restype = None
         _lib.gemma_attn_decode_i16_mt.argtypes = [_void_p] * 7 + [_int] * 3 + [
@@ -346,6 +436,16 @@ try:
         _lib.gemma_run.restype = _int
         _lib.gemma_run_parts.argtypes = [_void_p, _int, _int, _void_p]
         _lib.gemma_run_parts.restype = _int
+        _lib.gemma_run_parts_prof.argtypes = [_void_p, _int, _int, _void_p, _void_p, _int]
+        _lib.gemma_run_parts_prof.restype = _int
+        _lib.gemma_xbar_stats.argtypes = [_void_p]
+        _lib.gemma_xbar_stats.restype = _int
+        _lib.kq_linear16.argtypes = [_void_p, _int, _int, _void_p, _void_p, _void_p, _int, _void_p]
+        _lib.kq_linear16.restype = None
+        _lib.kq_q16_ok.argtypes = []
+        _lib.kq_q16_ok.restype = _int
+        _lib.gemma_part_cpus.argtypes = [_int, _int, _void_p]
+        _lib.gemma_part_cpus.restype = _int
         _lib.gemma_gp_record_size.argtypes = []
         _lib.gemma_gp_record_size.restype = _int
         _lib.gemma_router_mt.argtypes = [_void_p, _void_p, _void_p, _void_p,
@@ -750,6 +850,62 @@ def kq_to_q8_0(src, cols):
     return out
 
 
+def kq_to_q6_k(src, cols):
+    """Q6_K blocks (uint8, rows x cols / 256 * 210; cols a multiple of 256)
+    of a matrix: bfloat16 as uint16, or float32 (ggml quantize_row_q6_K_ref)."""
+    assert cols % 256 == 0, cols
+    rows = src.size // cols
+    src = np.ascontiguousarray(src)
+    out = np.empty(rows * (cols // 256) * 210, dtype=np.uint8)
+    _lib.kq_to_q6_k(src.ctypes.data, 1 if src.dtype == np.uint16 else 0, rows, cols,
+                    out.ctypes.data)
+    return out
+
+
+def bf12_row_bytes(cols):
+    """The bytes of a BF12 row (BF12_PLAN.md): cols + cols / 2 + cols / 32, to 16."""
+    return (cols + cols // 2 + cols // 32 + 15) // 16 * 16
+
+
+def kq_bf16_to_bf12(src, cols):
+    """BF12 rows (uint8, rows x bf12_row_bytes(cols)) of bfloat16 rows (uint16;
+    cols a multiple of 32), and the report: a dict of zeroed (the nonzero
+    values that decode to 0: more than 15 binades under the largest of their
+    group of 32), collisions (-2^(E-15), which decode to 0), nonfinite (Inf,
+    NaN), largest (the largest zeroed value in absolute value), rms (of the
+    finite values), worst (up to 10 of (value, row, column, the largest of its
+    group), the largest first)."""
+    assert cols % 32 == 0, cols
+    src = np.ascontiguousarray(src).view(np.uint16)
+    rows = src.size // cols
+    out = np.empty((rows, bf12_row_bytes(cols)), dtype=np.uint8)
+    rep = np.zeros(6 + 40, np.float64)
+    _lib.kq_bf16_to_bf12(src.ctypes.data, rows, cols, out.ctypes.data, rep.ctypes.data)
+    n = rows * cols - int(rep[2])
+    k = int(rep[5])
+    return out, dict(zeroed=int(rep[0]), collisions=int(rep[1]), nonfinite=int(rep[2]),
+                     largest=float(rep[3]), rms=float(np.sqrt(rep[4] / max(n, 1))),
+                     worst=[(float(rep[6 + 4 * i]), int(rep[7 + 4 * i]), int(rep[8 + 4 * i]),
+                             float(rep[9 + 4 * i])) for i in range(k)])
+
+
+def kq_pack_bf12x16(src, rows, cols):
+    """BF12 rows as KQ_BF12X16 (groups of 16 rows, the last one padded; csrc/
+    kquants.c kq_x16f_col): 784 bytes a block of 32 columns of a group."""
+    src = np.ascontiguousarray(src).view(np.uint8)
+    out = np.empty(((rows + 15) // 16) * (cols // 32) * 784, dtype=np.uint8)
+    _lib.kq_pack_bf12x16(src.ctypes.data, rows, cols, out.ctypes.data)
+    return out
+
+
+def kq_bf12_to_bf16(src, rows, cols):
+    """The bfloat16 bits (uint16, rows x cols) of BF12 rows."""
+    src = np.ascontiguousarray(src).view(np.uint8)
+    out = np.empty((rows, cols), dtype=np.uint16)
+    _lib.kq_bf12_to_bf16(src.ctypes.data, rows, cols, out.ctypes.data)
+    return out
+
+
 KQ_Q8X16 = 60
 
 
@@ -762,6 +918,38 @@ def kq_pack_q8x16(q8, rows, cols):
 
 
 KQ_BF16X16, KQ_F32X16 = 61, 62
+KQ_Q4X = 54
+
+
+def kq_q4x_pack(packed, scales):
+    """The int4 matrix of the Gemma 4 26B (Q4_0 blocks of 18 bytes, rows x
+    blocks x 18; float32 scales, rows x blocks) to KQ_Q4X: groups of 16 rows
+    (csrc/kquants.c). A stack of matrices packs as one matrix of all the
+    rows."""
+    packed = np.ascontiguousarray(packed)
+    scales = np.ascontiguousarray(scales, dtype=np.float32)
+    nb = packed.shape[-2]
+    rows = packed.size // (nb * 18)
+    assert rows % 16 == 0
+    out = np.empty(rows * nb * 18, dtype=np.uint8)
+    if _lib.kq_q4x_pack(packed.ctypes.data, scales.ctypes.data, rows, nb * 32, out.ctypes.data):
+        raise ValueError("a scale is not exact in float16")
+    return out
+
+
+def kq_moe_act(hq, hs, hm, ids, val, experts, mats, shared_logit, hidden, inner, scratch, out,
+               gelu=True, hf=None, x16=False):
+    """kq_moe with the tanh GELU of the gate (gelu) in place of SiLU. hf (the
+    float32 rows of h; KQ_Q4X matrices): float32 activations, no
+    quantization; with x16, the int16 rows of hf and of the GELU (act bit 2;
+    hq, hs, hm not read)."""
+    t, k = ids.shape
+    _lib.kq_moe_act(hq.ctypes.data, hs.ctypes.data, hm.ctypes.data, ids.ctypes.data,
+                    val.ctypes.data, t, k, experts, mats.ctypes.data,
+                    None if shared_logit is None else shared_logit.ctypes.data, hidden, inner,
+                    scratch.ctypes.data, out.ctypes.data,
+                    (1 if gelu else 0) | (4 if x16 else (2 if hf is not None else 0)),
+                    None if hf is None else hf.ctypes.data)
 
 
 def kq_pack_x16f(a, bf, rows, cols):
@@ -770,6 +958,26 @@ def kq_pack_x16f(a, bf, rows, cols):
     out = np.empty(((rows + 15) // 16) * 16 * cols * (2 if bf else 4), dtype=np.uint8)
     _lib.kq_pack_x16f(np.ascontiguousarray(a).ctypes.data, 1 if bf else 0, rows, cols,
                       out.ctypes.data)
+    return out
+
+
+def kq_memcpy_par(dst, src):
+    """Copy the bytes of src into dst (both contiguous, the same size) on all
+    the threads of OpenMP (kq_memcpy_par)."""
+    assert dst.nbytes == src.nbytes and dst.flags.c_contiguous and src.flags.c_contiguous
+    _lib.kq_memcpy_par(dst.ctypes.data, src.ctypes.data, ctypes.c_int64(dst.nbytes))
+
+
+def kq_calib_nodes(mats, mats1, experts, hidden, inner, ncold, reps, nth):
+    """The mean compute time of a thread of each half of a team of nth threads
+    (bound spread: node 0, node 1) on the cold experts of a decode step
+    (kq_calib_nodes): mats and mats1 are (layers, 12) int64 tables
+    (kq_moe_mats; mats1 the copies of node 1, or None)."""
+    mats = np.ascontiguousarray(mats, dtype=np.int64)
+    m1 = None if mats1 is None else np.ascontiguousarray(mats1, dtype=np.int64)
+    out = np.zeros(2)
+    _lib.kq_calib_nodes(mats.ctypes.data, None if m1 is None else m1.ctypes.data, mats.shape[0],
+                        experts, hidden, inner, ncold, reps, nth, out.ctypes.data)
     return out
 
 
@@ -849,6 +1057,26 @@ def q6k_rows(table, ids, cols):
     out = np.empty((ids.size, cols), dtype=np.float32)
     _lib.gemma_q6k_rows(table.ctypes.data, ids.ctypes.data, ctypes.c_int(ids.size),
                         ctypes.c_int(cols), out.ctypes.data)
+    return out
+
+
+def q4_0_rows(table, ids, cols):
+    """Return the rows ids of a Q4_0 table as float32, shape (len(ids), cols),
+    with the bits of gguf._dequant."""
+    ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
+    out = np.empty((ids.size, cols), dtype=np.float32)
+    _lib.gemma_q4_0_rows(table.ctypes.data, ids.ctypes.data, ctypes.c_int(ids.size),
+                         ctypes.c_int(cols), out.ctypes.data)
+    return out
+
+
+def kq45_rows(table, ids, cols, five):
+    """Return the rows ids of a Q4_K (five False) or Q5_K table as float32,
+    shape (len(ids), cols), with the bits of gguf._dequant."""
+    ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
+    out = np.empty((ids.size, cols), dtype=np.float32)
+    _lib.gemma_kq45_rows(table.ctypes.data, ids.ctypes.data, ctypes.c_int(ids.size),
+                         ctypes.c_int(cols), ctypes.c_int(1 if five else 0), out.ctypes.data)
     return out
 
 
@@ -1130,6 +1358,10 @@ def softmax_mask(x, positions, n_rep, base, window):
 
 
 if _lib is not None:
+    _lib.gemma_attn_prefill_qc.argtypes = [_void_p] * 6 + [_int, _int, _void_p] + [_int] * 5 + [_void_p]
+    _lib.gemma_attn_prefill_qc.restype = None
+    _lib.gemma_attn_prefill_qc_ok.argtypes = [_int, _int, _int]
+    _lib.gemma_attn_prefill_qc_ok.restype = _int
     _lib.gemma_attn_prefill.argtypes = [_void_p, _void_p, _void_p, _void_p,
                                         _int, _int, _void_p, _int, _int,
                                         _int, _int, _int]
@@ -1146,6 +1378,33 @@ def attn_prefill_impl(which):
     """
     if _lib is not None:
         _lib.gemma_attn_prefill_set_impl(ctypes.c_int(int(which)))
+
+
+def attn_prefill_qc(q, kq, ks, vq, vs, positions, base, window, limit=None):
+    """attn_prefill over the int16 cache: kq, vq (keys, kv_heads, head_dim)
+    int16 and ks, vs (keys, kv_heads, head_dim / 32) float32, as
+    KVCache.read_qc gives them. The same values as attn_prefill on the rows
+    of KVCache.read. limit (None, or t) gives the last key position of each
+    query in place of its position (the tokens of an image, the mask of
+    ops.softmax_mask_limit). Return None when the kernel does not take the
+    shape."""
+    t, q_heads, hd = q.shape
+    n, kv_heads, _ = kq.shape
+    if not _lib.gemma_attn_prefill_qc_ok(q_heads, kv_heads, hd):
+        return None
+    q = np.ascontiguousarray(q, dtype=np.float32)
+    args = [np.ascontiguousarray(a) for a in (kq, ks, vq, vs)]
+    assert args[0].dtype == np.int16 and args[2].dtype == np.int16
+    positions = np.ascontiguousarray(positions, dtype=np.int32)
+    if limit is not None:
+        limit = np.ascontiguousarray(limit, dtype=np.int32)
+    out = np.empty((t, q_heads, hd), dtype=np.float32)
+    _lib.gemma_attn_prefill_qc(q.ctypes.data, *(a.ctypes.data for a in args),
+                               positions.ctypes.data, ctypes.c_int(int(base)),
+                               ctypes.c_int(int(window)), out.ctypes.data, ctypes.c_int(t),
+                               ctypes.c_int(n), ctypes.c_int(q_heads), ctypes.c_int(kv_heads),
+                               ctypes.c_int(hd), None if limit is None else limit.ctypes.data)
+    return out
 
 
 def attn_prefill(q, k, v, positions, base, window):
@@ -1541,6 +1800,50 @@ def gp_run_parts(addrs, team, bar):
                                 ctypes.c_int(team), bar.ctypes.data)
 
 
+def gp_run_parts_prof(addrs, team, bar, ms):
+    """gp_run_parts with the time of each record: ms is a float64 array
+    (parts, records), and part p adds the ms of record pc to ms[p, pc]."""
+    assert ms.dtype == np.float64 and ms.flags.c_contiguous and ms.shape[0] == addrs.size
+    return _lib.gemma_run_parts_prof(addrs.ctypes.data, ctypes.c_int(addrs.size),
+                                     ctypes.c_int(team), bar.ctypes.data, ms.ctypes.data,
+                                     ctypes.c_int(ms.shape[1]))
+
+
+def gp_xbar_stats():
+    """Return and reset the measures of the barriers of the parts: an array
+    (8, 3) with, for each part, the s that its team waited for the other
+    parts, the s of its team barrier before that, and the count."""
+    out = np.zeros(8 * 3, dtype=np.float64)
+    _lib.gemma_xbar_stats(out.ctypes.data)
+    return out.reshape(8, 3)
+
+
+def kq_linear16(qx, rows, cols, x):
+    """The KQ_Q4X matrix qx (rows x cols) on the rows of x with int16 x (a
+    scale for each 32, gemma_quant_group32_i16): kq_linear16."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    t = x.shape[0]
+    xq = np.empty((t, cols), np.int16)
+    xs = np.empty((t, cols // 32), np.float32)
+    out = np.empty((t, rows), np.float32)
+    _lib.kq_linear16(qx.ctypes.data, rows, cols, x.ctypes.data, xq.ctypes.data, xs.ctypes.data,
+                     t, out.ctypes.data)
+    return out
+
+
+def kq_q16_ok():
+    """True when the library has the int16 kernels of the prompt (VNNI)."""
+    return bool(_lib.kq_q16_ok())
+
+
+def gp_part_cpus(nparts, team):
+    """Return the CPU of each thread of the parts of gemma_run_parts, an int32
+    array (nparts, team); -1 for a thread that did not run."""
+    cpus = np.full(nparts * max(team, 4096), -1, dtype=np.int32)
+    team = _lib.gemma_part_cpus(ctypes.c_int(nparts), ctypes.c_int(team), cpus.ctypes.data)
+    return cpus[:nparts * team].reshape(nparts, team)
+
+
 def gp_record_size():
     """Return the size of one program record in C."""
     return _lib.gemma_gp_record_size()
@@ -1573,6 +1876,97 @@ def quantize_i16_groups(x):
     _lib.gemma_quantize_i16_groups(x.ctypes.data, q.ctypes.data, s.ctypes.data,
                                    ctypes.c_long(groups))
     return q, s
+
+
+def dequantize_i16_groups(q, s, out):
+    """Write the float32 values of groups of 32 int16 values q with the
+    scales s into out (contiguous, q.size values)."""
+    q = np.ascontiguousarray(q, dtype=np.int16)
+    s = np.ascontiguousarray(s, dtype=np.float32)
+    assert out.flags.c_contiguous and out.dtype == np.float32 and out.size == q.size
+    assert s.size * 32 == q.size
+    _lib.gemma_dequantize_i16_groups(q.ctypes.data, s.ctypes.data, out.ctypes.data,
+                                     ctypes.c_long(s.size))
+
+
+def quantize_i8_groups(x):
+    """Quantize groups of 32 float32 values to int8 (the int8 cache: the
+    scale max |x| / 127). Return (q, scales)."""
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
+    groups = x.size // 32
+    q = np.empty(x.size, dtype=np.int8)
+    s = np.empty(groups, dtype=np.float32)
+    _lib.gemma_quantize_i8_groups(x.ctypes.data, q.ctypes.data, s.ctypes.data,
+                                  ctypes.c_long(groups))
+    return q, s
+
+
+def tq6_quantize(x):
+    """The TQ6 form (np_gemma/tq6.py) of groups of 32 float32 values: the
+    bytes (24 for a group) and the norms."""
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
+    groups = x.size // 32
+    b = np.empty(groups * 24, dtype=np.uint8)
+    s = np.empty(groups, dtype=np.float32)
+    _lib.gemma_tq6_quantize(x.ctypes.data, b.ctypes.data, s.ctypes.data, ctypes.c_long(groups))
+    return b, s
+
+
+def tq6_dequantize_rotated(b, s):
+    """The rotated values of the TQ6 groups (bytes b, norms s)."""
+    b = np.ascontiguousarray(b, dtype=np.uint8).reshape(-1)
+    s = np.ascontiguousarray(s, dtype=np.float32).reshape(-1)
+    out = np.empty(s.size * 32, dtype=np.float32)
+    _lib.gemma_tq6_dequantize_rotated(b.ctypes.data, s.ctypes.data, out.ctypes.data,
+                                      ctypes.c_long(s.size))
+    return out
+
+
+def kq_set_moe_rot(on):
+    """The RQ8_0 experts (kquants.c kq_moe_rot): the MoE kernels of the CPU
+    rotate the act of each pair. A state of the process."""
+    _lib.kq_set_moe_rot(int(bool(on)))
+
+
+def tq6_rotate(x, inverse=False):
+    """The TQ6 rotation of each group of 32 values of x (a copy), or its inverse."""
+    y = np.array(x, dtype=np.float32, copy=True, order="C")
+    _lib.gemma_tq6_rotate(y.ctypes.data, ctypes.c_long(y.size // 32), int(inverse))
+    return y
+
+
+def dequantize_i8_groups(q, s, out):
+    """dequantize_i16_groups for int8 values (the int8 cache)."""
+    q = np.ascontiguousarray(q, dtype=np.int8)
+    s = np.ascontiguousarray(s, dtype=np.float32)
+    assert out.flags.c_contiguous and out.dtype == np.float32 and out.size == q.size
+    assert s.size * 32 == q.size
+    _lib.gemma_dequantize_i8_groups(q.ctypes.data, s.ctypes.data, out.ctypes.data,
+                                    ctypes.c_long(s.size))
+
+
+def attn_decode_q8(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
+    """The attention of tokens queries q (tokens, q_heads, head_dim) over the
+    int8 cache (int8 values; int8 keys, or int16 keys of the form k16v8). Token t reads the rows lo[t] to lo[t] + n[t] - 1 (lo None:
+    rows 0 to n[t] - 1). Return (tokens, q_heads, head_dim)."""
+    q = np.ascontiguousarray(q, dtype=np.float32)
+    t = q.shape[0]
+    n = np.ascontiguousarray(n, dtype=np.int32).reshape(t)
+    nmax = int(n.max())
+    scores = np.empty((t, q_heads, nmax), dtype=np.float32)
+    out = np.empty((t, q_heads, head_dim), dtype=np.float32)
+    lo_p = None
+    if lo is not None:
+        lo = np.ascontiguousarray(lo, dtype=np.int32).reshape(t)
+        lo_p = lo.ctypes.data
+    rc = _lib.gemma_attn_decode_q8(q.ctypes.data, kq.ctypes.data, ks.ctypes.data,
+                                   vq.ctypes.data, vs.ctypes.data, scores.ctypes.data,
+                                   out.ctypes.data, q_heads, kv_heads, head_dim, lo_p,
+                                   n.ctypes.data, nmax, t, int(kq.dtype == np.int16))
+    if not rc:
+        raise RuntimeError("the int8 cache has no attention kernel for %d heads of %d values"
+                           % (q_heads // kv_heads, head_dim))
+    return out
 
 
 def attn_decode_i16(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
@@ -1659,3 +2053,44 @@ def int4_q16_moe(w, scales, qxt, sx, rows, cols, stride, off, ntok, eid):
                                 off.ctypes.data, ntok.ctypes.data, eid.ctypes.data,
                                 int(eid.size))
     return out
+
+
+def team_warn(min_threads=None):
+    """Report (stderr, once a place of the call) every OpenMP team of at least
+    min_threads threads that is not a planned one (gemma_run_task and the
+    runners). None: NP_GEMMA_TEAM_WARN, default 5; 0 turns it off. The
+    servers turn it on after the load (a load may use all the threads)."""
+    if _lib is None:
+        return
+    if min_threads is None:
+        min_threads = int(os.environ.get("NP_GEMMA_TEAM_WARN", "5"))
+    _lib.gemma_team_warn.argtypes = [_int]
+    _lib.gemma_team_warn(int(min_threads))
+
+
+def team_warn_stats(max_sites=64):
+    """[(place, count)] of the teams that team_warn reported: the place is the
+    return address in this library, as its nearest symbol and offset."""
+    if _lib is None:
+        return []
+    sites = (ctypes.c_void_p * max_sites)()
+    counts = (ctypes.c_long * max_sites)()
+    _lib.gemma_team_warn_stats.restype = _int
+    n = _lib.gemma_team_warn_stats(sites, counts, max_sites)
+    out = []
+    for i in range(n):
+        info = _DlInfo()
+        name = "?"
+        if _libdl.dladdr(ctypes.c_void_p(sites[i]), ctypes.byref(info)) and info.dli_sname:
+            name = "%s+%#x" % (info.dli_sname.decode(), sites[i] - info.dli_saddr)
+        out.append((name, int(counts[i])))
+    return out
+
+
+class _DlInfo(ctypes.Structure):
+    _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+
+_libdl = ctypes.CDLL(None)
+_libdl.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(_DlInfo)]

@@ -51,13 +51,55 @@ from __future__ import annotations
 import json
 import os
 import warnings
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
 
 from . import cops
+from . import gguf as _gg
 from . import ops
 from . import rope as rope_mod
+
+
+class _KQ:
+    """A matrix in the blocks of the GGUF products: data (uint8), the ggml
+    type, rows, and cols (as qwen.KMat)."""
+
+    def __init__(self, data, type_, rows, cols):
+        self.data, self.type, self.rows, self.cols = data, type_, rows, cols
+
+    def c(self):
+        return (self.data, self.type)
+
+
+def _iq4xs_to_q8_0(blocks):
+    """IQ4_XS blocks (256 values) as Q8_0 blocks (32 values): for each 32,
+    the float16 scale d (ls - 32) and the int8 table values of the codes."""
+    nb = blocks.shape[0]
+    j = np.arange(8)
+    sl = blocks["sl"].astype(np.int32)[:, j // 2] >> (4 * (j % 2)) & 0xF
+    sh = blocks["sh"].astype(np.int32)[:, None] >> (2 * j) & 3
+    ls = (sl | (sh << 4)) - 32
+    out = np.empty(nb * 8, dtype=_gg._BLOCK_DT[_gg.Q8_0])
+    out["d"] = (blocks["d"].astype(np.float32)[:, None] * ls).reshape(-1).astype(np.float16)
+    q = blocks["qs"].reshape(nb, 8, 16)
+    vals = _gg._IQ4_NL_VALUES.astype(np.int8)
+    out["qs"] = np.concatenate([vals[q & 0x0F], vals[q >> 4]], axis=2).reshape(nb * 8, 32)
+    return out
+
+
+def _kq_linear(x, k):
+    """x times the GGUF matrix k (see E4B.kq), with the int8 rows of x."""
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1, k.cols)
+    t = x.shape[0]
+    xq = np.empty((t, k.cols), np.int8)
+    xs = np.empty((t, k.cols // 32), np.float32)
+    xm = np.empty((t, k.cols // 16), np.float32)
+    cops.kq_quant_x(x, xq, xs, xm)
+    out = np.empty((t, k.rows), np.float32)
+    cops.kq_linear(k.data, k.type, k.rows, k.cols, xq, xs, xm, x, t, out)
+    return out
 
 PREFIX = "model.language_model."
 
@@ -281,9 +323,8 @@ class E4BCache:
                 continue
             for i in (0, 1):
                 old = store[i]
-                shape = (old.shape[0], cap, old.shape[2])
-                new = np.empty(shape, np.float32)
-                new[:, :self.n, :] = old[:, :self.n, :]
+                new = np.empty((cap,) + old.shape[1:], np.float32)
+                new[:self.n] = old[:self.n]
                 store[i] = new
         self.cap = cap
 
@@ -296,18 +337,20 @@ class E4BCache:
             store = [None, None]
             self.kv[plan.idx] = store
         if store[0] is None:
-            shape = (k.shape[1], self.cap, k.shape[2])
+            # position-major (positions, kv heads, head_dim), as all the
+            # caches (gpumm shares the part past the positions in use)
+            shape = (self.cap, k.shape[1], k.shape[2])
             store[0] = np.empty(shape, np.float32)
             store[1] = np.empty(shape, np.float32)
-        store[0][:, start:start + count, :] = k.transpose(1, 0, 2)
-        store[1][:, start:start + count, :] = v.transpose(1, 0, 2)
+        store[0][start:start + count] = k
+        store[1][start:start + count] = v
         if plan.stores:
             # The shared layers read the same buffer, so the data stays in one
             # place.
             self.shared[plan.kind] = store
         if start + count > self.n:
             self.n = start + count
-        return store[0][:, :self.n, :], store[1][:, :self.n, :]
+        return self._heads(store)
 
     def shared_kv(self, plan):
         """Return the key and the value that a shared layer reuses."""
@@ -316,7 +359,12 @@ class E4BCache:
             raise RuntimeError(
                 "layer %d wants the shared %s key and value, but layer %d has "
                 "not stored them" % (plan.idx, plan.kind, plan.source))
-        return store[0][:, :self.n, :], store[1][:, :self.n, :]
+        return self._heads(store)
+
+    def _heads(self, store):
+        """The keys and the values of positions 0 .. n - 1 as (kv heads, n,
+        head_dim) views of the position-major store."""
+        return store[0][:self.n].transpose(1, 0, 2), store[1][:self.n].transpose(1, 0, 2)
 
     def truncate(self, n):
         """Cut the cache back to n positions. Use it to reuse a prefix.
@@ -358,6 +406,7 @@ class E4B:
         self.resident = mode in ("f32", "int4")
         self._w = {}
         self._packed = {}
+        self._kq = {}           # the GGUF matrices of the GGUF products (kq)
         # The bfloat16 copy of a weight that the quantization did not touch.
         self._bf16 = {}
         # The cosine and sine tables of the rope, by layer type and position.
@@ -370,6 +419,7 @@ class E4B:
         # the two matrices hold the same values in the checkpoint.
         self.head = (PREFIX + "embed_tokens") if self._q4 else HEAD
         self._head_q6k = None
+        self._head_q4 = None
         # The GPU runner, the cache that is on the GPU, and the hidden state
         # of the last GPU step (see _gpu_step).
         self._gpu = None
@@ -493,6 +543,44 @@ class E4B:
         self._bf16[module] = w16 if w16 is not None else False
         return w16
 
+    def kq(self, module):
+        """Return a matrix of a GGUF file in the blocks of the GGUF products
+        (csrc/kquants.c, GP_KQ_LINEAR), or None: the K quants (Q4_K, Q5_K,
+        Q6_K) and Q8_0 of the UD files of unsloth. An IQ4_XS matrix becomes
+        Q8_0: the codes become their int8 table values, and the scale of
+        each 32 values, d (ls - 32), becomes a float16 (a relative change of
+        at most 2^-11). The object has data, type, rows, cols, and c(), as
+        qwen.KMat."""
+        e = self._kq.get(module)
+        if e is not None:
+            return e if e is not False else None
+        e = False
+        if self._q4:
+            try:
+                gname = self.ct._gguf(module + ".weight")
+                dims, t, _off = self.ct.tensors[gname]
+            except (KeyError, AttributeError):
+                t = None
+            if t in (_gg.Q4_K, _gg.Q5_K, _gg.Q6_K, _gg.Q8_0, _gg.IQ4_XS) and len(dims) == 2:
+                blocks, dims, t = self.ct.raw(gname)
+                if t == _gg.IQ4_XS:
+                    blocks, t = _iq4xs_to_q8_0(blocks), _gg.Q8_0
+                e = _KQ(np.ascontiguousarray(blocks).view(np.uint8).reshape(-1), t,
+                        int(dims[1]), int(dims[0]))
+        self._kq[module] = e
+        return e if e is not False else None
+
+    def kq_q4(self, module):
+        """Return a Q4_0 matrix of a GGUF file as a matrix of the GGUF products
+        (ggml type 2, as kq), or None. The GPU then runs it with int8 x and
+        dp4a (GP_KQ_LINEAR, kq_rows_i8), as the K quants of the UD files. The
+        data is a view of the int4 blocks (q4), so the GPU holds one copy."""
+        q = self.q4(module)
+        if q is None:
+            return None
+        packed = q[0]
+        return _KQ(packed.reshape(-1), _gg.Q4_0, int(packed.shape[0]), int(packed.shape[1]) * 32)
+
     def linear(self, x, module):
         """Multiply x by a weight matrix of the model.
 
@@ -513,6 +601,9 @@ class E4B:
                     if mt:
                         return ops.linear_int4_mt(x, packed, scales)
                     return ops.linear_int4(x, packed, scales)
+                k = self.kq(module)
+                if k is not None:
+                    return _kq_linear(x, k)
             else:
                 entry = self.packed(module)
                 if entry is not None:
@@ -800,25 +891,31 @@ class E4B:
             hook(i, x)
         return x
 
-    def forward(self, input_ids, cache=None, start_pos=0, hook=None):
+    def forward(self, input_ids, cache=None, start_pos=0, hook=None, media=None):
         """Run the model. Return the final hidden state.
 
         input_ids  The token ids. A list or an array.
         cache      An E4BCache. Make one when the argument is None.
         start_pos  The position of the first token. Use it after a prefill.
         hook       A callable (layer, hidden) for a trace.
+        media      A list of media.Span (absolute positions): the soft rows of
+                   images and audio. A soft token takes its row in place of
+                   the token row (no scale), and the per-layer token row of
+                   the pad token (id 0), as Gemma4Model of transformers.
         """
         cfg = self.cfg
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
+        t0 = int(start_pos)
+        media = [sp for sp in media or () if sp.start < t0 + ids.size and sp.end > t0]
         if _GPU and hook is None and isinstance(cache, E4BCache):
             from . import program
-            if ids.size == 1 and program.e4b_ready(self, cache):
+            if ids.size == 1 and not media and program.e4b_ready(self, cache):
                 return self._gpu_step(ids, cache, int(start_pos))
             if ids.size > 1 and self._q4 and self.mode == "int4":
                 # A prompt, or the verify group of an MTP step.
-                return self._gpu_prefill(ids, cache, int(start_pos))
+                return self._gpu_prefill(ids, cache, int(start_pos), media)
         self._gpu_release(cache)
-        if (_PROGRAM and hook is None and isinstance(cache, E4BCache)
+        if (_PROGRAM and hook is None and isinstance(cache, E4BCache) and not media
                 and (ids.size == 1 or ops.mt_ready(ids.size))):
             # One decode step, or the group of an MTP verify step, as one
             # program in C (np_gemma/program.py). The result has the bits of
@@ -830,23 +927,45 @@ class E4B:
             cache = E4BCache(cfg)
         emb = self.embed_rows(PREFIX + "embed_tokens", ids)
         x = emb * cfg.embed_scale
-        per_layer = self.per_layer_inputs(ids, x)
+        tok_ids = ids
+        for sp in media:
+            lo, hi = max(sp.start, t0), min(sp.end, t0 + ids.size)
+            x[lo - t0:hi - t0] = sp.rows[lo - sp.start:hi - sp.start]
+            if tok_ids is ids:
+                tok_ids = ids.copy()
+            tok_ids[lo - t0:hi - t0] = 0
+        per_layer = self.per_layer_inputs(tok_ids, x)
         for i in range(cfg.num_hidden_layers):
             x = self.layer(x, per_layer[:, i, :], i, cache, start_pos, hook)
         return ops.rms_norm(x, self.T(PREFIX + "norm.weight"), cfg.rms_norm_eps)
 
+    def _gpu_cached(self):
+        """The host cache that is on the GPU, or None (a weak reference, as
+        Model._gpu_cached)."""
+        r = self.__dict__.get("_gpu_cache")
+        return r() if r is not None else None
+
     def _gpu_attach(self, cache):
         """Put the cache on the GPU. The first use of a cache copies it to the
         GPU. From then on, the copy on the GPU is the true one, until
-        _gpu_release copies it back."""
+        _gpu_release (or gpu_sync) copies it back. The cache that was on the
+        GPU before gets its rows only when the caller still holds it (see
+        Model._gpu_attach)."""
         if self._gpu is None:
             from . import gpu
             self._gpu = gpu.E4BGPU(self)
-        if self._gpu_cache is not cache:
-            if self._gpu_cache is not None:
-                self._gpu.detach(self._gpu_cache)
+        prev = self._gpu_cached()
+        if prev is not cache:
+            if prev is not None:
+                self._gpu.detach(prev)
             self._gpu.attach(cache)
-            self._gpu_cache = cache
+            self._gpu_cache = weakref.ref(cache)
+
+    def gpu_sync(self, cache):
+        """Copy the cache on the GPU into the host cache, and keep it on the
+        GPU (as Model.gpu_sync)."""
+        if self._gpu is not None and self._gpu_cached() is cache:
+            self._gpu.cache.to_host()
 
     def _gpu_step(self, ids, cache, pos):
         """Run a decode step on the GPU."""
@@ -854,15 +973,18 @@ class E4B:
         self._gpu_xn = self._gpu.step(ids, pos, cache)
         return self._gpu_xn
 
-    def _gpu_prefill(self, ids, cache, pos):
+    def _gpu_prefill(self, ids, cache, pos, media=None):
         """Run a group or a prompt on the GPU (E4BGPU.prefill)."""
         self._gpu_attach(cache)
-        self._gpu_xn = self._gpu.prefill(ids, pos, cache)
+        if media:
+            self._gpu_xn = self._gpu.prefill(ids, pos, cache, media=media)
+        else:
+            self._gpu_xn = self._gpu.prefill(ids, pos, cache)
         return self._gpu_xn
 
     def _gpu_release(self, cache):
         """Copy the cache back to the host before the CPU uses it."""
-        if self._gpu is not None and self._gpu_cache is cache:
+        if self._gpu is not None and self._gpu_cached() is cache:
             self._gpu.detach(cache)
             self._gpu_cache = None
             self._gpu_xn = None
@@ -876,9 +998,10 @@ class E4B:
         """Return an empty cache for this model. Session uses it."""
         return E4BCache(self.cfg, max_len=max_len)
 
-    def prefill(self, ids, cache, start=0):
-        """Run the prompt into the cache. Return the final hidden states."""
-        return self.forward(ids, cache=cache, start_pos=start)
+    def prefill(self, ids, cache, start=0, media=None):
+        """Run the prompt into the cache. Return the final hidden states.
+        media: see forward."""
+        return self.forward(ids, cache=cache, start_pos=start, media=media)
 
     def logits(self, hidden, softcap=True):
         """Project the hidden state onto the vocabulary."""
@@ -903,6 +1026,30 @@ class E4B:
             out = ops.softcap(out, cap)
         return out
 
+    def logits_topk(self, hidden, k, temperature):
+        """Return the candidates of sampling of the rows of hidden from the GPU
+        (E4BGPU.topk: the k largest logits of each row and the row stats), or
+        None when the rows are not the last rows of a GPU step."""
+        xn = self._gpu_xn
+        if (xn is not None and hidden.shape[0] <= 16
+                and (hidden is xn or (getattr(hidden, "base", None) is xn and
+                                      hidden.ctypes.data + hidden.nbytes ==
+                                      xn.ctypes.data + xn.nbytes))):
+            return self._gpu.topk(hidden.shape[0], k, temperature)
+        return None
+
+    def argmax_rows(self, hidden):
+        """The greedy token of each row of hidden: np.argmax of each row of
+        logits(hidden). For the last rows of a GPU step or group, the GPU
+        picks them and copies only the tokens."""
+        xn = self._gpu_xn
+        if (xn is not None and hidden.shape[0] <= 16
+                and (hidden is xn or (getattr(hidden, "base", None) is xn and
+                                      hidden.ctypes.data + hidden.nbytes ==
+                                      xn.ctypes.data + xn.nbytes))):
+            return self._gpu.argmax(hidden.shape[0])
+        return [int(v) for v in np.argmax(self.logits(hidden), axis=1)]
+
     def _head_is_q6k(self):
         """Return True when the output head is a Q6_K table. Prepare it."""
         if self._head_q6k is not None:
@@ -916,6 +1063,27 @@ class E4B:
         except (KeyError, AttributeError, ValueError):
             self._head_q6k = False
         return self._head_q6k is not False
+
+    def _gpu_head(self):
+        """Return (kind, blocks) of a GGUF head that a GPU head kernel reads in
+        place: ("q6k", the Q6_K blocks) for gg_q6k_head, or ("q4", the Q4_0
+        blocks, one row of bytes for each token) for gg_q4_head (the QAT files
+        of unsloth keep the token table in Q4_0). None for another head
+        (GPU._kq_head)."""
+        if not self._q4:
+            return None
+        if self._head_is_q6k():
+            return "q6k", self._head_q6k
+        if self._head_q4 is None:
+            self._head_q4 = False
+            key = self.head + ".weight"
+            try:
+                if self.ct.dtype(key) == "Q4_0":
+                    blocks, dims, _t = self.ct.raw(self.ct._gguf(key))
+                    self._head_q4 = blocks.view(np.uint8).reshape(int(dims[1]), -1)
+            except (KeyError, AttributeError, ValueError):
+                pass
+        return ("q4", self._head_q4) if self._head_q4 is not False else None
 
     def generate(self, input_ids, max_new_tokens=8, eos_ids=(), cache=None,
                  sampler=None, hook=None):

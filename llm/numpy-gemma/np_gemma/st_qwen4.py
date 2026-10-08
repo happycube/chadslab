@@ -131,15 +131,7 @@ class NVFP4Source:
                   dims=(self._shape(m + "shared_expert_gate.weight")[-1],))
         for x in ("gate", "up", "down"):
             self._dense_mat(b + "ffn_%s_shexp.weight" % x, m + "shared_expert.%s_proj.weight" % x)
-            e0 = m + "experts.0.%s_proj.weight" % x
-            if mtp:
-                rows, cols = self._shape(e0)
-                self._add(b + "ffn_%s_exps.weight" % x, "fp8exps", (m, x), (cols, rows, self.E),
-                          KQ_Q8_0)
-            else:
-                rows, half = self._shape(e0)
-                self._add(b + "ffn_%s_exps.weight" % x, "nv4exps", (m, x), (half * 2, rows, self.E),
-                          self.xtype)
+        self._experts(b, m, mtp)
         a = base + "self_attn."
         if a + "q_proj.weight" in self.where:
             for x, g in (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v"), ("o", "attn_output")):
@@ -176,6 +168,20 @@ class NVFP4Source:
             conv = pl + "conv1d.weight"
             ch, _one, k = self._shape(conv)
             self._f32(b + "ple_conv1d.weight", conv, lambda w: w.reshape(ch, k), dims=(k, ch))
+
+    def _experts(self, b, m, mtp):
+        """The routed experts of a layer (m: the prefix of its mlp): NVFP4
+        stacks, or the FP8 blocks of the MTP layer as Q8_0."""
+        for x in ("gate", "up", "down"):
+            e0 = m + "experts.0.%s_proj.weight" % x
+            if mtp:
+                rows, cols = self._shape(e0)
+                self._add(b + "ffn_%s_exps.weight" % x, "fp8exps", (m, x), (cols, rows, self.E),
+                          KQ_Q8_0)
+            else:
+                rows, half = self._shape(e0)
+                self._add(b + "ffn_%s_exps.weight" % x, "nv4exps", (m, x), (half * 2, rows, self.E),
+                          self.xtype)
 
     def _build(self):
         for i in range(self.L):
@@ -243,7 +249,7 @@ class NVFP4Source:
         cfg.vocab_size = int(h["vocab_size"])
         cfg.eos_token_ids = None
         cfg.v_tiled = False             # the order of the checkpoint
-        cfg.kv_form = os.environ.get("NP_GEMMA_QWEN_KV", "int16")
+        cfg.kv_form = os.environ.get("NP_GEMMA_QWEN_KV", "int8")
         cfg.hc_count = int(h["hc_count"])
         cfg.hc_lowrank = int(h["hc_lowrank"])
         cfg.ple_layers = [int(x) - 1 for x in h.get("ple_layer_ids", [])]

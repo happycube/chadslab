@@ -17,14 +17,63 @@ then run many prompts.
 from __future__ import annotations
 
 import os
+import weakref
 
 import numpy as np
 
 from . import ops
 from . import rope as rope_mod
+from . import tq6
 from .weight_cache import WeightCache
 
 PREFIX = "model.language_model."
+
+# The rows that a layer with a window keeps before the window when it drops
+# old rows (KVCache.prepare, GPUKV.prepare). A chat turn cuts the cache back
+# to the start of the last answer, and the first new token needs the window
+# before the cut. Without this margin a cut soon after a drop found the rows
+# gone, and the Session read the whole history again (a video of 2325 tokens:
+# 5 s for each question). A cut back of up to KV_KEEP tokens is always
+# possible. The cost: KV_KEEP more rows in each layer with a window.
+KV_KEEP = int(os.environ.get("NP_GEMMA_KV_KEEP", "1024"))
+
+# NP_GEMMA_KV_INT8=1: the cache is int8 only (KVCache kv="int8"), with no
+# float32 rows. A step of the 26B then reads half the bytes of the int16
+# copy (about 150 MB in place of 300 MB a token at 4300 tokens).
+# NP_GEMMA_KV_INT8=v: int16 keys and int8 values (kv="k16v8"), also with no
+# float32 rows: three quarters of the bytes of the int16 copy.
+# NP_GEMMA_KV_INT8=r: rq8, the int8 cache of the rows rotated in each 32
+# values (the TQ6 rotation, np_gemma/tq6.py); =vr: k16vr8, int16 keys and
+# rotated int8 values. The storage of int8 and k16v8 (KV_BASE): the step
+# rotates the keys and the values before their write, the query for rotated
+# keys (the scores do not change) and the output back for rotated values.
+# On the 26B at 100K tokens (scripts/study_kv_forms.py), the error of the
+# attention output: int8 7.4e-4, rq8 5.5e-4, k16v8 5.2e-4.
+KV_FORM = {"1": "int8", "v": "k16v8", "r": "rq8", "vr": "k16vr8"}.get(
+    os.environ.get("NP_GEMMA_KV_INT8", "0"), "int16")
+KV_BASE = {"rq8": "int8", "k16vr8": "k16v8"}
+
+
+def kv_base(form):
+    """The storage form of a KV form (rq8: int8, k16vr8: k16v8)."""
+    return KV_BASE.get(form, form)
+
+
+def kv_rot(form=None):
+    """(keys rotated, values rotated) of a KV form (else of KV_FORM)."""
+    f = KV_FORM if form is None else form
+    return f == "rq8", f in ("rq8", "k16vr8")
+
+# The tokens of one image see each other in every layer. The docstring of
+# create_masks_for_vision_model (transformers) says that the global layers
+# stay causal, but the logits of generate() and of forward() both agree bit
+# for bit with the mask in every layer (scripts/check_mm_prompt.py, the 12B in
+# float32), and llama.cpp does the same. NP_GEMMA_BIDIR_ALL=0 keeps the
+# global layers causal (KL 0.008 to transformers on a prompt with an image).
+_BIDIR_ALL = os.environ.get("NP_GEMMA_BIDIR_ALL", "1") == "1"
+# A prompt with media runs on the GPU when the model does (ModelGPU.group);
+# NP_GEMMA_MEDIA_GPU=0 runs it on the CPU in Python.
+_MEDIA_GPU = os.environ.get("NP_GEMMA_MEDIA_GPU", "1") == "1"
 
 # These tensors are small. Keep them in float32 format.
 _NORM_KEYS = (
@@ -78,30 +127,58 @@ class KVCache:
     A global layer keeps the full sequence. A sliding layer keeps the last
     window. The buffers have a fixed size. The code writes in place. Thus the
     cache does not copy the full sequence for each token.
+
+    The cache keeps only quantized rows, with a float32 scale for each group
+    of 32 values: no float32 rows. The form "int16" (a scale of max |x| /
+    32767), "int8" (max |x| / 127: half the bytes for each step to read),
+    or "k16v8" (int16 keys, int8 values). read() gives dequantized rows to
+    the readers of float rows (the prompt attention). The default form comes
+    from NP_GEMMA_KV_INT8.
+
+    With NP_GEMMA_PARTS=2 (or more) and the int16 form, KVCache(...) gives a
+    parts.PartKVCache: a cache for each part of a step, in the memory of its
+    node, with the KV heads of that part. NP_GEMMA_PART_KV=0 turns this off.
     """
 
-    def __init__(self, cfg, max_len=4096):
+    split = False      # True for a parts.PartKVCache
+
+    def __new__(cls, cfg=None, max_len=4096, kv=None, **kw):
+        if (cls is KVCache and int(os.environ.get("NP_GEMMA_PARTS", "1")) > 1
+                and os.environ.get("NP_GEMMA_PART_KV", "1") != "0"
+                and (kv or KV_FORM) == "int16"):
+            from .parts import PartKVCache
+            cls = PartKVCache
+        return super().__new__(cls)
+
+    def __init__(self, cfg, max_len=4096, kv=None):
         self.cfg = cfg
         self.window = cfg.sliding_window or 0
         self.max_len = max_len
+        if kv is None:
+            kv = KV_FORM
+        # rq8, k16vr8: rotated rows in the storage of int8, k16v8 (kv_rot)
+        self.rot_k, self.rot_v = kv_rot(kv)
+        kv = kv_base(kv)
+        if kv not in ("int16", "int8", "k16v8"):
+            raise ValueError("kv must be int16, int8, k16v8, rq8 or k16vr8, not %r" % (kv,))
+        if not ops._COPS_READY:
+            raise ValueError("the quantized cache needs the C kernels")
+        self.kv = kv
+        # the dtypes of the keys and of the values
+        self.kdtype = np.int8 if kv == "int8" else np.int16
+        self.vdtype = np.int8 if kv in ("int8", "k16v8") else np.int16
         n = cfg.num_hidden_layers
-        self.k = [None] * n
-        self.v = [None] * n
-        self.kq = [None] * n     # int16 copy of k for the fused attention
+        self.kq = [None] * n     # the keys, quantized
         self.ks = [None] * n     # one float32 scale for each group of 32
-        self.vq = [None] * n     # int16 copy of v for the fused attention
+        self.vq = [None] * n     # the values, quantized
         self.vs = [None] * n
         self.base = [0] * n      # absolute position of buffer row 0
         self.end = [0] * n       # absolute position after the last stored row
-        self._qc_on = [False] * n
-        self.attn_min = ops.ATTN_MIN
-        # The int16 copy is only useful to the fused attention. The float path
-        # never reads it, so do not build it and do not spend the memory.
-        self.attn_on = ops.attn_ready()
 
-    def _shape(self, layer, cap):
-        plan = self.cfg.plan[layer]
-        return (cap, plan.num_kv_heads, plan.head_dim)
+    def _cap(self, layer):
+        """The rows of the buffers of a layer (0 before the first write)."""
+        a = self.kq[layer]
+        return 0 if a is None else a.shape[0]
 
     def _shape_q(self, layer, cap):
         plan = self.cfg.plan[layer]
@@ -111,43 +188,22 @@ class KVCache:
         plan = self.cfg.plan[layer]
         return (cap, plan.num_kv_heads, plan.head_dim // 32)
 
-    def _alloc_q(self, layer, cap):
-        self.kq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int16)
-        self.ks[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-        self.vq[layer] = np.empty(self._shape_q(layer, cap), dtype=np.int16)
-        self.vs[layer] = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-
-    def _alloc(self, layer, cap):
-        self.k[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
-        self.v[layer] = np.empty(self._shape(layer, cap), dtype=np.float32)
-        if self.attn_on:
-            self._alloc_q(layer, cap)
-
     def _grow(self, layer, cap):
-        old = 0 if self.k[layer] is None else self.k[layer].shape[0]
-        nk = np.empty(self._shape(layer, cap), dtype=np.float32)
-        nv = np.empty(self._shape(layer, cap), dtype=np.float32)
+        """Give layer i buffers of cap rows; keep the rows it has."""
+        old = self._cap(layer)
+        new = [np.empty(self._shape_q(layer, cap), dtype=self.kdtype),
+               np.empty(self._shape_s(layer, cap), dtype=np.float32),
+               np.empty(self._shape_q(layer, cap), dtype=self.vdtype),
+               np.empty(self._shape_s(layer, cap), dtype=np.float32)]
         if old:
-            nk[:old] = self.k[layer][:old]
-            nv[:old] = self.v[layer][:old]
-        self.k[layer] = nk
-        self.v[layer] = nv
-        if not self.attn_on:
-            return
-        ok = 0 if self.kq[layer] is None else self.kq[layer].shape[0]
-        qk = np.empty(self._shape_q(layer, cap), dtype=np.int16)
-        qks = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-        qv = np.empty(self._shape_q(layer, cap), dtype=np.int16)
-        qvs = np.empty(self._shape_s(layer, cap), dtype=np.float32)
-        if ok:
-            qk[:ok] = self.kq[layer][:ok]
-            qks[:ok] = self.ks[layer][:ok]
-            qv[:ok] = self.vq[layer][:ok]
-            qvs[:ok] = self.vs[layer][:ok]
-        self.kq[layer] = qk
-        self.ks[layer] = qks
-        self.vq[layer] = qv
-        self.vs[layer] = qvs
+            for dst, src in zip(new, (self.kq[layer], self.ks[layer], self.vq[layer],
+                                      self.vs[layer])):
+                dst[:old] = src[:old]
+        self.kq[layer], self.ks[layer], self.vq[layer], self.vs[layer] = new
+
+    def _buffers(self, layer):
+        """The arrays of a layer, with one row for each position."""
+        return (self.kq[layer], self.ks[layer], self.vq[layer], self.vs[layer])
 
     def prepare(self, layer, start_pos, t):
         """Make room for t rows at start_pos. Return the buffer row of start_pos.
@@ -159,8 +215,17 @@ class KVCache:
         end = start_pos + t
         if self.cfg.plan[layer].is_sliding:
             w = self.window
-            if self.k[layer] is None:
-                self._alloc(layer, 2 * w)
+            if self._cap(layer) == 0:
+                self._grow(layer, 2 * w)
+            if start_pos > self.end[layer]:
+                # Rows after a gap (GPUKV.detach: the GPU dropped the rows of
+                # the window before its base, and the host had none of them):
+                # the layer starts at start_pos. The drop below had set base to
+                # start_pos - window - KV_KEEP, over rows that no one wrote, and
+                # a truncate then took them for the window of the prompt (the
+                # 26B, a session of 108K tokens back after another session:
+                # garbage in the window, and the GPU hung).
+                self.base[layer] = self.end[layer] = start_pos
             # Drop the oldest rows when the buffer holds more than two
             # windows. A query at position p sees back to p - window + 1, so
             # the first query of the new block sees back to
@@ -170,79 +235,106 @@ class KVCache:
             # a prompt block both compact. The old code compacted only for a
             # decode step, so a prompt block grew the buffer to the full
             # sequence.
-            if start_pos - self.base[layer] > 2 * w:
-                keep = start_pos - w + 1
+            if start_pos - self.base[layer] > 2 * w + KV_KEEP:
+                keep = start_pos - w + 1 - KV_KEEP
                 off = keep - self.base[layer]
                 rows = self.end[layer] - keep
                 if rows > 0:
-                    self.k[layer][:rows] = self.k[layer][off:off + rows]
-                    self.v[layer][:rows] = self.v[layer][off:off + rows]
-                    if self._qc_on[layer]:
-                        self.kq[layer][:rows] = self.kq[layer][off:off + rows]
-                        self.ks[layer][:rows] = self.ks[layer][off:off + rows]
-                        self.vq[layer][:rows] = self.vq[layer][off:off + rows]
-                        self.vs[layer][:rows] = self.vs[layer][off:off + rows]
+                    for a in self._buffers(layer):
+                        a[:rows] = a[off:off + rows]
                 self.base[layer] = keep
             need = end - self.base[layer]
-            if need > self.k[layer].shape[0]:
-                self._grow(layer, max(need, 2 * w))
+            if need > self._cap(layer):
+                # The rows stay below 2 w + KV_KEEP + t (the drop above), so
+                # one growth to that size serves every later decode step. A
+                # growth of only the rows of the step copied the whole buffer
+                # of each sliding layer for each token from 2 w to 2 w +
+                # KV_KEEP rows: the 26B went from 42 to 210 ms a step.
+                self._grow(layer, max(need, 2 * w + KV_KEEP + 1))
         else:
-            if self.k[layer] is None or self.k[layer].shape[0] < end:
+            if self._cap(layer) < end:
                 cap = max(self.max_len, end)
-                if self.k[layer] is not None:
-                    cap = max(cap, self.k[layer].shape[0] * 2)
+                if self._cap(layer):
+                    cap = max(cap, self._cap(layer) * 2)
                 self._grow(layer, cap)
         return start_pos - self.base[layer]
 
     def write(self, layer, start_pos, k, v):
         """Store a block of keys and values. start_pos is the position of k[0]."""
         t = k.shape[0]
-        end = start_pos + t
         start = self.prepare(layer, start_pos, t)
-        self.k[layer][start:start + t] = k
-        self.v[layer][start:start + t] = v
-        self.end[layer] = end
-        # Keep an int16 copy for the fused attention of a decode step. Build it
-        # only when the cache is long enough that the fused path pays for the
-        # work of the quantization.
-        if self.attn_on and end - self.base[layer] >= self.attn_min:
-            if not self._qc_on[layer]:
-                self._quantize_all(layer)
-                self._qc_on[layer] = True
-            else:
-                self._store_qc(layer, start_pos - self.base[layer], k, v)
+        self.end[layer] = start_pos + t
+        self._store_qc(layer, start, k, v)
+
+    def rows_q(self, layer, start_pos, t):
+        """Make room for t rows at start_pos, for a writer that stores the
+        quantized rows of a GPU cache there with no copy. Return the views
+        (kq, ks, vq, vs) of the rows, of the shapes (t, kv heads, head_dim)
+        and (t, kv heads, head_dim / 32). Then the writer calls
+        rows_q_done."""
+        start = self.prepare(layer, start_pos, t)
+        r = slice(start, start + t)
+        return self.kq[layer][r], self.ks[layer][r], self.vq[layer][r], self.vs[layer][r]
+
+    def rows_q_done(self, layer, start_pos, t):
+        """The rows of rows_q are written."""
+        self.end[layer] = start_pos + t
+
+    def write_q(self, layer, start_pos, kq, ks, vq, vs):
+        """Store a block of quantized keys and values (shapes as rows_q), as a
+        GPU cache holds them. They are not quantized a second time."""
+        t = kq.shape[0]
+        for dst, src in zip(self.rows_q(layer, start_pos, t), (kq, ks, vq, vs)):
+            dst[...] = src
+        self.rows_q_done(layer, start_pos, t)
 
     def _store_qc(self, layer, start, k, v):
-        """Store the int16 copy of a block of keys and values."""
+        """Quantize and store a block of keys and values from buffer row
+        start."""
         t = k.shape[0]
         plan = self.cfg.plan[layer]
         g = plan.head_dim // 32
         nkv = plan.num_kv_heads
-        kq, ks = ops.quantize_i16(k.reshape(t, nkv, g, 32))
-        vq, vs = ops.quantize_i16(v.reshape(t, nkv, g, 32))
+        quant = {np.dtype(np.int8): ops.quantize_i8, np.dtype(np.int16): ops.quantize_i16}
+        if getattr(self, "rot_k", False):
+            k = tq6.rotate(k)
+        if getattr(self, "rot_v", False):
+            v = tq6.rotate(v)
+        kq, ks = quant[np.dtype(self.kdtype)](k.reshape(t, nkv, g, 32))
+        vq, vs = quant[np.dtype(self.vdtype)](v.reshape(t, nkv, g, 32))
         self.kq[layer][start:start + t] = kq.reshape(t, nkv, g * 32)
         self.ks[layer][start:start + t] = ks
         self.vq[layer][start:start + t] = vq.reshape(t, nkv, g * 32)
         self.vs[layer][start:start + t] = vs
 
-    def read(self, layer, end):
-        """Return the keys, the values, and the position of the first row."""
+    def read(self, layer, end, lo=0, rotated=False):
+        """Return the keys, the values (new float32 arrays of the dequantized
+        rows), and the position of the first row. lo skips the first lo rows
+        of the buffer (their position is base + lo). rotated: the rows of
+        the rotated forms (rq8, k16vr8) as stored (the reader rotates its
+        queries and unrotates its output)."""
         base = self.base[layer]
-        return self.k[layer][:end - base], self.v[layer][:end - base], base
-
-    def _quantize_all(self, layer):
-        """Quantize every stored row of one layer from the float32 copy."""
-        n = self.end[layer] - self.base[layer]
-        if n > 0:
-            self._store_qc(layer, 0, self.k[layer][:n], self.v[layer][:n])
+        n = end - base - lo
+        shape = (n,) + self.kq[layer].shape[1:]
+        out = []
+        rots = (getattr(self, "rot_k", False), getattr(self, "rot_v", False))
+        for (q, sc), rot in zip(((self.kq[layer], self.ks[layer]), (self.vq[layer], self.vs[layer])), rots):
+            x = np.empty(shape, np.float32)
+            q, sc = q[lo:lo + n], sc[lo:lo + n]
+            if q.dtype == np.int8:
+                ops._cops.dequantize_i8_groups(q, sc, x)
+            else:
+                ops._cops.dequantize_i16_groups(q, sc, x)
+            out.append(tq6.unrotate(x) if rot and not rotated else x)    # (rq8, k16vr8: the rows back)
+        return out[0], out[1], base + lo
 
     def qc_ready(self, layer):
-        """Return True when the int16 copy of one layer is ready."""
-        return self._qc_on[layer]
+        """Return True: the quantized rows are the cache (an old test)."""
+        return True
 
     def read_qc(self, layer, end):
-        """Return the int16 keys and values, their scales, and the position of
-        row 0."""
+        """Return the quantized keys and values, their scales, and the
+        position of row 0."""
         base = self.base[layer]
         n = end - base
         return (self.kq[layer][:n], self.ks[layer][:n],
@@ -250,23 +342,31 @@ class KVCache:
 
     def length(self, layer):
         """Return the number of stored positions in one layer."""
-        if self.k[layer] is None:
+        if self._cap(layer) == 0:
             return 0
         return self.end[layer] - self.base[layer]
 
     def truncate(self, n):
         """Keep only the positions before n. Return False when that is not possible.
 
-        A sliding layer drops the oldest rows. If n is before the first row of
-        a layer, that layer cannot go back. The caller must then start again.
+        A sliding layer drops the oldest rows. The next token at n sees back
+        to n - window + 1, so a sliding layer must still hold that row. If it
+        does not, that layer cannot go back. The caller must then start again.
         """
-        for i in range(len(self.k)):
-            if self.k[i] is not None and n < self.base[i]:
+        layers = range(self.cfg.num_hidden_layers)
+        for i in layers:
+            if self._cap(i) and self.base[i] > self.first_row(i, n):
                 return False
-        for i in range(len(self.k)):
-            if self.k[i] is not None and n < self.end[i]:
+        for i in layers:
+            if self._cap(i) and n < self.end[i]:
                 self.end[i] = n
         return True
+
+    def first_row(self, layer, n):
+        """Return the first position that a token at n sees in the layer."""
+        if self.cfg.plan[layer].is_sliding and self.window:
+            return max(0, n - self.window + 1)
+        return n
 
 
 class Model:
@@ -288,6 +388,8 @@ class Model:
         self._embed_q6k_bytes = None
         self._norm_w = None
         self._dtype = "f32"
+        # The soft-token spans of the prompt that prefill runs now (media.Span).
+        self._media = None
         self._cache = None
         self._cache_write = None
         # The cosine and sine tables of the rope, by layer type and position.
@@ -307,8 +409,8 @@ class Model:
         # on. The copy is the transpose of the data, so it is the same size.
         self._packed = os.environ.get("NP_GEMMA_PACKED") == "1"
         # The activations of the int4 products of a prompt pass: "1" (int8),
-        # "16" (float matrices and int16 experts), or "0" (float). See
-        # ops.prompt_act.
+        # "16" (int16; the default of a model with experts), or "0" (float).
+        # See ops.prompt_act.
         self.prompt_act = ops.prompt_act(cfg.enable_moe_block)
 
     # ---- weights -----------------------------------------------------------
@@ -407,18 +509,22 @@ class Model:
             return self.st.get_bf16(src)
         return self.st.get(src)
 
-    def _is_q6k_embed(self, hf_name):
-        """Return True when the source table is Q6_K.
+    def _embed_type(self, hf_name):
+        """Return the GGUF type name of the source table, or None.
 
-        Only a GGUF file sets keep_embedding_bf16. The QAT GGUFs keep the tied
-        output head in Q6_K.
+        Only a GGUF file sets keep_embedding_bf16. The QAT GGUFs of Google keep
+        the tied output head in Q6_K; other files (Unsloth) keep it in Q4_0.
         """
         if not getattr(self.st, "keep_embedding_bf16", False):
-            return False
+            return None
         try:
-            return self.st.dtype(hf_name) == "Q6_K"
+            return self.st.dtype(hf_name)
         except (KeyError, AttributeError, ValueError):
-            return False
+            return None
+
+    def _is_q6k_embed(self, hf_name):
+        """Return True when the source table is Q6_K."""
+        return self._embed_type(hf_name) == "Q6_K"
 
     def load_all(self, dtype="f32"):
         """Load all layers and the embedding table. Keep the data in memory.
@@ -433,9 +539,10 @@ class Model:
         if dtype not in ("f32", "bf16", "int8", "int4"):
             raise ValueError("dtype must be f32, bf16, int8, or int4")
         if dtype in ("int8", "int4") and self._use_cache:
-            # The int4 layout changed to the block layout of Q4_0. Use a new
+            # The int4 layout changed to the block layout of Q4_0, then the
+            # quantizer found the QAT grid (ops.quantize_int4). Use a new
             # cache key.
-            cache = WeightCache(self.st.path, dtype, extra="blk" if dtype == "int4" else "")
+            cache = WeightCache(self.st.path, dtype, extra="grid" if dtype == "int4" else "")
             if cache.ready():
                 self._cache = cache
             else:
@@ -460,6 +567,12 @@ class Model:
             self._embed_q6k_bytes = self.st.q6k_bytes(src)
         elif dtype == "bf16":
             self._embed_bf16 = self.st.get_bf16(src)
+        elif (dtype == "int4" and self._embed_type(src) == "Q4_0"
+              and hasattr(self.st, "int4_packed")):
+            # The file keeps the tied output head in Q4_0. Use the blocks in
+            # place, as for the layers: the head reads 4.5 bits for each
+            # weight, not the 16 of a bfloat16 copy, and has the same values.
+            self._embed_q, self._embed_s = self.st.int4_packed(src)
         elif dtype == "int4" and (self._w4a16 or keep_head):
             # The source keeps the embedding at a higher precision. Do not
             # quantize the tied output head to 4 bits.
@@ -480,12 +593,16 @@ class Model:
         if self._cache_write is not None:
             self._cache_write.close_write()
             self._cache_write = None
-            self._cache = WeightCache(self.st.path, dtype, extra="blk" if dtype == "int4" else "")
+            self._cache = WeightCache(self.st.path, dtype, extra="grid" if dtype == "int4" else "")
         self._dtype = dtype
         self.keep_weights = True
         if dtype in ("int8", "int4"):
             # The copy holds all the weights. Drop the mapped bf16 pages.
             self.st.release_pages()
+        if dtype == "int4":
+            # The int4 matrices in groups of 16 rows too, for the prompt
+            # (ops.q4x_pack_model; NP_GEMMA_Q4X=0 turns it off).
+            ops.q4x_pack_model(self)
         return self
 
     def free_all(self):
@@ -519,7 +636,8 @@ class Model:
                 return ops.linear_int8(x, w[0], w[1], w[2])
             return ops.linear_int8(x, w[0], w[1])
         if self._dtype == "int4":
-            return ops.linear_int4(x, w[0], w[1], q8=self.prompt_act == "1")
+            return ops.linear_int4(x, w[0], w[1], q8=self.prompt_act == "1",
+                                   x16=self.prompt_act == "16")
         if self._dtype == "bf16":
             return ops.linear_bf16(x, w)
         return ops.linear(x, w)
@@ -697,23 +815,36 @@ class Model:
         """
         cfg = self.cfg
         t = len(input_ids)
-        if (_GPU and t <= 16 and hook is None and max_layers is None
+        media = self._media_in(start_pos, t)
+        if (_GPU and t <= 16 and hook is None and max_layers is None and not media
                 and isinstance(cache, KVCache) and self._dtype == "int4" and self.keep_weights):
             # One decode step, or the verify group of an MTP step.
             if t == 1:
                 return self._gpu_step(input_ids, cache, int(start_pos))
             return self._gpu_group(input_ids, cache, int(start_pos))
         self._gpu_release(cache)
-        if (_PROGRAM and (t == 1 or ops.mt_ready(t)) and hook is None
+        if (_PROGRAM and (t == 1 or ops.mt_ready(t)) and hook is None and not media
                 and max_layers is None and isinstance(cache, KVCache)
-                and self._dtype == "int4" and self.keep_weights):
+                and self._dtype == "int4" and self.keep_weights
+                and not (getattr(cache, "split", False) and t > 1)):
             # One decode step, or the group of an MTP verify step, as one
             # program in C (np_gemma/program.py). The result has the bits of
             # the Python loop below.
             from . import program
             if program.ready(self, cache) is not None:
                 return program.decode_step(self, cache, input_ids, int(start_pos))
+        if t > 1 and hook is None and max_layers is None:
+            # A prompt block as one program (np_gemma/prompt.py): the kernels
+            # of the loop below, so the same bits, with no Python between them.
+            # The soft rows of media and their attention too.
+            from . import prompt
+            if prompt.prompt_ready(self, cache, t):
+                return prompt.prompt_step(self, cache, input_ids, int(start_pos), media)
         x = self.embed(input_ids)
+        for sp in media:
+            # A soft token takes the row of its image or clip, with no scale.
+            lo, hi = max(sp.start, start_pos), min(sp.end, start_pos + t)
+            x[lo - start_pos:hi - start_pos] = sp.rows[lo - sp.start:hi - sp.start]
         if start_pos == 0:
             emit(hook, "embed_tokens", x)
             emit(hook, "inputs_embeds", x)
@@ -873,46 +1004,85 @@ class Model:
             q = rope_mod.apply(q, cos, sin)
             k = rope_mod.apply(k, cos, sin)
 
+        # The tokens of an image see each other (use_bidirectional_attention
+        # "vision"): the last key of each query. See _BIDIR_ALL.
+        limit = self._media_limit(positions) if (plan.sliding_window or _BIDIR_ALL) else None
         if cache is not None:
             start = int(positions[0])
-            qc_before = cache.qc_ready(i)
+            flash = os.environ.get("NP_GEMMA_FLASH", "1")
+            window = plan.sliding_window or 0
+            if (getattr(cache, "split", False) and t > 1 and not mt and limit is None
+                    and flash not in ("0", "ref") and (flash != "slide" or window > 0)
+                    and ops.flash_ready()):
+                # The parts write and read the cache of their own heads, each
+                # in its team on its node (parts.PartKVCache): the bits of the
+                # flash path below.
+                fo = cache.prefill_attention(i, start, q, k, v, positions, window)
+                out = self.linear(fo.reshape(t, plan.q_dim), w["self_attn.o_proj"])
+                emit(hook, p + "self_attn.o_proj", out)
+                return out
             cache.write(i, start, k, v)
-            if t == 1 or mt:
+            if (t == 1 or mt) and limit is None:
                 # A decode step, or a small group that repeats the decode step
                 # for each token. Row j sees the cache rows up to its position.
                 o = None
-                if mt and ops.attn_ready() and cache.qc_ready(i) and (
-                        qc_before or start + 1 - cache.base[i] >= cache.attn_min):
+                if mt and ops.attn_ready():
                     # Every row uses the int16 cache. One call serves the group.
                     kq, ks, vq, vs, base = cache.read_qc(i, start + t)
                     pos = start + np.arange(t)
                     window = plan.sliding_window or 0
                     lo = np.maximum(0, pos - window + 1 - base) if window else np.zeros(t, np.int64)
-                    o = ops.attn_decode_mt(q, kq, ks, vq, vs, plan.num_q_heads,
+                    rk, rv = getattr(cache, "rot_k", False), getattr(cache, "rot_v", False)
+                    o = ops.attn_decode_mt(tq6.rotate(q) if rk else q, kq, ks, vq, vs, plan.num_q_heads,
                                            plan.num_kv_heads, hd, lo, pos + 1 - base - lo)
                     o = o.reshape(t, plan.q_dim)
+                    if rv:
+                        o = tq6.unrotate(o)
                 if o is None:
                     o = np.empty((t, plan.q_dim), dtype=np.float32)
                     for j in range(t):
-                        o[j] = self._attend_one(q[j:j + 1], plan, i, start + j, cache,
-                                                qc_before)
+                        o[j] = self._attend_one(q[j:j + 1], plan, i, start + j, cache)
                 if mt:
                     out = ops.linear_int4_mt(o, *w["self_attn.o_proj"])
                 else:
                     out = self.linear(o, w["self_attn.o_proj"])
                 emit(hook, p + "self_attn.o_proj", out)
                 return out
-            K, V, base = cache.read(i, start + t)
+            if (t > 1 and flash not in ("0", "ref")
+                    and (flash != "slide" or window > 0) and ops.flash_ready()
+                    and cache.kdtype == np.int16 and cache.vdtype == np.int16):
+                # The flash kernel on the int16 cache itself (no float copy of
+                # the cache): the bits of KVCache.read and flash_prefill. With
+                # media, limit gives the last key of each query (the tokens
+                # of an image see each other), as the prompt program.
+                kq, ks, vq, vs, base = cache.read_qc(i, start + t)
+                fo = ops.flash_prefill_qc(q, kq, ks, vq, vs, positions, base, window, limit)
+                if fo is not None:
+                    out = self.linear(fo.reshape(t, plan.q_dim), w["self_attn.o_proj"])
+                    emit(hook, p + "self_attn.o_proj", out)
+                    return out
+            # the rotated forms (rq8, k16vr8): the rows as stored, the
+            # queries rotated and the output back, as the decode (an unrotate
+            # of every row for each block of a prompt took 2.3 times the
+            # prompt of int16 at 4300 tokens)
+            rk, rv = getattr(cache, "rot_k", False), getattr(cache, "rot_v", False)
+            K, V, base = cache.read(i, start + t, rotated=True)
+            if rk:
+                q = tq6.rotate(q)
         else:
             K, V, base = k, v, positions[0]
+            rv = False
 
-        flash = os.environ.get("NP_GEMMA_FLASH", "0")
+        # The C flash kernel is the default: a prompt of the 26B of 512 tokens
+        # takes 2.2 s, not 3.1 s, and one of 16384 tokens 156 s, not 318
+        # (README.md, "The int4 matrices in groups of 16 rows").
+        flash = os.environ.get("NP_GEMMA_FLASH", "1")
         window = plan.sliding_window or 0
         # "slide" combines the two paths: the kernel serves a sliding layer,
         # where the window caps the work, and the batched matmul serves a
         # global layer, where OpenBLAS tiles the score matrix better than a
         # small register tile.
-        use_flash = flash != "0" and (flash != "slide" or window > 0)
+        use_flash = flash != "0" and (flash != "slide" or window > 0) and limit is None
         if t > 1 and use_flash:
             # The flash path. It keeps the scores of one block at a time and it
             # walks only the keys that the mask leaves visible. Use the C
@@ -923,34 +1093,56 @@ class Model:
                 fo = flash_attention(q, K, V, positions, base, window)
             else:
                 fo = ops.flash_prefill(q, K, V, positions, base, window)
+            if rv:
+                fo = tq6.unrotate(fo)
             out = self.linear(fo.reshape(t, plan.q_dim), w["self_attn.o_proj"])
             emit(hook, p + "self_attn.o_proj", out)
             return out
-        out = self._attend_rows(q, K, V, base, positions, plan)
+        out = self._attend_rows(q, K, V, base, positions, plan, limit)
+        if rv:
+            out = tq6.unrotate(out)
         out = self.linear(out, w["self_attn.o_proj"])
         emit(hook, p + "self_attn.o_proj", out)
         return out
 
-    def _attend_one(self, q, plan, i, pos, cache, qc_before):
+    def _media_in(self, start, t):
+        """Return the media spans that overlap positions start to start + t - 1."""
+        media = self.__dict__.get("_media")
+        if not media:
+            return ()
+        return [sp for sp in media if sp.start < start + t and sp.end > start]
+
+    def _media_limit(self, positions):
+        """Return the last key position of each query, or None when no query
+        is in a span whose tokens see each other."""
+        spans = [sp for sp in self._media_in(int(positions[0]), len(positions)) if sp.bidir]
+        if not spans:
+            return None
+        limit = np.array(positions, dtype=np.int64)
+        for sp in spans:
+            inside = (limit >= sp.start) & (np.asarray(positions) < sp.end)
+            limit[inside] = sp.end - 1
+        return limit
+
+    def _attend_one(self, q, plan, i, pos, cache):
         """Run the attention of one query at pos over the cache. Return (q_dim,).
 
-        Use the int16 cache when a decode step at pos uses it. That is true
-        when the int16 copy is on before the write. It is also true when the
-        write turns the copy on at pos + 1 rows. Otherwise use the float cache.
+        The fused kernel reads the quantized rows (NP_GEMMA_ATTN=1, the
+        default). NP_GEMMA_ATTN=0 reads dequantized rows (KVCache.read).
 
         A sliding layer reads only the rows of the window. The cache can hold
         more rows than the window, because it drops old rows in large steps.
         """
         hd = plan.head_dim
         window = plan.sliding_window or 0
-        if ops.attn_ready() and cache.qc_ready(i) and (
-                qc_before or pos + 1 - cache.base[i] >= cache.attn_min):
+        if ops.attn_ready():
             kq, ks, vq, vs, base = cache.read_qc(i, pos + 1)
             lo = max(0, pos - window + 1 - base) if window else 0
-            o = ops.attn_decode(q[0], kq[lo:], ks[lo:], vq[lo:], vs[lo:],
+            rk, rv = getattr(cache, "rot_k", False), getattr(cache, "rot_v", False)
+            o = ops.attn_decode(tq6.rotate(q[0]) if rk else q[0], kq[lo:], ks[lo:], vq[lo:], vs[lo:],
                                 plan.num_q_heads, plan.num_kv_heads, hd,
                                 kq.shape[0] - lo)
-            return o.reshape(plan.q_dim)
+            return (tq6.unrotate(o) if rv else o).reshape(plan.q_dim)
         K, V, base = cache.read(i, pos + 1)
         if _F32_ATTN_C:
             # The C kernel of the float cache. The program of a decode step
@@ -960,10 +1152,12 @@ class Model:
             return o.reshape(plan.q_dim)
         return self._attend_rows(q, K, V, base, np.array([pos]), plan)[0]
 
-    def _attend_rows(self, q, K, V, base, positions, plan):
+    def _attend_rows(self, q, K, V, base, positions, plan, limit=None):
         """Run the attention of the queries q over K and V. Return (t, q_dim).
 
-        The causal mask and the window mask come from the positions.
+        The causal mask and the window mask come from the positions. limit
+        gives the last key position of each query in place of its position
+        (the tokens of one image, _media_limit).
         """
         t = q.shape[0]
         hd = plan.head_dim
@@ -982,7 +1176,8 @@ class Model:
         if window and os.environ.get("NP_GEMMA_SLIDE", "1") == "1":
             kpos = base + np.arange(n)
             lo = int(np.searchsorted(kpos, positions.min() - window + 1, side='left'))
-            hi = int(np.searchsorted(kpos, positions.max(), side='right'))
+            top = positions.max() if limit is None else max(positions.max(), limit.max())
+            hi = int(np.searchsorted(kpos, top, side='right'))
             if lo or hi < n:
                 K = K[lo:hi]
                 V = V[lo:hi]
@@ -997,29 +1192,55 @@ class Model:
         # The kernel applies the causal mask, the window mask, and the softmax
         # over the last axis in one pass. The values that the mask hides become
         # zero, so a decode step needs no special case.
-        probs = ops.softmax_mask(scores, positions, n_rep, base, window)
+        if limit is None:
+            probs = ops.softmax_mask(scores, positions, n_rep, base, window)
+        else:
+            probs = ops.softmax_mask_limit(scores, positions, limit, base, window)
         vb = V.transpose(1, 0, 2)
         out = np.matmul(probs.reshape(nk, t * n_rep, n), vb)
         return out.reshape(nk, t, n_rep, hd).transpose(1, 0, 2, 3).reshape(t, plan.q_dim)
 
     # ---- output head -------------------------------------------------------
+    def _gpu_cached(self):
+        """The host cache that is on the GPU, or None. The model keeps a weak
+        reference to it: a cache that the caller no longer holds is gone."""
+        r = self.__dict__.get("_gpu_cache")
+        return r() if r is not None else None
+
     def _gpu_attach(self, cache):
         """Return the GPU runner with this cache on the GPU. The first use of
         a cache copies it to the GPU. From then on, the GPU has the new rows,
-        until _gpu_release writes them into the host cache."""
+        until _gpu_release (or gpu_sync) writes them into the host cache.
+
+        The cache that was on the GPU before gets its new rows only when the
+        caller still holds it (a Session of the server does). A cache that no
+        one holds (a new KVCache for each request, or each rep of a
+        benchmark) needs no copy: the copy of 2048 rows of the 12B took 0.6 s
+        before each prompt."""
         g = self.__dict__.get("_gpu")
         if g is None:
             from . import gpu
             g = self._gpu = gpu.ModelGPU(self)
             self._gpu_cache = None
-        if self._gpu_cache is not cache:
-            if self._gpu_cache is not None:
-                g.detach(self._gpu_cache)
+        prev = self._gpu_cached()
+        if prev is not cache:
+            if prev is not None:
+                g.detach(prev)
             g.attach(cache)
-            self._gpu_cache = cache
+            self._gpu_cache = weakref.ref(cache)
         else:
             g.kv.sync(cache)
         return g
+
+    def gpu_sync(self, cache):
+        """Write the rows that the GPU made into the host cache, and keep the
+        cache on the GPU: a server reads or saves a cache with it while the
+        GPU goes on with it (the next step needs no new copy to the GPU). A
+        cache that is not on the GPU is up to date already."""
+        g = self.__dict__.get("_gpu")
+        if g is not None and self._gpu_cached() is cache:
+            g.kv.sync(cache)
+            g.kv.detach(cache)
 
     def _gpu_step(self, ids, cache, pos):
         """Run a decode step on the GPU."""
@@ -1034,10 +1255,14 @@ class Model:
         self._gpu_mirror_rows(cache)
         return self._gpu_xn
 
-    def _gpu_prefill(self, ids, cache, start):
+    def _gpu_prefill(self, ids, cache, start, media=None):
         """Run a prompt on the GPU. Return the hidden states of every
         token (see ModelGPU.prefill)."""
-        self._gpu_xn = self._gpu_attach(cache).prefill(list(ids), start)
+        g = self._gpu_attach(cache)
+        if media:
+            self._gpu_xn = g.prefill(list(ids), start, media=media)
+        else:
+            self._gpu_xn = g.prefill(list(ids), start)
         self._gpu_mirror_rows(cache)
         return self._gpu_xn
 
@@ -1053,18 +1278,107 @@ class Model:
     def _gpu_mirror_rows(self, cache):
         layers = self.__dict__.get("_gpu_mirror")
         g = self.__dict__.get("_gpu")
-        if layers and g is not None and self.__dict__.get("_gpu_cache") is cache:
+        if layers and g is not None and self._gpu_cached() is cache:
             g.kv.sync(cache)
             g.kv.detach(cache, layers)
+
+    def truncate_cache(self, cache, n):
+        """Cut the cache back to n positions (KVCache.truncate), and its copy
+        on the GPU too when the GPU has it. Return False when a layer lacks
+        the rows that a token at n sees; the caller must then start again."""
+        g = self.__dict__.get("_gpu")
+        if g is not None and self._gpu_cached() is cache:
+            # The GPU copy drops its rows on its own, and while it holds the
+            # cache the host rows lag behind it: sync() cannot find a cut.
+            if not g.kv.truncate(n):
+                return False
+        return cache.truncate(n)
+
+    def window_snapshot(self, cache, n):
+        """The rows of the window of each sliding layer that a token at n
+        sees (positions n - window + 1 .. n - 1), for window_restore: a
+        decode past two windows drops them (KVCache.prepare, GPUKV.prepare),
+        and the next turn of a chat, whose history goes back to n (the
+        template drops the thought of the answer), then read the whole prompt
+        again (the 26B: 84 s for 108K tokens). None for a model with no
+        window. The GPU copy when the GPU holds the cache."""
+        w = self.cfg.sliding_window or 0
+        if not w or n < 1:
+            return None
+        start = max(0, n - w + 1)
+        g = self.__dict__.get("_gpu")
+        on_gpu = g is not None and self._gpu_cached() is cache
+        rows = {}
+        for i, plan in enumerate(self.cfg.plan):
+            if not plan.is_sliding:
+                continue
+            if on_gpu:
+                got = g.kv.window_get(i, start, n - start)
+            elif cache.base[i] <= start and cache.end[i] >= n and cache._cap(i):
+                r = slice(start - cache.base[i], n - cache.base[i])
+                got = {name: a[r].copy() for name, a in zip(("kq", "ks", "vq", "vs"), cache._buffers(i))}
+            else:
+                got = None
+            if got is None:
+                return None
+            rows[i] = got
+        return {"n": n, "start": start, "rows": rows}
+
+    def window_restore(self, cache, snap):
+        """Cut the cache back to snap["n"] positions with the rows of the
+        window of window_snapshot: the global layers keep their rows (end n),
+        the sliding layers get the rows of the snapshot (base start). The
+        GPU copy too when the GPU holds the cache. Return True."""
+        n, start = snap["n"], snap["start"]
+        g = self.__dict__.get("_gpu")
+        on_gpu = g is not None and self._gpu_cached() is cache
+        for i, plan in enumerate(self.cfg.plan):
+            if plan.is_sliding:
+                got = snap["rows"][i]
+                k = n - start
+                if cache._cap(i) < k:
+                    cache._grow(i, max(k, 2 * cache.window + KV_KEEP + 1))
+                for dst, name in zip(cache._buffers(i), ("kq", "ks", "vq", "vs")):
+                    dst[:k] = np.asarray(got[name]).reshape(dst[:k].shape)
+                cache.base[i], cache.end[i] = start, n
+                if on_gpu:
+                    g.kv.window_put(i, got, start, n)
+            else:
+                cache.end[i] = min(cache.end[i], n)
+                if on_gpu:
+                    g.kv.end[i] = min(g.kv.end[i], n)
+                    g.kv.host_end[i] = min(g.kv.host_end[i], cache.end[i])
+        return True
 
     def _gpu_release(self, cache):
         """Write the rows of the GPU cache into the host cache before the CPU
         uses it."""
         g = self.__dict__.get("_gpu")
-        if g is not None and self._gpu_cache is cache:
+        if g is not None and self._gpu_cached() is cache:
             g.detach(cache)
             self._gpu_cache = None
             self._gpu_xn = None
+
+    def argmax_rows(self, x):
+        """The greedy token of each row of x: np.argmax of each row of
+        logits(x). For the last rows of a GPU step, the GPU picks them and
+        copies only the tokens (ModelGPU.argmax)."""
+        xn = self.__dict__.get("_gpu_xn")
+        if xn is not None and x.shape[0] <= 16 and (
+                x is xn or (getattr(x, "base", None) is xn
+                            and x.ctypes.data + x.nbytes == xn.ctypes.data + xn.nbytes)):
+            return self._gpu.argmax(x.shape[0])
+        return [int(v) for v in np.argmax(self.logits(x), axis=1)]
+
+    def logits_topk(self, x, k, temperature):
+        """Return the candidates of sampling of the rows x from the GPU
+        (ModelGPU.topk), or None when x is not the last rows of a GPU step."""
+        xn = self.__dict__.get("_gpu_xn")
+        if xn is not None and x.shape[0] <= 16 and (
+                x is xn or (getattr(x, "base", None) is xn
+                            and x.ctypes.data + x.nbytes == xn.ctypes.data + xn.nbytes)):
+            return self._gpu.topk(x.shape[0], k, temperature)
+        return None
 
     def logits(self, x, chunk=32768, apply_softcap=True):
         """Return the logits for the hidden states x.
@@ -1079,7 +1393,13 @@ class Model:
             if x is xn or (getattr(x, "base", None) is xn
                            and x.ctypes.data + x.nbytes == xn.ctypes.data + xn.nbytes):
                 return self._gpu.logits(x.shape[0])
-        if self._embed_q6k is not None:
+        px = self.__dict__.get("_parts_xn")
+        if px is not None and (x is px or (getattr(x, "base", None) is px
+                                           and x.ctypes.data + x.nbytes
+                                           == px.ctypes.data + px.nbytes)):
+            # The last step of the parts ran the head (np_gemma/parts.py).
+            out = self._parts_logits[-x.shape[0]:].copy()
+        elif self._embed_q6k is not None:
             out = ops.linear_q6k(x, self._embed_q6k_bytes, self.cfg.hidden_size)
         elif self._embed_q is not None:
             if self._dtype == "int4":
@@ -1102,22 +1422,42 @@ class Model:
         return out
 
     # ---- generation --------------------------------------------------------
-    def prefill(self, ids, cache, start=0, hook=None):
+    def prefill(self, ids, cache, start=0, hook=None, media=None):
         """Run the prompt. Use blocks to keep the GEMM in its fast range.
 
         The key and value cache holds the earlier blocks. The result is the
         same as one forward pass over the full prompt. start is the position
         of ids[0]. Use it to add tokens to a cache that already has data. The
         hook gives the time of each stage of every block.
+
+        media is a list of media.Span (absolute positions): the soft rows of
+        images and audio. A block does not split a span whose tokens see each
+        other. With media on the CPU the prompt takes the program
+        (np_gemma/prompt.py) as without, or the Python path.
         """
+        media = [sp for sp in (media or ()) if sp.end > start]
         if (_GPU and hook is None and len(ids) > 1 and isinstance(cache, KVCache)
-                and self._dtype == "int4" and self.keep_weights):
+                and self._dtype == "int4" and self.keep_weights
+                and (not media or (_MEDIA_GPU and _BIDIR_ALL))):
+            if media:
+                return self._gpu_prefill(ids, cache, start, media)
             return self._gpu_prefill(ids, cache, start)
+        if media:
+            self._gpu_release(cache)
         chunk = self.prefill_chunk
         x = None
-        for off in range(0, len(ids), chunk):
-            x = self.forward(ids[off:off + chunk], cache=cache, start_pos=start + off,
-                             hook=hook)
+        self._media = media or None
+        try:
+            off = 0
+            while off < len(ids):
+                end = min(off + chunk, len(ids))
+                for sp in media:
+                    if sp.bidir and sp.start < start + end < sp.end:
+                        end = sp.end - start
+                x = self.forward(ids[off:end], cache=cache, start_pos=start + off, hook=hook)
+                off = end
+        finally:
+            self._media = None
         return x
 
     def prefill_layer_major(self, ids, cache, start=0, hook=None, chunk=None):
@@ -1219,32 +1559,60 @@ class Session:
         make = getattr(self.model, "new_cache", None)
         self.cache = make(self.max_len) if make else KVCache(self.model.cfg, max_len=self.max_len)
         self.ids = []
+        # The media keys of the soft tokens in the cache: {position: key}
+        # (media.keys). A soft token matches only the same image or clip.
+        self.media_keys = {}
         self._x = None
 
-    def _common(self, ids):
-        """Return the count of the first ids that are already in the cache."""
+    def common(self, ids, media=None):
+        """Return the count of the first ids that are already in the cache.
+        media gives the soft-token spans of ids (media.Span)."""
+        want = {}
+        for sp in media or ():
+            for j in range(sp.start, sp.end):
+                want[j] = (sp.key, j - sp.start)
         n = min(len(ids), len(self.ids))
         i = 0
-        while i < n and ids[i] == self.ids[i]:
+        while i < n and ids[i] == self.ids[i] and want.get(i) == self.media_keys.get(i):
             i += 1
         return i
 
-    def prefill(self, ids):
-        """Put the tokens in the cache. Run the forward pass for the new tokens."""
+    def _common(self, ids):
+        return self.common(ids)
+
+    def prefill(self, ids, media=None):
+        """Put the tokens in the cache. Run the forward pass for the new tokens.
+        media is a list of media.Span of ids: the soft rows of images and
+        audio (Model.prefill)."""
         ids = list(ids)
-        common = self._common(ids)
+        common = self.common(ids, media)
         if common < len(self.ids):
             # The history changed at position common. Drop the rows after it.
-            if self.cache.truncate(common):
+            cut = getattr(self.model, "truncate_cache", None)
+            snap = getattr(self, "snap", None)
+            if cut(self.cache, common) if cut else self.cache.truncate(common):
+                self.ids = self.ids[:common]
+            elif snap is not None and snap["n"] <= common and \
+                    self.model.window_restore(self.cache, snap):
+                # the window of the start of the last answer (window_snapshot):
+                # read again only the tokens after it
+                common = snap["n"]
                 self.ids = self.ids[:common]
             else:
                 self.reset()
                 common = 0
+            self.media_keys = {j: k for j, k in self.media_keys.items() if j < common}
         new = ids[common:]
         self.prefilled = len(new)
         if new:
-            self._x = self.model.prefill(new, self.cache, start=common)
+            if media:
+                self._x = self.model.prefill(new, self.cache, start=common, media=media)
+            else:
+                self._x = self.model.prefill(new, self.cache, start=common)
             self.ids = ids
+            for sp in media or ():
+                for j in range(sp.start, sp.end):
+                    self.media_keys[j] = (sp.key, j - sp.start)
         else:
             self._x = None
         return common
@@ -1271,21 +1639,25 @@ class Session:
             out.append(nxt)
         return out
 
-    def generate_stream(self, ids, max_new_tokens=1, eos_ids=(), sampler=None):
+    def generate_stream(self, ids, max_new_tokens=1, eos_ids=(), sampler=None, media=None):
         """Yield one token id at a time.
 
         Run the new prompt tokens, then select one token for each step. The
         sampler holds the sampling settings. The default sampler selects the
         most probable token. The generator stops at an end token.
         """
+        from .assistant import RowPicker
         from .sampling import Sampler
 
         ids = list(ids)
-        self.prefill(ids)
+        self.prefill(ids, media)
         if self._x is None:
             # The prompt is the same as the cache. Run the last token again.
             self._x = self.model.forward(ids[-1:], cache=self.cache,
                                          start_pos=len(ids) - 1)
+        # the window at the start of the answer: the next turn goes back here
+        snap_of = getattr(self.model, "window_snapshot", None)
+        self.snap = snap_of(self.cache, len(ids)) if snap_of else None
         if sampler is None:
             sampler = Sampler(temperature=0.0)
         sampler.reset(ids)
@@ -1297,14 +1669,16 @@ class Session:
                 # The drafter proposes tokens and one pass of the model checks
                 # them. The sampler picks each token, as below, so the tokens
                 # are the tokens of the plain loop.
-                nxt = sampler(self.model.logits(x[-1:])[0])
+                nxt = RowPicker(self.model, x[-1:], sampler).token(0)
                 self.mtp_stats = {}
                 yield from mtp_stream(self.model, self.drafter, self.cache, self.ids,
                                       x[-1:], nxt, self.n_draft, eos_ids, sampler,
                                       max_new_tokens, self.mtp_stats)
                 return
         for _ in range(max_new_tokens):
-            nxt = sampler(self.model.logits(x[-1:])[0])
+            # The cheapest path to the token of the sampler (GPU argmax, or
+            # the candidates of the GPU; assistant.RowPicker).
+            nxt = RowPicker(self.model, x[-1:], sampler).token(0)
             yield nxt
             if nxt in eos_ids:
                 return

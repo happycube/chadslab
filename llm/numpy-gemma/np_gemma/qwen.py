@@ -27,11 +27,22 @@ import os
 
 import numpy as np
 
-from . import cops, mlx_affine, ops
+from . import cops, mlx_affine, ops, tq6
 from .mlx_affine import QMat
 from .st import SafeTensors
 
 PREFIX = "language_model.model."
+
+
+def default_kv_form():
+    """NP_GEMMA_QWEN_KV, else tq6 when the dense matrices stay in bfloat16
+    (NP_GEMMA_DENSE=bf16: the smaller cache leaves the GPU room for more hot
+    experts, 18.7 KB a token of Qwen3.8 in place of 21.8; the first full
+    attention layer keeps float32 rows, NP_GEMMA_QWEN_KV_FIRST), else int8."""
+    v = os.environ.get("NP_GEMMA_QWEN_KV")
+    if v:
+        return v
+    return "tq6" if os.environ.get("NP_GEMMA_DENSE") == "bf16" else "int8"
 
 
 class QwenConfig:
@@ -54,6 +65,7 @@ class QwenConfig:
         self.rope_theta = rp.get("rope_theta", t.get("rope_theta", 10000.0))
         self.rotary_dim = int(self.head_dim * rp.get("partial_rotary_factor",
                                                       t.get("partial_rotary_factor", 1.0)))
+        self.mrope_section = rp.get("mrope_section")
         # linear attention
         self.lin_k_heads = t["linear_num_key_heads"]
         self.lin_v_heads = t["linear_num_value_heads"]
@@ -73,9 +85,13 @@ class QwenConfig:
         # h % k_heads. All the tensors of a head move together, so only
         # this rule changes.
         self.v_tiled = False
-        # The form of the keys and values of the cache: "int16" (a scale for
-        # each 32 values, the form of the 26B; half the memory) or "f32".
-        self.kv_form = os.environ.get("NP_GEMMA_QWEN_KV", "int16")
+        # The form of the keys and values of the cache: "int8" (the default:
+        # a scale of max |x| / 127 for each 32 values), "int16" (max |x| /
+        # 32767), "k16v8" (int16 keys, int8 values), or "f32". The first full
+        # attention layer of a quantized form keeps float32 rows (see
+        # layer_kv_form). The default is int8, and tq6 with NP_GEMMA_DENSE=bf16
+        # (default_kv_form).
+        self.kv_form = default_kv_form()
 
     @classmethod
     def from_gguf(cls, g):
@@ -100,6 +116,8 @@ class QwenConfig:
         cfg.head_dim = int(k("attention.key_length"))
         cfg.rope_theta = float(k("rope.freq_base"))
         cfg.rotary_dim = int(k("rope.dimension_count"))
+        sec = k("rope.dimension_sections")
+        cfg.mrope_section = [int(v) for v in sec] if sec is not None else None
         cfg.lin_k_heads = int(k("ssm.group_count"))
         cfg.lin_v_heads = int(k("ssm.time_step_rank"))
         cfg.lin_k_dim = int(k("ssm.state_size"))
@@ -112,7 +130,7 @@ class QwenConfig:
         cfg.vocab_size = int(g.tensors["output.weight"][0][1])
         cfg.eos_token_ids = None
         cfg.v_tiled = True
-        cfg.kv_form = os.environ.get("NP_GEMMA_QWEN_KV", "int16")
+        cfg.kv_form = default_kv_form()
         return cfg
 
     @property
@@ -150,6 +168,62 @@ def softplus(x):
     return np.where(x > 20.0, x, np.log1p(np.exp(np.minimum(x, 20.0))))
 
 
+# The quantized forms of the cache (the C kernels of the 26B read them; tq6:
+# np_gemma/tq6.py, 6 bits and a norm for each 32 rotated values).
+QUANT_FORMS = ("int16", "int8", "k16v8", "tq6")
+# NP_GEMMA_QWEN_KV_FIRST: the form of the first full attention layer under a
+# quantized form of the cache: "f32" (the default), a quantized form, or
+# "same". Rounding that one layer gives most of the error of the cache: over
+# 25766 positions of a chat text with Qwen3.6-35B-A3B, the KL (top 64)
+# against a float cache is 3.10e-3 for int8 with this layer float32, 3.64e-3
+# with it int16, 3.81e-3 with it float16, and 4.32e-3 for int8 in every
+# layer; int16 in every layer gives 3.68e-3 (QWEN_PLAN.md).
+KV_FIRST = os.environ.get("NP_GEMMA_QWEN_KV_FIRST", "f32")
+
+
+def layer_kv_form(form, cfg, i):
+    """The form of the cache of the full attention layer i under the form
+    of the cache: the first full layer takes KV_FIRST."""
+    if form in QUANT_FORMS and KV_FIRST != "same":
+        first = next(j for j, t in enumerate(cfg.layer_types) if t == "full_attention")
+        if i == first:
+            return KV_FIRST
+    return form
+
+
+def layer_quant(cache, i):
+    """True when layer i of the cache keeps quantized rows (else float32
+    rows, (positions, heads, head_dim))."""
+    return cache.layer_form.get(i, cache.kv_form) in QUANT_FORMS
+
+
+def kv_dtypes(form):
+    """The dtypes of the keys and of the values of a quantized form."""
+    if form == "tq6":
+        return np.uint8, np.uint8
+    return (np.int8 if form == "int8" else np.int16,
+            np.int8 if form in ("int8", "k16v8") else np.int16)
+
+
+def kv_row_bytes(form, per):
+    """The bytes of a row of per keys, and of per values, of a quantized form."""
+    if form == "tq6":
+        return per * 3 // 4, per * 3 // 4
+    return tuple(np.dtype(d).itemsize * per for d in kv_dtypes(form))
+
+
+def kv_arrays(form, max_len, per):
+    """The arrays (kq, ks, vq, vs) of a quantized form: a row for each
+    position, the heads in order, a float32 scale (tq6: the norm) for each 32
+    values."""
+    kd, vd = kv_dtypes(form)
+    kb, vb = kv_row_bytes(form, per)
+    return [np.zeros((max_len, kb // np.dtype(kd).itemsize), kd),
+            np.zeros((max_len, per // 32), np.float32),
+            np.zeros((max_len, vb // np.dtype(vd).itemsize), vd),
+            np.zeros((max_len, per // 32), np.float32)]
+
+
 class QwenCache:
     """The state of a sequence: keys and values of the full layers, and the
     convolution inputs and the recurrent state of the linear layers."""
@@ -163,21 +237,64 @@ class QwenCache:
         self.conv = {}
         self.state = {}
         per = cfg.num_kv_heads * cfg.head_dim
+        self.layer_form = {}
         for i, t in enumerate(cfg.layer_types):
-            if t == "full_attention" and self.kv_form == "int16":
-                # (kq, ks, vq, vs): a row for each position, the heads in
-                # order; a float32 scale for each 32 values.
-                self.kv[i] = [np.zeros((max_len, per), np.int16),
-                              np.zeros((max_len, per // 32), np.float32),
-                              np.zeros((max_len, per), np.int16),
-                              np.zeros((max_len, per // 32), np.float32)]
+            lf = layer_kv_form(self.kv_form, cfg, i) if t == "full_attention" else None
+            if lf is not None:
+                self.layer_form[i] = lf
+            if lf in QUANT_FORMS:
+                # (kq, ks, vq, vs) of the form of the layer (layer_kv_form)
+                self.kv[i] = kv_arrays(lf, max_len, per)
             elif t == "full_attention":
-                shape = (cfg.num_kv_heads, max_len, cfg.head_dim)
+                # position-major (positions, kv heads, head_dim), as all the caches
+                shape = (max_len, cfg.num_kv_heads, cfg.head_dim)
                 self.kv[i] = [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]
             else:
                 self.conv[i] = np.zeros((cfg.conv_kernel - 1, cfg.conv_dim), np.float32)
                 self.state[i] = np.zeros((cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim),
                                          np.float32)
+        # The M-RoPE positions (3, max_len) of the rows, after a prompt with
+        # an image (set_rope); None: the position of a row is its index.
+        self.rpos = None
+
+    def set_rope(self, pos):
+        """Set the M-RoPE positions (3, n) of a prompt of n tokens from row 0
+        (media.mrope_positions). The rows after it (the answer, the next
+        prompt) continue from the largest position + 1. A prompt of text
+        only leaves the positions as they are (the row index)."""
+        n = pos.shape[1]
+        if self.rpos is None:
+            if np.array_equal(pos, np.broadcast_to(np.arange(n), pos.shape)):
+                return
+            self.rpos = np.empty((3, self.max_len), np.int64)
+        self.rpos[:, :n] = pos
+        nxt = int(pos.max()) + 1 if n else 0
+        self.rpos[:, n:] = np.arange(nxt, nxt + self.max_len - n)
+
+
+def rope_positions(cache, pos, t):
+    """The rope positions of the rows pos .. pos + t - 1: (t,), or (3, t)
+    where the rows of M-RoPE differ (the tokens of an image)."""
+    rp = getattr(cache, "rpos", None)
+    if rp is None:
+        return np.arange(pos, pos + t)
+    r = rp[:, pos:pos + t]
+    if r.shape[1] < t:          # the padding rows of a group past the end
+        r = np.concatenate([r, r[:, -1:] + np.arange(1, t - r.shape[1] + 1)], axis=1)
+    if np.array_equal(r[0], r[1]) and np.array_equal(r[0], r[2]):
+        return r[0]
+    return r
+
+
+def media_inputs(x, pos, media):
+    """Put the rows of the images (media: spans at cache positions) into x,
+    the input rows of the tokens at pos .. pos + len(x) - 1. Return x."""
+    t = x.shape[0]
+    for sp in media or ():
+        a, b = max(sp.start, pos), min(sp.end, pos + t)
+        if a < b:
+            x[a - pos:b - pos] = sp.rows[a - sp.start:b - sp.start]
+    return x
 
 
 def gdn_flags(cfg):
@@ -190,30 +307,35 @@ def kv_store(cache, i, k, v, pos):
     """Write the keys and values k, v (t x heads x head_dim) of layer i at
     positions pos .. pos + t - 1."""
     t = k.shape[0]
-    if cache.kv_form == "int16":
+    if layer_quant(cache, i):
         kq, ks, vq, vs = cache.kv[i]
         for src, q, sc in ((k, kq, ks), (v, vq, vs)):
-            a, b = cops.quantize_i16_groups(np.ascontiguousarray(src, np.float32))
+            quant = {np.dtype(np.int8): cops.quantize_i8_groups, np.dtype(np.uint8): tq6.quantize,
+                     np.dtype(np.int16): cops.quantize_i16_groups}[q.dtype]
+            a, b = quant(np.ascontiguousarray(src, np.float32))
             q[pos:pos + t] = a.reshape(t, -1)
             sc[pos:pos + t] = b.reshape(t, -1)
         return
     K, V = cache.kv[i]
-    K[:, pos:pos + t] = k.transpose(1, 0, 2)
-    V[:, pos:pos + t] = v.transpose(1, 0, 2)
+    K[pos:pos + t] = k
+    V[pos:pos + t] = v
 
 
 def kv_rows(cache, i, n):
     """The keys and values of the first n positions of layer i, float32,
     (heads, n, head_dim) each."""
-    if cache.kv_form == "int16":
+    if layer_quant(cache, i):
         cfg = cache.cfg
         out = []
         for q, sc in (cache.kv[i][0:2], cache.kv[i][2:4]):
-            x = q[:n].astype(np.float32).reshape(n, -1, 32) * sc[:n, :, None]
+            if q.dtype == np.uint8:
+                x = tq6.dequantize(q[:n], sc[:n])
+            else:
+                x = q[:n].astype(np.float32).reshape(n, -1, 32) * sc[:n, :, None]
             out.append(x.reshape(n, cfg.num_kv_heads, cfg.head_dim).transpose(1, 0, 2))
         return out
     K, V = cache.kv[i]
-    return K[:, :n], V[:, :n]
+    return K[:n].transpose(1, 0, 2), V[:n].transpose(1, 0, 2)
 
 
 def _cache_snapshot(self):
@@ -289,10 +411,22 @@ class Qwen:
         return m.dequant(rows=np.asarray(ids, dtype=np.int64))
 
     def rope(self, positions):
+        """cos and sin (t, rotary_dim) of positions: (t,), or (3, t) of M-RoPE
+        (time, row, column). The frequency pairs j take the row if j % 3 ==
+        1, the column if j % 3 == 2, else the time (the interleaved M-RoPE
+        of transformers, sections [11, 11, 10])."""
         cfg = self.cfg
         d = cfg.rotary_dim
         inv = 1.0 / (cfg.rope_theta ** (np.arange(0, d, 2, dtype=np.float64) / d))
-        f = np.outer(np.asarray(positions, dtype=np.float64), inv)
+        positions = np.asarray(positions)
+        if positions.ndim == 2:
+            f = positions[0].astype(np.float64)[:, None] * inv[None, :]
+            sec = getattr(cfg, "mrope_section", None) or [11, 11, 10]
+            for dim, off in ((1, 1), (2, 2)):
+                j = np.arange(off, sec[dim] * 3, 3)
+                f[:, j] = positions[dim].astype(np.float64)[:, None] * inv[j][None, :]
+        else:
+            f = np.outer(positions.astype(np.float64), inv)
         f = np.concatenate([f, f], axis=-1)
         return np.cos(f).astype(np.float32), np.sin(f).astype(np.float32)
 
@@ -307,7 +441,7 @@ class Qwen:
         v = (h @ self.W(p + "v_proj").T).reshape(t, nk, hd)
         q = rms_norm(q, self.t(p + "q_norm.weight"), cfg.rms_norm_eps)
         k = rms_norm(k, self.t(p + "k_norm.weight"), cfg.rms_norm_eps)
-        cos, sin = self.rope(np.arange(pos, pos + t))
+        cos, sin = self.rope(rope_positions(cache, pos, t))
         d = cfg.rotary_dim
 
         def rot(x):
@@ -414,10 +548,11 @@ class Qwen:
         h = rms_norm(x, self.t(p + "post_attention_layernorm.weight"), cfg.rms_norm_eps)
         return x + self.moe(i, h)
 
-    def forward(self, ids, cache, start_pos=0, hook=None):
+    def forward(self, ids, cache, start_pos=0, hook=None, media=None):
         """Run tokens from start_pos. Return the hidden states after the final
-        norm, (t, hidden). hook(name, array) gets the output of each layer."""
-        x = self.embed(ids)
+        norm, (t, hidden). hook(name, array) gets the output of each layer.
+        media: spans (cache positions) whose rows replace the embeddings."""
+        x = media_inputs(self.embed(ids), start_pos, media)
         for i in range(self.n_layers):
             x = self.layer(i, x, cache, start_pos)
             if hook is not None:
@@ -482,8 +617,8 @@ class QwenCPU(Qwen):
             x = x + self.linear_attention(i, h, cache, pos)
         return x + self.moe(i, self.norm(x, p + "post_attention_layernorm.weight"))
 
-    def forward(self, ids, cache, start_pos=0, hook=None):
-        x = self.embed(ids)
+    def forward(self, ids, cache, start_pos=0, hook=None, media=None):
+        x = media_inputs(self.embed(ids), start_pos, media)
         for i in range(self.n_layers):
             x = self.layer(i, x, cache, start_pos)
             if hook is not None:
@@ -520,7 +655,7 @@ class QwenCPU(Qwen):
         v = self.lin(p + "v_proj", qx).reshape(t, nk, hd)
         q = ops.rms_norm(q, self.F(p + "q_norm.weight"), cfg.rms_norm_eps)
         k = ops.rms_norm(k, self.F(p + "k_norm.weight"), cfg.rms_norm_eps)
-        cos, sin = self.rope(np.arange(pos, pos + t))
+        cos, sin = self.rope(rope_positions(cache, pos, t))
         d = cfg.rotary_dim
         half = d // 2
 
@@ -537,13 +672,14 @@ class QwenCPU(Qwen):
         o = np.empty((t, nq, hd), np.float32)
         for j in range(t):
             n = pos + j + 1
-            if cache.kv_form == "int16":
+            if layer_quant(cache, i):
                 kq, ks, vq, vs = cache.kv[i]
-                o[j] = cops.attn_decode_i16(np.ascontiguousarray(q[j]), kq, ks, vq, vs, nq, nk,
-                                            hd, n)
+                o[j] = ops.attn_decode(np.ascontiguousarray(q[j]), kq, ks, vq, vs, nq, nk,
+                                       hd, n)
             else:
                 K, V = cache.kv[i]
-                o[j] = ops.attn_decode_f32(q[j], K[:, :n], V[:, :n], pos + j)
+                o[j] = ops.attn_decode_f32(q[j], K[:n].transpose(1, 0, 2),
+                                           V[:n].transpose(1, 0, 2), pos + j)
         o = o.reshape(t, nq * hd) * sigmoid(gate)
         return self.lin(p + "o_proj", self.QX(o))
 
@@ -655,7 +791,11 @@ def compile_qwen_step(model, t, verify=False):
     def lin(name, out):
         model.emit_lin(prog, xb, name, out)
 
-    kv16 = getattr(cfg, "kv_form", "f32") == "int16"
+    form = getattr(cfg, "kv_form", "f32")
+    # the quantized layers (layer_kv_form): the first full layer can keep
+    # float32 rows
+    quant_layer = lambda i: layer_kv_form(form, cfg, i) in QUANT_FORMS  # noqa: E731
+    kv16 = any(quant_layer(i) for i, t in enumerate(cfg.layer_types) if t == "full_attention")
     per = nk * hd
     kbuf = f32(t, per) if kv16 else None
     lo_n = (np.zeros(t, np.int32), np.zeros(t, np.int32)) if kv16 else None
@@ -676,15 +816,27 @@ def compile_qwen_step(model, t, verify=False):
                   model.F(a + "k_norm.weight"), cos, sin, None, None, 0, pos, t, nq, nk, hd,
                   cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate, kbuf)
         base = [prog.slot("%s.%d" % (nm, i)) for nm in ("kq", "ks", "vq", "vs")]
+        # the int8 forms (layer_kv_form): 1 byte for a value, other records
+        lf = layer_kv_form(form, cfg, i)
+        kb, vb = kv_row_bytes(lf, per)
+        write, one, many = {"int16": (P.KV_WRITE, P.ATTN_QC, P.ATTN_QC_MT),
+                            "int8": (P.KV_WRITE8, P.ATTN_Q8, P.ATTN_Q8_MT),
+                            "k16v8": (P.KV_WRITEV8, P.ATTN_V8, P.ATTN_V8_MT),
+                            "tq6": (P.KV_WRITETQ, P.ATTN_TQ, P.ATTN_TQ_MT)}[lf]
         rows = [scalar(P.S_ADD, b, scalar(P.S_MUL, pos, step))
-                for b, step in zip(base, (2 * per, per // 8, 2 * per, per // 8))]
-        prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
+                for b, step in zip(base, (kb, per // 8, vb, per // 8))]
+        prog.emit(write, kbuf, o3, None, None, *rows, t * per)
+        if lf == "tq6":
+            # the queries and the output in the rotated form (tq6.py)
+            prog.emit(P.TQ_ROT, qout, t * nq * hd // 32, 0)
         if t <= 16:
             for j in range(t):
                 nj = scalar(P.S_ADD, pos, j + 1)
-                prog.emit(P.ATTN_QC, qout[j:j + 1], *base, scores, att[j:j + 1], nq, nk, hd, nj)
+                prog.emit(one, qout[j:j + 1], *base, scores, att[j:j + 1], nq, nk, hd, nj)
         else:
-            prog.emit(P.ATTN_QC_MT, qout, *base, scores, att, nq, nk, hd, t, pos, 0, 0, *lo_n)
+            prog.emit(many, qout, *base, scores, att, nq, nk, hd, t, pos, 0, 0, *lo_n)
+        if lf == "tq6":
+            prog.emit(P.TQ_ROT, att, t * nq * hd // 32, 1)
 
     def log_of(i):
         if not verify:
@@ -703,14 +855,14 @@ def compile_qwen_step(model, t, verify=False):
             lin(a + "q_proj", o1)
             lin(a + "k_proj", o2)
             lin(a + "v_proj", o3)
-            if kv16:
+            if quant_layer(i):
                 emit_attn16(i)
             else:
                 prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(a + "q_norm.weight"),
                           model.F(a + "k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
                           prog.slot("V.%d" % i), hs, pos, t, nq, nk, hd, cfg.rotary_dim, eps,
                           float(hd ** -0.5), qout, gate)
-            if kv16:
+            if quant_layer(i):
                 pass
             elif hasattr(model, "emit_attn"):
                 model.emit_attn(prog, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i), scores,
@@ -754,7 +906,7 @@ def bind_qwen_step(prog, model, cache, pos):
     """Write the parameters of a step of prog.tokens tokens from pos."""
     cfg = model.cfg
     t = prog.tokens
-    cos, sin = model.rope(np.arange(pos, pos + t))
+    cos, sin = model.rope(rope_positions(cache, pos, t))
     kw = {"pos": pos, "cos": np.ascontiguousarray(cos), "sin": np.ascontiguousarray(sin),
           "scores": scores_buffer(cfg, pos + t)}
     kw.update(cache_params(model, cache))
@@ -773,13 +925,13 @@ def cache_params(model, cache):
     assert cache.kv_form == getattr(cfg, "kv_form", "f32"), "the cache has another form"
     kw = {}
     for i in range(model.n_layers):
-        if cfg.layer_types[i] == "full_attention" and cache.kv_form == "int16":
+        if cfg.layer_types[i] == "full_attention" and layer_quant(cache, i):
             for nm, a in zip(("kq", "ks", "vq", "vs"), cache.kv[i]):
                 kw["%s.%d" % (nm, i)] = a
         elif cfg.layer_types[i] == "full_attention":
             K, V = cache.kv[i]
             kw["K.%d" % i], kw["V.%d" % i] = K, V
-            kw["hs"] = K.shape[1] * K.shape[2]
+            kw["hs"] = K.shape[2]           # position-major: a head stride of head_dim
         else:
             kw["conv.%d" % i], kw["S.%d" % i] = cache.conv[i], cache.state[i]
     return kw
@@ -810,7 +962,14 @@ class _QwenRuns:
         """Run a group of tokens from start_pos as an MTP verify group.
         Return the hidden states of every token. The keys and values of the
         full layers are written for all the tokens; the state of the linear
-        layers does not change until commit()."""
+        layers does not change until commit().
+
+        The rule of verify (all the backends, and the MTP cache): the rows
+        at positions >= cache.n (the drafts that commit drops) stay in the
+        cache until the next run writes them again. That is safe because no
+        reader takes a row at or after cache.n: attention reads the rows
+        before pos + t of its own run, and QSA_SELECT the blocks before it.
+        A new reader of such rows needs a rollback here first."""
         t = len(ids)
         prog = self.programs.get(("verify", t))
         if prog is None:
@@ -833,7 +992,7 @@ class _QwenRuns:
         cache.n = start + n
         self._pending = None
 
-    def forward(self, ids, cache, start_pos=0, hook=None):
+    def forward(self, ids, cache, start_pos=0, hook=None, media=None):
         ids = list(ids)
         out = []
         c0 = 0
@@ -841,7 +1000,7 @@ class _QwenRuns:
             chunk = ids[c0:c0 + self.CHUNK]
             prog = self.program(len(chunk))
             bind_qwen_step(prog, self, cache, start_pos + c0)
-            prog.names["x"][:] = self.embed(chunk)
+            prog.names["x"][:] = media_inputs(self.embed(chunk), start_pos + c0, media)
             prog.run()
             out.append(prog.names["xn"].copy())
             c0 += len(chunk)

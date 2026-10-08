@@ -7,7 +7,14 @@ are close to those of the CPU program, not the same. The script:
 1. runs a chat prompt and a greedy decode on the GPU and on the CPU
    program: the logits of the prompt, and the tokens;
 2. runs a verify group and commit(2) on the GPU against steps;
-3. runs the greedy decode with MTP drafts (the MTP layer on the CPU).
+3. runs the greedy decode with MTP drafts, the MTP layer on the GPU and on
+   the CPU, against a plain decode with the same hot experts.
+
+HotCache moves experts between the GPU and the CPU, and a hot expert gives
+values a little different from a cold one. At a near tie of the top two
+logits (a margin of about 0.1), a decode with other hot experts can pick
+another token. Thus parts 2 and 3 keep the hot experts fixed, and then
+MTP must give the tokens of the plain decode exactly.
 
     python scripts/check_qwen4_gpu.py --hot-gb 1
 """
@@ -41,14 +48,18 @@ def rel(a, b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--path", default=PATH)
-    ap.add_argument("--mtp", default=MTP)
+    ap.add_argument("--mtp", default=MTP, help='the MTP file ("": the MTP layer of --path)')
     ap.add_argument("--tok", default=TOK)
     ap.add_argument("--hot-gb", type=float, default=1.0)
     ap.add_argument("--tokens", type=int, default=48)
     ap.add_argument("--draft", type=int, default=3)
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--no-cpu", action="store_true", help="skip the CPU reference")
+    ap.add_argument("--lend-gb", type=float, default=0.0,
+                    help="room lent to the pool of HotCache (warm experts in pool blocks that "
+                         "a new program does not take)")
     args = ap.parse_args()
+    args.mtp = args.mtp or None
     tok = QwenTokenizer(args.tok)
     stop = set(tok.stop_ids)
     ids = tok.encode(args.prompt)
@@ -69,6 +80,8 @@ def main():
 
     t0 = time.time()
     g = Qwen4GPU(m, hot_gb=args.hot_gb)
+    if args.lend_gb > 0:
+        g.lend_warm(int(args.lend_gb * 1e9))
     print("Qwen4GPU: %d hot experts in each layer, %.1f s" % (g.n_slots, time.time() - t0))
     cache = Qwen4Cache(m.cfg, max_len)
     g.attach(cache)
@@ -126,7 +139,19 @@ def main():
 
     g.hot_cache = hc
 
-    # 3. MTP: the MTP layer on the GPU, and on the CPU.
+    # 3. MTP: the MTP layer on the GPU, and on the CPU, against a plain decode
+    # with the same hot experts (HotCache off).
+    hc, g.hot_cache = g.hot_cache, None
+    c = Qwen4Cache(m.cfg, max_len)
+    g.attach(c)
+    g.prefill(ids)
+    nxt, pos, out = int(np.argmax(g.logits())), len(ids), []
+    out.append(nxt)
+    while len(out) < args.tokens and nxt not in stop:
+        g.step(nxt, pos)
+        nxt = int(np.argmax(g.logits()))
+        out.append(nxt)
+        pos += 1
     for where in ("GPU", "CPU"):
         c = Qwen4Cache(m.cfg, max_len)
         g.attach(c)
@@ -143,6 +168,13 @@ def main():
         same = next((i for i, (a, b) in enumerate(zip(got, out)) if a != b),
                     min(len(got), len(out)))
         print("  the same tokens as the GPU decode: the first %d of %d" % (same, len(out)))
+        if same < len(out):
+            print("  " + repr(tok.decode(got)))
+        ok &= same == len(out)
+    g.hot_cache = hc
+    if g.pool is not None:
+        print("pool: %d blocks held (%.2f GB in segments)" % (int((g.pool.owner >= 0).sum()),
+                                                            g.pool.nbytes() / 1e9))
     g.close()
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

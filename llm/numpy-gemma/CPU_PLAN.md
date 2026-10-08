@@ -179,3 +179,193 @@ tests of scripts/check_program.py, scripts/check_mt.py, and the decode
 tests. The measure is the rate of the decode (scripts/bench_decode.py) on
 an idle machine, if possible. The A/B test of OMP_PROC_BIND is still open,
 and it needs an idle machine too.
+
+## The 26B on AVX2: results
+
+The test runs the AVX2 library on the Xeon (NP_GEMMA_ARCH=avx2) with 6
+threads, as the Core i5-8500 of the earlier AVX2 work. The file is the
+Unsloth 26B. Its token table and head are Q4_0, not Q6_K. The method of
+llama-bench (scripts/bench_llama_method.py, tok/s):
+
+    runtime                        pp512   tg64
+    numpy-gemma before             61.8    17.0
+    numpy-gemma now                64.6    20.4
+    llama.cpp (build-avx2, -t 6)   33.1    14.3
+
+A profile of a step (gemma_profile, 383 tokens of context) first gave
+49 ms for the step and 16.5 ms for the head. The changes:
+
+1. The head. The Q4_0 token table gets a KQ_Q4X copy (ops._Q4X_HEAD), for
+   every token count, with int8 x. A token: 16.5 to 8.2 ms. Four tokens:
+   65.9 to 13.4 ms.
+
+   On VNNI the int4 head took float x for a token and int8 x for a group.
+   Thus check_mt failed there (logits 0.13). One kernel for every count
+   fixes it, and the VNNI head is faster too (8.2 to 6.1 ms).
+2. The decode attention (gemma_attn_split_i16_body). An item is a token, a
+   key head, and a chunk of keys. It does all the query heads of the key
+   head, and a second pass joins the chunks. The chunk length depends only
+   on the count of keys, so a group keeps the bits of the steps. On AVX2:
+   - the scores take int16 q with vpmaddwd;
+   - the values keep blocks of the output in registers, two heads at a
+     time;
+   - the rows are fetched 3 keys ahead, because each row starts a new page;
+   - a weight below exp(-64) is 0, because its products were denormals;
+   - a vector exp replaces libm expf.
+   ATTN_QC: 9.0 to 5.1 ms for each step.
+3. The router. The scalar loop did not vectorize. router_dot has 4 vector
+   accumulators, and the step and the group use it. 2.85 to 1.09 ms.
+4. The products of a prompt (kq_q4x_rows on AVX2) unpack the codes once for
+   4 tokens, not 2. pp512: 61.3 to 64.9 tok/s.
+
+The step now takes 42.6 ms. The products take 34.4 ms of it, at about
+50 GB/s, which is the rate of the memory with 6 threads. Thus the plain
+decode is near its limit. The rest: the attention 5.1 ms, the router
+1.1 ms, and about 2.5 ms for the small records.
+
+MTP on the CPU (scripts/check_mtp.py, CPU drafter, 100 tokens):
+
+    drafts   before   now
+    1        1.06x    1.15x
+    2        0.99x    1.15x
+
+- The drafter of the 26B has no centroid head. Its head has 262144 rows of
+  1024 values. The Assistant now gives its matrices KQ_Q4X copies. A draft
+  step: 13.6 to 8.1 ms.
+- A verify group of 2 tokens takes 65 ms, 1.5 steps: the second token
+  selects other experts. This limits MTP on the CPU.
+
+Later changes to the decode attention on AVX2 (gemma_attn_split_i16_body):
+
+- The queries are quantized once for each token and head.
+- A head has one scale (14 bits), so a key group needs one scale for all
+  the heads.
+- The value pass of more than 2 heads converts the rows of 128 keys once,
+  for all the pairs of heads.
+
+At 4301 tokens of context, 6 threads:
+
+    part                   before   now
+    attention (a step)     18.5 ms  15.6 ms
+    a global layer         1462 us  1091 us
+    a layer with a window  432 us   404 us
+
+MTP with 1 and 2 drafts is then 1.16x and 1.17x.
+
+The int8 x of the AVX2 decode makes each small change of a kernel look
+large. Two variants of the attention differ by a KL of about 4e-3, as much
+as the int8 x itself. Against the float decode of VNNI over 160 steps, the
+old kernel gives 3.0e-3 and the new one 3.9e-3. Thus the test of a kernel
+is its error against float32 (7e-5 here), and the KL against the float
+decode over many steps.
+
+The prompt pass at 2048 tokens: 53.4 tok/s (llama.cpp AVX2: 29.3). The
+attention takes 10.7 s of 38.3 s, at about 95 GFLOP/s. That is the next
+large part for long prompts. A profiler (perf) needs
+kernel.perf_event_paranoid at 1 or lower on this machine.
+
+## The memory of the target CPU
+
+The Core i5-8500 has two channels of DDR4 (DDR4-2666: at most 42.7 GB/s,
+about 35 GB/s to read in practice). The Xeon has four channels.
+scripts/membw (read f32) on the Xeon:
+
+    threads   1      3      6      18
+    GB/s      13.8   34.3   57.7   68.4
+
+Thus the tests with 6 threads on the Xeon give the decode about 1.6 times
+the bandwidth of the i5. They overstate the decode of the i5. With 3
+threads (about the bandwidth of the i5, but half its cores), llama-bench
+method, AVX2 code:
+
+    runtime                        pp512   tg64
+    numpy-gemma (3 threads)        35.5    12.9
+    llama.cpp (build-avx2, -t 3)   18.1    8.6
+
+A token of the decode reads about 2.2 GB. The dense matrices and the
+experts are 1.73 GB, and the head is 0.42 GB. At 35 GB/s
+that is about 63 ms, so the i5 can give at most about 16 tok/s. On the i5:
+
+- the bytes of each token set the rate of the decode. The work of the
+  attention and the router counts less than on the Xeon.
+- MTP counts more: a verify group reads the dense matrices and the head
+  once for 2 or 3 tokens.
+- The head is about 19% of the bytes of a token.
+- The int16 cache grows with the context. At 4301 tokens it is about
+  300 MB a token (25 layers with a window of 1024 rows: 210 MB). An int8
+  cache reads half of that.
+- The prompt pass is bound by compute, so the tests with 6 threads apply.
+- The L3 of the i5 is 9 MB, not 24.8 MB.
+
+## The int8 cache
+
+NP_GEMMA_KV_INT8=1 makes the copy of the cache that the decode reads int8.
+KVCache kv="int8" and the server option --kv-attn int8 do the same. Each group of
+32 values gets a scale of max |x| / 127. The decode programs then take the
+attention mode "q8", with the records KV_WRITE8, ATTN_Q8, and ATTN_Q8_MT.
+The split attention (as_split_body) reads int8 or int16 values with the
+same code. A group keeps the bits of the steps (check_mt passes on AVX2 and
+VNNI), and MTP gives the tokens of the plain decode.
+
+The 26B at 4301 tokens of context, AVX2 code (a step and the head):
+
+    threads   int16      int8
+    3         9.95       10.91 tok/s
+    6         16.19      17.73 tok/s
+
+The KL of the decode against the int16 cache is 1.3e-3 over 160 steps
+(float x, VNNI), and all 160 top tokens agree. With the int8 x of AVX2, the
+KL against the float decode goes from 3.9e-3 to 4.3e-3.
+
+Later the int8 rows became the only copy: the int8 form keeps no float32
+rows. KVCache.read gives dequantized rows to the prompt attention and to the
+other float readers. Thus the prompt attention also reads int8 values, and
+the KL of the decode against the int16 cache is 3.7e-3 (158/160 top
+tokens).
+
+A test rounds the keys and values of the int16 cache to int8 in
+the prompt. It gives the same values. Thus the cost comes from the int8
+values, not from the code. The cache takes about a sixth of the memory. A prompt of 2048
+tokens is 3.5% slower (the dequantization of the rows).
+
+## The int8 cache on the GPU, and int16 keys with int8 values
+
+The GPU takes the int8 cache too (GPUKV "int8"). The records KV_WRITE8,
+ATTN_Q8, and ATTN_Q8_MT have kernels on the GPU. The decode uses k_attn_fdt
+and k_attn_part, and a prompt uses k_flash_qc_h. The GPU drafter of MTP
+reads the int8 cache of the target.
+
+A third form keeps int16 keys and int8 values (NP_GEMMA_KV_INT8=v,
+KVCache kv="k16v8"). Its records are KV_WRITEV8, ATTN_V8, and ATTN_V8_MT. The
+kernels have one element type for the keys and one for the values.
+
+The cost of each half: a test runs the 12B on the CPU with a float cache
+and float attention. It rounds the keys or the values to int8 when it
+stores them, and it runs 160 decode steps:
+
+    rounded     KL against none   top tokens
+    keys        6.7e-4            156/160
+    values      7.7e-4            154/160
+    both        1.3e-3            154/160
+
+The keys and the values cost about the same, and the costs add. The NLL of
+the text does not move (within 0.01). On random data the keys gave most of
+the error, so the test on the model is the one that counts.
+
+The 26B on the GPU: check_mt passes with each form when the hot experts stay
+fixed (NP_GEMMA_GPU_HOT_DYN=0). HotCache can move experts between the group
+and the steps, and then even the int16 cache gives other bits.
+
+## No float32 rows in the cache
+
+KVCache keeps only quantized rows in each form, also int16: the float32
+rows are gone. The cache of the int16 form takes a third of its old memory.
+The prompt attention on the CPU reads dequantized rows (KVCache.read).
+
+- A prompt of 2048 tokens of the 26B (AVX2, 6 threads): 56.2 to 55.3
+  tok/s.
+- The KL against the chat references: 0.0011, 0.0004, 0.0012 (before:
+  0.0016, 0.0004, 0.0010).
+- check_program.py passes for each form. The Python path of a group
+  (gemma_attn_decode_i16_mt) now takes the split attention, as the program
+  does. Before this change, the two gave different bits.

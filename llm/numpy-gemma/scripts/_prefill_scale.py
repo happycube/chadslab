@@ -3,7 +3,7 @@ sys.path.insert(0, '.')
 from np_gemma import Model, Tokenizer, KVCache
 from np_gemma.config import Config
 from np_gemma.gguf import GGUF
-g = GGUF('models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf')
+g = GGUF('models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf')
 tok = Tokenizer.from_gguf(g)
 cfg = Config({'text_config': g.text_config()})
 m = Model(g, cfg).load_all(dtype='int4')

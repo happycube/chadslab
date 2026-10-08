@@ -6,7 +6,7 @@ gemma4-12b-qat-pytorch has it). It encodes the files of this repository,
 text in other scripts, and random strings, and compares the ids. It also
 checks that decode gives the text back.
 
-    $VENV/bin/python scripts/check_qwen_tok.py
+    [TOKENIZER=.../tokenizer.json] $VENV/bin/python scripts/check_qwen_tok.py
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from tokenizers import Tokenizer  # noqa: E402
 
 from np_gemma.qwen_tok import QwenTokenizer  # noqa: E402
 
-PATH = "models/Qwen3.6-35B-A3B-OptiQ-4bit/tokenizer.json"
+PATH = os.environ.get("TOKENIZER", "models/Qwen3.6-35B-A3B-OptiQ-4bit/tokenizer.json")
 
 SAMPLES = [
     "Hello, world! It's a test. They'll go; we've done it, I'm sure, you'd see.",

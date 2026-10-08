@@ -205,14 +205,23 @@ def _text_of(content):
     return ""
 
 
+def _note(media, part):
+    """Add a media part to the list media (if a list): the parts in the order
+    of their placeholders in the prompt."""
+    if media is not None:
+        media.append(part)
+
+
 def render_chat(messages, tools=None, add_generation_prompt=True,
                 enable_thinking=False, preserve_thinking=False,
-                bos_token="<bos>", empty_thought_block=True):
+                bos_token="<bos>", empty_thought_block=True, media=None):
     """Return the chat prompt text.
 
     messages follows the OpenAI shape. A tool call takes an arguments mapping
     or a JSON string. A tool result uses the role "tool" and the field
-    tool_call_id. The result matches the canonical Jinja template.
+    tool_call_id. The result matches the canonical Jinja template. Give a
+    list as media to get each image, audio, or video part, in the order of
+    its placeholder in the text.
 
     Set empty_thought_block to False for the E2B and E4B models. When thinking
     is off, the 12B, the 26B, and the 31B start the answer with an empty
@@ -311,10 +320,13 @@ def render_chat(messages, tools=None, add_generation_prompt=True,
                         if isinstance(part, dict):
                             if part.get("type") in ("image", "image_url"):
                                 out.append("<|image|>")
+                                _note(media, part)
                             elif part.get("type") in ("audio", "input_audio"):
                                 out.append("<|audio|>")
-                            elif part.get("type") == "video":
+                                _note(media, part)
+                            elif part.get("type") in ("video", "video_url"):
                                 out.append("<|video|>")
+                                _note(media, part)
                 else:
                     out.append(format_tool_response_block(name, body))
                 tr_flag = True
@@ -333,10 +345,13 @@ def render_chat(messages, tools=None, add_generation_prompt=True,
                     parts.append(strip_thinking(t) if role == "model" else t.strip())
                 elif item.get("type") in ("image", "image_url"):
                     parts.append("<|image|>")
+                    _note(media, item)
                 elif item.get("type") in ("audio", "input_audio"):
                     parts.append("<|audio|>")
-                elif item.get("type") == "video":
+                    _note(media, item)
+                elif item.get("type") in ("video", "video_url"):
                     parts.append("<|video|>")
+                    _note(media, item)
             captured = "".join(parts)
         out.append(captured)
         has_content = len(captured.strip()) > 0
@@ -508,7 +523,11 @@ def parse_output(text):
     """
     body = str(text)
     # A model that waits for a tool result repeats the empty thought channel.
-    # Remove every channel, not only the first.
+    # Remove every channel, not only the first. The label of a channel (the
+    # text after <|channel> to the newline: "thought") is not read: every
+    # channel is reasoning. That fails closed (an unknown channel is never
+    # shown as the answer); a model with a channel for the answer needs a
+    # rule here.
     parts = []
     while True:
         start = body.find("<|channel>")

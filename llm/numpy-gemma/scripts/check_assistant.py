@@ -28,7 +28,7 @@ from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 from np_gemma.tokenizer import Tokenizer
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 HUB = "../gemma4-12b-qat-pytorch/.cache/huggingface/hub"
 REPO = "models--google--gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant"
 
@@ -75,9 +75,9 @@ def main():
         layers = None
         for name in ("sliding_attention", "full_attention"):
             K, V = cache.shared[name]
-            # (heads, keys, dim) -> (1, heads, keys, dim)
-            shared[name] = (torch.from_numpy(np.ascontiguousarray(K[:, :pos]))[None],
-                            torch.from_numpy(np.ascontiguousarray(V[:, :pos]))[None])
+            # (keys, heads, dim) -> (1, heads, keys, dim)
+            shared[name] = (torch.from_numpy(np.ascontiguousarray(K[:pos].transpose(1, 0, 2)))[None],
+                            torch.from_numpy(np.ascontiguousarray(V[:pos].transpose(1, 0, 2)))[None])
     else:
         layers = shared_layers(cfg)
         for name, layer in (("sliding_attention", layers[0]), ("full_attention", layers[1])):

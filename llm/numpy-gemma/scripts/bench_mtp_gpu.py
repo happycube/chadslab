@@ -22,7 +22,7 @@ from np_gemma.config import Config  # noqa: E402
 from np_gemma.gguf import GGUF  # noqa: E402
 from np_gemma.tokenizer import Tokenizer  # noqa: E402
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 HUB = "../gemma4-12b-qat-pytorch/.cache/huggingface/hub"
 REPO = "models--google--gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant"
 

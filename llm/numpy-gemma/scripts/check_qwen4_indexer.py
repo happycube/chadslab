@@ -14,7 +14,10 @@ keeps.
 
 The function relu gives many scores of 0. At the cut, torch.topk keeps an
 arbitrary subset of equal scores. A difference passes when the blocks that
-differ have the score of the last kept block.
+differ have the score of the last kept block. The keys of this runtime are
+float16, so a block with a score near the cut (within NEAR of it) can also
+change places with the last kept block; that passes too, and the script
+gives the count.
 
 It needs torch and transformers (the venv of gemma4-12b-qat-pytorch):
 
@@ -39,6 +42,8 @@ from np_gemma.qwen4 import Qwen4, Qwen4Cache  # noqa: E402
 
 DIR = "models/Qwen3.8-Flash-Next-GGUF"
 PATH = DIR + "/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+# the largest distance of a changed block from the score of the cut (relative)
+NEAR = 1e-2
 
 
 def main():
@@ -67,19 +72,22 @@ def main():
     ratio = m.cfg.compress_ratios[i]
     budget = m.cfg.indexer_top_k // ratio
     sparse = int(((ours.sum(1) < np.arange(1, n + 1))).sum())
-    ties = bad = 0
+    ties = near = bad = 0
     for j in np.nonzero((ours != theirs).any(1))[0]:
         score = m.qsa_scores[j]
         nb = len(score)
         a = ours[j][:nb * ratio].reshape(nb, ratio).all(1)
         b = theirs[j][:nb * ratio].reshape(nb, ratio).all(1)
         cut = np.sort(score)[::-1][budget - 1]
-        if np.all(score[a != b] == cut) and np.array_equal(ours[j][nb * ratio:], theirs[j][nb * ratio:]):
+        tail = np.array_equal(ours[j][nb * ratio:], theirs[j][nb * ratio:])
+        if np.all(score[a != b] == cut) and tail:
             ties += 1
+        elif tail and np.all(np.abs(score[a != b] - cut) <= NEAR * abs(cut)):
+            near += 1
         else:
             bad += 1
-    print("%d queries, %d with dropped keys; %d differ at equal scores, %d differ otherwise" % (
-        n, sparse, ties, bad))
+    print("%d queries, %d with dropped keys; %d differ at equal scores, %d near the cut, "
+          "%d differ otherwise" % (n, sparse, ties, near, bad))
     ok = bad == 0 and sparse > 0
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

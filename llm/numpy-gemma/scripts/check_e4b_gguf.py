@@ -10,7 +10,8 @@ for the head as well.
 
 Run:
 
-    PYTHONPATH=. $PY scripts/check_e4b_gguf.py --gguf ~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf \
+    PYTHONPATH=. $PY scripts/check_e4b_gguf.py \
+        --gguf models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf \
         --config-snapshot "$SNAP4B"
 """
 from __future__ import annotations

@@ -32,6 +32,8 @@ import numpy as np
 
 from . import ops
 from . import rope as rope_mod
+from . import speculative
+from .speculative import RowPicker, greedy_pick  # noqa: F401  (they lived here)
 from .config import Config
 from .st import SafeTensors
 
@@ -40,6 +42,41 @@ _NORMS = ("input_layernorm", "post_attention_layernorm",
           "self_attn.q_norm")
 _MATS = ("self_attn.q_proj", "self_attn.o_proj",
          "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+# The names of the tensors of a drafter GGUF (arch gemma4-assistant, as the
+# MTP files of unsloth) for the names of the safetensors of the assistant.
+_GGUF_LAYER = {"input_layernorm": "attn_norm", "post_attention_layernorm": "post_attention_norm",
+               "pre_feedforward_layernorm": "ffn_norm", "post_feedforward_layernorm": "post_ffw_norm",
+               "self_attn.q_norm": "attn_q_norm", "self_attn.q_proj": "attn_q",
+               "self_attn.o_proj": "attn_output", "mlp.gate_proj": "ffn_gate",
+               "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+_GGUF_TOP = {"model.norm.weight": "output_norm.weight",
+             "pre_projection.weight": "nextn.pre_projection.weight",
+             "post_projection.weight": "nextn.post_projection.weight",
+             "model.embed_tokens.weight": "token_embd.weight"}
+
+
+def _gguf_getter(path):
+    """Return get(name) for the tensors of a drafter GGUF by their names in the
+    safetensors of the assistant, as float32 (the blocks dequantized). The
+    norms are stored as is (no added 1)."""
+    from .gguf import GGUF
+    g = GGUF(path)
+
+    def get(name, dtype=np.float32):
+        if name in _GGUF_TOP:
+            gn = _GGUF_TOP[name]
+        else:
+            parts = name.split(".")          # model.layers.<i>.<key>...
+            i, key = parts[2], ".".join(parts[3:])
+            if key == "layer_scalar":
+                gn = "blk.%s.layer_output_scale.weight" % i
+            else:
+                gn = "blk.%s.%s.weight" % (i, _GGUF_LAYER[key[:-len(".weight")]])
+        return np.ascontiguousarray(g.dequant(gn), dtype=np.float32)
+    get.release_pages = lambda: None
+    return get
 
 
 def shared_layers(cfg):
@@ -63,9 +100,12 @@ class Assistant:
     path is the snapshot directory of the Hugging Face checkpoint. It holds
     config.json and model.safetensors. dtype "f32" keeps float32 weights.
     dtype "int4" and "int8" quantize every matrix, the output head too.
+    weights, a drafter GGUF (the MTP files of unsloth, arch
+    gemma4-assistant), gives the weights in place of model.safetensors; the
+    snapshot still gives config.json.
     """
 
-    def __init__(self, path, dtype="int4", q8_attn=True):
+    def __init__(self, path, dtype="int4", q8_attn=True, weights=None):
         with open(os.path.join(path, "config.json")) as fh:
             raw = json.load(fh)
         self.raw = raw
@@ -78,8 +118,14 @@ class Assistant:
         # Stop a draft when the drafter gives its best token less than this
         # probability. Zero turns the test off. NP_GEMMA_MTP_PMIN sets it.
         self.p_min = float(os.environ.get("NP_GEMMA_MTP_PMIN", "0"))
-        self.st = SafeTensors(os.path.join(path, "model.safetensors"))
-        get = self.st.get
+        if weights:
+            if raw.get("use_ordered_embeddings"):
+                raise ValueError("a drafter GGUF has no centroid head")
+            get = _gguf_getter(weights)
+            self.st = get
+        else:
+            self.st = SafeTensors(os.path.join(path, "model.safetensors"))
+            get = self.st.get
         self.layers = []
         for i in range(self.cfg.num_hidden_layers):
             p = "model.layers.%d." % i
@@ -104,6 +150,16 @@ class Assistant:
             self.head_f32 = get("model.embed_tokens.weight")
         self.st.release_pages()
         self._rope = {}
+        # The int4 matrices in groups of 16 rows (KQ_Q4X, as the target:
+        # ops.q4x_pack_model), with int8 x for each token count. The head
+        # alone (262144 rows of 1024 values for the 26B) took 6.3 ms of the
+        # 13.6 ms of a draft step on the int4 path (AVX2, 6 threads).
+        self._q4x = {}
+        if dtype == "int4" and ops._Q4X_ON:
+            mats = [self.pre, self.post, self.head] + [w[k] for w in self.layers for k in _MATS]
+            for q, sc in mats:
+                if ops._q4x_ok(q, sc):
+                    self._q4x[q.ctypes.data] = ops._cops.kq_q4x_pack(q, sc)
 
     def _quant(self, w):
         if self.dtype == "int4":
@@ -115,6 +171,9 @@ class Assistant:
     def linear(self, x, w):
         """Multiply x by W. Use the kernel of the weight dtype."""
         if self.dtype == "int4":
+            qx = self._q4x.get(w[0].ctypes.data)
+            if qx is not None:
+                return ops._q4x_linear(x, qx)
             return ops.linear_int4(x, w[0], w[1])
         if self.dtype == "int8":
             return ops.linear_int8(x, w[0], w[1])
@@ -145,12 +204,12 @@ class Assistant:
         q = rope_mod.apply(q[None], cos, sin)[0]
         if layer is None:
             # The E4B cache keeps the key and the value that the shared layers
-            # reuse, for each layer type, with the shape (heads, keys, dim).
+            # reuse, for each layer type, with the shape (keys, heads, dim).
             store = cache.shared[plan.kind if hasattr(plan, "kind") else
                                  ("sliding_attention" if plan.is_sliding else "full_attention")]
             window = self.cfg.sliding_window if plan.is_sliding else 0
-            o = ops.attn_decode_f32(np.ascontiguousarray(q), store[0][:, :pos, :],
-                                    store[1][:, :pos, :], pos, 0, window)
+            o = ops.attn_decode_f32(np.ascontiguousarray(q), store[0][:pos].transpose(1, 0, 2),
+                                    store[1][:pos].transpose(1, 0, 2), pos, 0, window)
             return self.linear(o.reshape(1, nq * hd), w["self_attn.o_proj"])
         if self.q8_attn and ops.attn_ready() and cache.qc_ready(layer):
             # The int16 copy of the target cache, with the fused kernel of the
@@ -264,14 +323,16 @@ def mtp_enabled():
 
 def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
                max_new_tokens, stats=None):
-    """Yield the new tokens of an MTP decode, one at a time.
+    """Yield the new tokens of an MTP decode, one at a time (the loop of
+    speculative.stream, for a Gemma target and its assistant).
 
     The list ids holds the tokens in the cache. The function adds the tokens
     of the rows that it keeps.
 
-    The token nxt is the first new token. The cache does not hold it yet. The array h is the target hidden state of the row
-    that predicted nxt. The function pick(logits) selects a token from one
-    row of target logits. It is the sampler of the plain decode.
+    The token nxt is the first new token. The cache does not hold it yet. The
+    array h is the target hidden state of the row that predicted nxt. The
+    function pick(logits) selects a token from one row of target logits. It
+    is the sampler of the plain decode.
 
     The target picks its own token at each row of a verify batch, with the
     sampler of the plain decode. A draft is kept while it is the token that
@@ -279,58 +340,19 @@ def mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids, pick,
     decode emits, and pick runs one time for each emitted token, in the same
     order. With greedy selection, or with a sampler that has a seed, the text
     is the same as the text of the plain decode.
+
+    A Sampler with mtp_accept "in_set" also keeps a draft that it did not
+    pick when its settings allow the draft (Sampler.draft_ok). That keeps
+    more drafts, but the text is no longer the text of the plain decode.
     """
-    pos = len(ids)
-    emitted = 0
     if (hasattr(target, "gpu_mirror") and not hasattr(cache, "shared")
             and not getattr(drafter, "on_gpu", False)):
         # With the cache on the GPU, the drafter needs the new rows of its
         # two layers in the host cache after each step.
         target.gpu_mirror(cache, shared_layers(target.cfg))
-    if stats is not None:
-        stats.setdefault("steps", 0)
-        stats.setdefault("drafts", 0)
-        stats.setdefault("accepted", 0)
-    while True:
-        yield nxt
-        emitted += 1
-        if nxt in eos_ids or emitted >= max_new_tokens:
-            return
-        k = min(n_draft, max_new_tokens - emitted)
-        d = drafter.draft(target, nxt, h, pos, cache, k, eos_ids)
-        batch = [nxt] + d
-        x = target.forward(batch, cache=cache, start_pos=pos)
-        logits = target.logits(x)
-        # Row j gives the token after batch[j]. Keep the drafts while they
-        # match the token that the target picks.
-        j = 0
-        while True:
-            tok = pick(logits[j])
-            if j < len(d) and tok == d[j]:
-                j += 1
-                continue
-            break
-        if stats is not None:
-            stats["steps"] += 1
-            stats["drafts"] += len(d)
-            stats["accepted"] += j
-        # The cache keeps the rows of batch[0] to batch[j]. The rows after
-        # them hold rejected drafts.
-        ids.extend(batch[:j + 1])
-        pos += j + 1
-        cache.truncate(pos)
-        for t in d[:j]:
-            yield t
-            emitted += 1
-            if t in eos_ids or emitted >= max_new_tokens:
-                return
-        h = x[j:j + 1]
-        nxt = tok
-
-
-def greedy_pick(logits):
-    """Return the most probable token of one row of logits."""
-    return ops.argmax(logits)
+    yield from speculative.stream(speculative.GemmaTarget(target, cache, ids),
+                                  speculative.GemmaDrafter(drafter, target, cache), nxt, h,
+                                  len(ids), n_draft, pick, eos_ids, max_new_tokens, stats)
 
 
 def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=2,
@@ -346,7 +368,7 @@ def mtp_generate(target, drafter, ids, cache, max_new_tokens, n_draft=2,
     x = target.prefill(ids, cache)
     t1 = time.perf_counter()
     h = x[-1:]
-    nxt = pick(target.logits(h)[0])
+    nxt = RowPicker(target, h, pick).token(0)
     st = {} if stats is None else stats
     out = list(mtp_stream(target, drafter, cache, ids, h, nxt, n_draft, eos_ids,
                           pick, max_new_tokens, st))

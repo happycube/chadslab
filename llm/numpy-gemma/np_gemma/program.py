@@ -37,9 +37,10 @@ The entry points:
     decode_step(model, ...)     bind the step, run it, return the hidden state
     compile_layers(model, ...)  the program of some layers, for a check
 
-The attention mode attn is "qc" or "f32". The mode "qc" reads the int16 copy
-of the cache (NP_GEMMA_ATTN=1, the default). The mode "f32" reads the float
-cache (NP_GEMMA_ATTN=0, the default of the server).
+The attention mode attn follows the form of the cache (KVCache keeps only
+quantized rows): "qc" int16, "q8" int8, "qv" int16 keys and int8 values. The
+mode "f32" reads a float cache (the E4B and parts of the GPU; KVCache has
+none).
 Model.forward uses decode_step for one token when ready() allows it. The
 program gives the same bits as the Python loop of Model; see
 scripts/check_program.py.
@@ -71,7 +72,21 @@ INT4_LINEAR, INT4_MULTI4, RMS_NORM_MULTI4, GELU_MUL_INT4 = 32, 33, 34, 35
 INT4_LINEAR_MT, INT4_MULTI4_MT, GELU_MUL_ROWS, BF16_LINEAR = 36, 37, 38, 39
 QKV_NORM_ROPE, KV_WRITE, ATTN_QC, ATTN_F32 = 48, 49, 50, 51
 ATTN_QC_MT, ATTN_F32_MT, QKV_NORM, ROPE, KV_WRITE_HEADS, ATTN_F32H = 52, 53, 54, 55, 56, 57
+# The int8 cache (KVCache kv="int8", the attention mode "q8"): the records of
+# KV_WRITE, ATTN_QC, and ATTN_QC_MT with int8 values.
+KV_WRITE8, ATTN_Q8, ATTN_Q8_MT = 58, 59, 60
+# int16 keys and int8 values (KVCache kv="k16v8", the attention mode "qv").
+KV_WRITEV8, ATTN_V8, ATTN_V8_MT = 61, 62, 63
+# the ctypes of the keys and of the values of each record (Program.run_py)
+_QTYPES = {op: (ctypes.c_int8 if op in (KV_WRITE8, ATTN_Q8, ATTN_Q8_MT) else ctypes.c_int16,
+                ctypes.c_int16 if op in (KV_WRITE, ATTN_QC, ATTN_QC_MT) else ctypes.c_int8)
+           for op in (KV_WRITE, ATTN_QC, ATTN_QC_MT, KV_WRITE8, ATTN_Q8, ATTN_Q8_MT,
+                      KV_WRITEV8, ATTN_V8, ATTN_V8_MT)}
 ROUTER, MOE, ROUTER_MT, MOE_MT, MOE_N = 64, 65, 66, 67, 68
+# The TQ6 cache of the Qwen models (np_gemma/tq6.py): KV_WRITETQ, ATTN_TQ, and
+# ATTN_TQ_MT have the operands of KV_WRITE8, ATTN_Q8, and ATTN_Q8_MT. TQ_ROT
+# (x, groups, inverse) rotates the queries before them and the output after.
+KV_WRITETQ, ATTN_TQ, ATTN_TQ_MT, TQ_ROT = 69, 70, 71, 72
 # The operations of a program in parts (np_gemma/parts.py, SPLIT_PLAN.md).
 XBAR, MOE_PART, ATTN_QC_H, ATTN_F32_H = 80, 81, 82, 83
 # The records that move work between the GPU and the CPU (np_gemma/gpu.py).
@@ -87,13 +102,34 @@ KQ_HOT_MOE, KQ_MULTI, ADD_RMS, KQ_GROUP_MOE = 110, 111, 112, 113
 HC_NORM, HC_ACT, HC_MIX, HC_ADD, PLE_GATE, PLE_CONV = 114, 115, 116, 117, 118, 119
 # qwen4exp: QSA (csrc/qsa.c).
 QSA_SELECT, ATTN_QSA, HC_CAT, MOE_PLAN, CPU_START, CPU_WAIT = 120, 121, 122, 123, 124, 125
+# The handoff to the CPU inside a graph: flags in pinned memory (csrc/gpu.cu).
+SIGNAL, AWAIT, D2H, H2D, CPU_TASK = 126, 127, 128, 129, 130
+# The end of a layer of the 26B in one kernel (the GPU only; see k_ffn_out).
+FFN_OUT = 131
+# x = tanh(x / cap) cap in place, the soft cap of the logits (the GPU only).
+SOFTCAP = 132
+# The media encoders (np_gemma/gemma4_encoders.py): rows split over the
+# threads on the CPU, the kernels k_enc_* on the GPU.
+ENC_LINEAR, ENC_RMS, ENC_GELU_MUL, ENC_ADD, ENC_ROPE2D, ENC_ATTN = 133, 134, 135, 136, 137, 138
+ENC_SILU, ENC_MUL_VEC, ENC_GLU, ENC_DWCONV, ENC_LOCAL_ATTN = 139, 140, 141, 142, 143
+ENC_CLAMP, ENC_BIAS_CLAMP, ENC_LNORM, ENC_GELU = 144, 145, 146, 147
+# The rows of a Q6_K matrix (the output head of np_gemma/parts.py).
+Q6K_LINEAR = 148
+# The attention of a prompt block for the KV heads of a part (parts.PartKVCache).
+PART_PREFILL = 149
+# The attention of a prompt block over the int16 cache (np_gemma/prompt.py).
+ATTN_PREFILL_QC = 150
+# The int16 x of a prompt block and its KQ_Q4X product (NP_GEMMA_INT4_Q8=16).
+KQ_QUANT16, KQ_LINEAR16 = 151, 152
 
 OP_NAMES = {v: k for k, v in dict(
     S_MOV=S_MOV, S_ADD=S_ADD, S_SUB=S_SUB, S_MUL=S_MUL, S_MAX=S_MAX, S_MIN=S_MIN,
     RMS_NORM=RMS_NORM, ADD=ADD, MUL_S=MUL_S, COPY=COPY, INT4_LINEAR=INT4_LINEAR,
     INT4_MULTI4=INT4_MULTI4, RMS_NORM_MULTI4=RMS_NORM_MULTI4,
     GELU_MUL_INT4=GELU_MUL_INT4, QKV_NORM_ROPE=QKV_NORM_ROPE, KV_WRITE=KV_WRITE,
-    ATTN_QC=ATTN_QC, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
+    KV_WRITE8=KV_WRITE8, ATTN_Q8=ATTN_Q8, ATTN_Q8_MT=ATTN_Q8_MT, KV_WRITEV8=KV_WRITEV8,
+    KV_WRITETQ=KV_WRITETQ, ATTN_TQ=ATTN_TQ, ATTN_TQ_MT=ATTN_TQ_MT, TQ_ROT=TQ_ROT,
+    ATTN_V8=ATTN_V8, ATTN_V8_MT=ATTN_V8_MT, ATTN_QC=ATTN_QC, ATTN_F32=ATTN_F32, ROUTER=ROUTER, MOE=MOE,
     INT4_LINEAR_MT=INT4_LINEAR_MT, INT4_MULTI4_MT=INT4_MULTI4_MT,
     GELU_MUL_ROWS=GELU_MUL_ROWS, ATTN_QC_MT=ATTN_QC_MT, ATTN_F32_MT=ATTN_F32_MT,
     ROUTER_MT=ROUTER_MT, MOE_MT=MOE_MT, GELU=GELU, MUL=MUL, BF16_LINEAR=BF16_LINEAR,
@@ -109,7 +145,14 @@ OP_NAMES = {v: k for k, v in dict(
     KQ_MULTI=KQ_MULTI, ADD_RMS=ADD_RMS, KQ_GROUP_MOE=KQ_GROUP_MOE, HC_NORM=HC_NORM, HC_ACT=HC_ACT,
     HC_MIX=HC_MIX, HC_ADD=HC_ADD, PLE_GATE=PLE_GATE, PLE_CONV=PLE_CONV, QSA_SELECT=QSA_SELECT,
     ATTN_QSA=ATTN_QSA, HC_CAT=HC_CAT, MOE_PLAN=MOE_PLAN, CPU_START=CPU_START,
-    CPU_WAIT=CPU_WAIT).items()}
+    CPU_WAIT=CPU_WAIT, SIGNAL=SIGNAL, AWAIT=AWAIT, D2H=D2H, H2D=H2D,
+    CPU_TASK=CPU_TASK, FFN_OUT=FFN_OUT, SOFTCAP=SOFTCAP, ENC_LINEAR=ENC_LINEAR, ENC_RMS=ENC_RMS,
+    ENC_GELU_MUL=ENC_GELU_MUL, ENC_ADD=ENC_ADD, ENC_ROPE2D=ENC_ROPE2D, ENC_ATTN=ENC_ATTN,
+    ENC_SILU=ENC_SILU, ENC_MUL_VEC=ENC_MUL_VEC, ENC_GLU=ENC_GLU, ENC_DWCONV=ENC_DWCONV,
+    ENC_LOCAL_ATTN=ENC_LOCAL_ATTN, ENC_CLAMP=ENC_CLAMP, ENC_BIAS_CLAMP=ENC_BIAS_CLAMP, ENC_LNORM=ENC_LNORM,
+    ENC_GELU=ENC_GELU, Q6K_LINEAR=Q6K_LINEAR,
+    PART_PREFILL=PART_PREFILL, ATTN_PREFILL_QC=ATTN_PREFILL_QC, KQ_QUANT16=KQ_QUANT16,
+    KQ_LINEAR16=KQ_LINEAR16).items()}
 
 # One record: the operation, the flags (not used yet), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
@@ -150,6 +193,9 @@ class Program:
         # A literal operand holds the address of an array. The program keeps
         # the array, so the address stays good for the life of the program.
         self.keep = []
+        # the team of gemma_run_task for this program (word 3 of the header),
+        # or 0 for its default
+        self.threads = 0
         self.bound = {}            # the arrays that a bind points to
         self.buf = None            # the int64 array that C runs; see finish
         self.names = {}            # the buffers of the compiler, by name
@@ -214,6 +260,7 @@ class Program:
         buf[0] = np.int64(MAGIC)
         buf[1] = n_env
         buf[2] = len(self.recs)
+        buf[3] = self.threads
         buf[4:4 + n_env] = self.init
         buf[4 + n_env:] = code.view(np.int64)
         self.buf = buf
@@ -370,27 +417,38 @@ def _py_step(op, a, e):
     elif op == QKV_NORM_ROPE:
         L.gemma_qkv_norm_rope(V(0), V(1), V(2), V(3), V(4), V(5), V(6), V(7),
                               V(8), V(9), V(10), V(11), V(12), F(13))
-    elif op == KV_WRITE:
+    elif op in (KV_WRITE, KV_WRITE8, KV_WRITEV8):
         n = V(8)
         k = _arr(V(0), n)
         v = _arr(V(1), n)
-        _arr(V(2), n)[:] = k
-        _arr(V(3), n)[:] = v
+        if V(2):
+            _arr(V(2), n)[:] = k
+            _arr(V(3), n)[:] = v
         if not V(4):
             return
-        kq, ks = ops.quantize_i16(k.reshape(-1, 32))
-        vq, vs = ops.quantize_i16(v.reshape(-1, 32))
-        _arr(V(4), n, ctypes.c_int16)[:] = kq.reshape(-1)
-        _arr(V(5), n // 32)[:] = ks.reshape(-1)
-        _arr(V(6), n, ctypes.c_int16)[:] = vq.reshape(-1)
-        _arr(V(7), n // 32)[:] = vs.reshape(-1)
-    elif op == ATTN_QC:
-        qh, kvh, hd, n = V(7), V(8), V(9), V(10)
-        q = _arr(V(0), qh * hd)
-        o = ops.attn_decode(q.reshape(qh, hd), _arr(V(1), n * kvh * hd, ctypes.c_int16),
-                            _arr(V(2), n * kvh * hd // 32), _arr(V(3), n * kvh * hd, ctypes.c_int16),
-                            _arr(V(4), n * kvh * hd // 32), qh, kvh, hd, n)
-        _arr(V(6), qh * hd)[:] = o.reshape(-1)
+        kt, vt = _QTYPES[op]
+        for src, b in ((k, 4), (v, 6)):
+            quant = ops.quantize_i8 if (kt if b == 4 else vt) is ctypes.c_int8 else ops.quantize_i16
+            xq, xs = quant(src.reshape(-1, 32))
+            _arr(V(b), n, kt if b == 4 else vt)[:] = xq.reshape(-1)
+            _arr(V(b + 1), n // 32)[:] = xs.reshape(-1)
+    elif op in (ATTN_QC, ATTN_Q8, ATTN_V8):
+        qh, kvh, hd, n0 = V(7), V(8), V(9), V(10)
+        kt, vt = _QTYPES[op]
+        t = V(11) if len(a) > 11 else 1       # a group: query j over n0 + j rows
+        win = V(12) if len(a) > 12 else 0     # a window: from row max(0, n0 + j - win)
+        q = _arr(V(0), t * qh * hd).reshape(t, qh, hd)
+        out = _arr(V(6), t * qh * hd).reshape(t, -1)
+        per = kvh * hd
+        for j in range(t):
+            lo = max(0, n0 + j - win) if win else 0
+            n = n0 + j - lo
+            kb, vb = ctypes.sizeof(kt) * per, ctypes.sizeof(vt) * per
+            out[j] = ops.attn_decode(q[j], _arr(V(1) + lo * kb, n * per, kt),
+                                     _arr(V(2) + lo * per // 8, n * per // 32),
+                                     _arr(V(3) + lo * vb, n * per, vt),
+                                     _arr(V(4) + lo * per // 8, n * per // 32), qh, kvh, hd,
+                                     n).reshape(-1)
     elif op == ATTN_F32:
         qh, kvh, hd, n = V(5), V(6), V(7), V(8)
         o = cops.attn_decode_f32s(_arr(V(0), qh * hd).reshape(qh, hd),
@@ -431,8 +489,8 @@ def _py_step(op, a, e):
         g = _arr(V(0), rows * inner).reshape(rows, inner)
         u = _arr(V(1), rows * inner).reshape(rows, inner)
         _arr(V(2), rows * inner)[:] = ops.gelu_mul_rows(g, u).reshape(-1)
-    elif op in (ATTN_QC_MT, ATTN_F32_MT):
-        qc = op == ATTN_QC_MT
+    elif op in (ATTN_QC_MT, ATTN_F32_MT, ATTN_Q8_MT, ATTN_V8_MT):
+        qc = op != ATTN_F32_MT
         o = 7 if qc else 5
         qh, kvh, hd, t = V(o), V(o + 1), V(o + 2), V(o + 3)
         pos, base, window = V(o + 4), V(o + 5), V(o + 6)
@@ -444,9 +502,10 @@ def _py_step(op, a, e):
         per = kvh * hd
         out = _arr(V(6 if qc else 4), t * qh * hd).reshape(t, qh, hd)
         if qc:
-            kq = _arr(V(1), rows * per, ctypes.c_int16).reshape(rows, kvh, hd)
+            kt, vt = _QTYPES[op]
+            kq = _arr(V(1), rows * per, kt).reshape(rows, kvh, hd)
             ks = _arr(V(2), rows * per // 32).reshape(rows, kvh, hd // 32)
-            vq = _arr(V(3), rows * per, ctypes.c_int16).reshape(rows, kvh, hd)
+            vq = _arr(V(3), rows * per, vt).reshape(rows, kvh, hd)
             vs = _arr(V(4), rows * per // 32).reshape(rows, kvh, hd // 32)
             out[:] = ops.attn_decode_mt(q, kq, ks, vq, vs, qh, kvh, hd, lo, n)
         else:
@@ -501,23 +560,132 @@ def _py_step(op, a, e):
         hs, pos, t, kvh, hd = V(4), V(5), V(6), V(7), V(8)
         k = _arr(V(0), t * kvh * hd).reshape(t, kvh, hd)
         v = _arr(V(1), t * kvh * hd).reshape(t, kvh, hd)
+        rs = kvh * hd if hs == hd else hd      # position-major or head-major (gp_kv_rs)
         for h in range(kvh):
-            base_ = h * hs + pos * hd
-            _arr(V(2) + 4 * base_, t * hd).reshape(t, hd)[:] = k[:, h]
-            _arr(V(3) + 4 * base_, t * hd).reshape(t, hd)[:] = v[:, h]
+            for j in range(t):
+                base_ = h * hs + (pos + j) * rs
+                _arr(V(2) + 4 * base_, hd)[:] = k[j, h]
+                _arr(V(3) + 4 * base_, hd)[:] = v[j, h]
     elif op == ATTN_F32H:
         qh, kvh, hd, t, pos, hs, window, slide = (V(5), V(6), V(7), V(8), V(9), V(10),
                                                   V(11), V(12))
         q = _arr(V(0), t * qh * hd).reshape(t, qh, hd)
         out = _arr(V(4), t * qh * hd).reshape(t, qh, hd)
-        span = (kvh - 1) * hs + (pos + t) * hd
-        K = np.lib.stride_tricks.as_strided(_arr(V(1), span), (kvh, pos + t, hd), (4 * hs, 4 * hd, 4))
-        Vv = np.lib.stride_tricks.as_strided(_arr(V(2), span), (kvh, pos + t, hd), (4 * hs, 4 * hd, 4))
+        rs = kvh * hd if hs == hd else hd      # position-major or head-major (gp_kv_rs)
+        span = (kvh - 1) * hs + (pos + t - 1) * rs + hd
+        K = np.lib.stride_tricks.as_strided(_arr(V(1), span), (kvh, pos + t, hd), (4 * hs, 4 * rs, 4))
+        Vv = np.lib.stride_tricks.as_strided(_arr(V(2), span), (kvh, pos + t, hd), (4 * hs, 4 * rs, 4))
         for j in range(t):
             p_ = pos + j
             lo = max(0, p_ - window + 1) if (slide and window) else 0
             out[j] = ops.attn_decode_f32(q[j:j + 1], K[:, lo:p_ + 1, :], Vv[:, lo:p_ + 1, :],
                                          p_, lo, window)[0]
+    elif op == ENC_LINEAR:
+        n, m, k = V(5), V(6), V(7)
+        x = np.clip(_arr(V(0), n * k).reshape(n, k), _f(a, e, 8), _f(a, e, 9))
+        if V(2):
+            w = ops.bf16_to_f32(_arr(V(1), m * k, ctypes.c_uint16).reshape(m, k).copy())
+        else:
+            w = _arr(V(1), m * k).reshape(m, k)
+        y = x @ w.T
+        if V(3):
+            y = y + _arr(V(3), m)
+        _arr(V(4), n * m).reshape(n, m)[:] = np.clip(y, _f(a, e, 10), _f(a, e, 11))
+    elif op == ENC_RMS:
+        rows, cols = V(3), V(4)
+        x = _arr(V(0), rows * cols).reshape(rows, cols)
+        y = x / np.sqrt((x * x).mean(axis=-1, keepdims=True) + _f(a, e, 5))
+        if V(1):
+            y = y * _arr(V(1), cols)
+        _arr(V(2), rows * cols).reshape(rows, cols)[:] = y
+    elif op == ENC_LNORM:
+        rows, cols = V(4), V(5)
+        x = _arr(V(0), rows * cols).reshape(rows, cols)
+        d = x - x.mean(axis=-1, keepdims=True)
+        y = d / np.sqrt((d * d).mean(axis=-1, keepdims=True) + _f(a, e, 6))
+        if V(1):
+            y = y * _arr(V(1), cols)
+        if V(2):
+            y = y + _arr(V(2), cols)
+        _arr(V(3), rows * cols).reshape(rows, cols)[:] = y
+    elif op == ENC_GELU:
+        n = V(2)
+        x = _arr(V(0), n).copy()
+        if V(3):
+            from math import erf
+            _arr(V(1), n)[:] = 0.5 * x * (1.0 + np.vectorize(erf)(x / np.sqrt(2.0)))
+        else:
+            _arr(V(1), n)[:] = ops.gelu_tanh(x)
+    elif op == ENC_GELU_MUL:
+        n = V(3)
+        _arr(V(2), n)[:] = ops.gelu_tanh(_arr(V(0), n).copy()) * _arr(V(1), n)
+    elif op == ENC_ADD:
+        n = V(2)
+        _arr(V(0), n)[:] += np.float32(_f(a, e, 3)) * _arr(V(1), n)
+    elif op == ENC_CLAMP:
+        n = V(2)
+        _arr(V(1), n)[:] = np.clip(_arr(V(0), n), _f(a, e, 3), _f(a, e, 4))
+    elif op == ENC_BIAS_CLAMP:
+        rows, cols = V(2), V(3)
+        y = _arr(V(0), rows * cols).reshape(rows, cols)
+        if V(1):
+            y += _arr(V(1), cols)
+        np.clip(y, _f(a, e, 4), _f(a, e, 5), out=y)
+    elif op == ENC_SILU:
+        n = V(2)
+        x = _arr(V(0), n)
+        _arr(V(1), n)[:] = x / (1.0 + np.exp(-x))
+    elif op == ENC_MUL_VEC:
+        rows, cols = V(3), V(4)
+        _arr(V(2), rows * cols).reshape(rows, cols)[:] = (
+            _arr(V(0), rows * cols).reshape(rows, cols) * _arr(V(1), cols))
+    elif op == ENC_GLU:
+        rows, cols = V(2), V(3)
+        x = _arr(V(0), rows * 2 * cols).reshape(rows, 2 * cols)
+        _arr(V(1), rows * cols).reshape(rows, cols)[:] = x[:, :cols] / (1.0 + np.exp(-x[:, cols:]))
+    elif op == ENC_DWCONV:
+        t, c, kw = V(3), V(4), V(5)
+        x = _arr(V(0), t * c).reshape(t, c)
+        w = _arr(V(1), c * kw).reshape(c, kw)
+        xp = np.concatenate([np.zeros((kw - 1, c), np.float32), x])
+        y = np.zeros((t, c), np.float32)
+        for j in range(kw):
+            y += xp[j:j + t] * w[:, j]
+        _arr(V(2), t * c).reshape(t, c)[:] = y
+    elif op == ENC_LOCAL_ATTN:
+        t, heads, hd, span, cap = V(6), V(7), V(8), V(9), _f(a, e, 10)
+        q, k, v = (_arr(V(i), t * heads * hd).reshape(t, heads, hd) for i in range(3))
+        R = _arr(V(3), (span + 1) * heads * hd).reshape(span + 1, heads, hd)
+        valid = _arr(V(4), t, ctypes.c_int32).astype(bool)
+        idx = np.arange(t)[:, None] - (span - 1) + np.arange(span)[None, :]
+        ok = (idx >= 0) & valid[np.clip(idx, 0, t - 1)]
+        ci = np.clip(idx, 0, t - 1)
+        s = np.einsum("thd,tjhd->thj", q, k[ci] + R[1:span + 1][None])
+        s = np.where(ok[:, None, :], np.tanh(s / cap) * cap, np.float32(-1e9))
+        s = np.exp(s - s.max(-1, keepdims=True))
+        s /= s.sum(-1, keepdims=True)
+        s = np.where((idx >= 0)[:, None, :], s, 0.0)
+        _arr(V(5), t * heads * hd).reshape(t, heads, hd)[:] = np.einsum("thj,tjhd->thd", s, v[ci])
+    elif op == ENC_ROPE2D:
+        n, heads, hd = V(3), V(4), V(5)
+        x = _arr(V(0), n * heads * hd).reshape(n, heads, hd)
+        pos = _arr(V(1), 2 * n, ctypes.c_int32).reshape(n, 2)
+        inv = _arr(V(2), hd // 4)
+        q4, h2 = hd // 4, hd // 2
+        for part in range(2):
+            ang = pos[:, part:part + 1].astype(np.float32) * inv[None, :]
+            c, s = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]
+            p = x[..., part * h2:(part + 1) * h2]
+            a0, b0 = p[..., :q4].copy(), p[..., q4:].copy()
+            p[..., :q4] = a0 * c - b0 * s
+            p[..., q4:] = b0 * c + a0 * s
+    elif op == ENC_ATTN:
+        n, heads, hd = V(4), V(5), V(6)
+        q, k, v = (_arr(V(i), n * heads * hd).reshape(n, heads, hd) for i in range(3))
+        s = np.einsum("qhd,khd->hqk", q, k)
+        s = np.exp(s - s.max(-1, keepdims=True))
+        s /= s.sum(-1, keepdims=True)
+        _arr(V(3), n * heads * hd).reshape(n, heads, hd)[:] = np.einsum("hqk,khd->qhd", s, v)
     else:
         raise ValueError("op %d" % op)
 
@@ -534,6 +702,10 @@ class _ArrW:
 
 class Compiler:
     """Turn the expressions of a model into the records of a Program.
+
+    q4x: the records of one row on the CPU take the KQ_Q4X copies of the
+    int4 matrices (ops.q4x_pack_model). The GPU compilers (np_gemma/gpu.py)
+    set it False.
 
     The special forms:
 
@@ -555,6 +727,8 @@ class Compiler:
     let, or else a parameter slot of that name. A kernel operation makes a new
     buffer for its result, except in a set.
     """
+
+    q4x = True
 
     def __init__(self, model, prog=None):
         self.model = model
@@ -617,11 +791,30 @@ class Compiler:
             layer, key = args
             if layer is None:
                 return {"norm": self.model._norm_w}[key]
-            return self.model._layers[layer][key]
+            v = self.model._layers[layer][key]
+            if (getattr(self, "q4_kq", False) and key in _Q4KQ_KEYS and isinstance(v, tuple)
+                    and v[0].dtype == np.uint8 and v[0].ndim == 3 and v[0].shape[-1] == 18):
+                # A Q4_0 matrix for the GPU products with int8 x (the GPU
+                # step and verify groups of the 26B, NP_GEMMA_GPU_Q4_I8_DENSE).
+                return _Q4KQ(v[0])
+            return v
         if head == "m":
-            # An E4B matrix: the int4 blocks, or else the bfloat16 copy.
-            entry = self.model.q4(args[0])
-            return entry if entry is not None else self.model.W16(args[0])
+            # An E4B matrix: the int4 blocks, or else the bfloat16 copy (a
+            # small matrix, which W16 keeps in float32, too). A compiler with
+            # q4_kq (the GPU step and verify groups) takes a Q4_0 matrix as a
+            # GGUF product (E4B.kq_q4: int8 x on the GPU).
+            entry = None
+            if getattr(self, "q4_kq", False) and hasattr(self.model, "kq_q4"):
+                entry = self.model.kq_q4(args[0])
+            if entry is None:
+                entry = self.model.q4(args[0])
+            if entry is None and hasattr(self.model, "kq"):
+                entry = self.model.kq(args[0])     # a K quant of a GGUF file
+            if entry is None:
+                entry = self.model.W16(args[0])
+            if entry is None:
+                entry = ops.to_bf16(self.model.W(args[0]))
+            return entry
         if head == "t":
             # An E4B tensor that the quantization did not touch.
             return np.ascontiguousarray(self.model.T(args[0]), dtype=np.float32)
@@ -729,11 +922,36 @@ def k_mul(c, x, s, out=None):
     return out
 
 
+def k_ffn_out(c, m, w1, e, w2, w, x, s, wn):
+    """(ffn_out m w1 e w2 w x s wn): the end of a layer of the 26B.
+    f = rms_norm(m, w1) + rms_norm(e, w2); x = (x + rms_norm(f, w)) s in
+    place. Return rms_norm(x, wn), the input norm of the next layer, or x
+    when wn is None (the last layer). The records of the separate forms (a
+    GPU compiler emits GP_FFN_OUT)."""
+    f = k_add(c, k_rms_norm(c, m, w1), k_rms_norm(c, e, w2))
+    k_add(c, x, k_rms_norm(c, f, w), out=x)
+    k_mul(c, x, s, out=x)
+    return x if wn is None else k_rms_norm(c, x, wn)
+
+
 def k_copy(c, x, out=None):
     """(copy x): a copy of x. The global layers use the key as the value."""
     out = c.buffer(x.shape, x.dtype) if out is None else out
     c.p.emit(COPY, x, out, x.nbytes)
     return out
+
+
+def _q4x(c, w, s, t=1):
+    """The operands of an int4 matrix for a record of t rows (a step, or a
+    verify group of MTP): its KQ_Q4X copy and no scales (ops.q4x_pack_model)
+    on the CPU (the compiler has q4x; the GPU compilers and that of the parts
+    do not), else w and s. Each token of a group has the operations of a
+    step: the same bits."""
+    if getattr(c, "q4x", False):
+        q = ops._Q4X.get(w.ctypes.data)
+        if q is not None:
+            return q, None
+    return w, s
 
 
 def _mats(c, mats, t=1):
@@ -744,7 +962,7 @@ def _mats(c, mats, t=1):
         if m < len(mats) and mats[m] is not None:
             w, s = mats[m]
             o = c.buffer((t, w.shape[0]))
-            args += [w, s, o, w.shape[0]]
+            args += list(_q4x(c, w, s, t)) + [o, w.shape[0]]
             outs.append(o)
         else:
             args += [None, None, None, 0]
@@ -755,8 +973,14 @@ def k_int4_multi4(c, x, *mats):
     """(int4_multi4 x m ...): up to four int4 matrices on the row x in one
     kernel. One row uses ops.int4_multi4, and a group of rows uses
     ops.int4_multi4_mt. Return one (rows of x, rows of m) buffer for each
-    matrix."""
+    matrix. A matrix that is not an int4 pair (a K quant of a GGUF file of
+    the E2B or the E4B) makes each matrix one (linear m x)."""
     t = x.shape[0]
+    if any(m is not None and not isinstance(m, tuple) for m in mats):
+        # One quantization of x for the GGUF matrices of the group.
+        xq = k_kq_quant(c, x) if any(_is_kq(m) for m in mats if m is not None) else None
+        return tuple(None if m is None else k_kq(c, m, x, xq=xq) if _is_kq(m) else
+                     k_linear(c, m, x) for m in mats)
     args, outs = _mats(c, mats, t)
     if t == 1:
         c.p.emit(INT4_MULTI4, x, x.shape[1], *args)
@@ -770,7 +994,7 @@ def k_rms_norm_multi4(c, x, wn, *mats):
     matrices on the result. As ops.rms_norm_multi4. A group makes the norm
     and the matrices as two operations, as the group path of
     Model._decoder_layer does."""
-    if x.shape[0] > 1:
+    if x.shape[0] > 1 or any(_is_kq(m) for m in mats if m is not None):
         return k_int4_multi4(c, k_rms_norm(c, x, wn), *mats)
     args, outs = _mats(c, mats)
     scratch = c.buffer(x.shape[1])
@@ -783,7 +1007,9 @@ def k_gelu_mul_int4(c, g, u, mat, out=None):
     """(gelu_mul_int4 g u m): gelu(g) * u, then the int4 matrix m. As
     ops.gelu_mul_int4. A group uses ops.gelu_mul_rows and the group matrix
     kernel."""
-    if g.shape[0] > 1:
+    if g.shape[0] > 1 or _is_kq(mat):
+        # A GGUF product (_Q4KQ) also takes this form: the GPU makes the
+        # gate, the up matrix, and GELU_MUL_ROWS one kernel (k_kq_glu_i8).
         t, inner = g.shape
         h = c.buffer((t, inner))
         c.p.emit(GELU_MUL_ROWS, g, u, h, t, inner)
@@ -791,20 +1017,23 @@ def k_gelu_mul_int4(c, g, u, mat, out=None):
     w, s = mat
     rows, cols = w.shape[0], g.size
     out = c.buffer((1, rows)) if out is None else out
-    c.p.emit(GELU_MUL_INT4, g, u, g.size, c.buffer(g.size), w, s, out, rows, cols)
+    c.p.emit(GELU_MUL_INT4, g, u, g.size, c.buffer(g.size), *_q4x(c, w, s), out, rows, cols)
     return out
 
 
 def k_int4(c, mat, x, out=None):
     """(int4 m x): the int4 matrix m on the rows of x. As Model.linear for
-    one token, and as ops.linear_int4_mt for a group."""
+    one token, and as ops.linear_int4_mt for a group. A matrix of the GGUF
+    products (_Q4KQ) makes GP_KQ_LINEAR."""
+    if _is_kq(mat):
+        return k_kq(c, mat, x, out)
     w, s = mat
     t = x.shape[0]
     out = c.buffer((t, w.shape[0])) if out is None else out
     if t == 1:
-        c.p.emit(INT4_LINEAR, x, w, s, out, w.shape[0], x.shape[1])
+        c.p.emit(INT4_LINEAR, x, *_q4x(c, w, s), out, w.shape[0], x.shape[1])
     else:
-        c.p.emit(INT4_LINEAR_MT, x, w, s, out, w.shape[0], x.shape[1], t)
+        c.p.emit(INT4_LINEAR_MT, x, *_q4x(c, w, s, t), out, w.shape[0], x.shape[1], t)
     return out
 
 
@@ -833,29 +1062,66 @@ def k_kv_write(c, layer, k, v, row, qc=1):
     plan = c.cfg.plan[layer]
     per = plan.num_kv_heads * plan.head_dim
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
+    # qc 1: the int16 cache; qc 2: the int8 cache (1 byte for each value); qc
+    # 3: int16 keys and int8 values. KVCache has no float rows, so the record
+    # stores none (null addresses).
+    kesz = 1 if qc == 2 else 2
+    vesz = 1 if qc in (2, 3) else 2
     if qc:
         # An int16 row has 2 bytes for each value and 4 bytes for each scale.
-        q = [_addr(c, s("kq"), row, 2 * per), _addr(c, s("ks"), row, 4 * (per // 32)),
-             _addr(c, s("vq"), row, 2 * per), _addr(c, s("vs"), row, 4 * (per // 32))]
+        q = [_addr(c, s("kq"), row, kesz * per), _addr(c, s("ks"), row, 4 * (per // 32)),
+             _addr(c, s("vq"), row, vesz * per), _addr(c, s("vs"), row, 4 * (per // 32))]
     else:
         q = [0, 0, 0, 0]
     # The rows of a group are adjacent in the cache, so one copy stores them.
+    if qc:
+        c.p.emit({1: KV_WRITE, 2: KV_WRITE8, 3: KV_WRITEV8}[qc], k, v, 0, 0, *q, k.size)
+        return
     c.p.emit(KV_WRITE, k, v,
              _addr(c, s("k"), row, 4 * per), _addr(c, s("v"), row, 4 * per), *q, k.size)
 
 
-def k_attn_qc(c, layer, q, lo, n):
+def k_tq_rot(c, x, inverse):
+    """The rotation of each group of 32 values of x in place, or its inverse
+    (the rotated forms of the cache, model.kv_rot: rq8, k16vr8)."""
+    c.p.emit(TQ_ROT, x, x.size // 32, int(inverse))
+
+
+def kv_rot_forms():
+    """The forms of the rotations of a layer: after qkv_norm_rope (the query
+    and the keys for rotated keys, the values for rotated values), and after
+    the attention (its output back, for rotated values)."""
+    from .model import kv_rot
+    rk, rv = kv_rot()
+    before = ((("tq_rot", "q", 0), ("tq_rot", "k", 0)) if rk else ()) + \
+        ((("tq_rot", "v", 0),) if rv else ())
+    after = (("tq_rot", "a", 1),) if rv else ()
+    return before, after
+
+
+def k_attn_qc(c, layer, q, lo, n, q8=False, t=1, window=0):
     """(attn_qc layer q lo n): the fused attention of one float32 query over
-    n rows of the int16 cache, from buffer row lo. As Model._attend_one."""
+    n rows of the int16 cache, from buffer row lo. As Model._attend_one.
+    (attn_q8 layer q lo n): the same over the int8 cache (q8 True), and
+    (attn_qv layer q lo n) over int16 keys and int8 values (q8 "v"). t > 1:
+    t queries (rows of q), query j over n + j rows (operand 11; the GPU
+    kernel of a global layer of the 26B only, gpu.py attn_rows_small).
+    window > 0 (operand 12; the GPU kernel of a sliding layer of the 26B):
+    query j over the rows max(0, n + j - window) to n + j - 1 from lo, and
+    operand 13 the base of the layer (the position of row 0)."""
     plan = c.cfg.plan[layer]
     hd, qh, kvh = plan.head_dim, plan.num_q_heads, plan.num_kv_heads
     per = kvh * hd
+    kesz = 1 if q8 is True else 2
+    vesz = 1 if q8 else 2
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
-    out = c.buffer((1, qh * hd))
-    c.p.emit(ATTN_QC, q,
-             _addr(c, s("kq"), lo, 2 * per), _addr(c, s("ks"), lo, 4 * (per // 32)),
-             _addr(c, s("vq"), lo, 2 * per), _addr(c, s("vs"), lo, 4 * (per // 32)),
-             c.p.slot("scores"), out, qh, kvh, hd, n)
+    out = c.buffer((t, qh * hd))
+    op = ATTN_V8 if q8 == "v" else (ATTN_Q8 if q8 else ATTN_QC)
+    c.p.emit(op, q,
+             _addr(c, s("kq"), lo, kesz * per), _addr(c, s("ks"), lo, 4 * (per // 32)),
+             _addr(c, s("vq"), lo, vesz * per), _addr(c, s("vs"), lo, 4 * (per // 32)),
+             c.p.slot("scores"), out, qh, kvh, hd, n,
+             *((t, window, s("base")) if window else (t,) if t > 1 else ()))
     return out
 
 
@@ -888,10 +1154,15 @@ def k_attn_rows(c, layer, q, attn):
     s = lambda name: c.p.slot("%s.%d" % (name, layer))  # noqa: E731
     out = c.buffer((t, qh * hd))
     pos, base, window = c.p.slot("pos"), s("base"), plan.sliding_window or 0
-    if attn == "qc":
-        c.p.emit(ATTN_QC_MT, q, s("kq"), s("ks"), s("vq"), s("vs"), c.p.slot("scores"), out,
+    if attn in ("qc", "q8", "qv"):
+        # "lim" (a GPU group, compile_split_group): the last key of each query
+        # less pos, so that the tokens of an image see each other.
+        lim = c.env.get("lim")
+        op = {"q8": ATTN_Q8_MT, "qv": ATTN_V8_MT}.get(attn, ATTN_QC_MT)
+        c.p.emit(op, q, s("kq"), s("ks"), s("vq"),
+                 s("vs"), c.p.slot("scores"), out,
                  qh, kvh, hd, t, pos, base, window, np.zeros(t, np.int32),
-                 np.zeros(t, np.int32))
+                 np.zeros(t, np.int32), lim)
     else:
         c.p.emit(ATTN_F32_MT, q, s("k"), s("v"), c.p.slot("scores"), out, qh, kvh, hd, t,
                  pos, base, window)
@@ -934,6 +1205,35 @@ def k_moe(c, h, val, idx, layer):
     dn_q, dn_s = w["experts.down_proj"]
     inner = c.cfg.moe_intermediate_size
     out = c.buffer(h.shape)
+    q4x = ops._Q4X_MOE.get(gu_q.ctypes.data) if getattr(c, "q4x", False) else None
+    if q4x is not None:
+        # The experts in groups of 16 rows (KQ_Q4X, ops.q4x_pack_model), with
+        # float32 activations: the products of MOE (to 4e-6) in 81 per cent
+        # of the time over the 30 layers. Each token of a verify group has
+        # the operations of a step: the same bits.
+        E = gu_q.shape[0]
+        t, top_k = idx.reshape(h.shape[0], -1).shape
+        mats = ops.q4x_moe_mats(q4x)
+        c.p.keep.append(mats)
+        hidden = h.shape[1]
+        if ops.DECODE_X16:
+            # int16 rows of h and of the GELU (act bit 2), from the float rows h
+            c.p.emit(KQ_MOE, None, None, None, idx.reshape(t, top_k), val.reshape(t, top_k), t,
+                     top_k, E, mats, None, hidden, inner,
+                     cops.kq_moe_scratch(t, top_k, E, hidden, inner), out, None, 1 | 4, h)
+            return out
+        if ops.Q4X_INT8_DECODE:
+            # AVX2: int8 x (KQ_QUANT, then kq_moe with the GELU only)
+            hq, hs, hm = k_kq_quant(c, h.reshape(t, hidden))
+            c.p.emit(KQ_MOE, hq, hs, hm, idx.reshape(t, top_k), val.reshape(t, top_k), t,
+                     top_k, E, mats, None, hidden, inner,
+                     cops.kq_moe_scratch(t, top_k, E, hidden, inner), out, None, 1, None)
+            return out
+        c.p.emit(KQ_MOE, c.buffer((t, hidden), np.int8), c.buffer((t, hidden // 32)),
+                 c.buffer((t, hidden // 16)), idx.reshape(t, top_k), val.reshape(t, top_k), t,
+                 top_k, E, mats, None, hidden, inner,
+                 cops.kq_moe_scratch(t, top_k, E, hidden, inner), out, None, 3, h)
+        return out
     if h.shape[0] > 1:
         # The group path. The scratch holds the pairs and the jobs of the
         # sort in C, then the outputs of the two expert kernels.
@@ -983,8 +1283,52 @@ def k_linear(c, mat, x, out=None):
     as E4B.linear does for one token and for a group."""
     if isinstance(mat, tuple):
         return k_int4(c, mat, x, out)
+    if _is_kq(mat):
+        return k_kq(c, mat, x, out)
     out = c.buffer((x.shape[0], mat.shape[0])) if out is None else out
     c.p.emit(BF16_LINEAR, x, mat, out, mat.shape[0], x.shape[1], x.shape[0])
+    return out
+
+
+class _Q4KQ:
+    """A Q4_0 int4 matrix of a Model (the blocks of _load_layer) as a matrix
+    of the GGUF products (ggml type 2), for the GPU products with int8 x
+    (GP_KQ_LINEAR). The data is a view of the int4 blocks."""
+
+    def __init__(self, w):
+        self.data, self.type = w.reshape(-1), 2
+        self.rows, self.cols = int(w.shape[0]), int(w.shape[1]) * 32
+
+    def c(self):
+        return (self.data, self.type)
+
+
+# The dense matrices of a layer that a compiler with q4_kq gives as _Q4KQ.
+_Q4KQ_KEYS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+              "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+def _is_kq(mat):
+    """A matrix in the blocks of the GGUF products (E4B.kq)."""
+    return hasattr(mat, "c") and hasattr(mat, "rows") and hasattr(mat, "type")
+
+
+def k_kq_quant(c, x):
+    """The int8 rows of x for GP_KQ_LINEAR (a scale for each 32, a sum for
+    each 16). The GPU products read x itself, so a GPU drops the record."""
+    t, cols = x.shape
+    xq = (c.buffer((t, cols), np.int8), c.buffer((t, cols // 32)), c.buffer((t, cols // 16)))
+    c.p.emit(KQ_QUANT, x, t, cols, *xq)
+    return xq
+
+
+def k_kq(c, mat, x, out=None, xq=None):
+    """A GGUF matrix (E4B.kq) on the rows of x: GP_KQ_LINEAR."""
+    t = x.shape[0]
+    if xq is None:
+        xq = k_kq_quant(c, x)
+    out = c.buffer((t, mat.rows)) if out is None else out
+    c.p.emit(KQ_LINEAR, *xq, x, mat.data, mat.type, mat.rows, mat.cols, t, out)
     return out
 
 
@@ -1037,10 +1381,178 @@ def k_attn_e4b(c, layer, q):
     return out
 
 
+# ---- the media encoders (np_gemma/gemma4_encoders.py) ----
+
+def k_enc_linear(c, lin, x, out=None):
+    """(enc_linear lin x): a linear of an encoder (gemma4_encoders._Linear):
+    the clamps of its input, W (bfloat16 or float32), the bias, the clamps
+    of its output. The buffer "_scratch" of the compiler holds the clamped
+    input."""
+    n = x.shape[0]
+    k = x.size // n
+    m = lin.w.shape[0]
+    out = c.buffer((n, m)) if out is None else out
+    wbf = 1 if lin.w.dtype == np.uint16 else 0
+    inf = float("inf")
+    scratch = None
+    if lin.imin is not None:
+        scratch = c.env["_scratch"]
+        assert scratch.size >= n * k, "the scratch of enc_linear is too small"
+    q8 = getattr(lin, "q8", None) if getattr(c, "q8", False) else None
+    if q8 is not None:
+        return _k_enc_linear_q8(c, lin, q8, x, n, m, k, out)
+    x16 = None
+    if getattr(c, "pack", False) and os.environ.get("NP_GEMMA_ENC_X16", "1") != "0":
+        # A CPU program: W in groups of 16 rows (kq_x16f_body), made once.
+        x16 = getattr(lin, "x16", None)
+        if x16 is None:
+            x16 = lin.x16 = cops.kq_pack_x16f(lin.w, wbf, m, k)
+    c.p.emit(ENC_LINEAR, x, lin.w, wbf, lin.b, out, n, m, k,
+             -inf if lin.imin is None else float(lin.imin),
+             inf if lin.imax is None else float(lin.imax),
+             -inf if lin.omin is None else float(lin.omin),
+             inf if lin.omax is None else float(lin.omax), scratch, x16)
+    return out
+
+
+def _k_enc_linear_q8(c, lin, q8, x, n, m, k, out):
+    """enc_linear with Q8_0 weights (lin.q8, and lin.q8x16 for a CPU with
+    VNNI): the input clamps (ENC_CLAMP), then the int8 product of the GGUF
+    records (KQ_QUANT and KQ_LINEAR; the GPU quantizes x itself), then the
+    bias and the output clamps (ENC_BIAS_CLAMP). The int8 rows of x share
+    the buffers "_xq", "_xs", and "_xm" of the compiler."""
+    inf = float("inf")
+    xin = x
+    if lin.imin is not None:
+        # The whole scratch array, not a view: the mirror of a GPU program
+        # makes a device copy for each array of the program, so a view at
+        # the address of the scratch had a device copy of its own.
+        xin = c.env["_scratch"]
+        c.p.emit(ENC_CLAMP, x, xin, n * k, float(lin.imin), float(lin.imax))
+    pack = getattr(c, "pack", False)
+    mat = getattr(lin, "q8x16", None) if pack else None
+    mat = mat or q8
+    if pack:
+        xq = (c.env["_xq"], c.env["_xs"], c.env["_xm"])     # whole arrays, as the scratch
+        c.p.emit(KQ_QUANT, xin, n, k, *xq)
+    else:
+        xq = (None, None, None)
+    c.p.emit(KQ_LINEAR, *xq, xin, mat.data, mat.type, mat.rows, mat.cols, n, out)
+    if lin.b is not None or lin.omin is not None:
+        c.p.emit(ENC_BIAS_CLAMP, out, lin.b, n, m,
+                 -inf if lin.omin is None else float(lin.omin),
+                 inf if lin.omax is None else float(lin.omax))
+    return out
+
+
+def k_enc_rms(c, x, w, cols, out=None):
+    """(enc_rms x w cols): the RMS norm of each row of cols values (w None:
+    no weight)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_RMS, x, w, out, x.size // cols, cols, float(c.eps))
+    return out
+
+
+def k_enc_lnorm(c, x, w, b, cols, out=None):
+    """(enc_lnorm x w b cols): the LayerNorm of each row of cols values (w
+    and b may be None)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_LNORM, x, w, b, out, x.size // cols, cols, float(c.eps))
+    return out
+
+
+def k_enc_gelu(c, x, erf=False, out=None):
+    """(enc_gelu x [erf]): gelu(x), the tanh form or the erf form."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_GELU, x, out, x.size, 1 if erf else 0)
+    return out
+
+
+def k_enc_gelu_mul(c, g, u, out=None):
+    """(enc_gelu_mul g u): gelu_tanh(g) u."""
+    out = c.buffer(g.shape) if out is None else out
+    c.p.emit(ENC_GELU_MUL, g, u, out, g.size)
+    return out
+
+
+def k_enc_add(c, x, y, s=1.0):
+    """(enc_add x y [s]): x += s y in place. Return x."""
+    c.p.emit(ENC_ADD, x, y, x.size, float(s))
+    return x
+
+
+def k_enc_silu(c, x, out=None):
+    """(enc_silu x): x sigmoid(x)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_SILU, x, out, x.size)
+    return out
+
+
+def k_enc_mul_vec(c, x, vec, out=None):
+    """(enc_mul_vec x vec): each row of x times vec."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_MUL_VEC, x, vec, out, x.size // vec.size, vec.size)
+    return out
+
+
+def k_enc_glu(c, x, out=None):
+    """(enc_glu x): a sigmoid(b) of the halves a, b of each row."""
+    rows, cols = x.shape[0], x.size // x.shape[0] // 2
+    out = c.buffer((rows, cols)) if out is None else out
+    c.p.emit(ENC_GLU, x, out, rows, cols)
+    return out
+
+
+def k_enc_dwconv(c, x, w, out=None):
+    """(enc_dwconv x w): the causal depthwise conv of the rows of x with w
+    (channels, kernel)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_DWCONV, x, w, out, x.shape[0], w.shape[0], w.shape[1])
+    return out
+
+
+def k_enc_local_attn(c, q, k, v, r, valid, heads, hd, span, cap, out=None):
+    """(enc_local_attn q k v r valid heads hd span cap): the local attention
+    of gemma4a (Gemma4Audio._attention)."""
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_LOCAL_ATTN, q, k, v, r, valid, out, q.shape[0], heads, hd, span, float(cap))
+    return out
+
+
+def k_enc_rope2d(c, x, pos, inv, heads, hd):
+    """(enc_rope2d x pos inv heads hd): the axial 2D RoPE of gemma4v in
+    place. Return x."""
+    c.p.emit(ENC_ROPE2D, x, pos, inv, x.shape[0], heads, hd)
+    return x
+
+
+def k_enc_attn(c, q, k, v, heads, hd, out=None):
+    """(enc_attn q k v heads hd): the attention of every query over every
+    key, scale 1."""
+    n = q.shape[0]
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN, q, k, v, out, n, heads, hd, np.full(n, n - 1, np.int32))
+    return out
+
+
 KERNELS = {
+    "enc_linear": k_enc_linear,
+    "enc_rms": k_enc_rms,
+    "enc_gelu_mul": k_enc_gelu_mul,
+    "enc_lnorm": k_enc_lnorm,
+    "enc_gelu": k_enc_gelu,
+    "enc_add": k_enc_add,
+    "enc_rope2d": k_enc_rope2d,
+    "enc_attn": k_enc_attn,
+    "enc_silu": k_enc_silu,
+    "enc_mul_vec": k_enc_mul_vec,
+    "enc_glu": k_enc_glu,
+    "enc_dwconv": k_enc_dwconv,
+    "enc_local_attn": k_enc_local_attn,
     "rms_norm": k_rms_norm,
     "add": k_add,
     "mul": k_mul,
+    "ffn_out": k_ffn_out,
     "copy": k_copy,
     "int4_multi4": k_int4_multi4,
     "rms_norm_multi4": k_rms_norm_multi4,
@@ -1048,11 +1560,16 @@ KERNELS = {
     "int4": k_int4,
     "qkv_norm_rope": k_qkv_norm_rope,
     "kv_write": k_kv_write,
+    "tq_rot": lambda c, x, inverse: k_tq_rot(c, x, inverse),
     "attn_qc": k_attn_qc,
     "attn_f32": k_attn_f32,
     # The mode is part of the name. A bare string operand is a name for the
     # compiler, so the form cannot give the mode as an operand.
     "attn_rows_qc": lambda c, layer, q: k_attn_rows(c, layer, q, "qc"),
+    "attn_q8": lambda c, layer, q, lo, n: k_attn_qc(c, layer, q, lo, n, q8=True),
+    "attn_rows_q8": lambda c, layer, q: k_attn_rows(c, layer, q, "q8"),
+    "attn_qv": lambda c, layer, q, lo, n: k_attn_qc(c, layer, q, lo, n, q8="v"),
+    "attn_rows_qv": lambda c, layer, q: k_attn_rows(c, layer, q, "qv"),
     "attn_rows_f32": lambda c, layer, q: k_attn_rows(c, layer, q, "f32"),
     "router": k_router,
     "gelu": k_gelu,
@@ -1073,7 +1590,7 @@ KERNELS = {
 
 # ---- the forms of the 26B model -------------------------------------------------
 
-def layer_form(model, i, attn="qc", t=1):
+def layer_form(model, i, attn="qc", t=1, fused=False):
     """Return one decoder layer as a nested expression.
 
     The expression follows Model._decoder_layer and Model._attention for t
@@ -1084,6 +1601,14 @@ def layer_form(model, i, attn="qc", t=1):
     changes it in place. A model with the
     mixture-of-experts block (the 26B) adds the router and the experts; the
     dense model (the 12B) does not.
+
+    fused (a model with experts) gives the forms add_norm2 and ffn_out: the
+    norms, the adds, and the scale of the end of the attention and of the
+    end of the layer in fewer operations. The layer then takes the input
+    norm h from the layer before (the name hn), which ffn_out makes. A
+    compiler that keeps the buffers of a layer for the next one (the step of
+    the GPU) uses it; the kernels of the CPU give the same bits in both
+    forms.
     """
     cfg = model.cfg
     plan = cfg.plan[i]
@@ -1104,7 +1629,8 @@ def layer_form(model, i, attn="qc", t=1):
         lo = ("max", 0, ("-", "pos", plan.sliding_window - 1, base))
     else:
         lo = 0
-    qc = 1 if attn == "qc" else 0
+    qc = {"qc": 1, "q8": 2, "qv": 3}.get(attn, 0)
+    rot_before, rot_after = kv_rot_forms()
     if t == 1:
         attn_forms = (("let", "lo", lo),
                       ("let", "n", ("-", ("+", "pos", 1), base, "lo")),
@@ -1124,29 +1650,84 @@ def layer_form(model, i, attn="qc", t=1):
     else:
         experts = ()
         ffn = (("let", "f", "m"),)
+    if fused and not cfg.enable_moe_block:
+        return _dense_fused_layer(model, i, qkv, attn_forms, base, qc)
+    fused = fused and cfg.enable_moe_block
+    if fused:
+        experts = (("let", ("val", "idx"), ("router", "x", i)),
+                   ("let", "e", ("moe", "hm", "val", "idx", i)))
+        wn = ("w", i + 1, "input_layernorm") if i + 1 < cfg.num_hidden_layers else None
     return ("layer", i,
-            ("let", "h", ("rms_norm", "x", w("input_layernorm"))),
+            ("let", "h", "hn" if fused and i > 0 else ("rms_norm", "x", w("input_layernorm"))),
             *qkv,
             ("qkv_norm_rope", "q", "k", "v", w("self_attn.q_norm"), w("self_attn.k_norm"),
              "cos." + kind, "sin." + kind, i),
+            *rot_before,
             ("let", "row", ("-", "pos", base)),
             ("kv_write", i, "k", "v", "row", qc),
             *attn_forms,
+            *rot_after,
             ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
-            ("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),
+            *((("let", "hm", ("add_norm2", "x", "o", w("post_attention_layernorm"),
+                              w("pre_feedforward_layernorm_2"))),) if fused else
+              (("set", "x", ("add", "x", ("rms_norm", "o", w("post_attention_layernorm")))),)),
             *experts,
             ("let", ("g", "u"), ("rms_norm_multi4", "x", w("pre_feedforward_layernorm"),
                                  w("mlp.gate_proj"), w("mlp.up_proj"))),
             ("let", "m", ("gelu_mul_int4", "g", "u", w("mlp.down_proj"))),
-            *ffn,
-            ("set", "x", ("add", "x", ("rms_norm", "f", w("post_feedforward_layernorm")))),
-            ("set", "x", ("mul", "x", w("layer_scalar"))))
+            *((("let", "hn", ("ffn_out", "m", w("post_feedforward_layernorm_1"), "e",
+                              w("post_feedforward_layernorm_2"),
+                              w("post_feedforward_layernorm"), "x", w("layer_scalar"), wn)),)
+              if fused else
+              (*ffn,
+               ("set", "x", ("add", "x", ("rms_norm", "f", w("post_feedforward_layernorm")))),
+               ("set", "x", ("mul", "x", w("layer_scalar"))))))
 
 
-def step_form(model, attn="qc", t=1):
+def _dense_fused_layer(model, i, qkv, attn_forms, base, qc):
+    """A layer of a dense model (the 12B) in the fused form of a GPU step: two
+    add_norm2 (as the E4B). After the attention, x += rms_norm(o) and the
+    input norm of the feed-forward part come from one kernel. At the end,
+    x = (x + rms_norm(m)) layer_scalar and the input norm of the next layer
+    (hn), or the final norm (xn) after the last layer, come from one more.
+    The values are those of the separate forms; the norms, the adds, and the
+    quantization of x for the next products (qx_fuse) are fewer kernels."""
+    cfg = model.cfg
+    plan = cfg.plan[i]
+    kind = "s" if plan.is_sliding else "f"
+
+    def w(name):
+        return ("w", i, name)
+
+    last = i == cfg.num_hidden_layers - 1
+    wn = ("w", None, "norm") if last else ("w", i + 1, "input_layernorm")
+    rot_before, rot_after = kv_rot_forms()
+    return ("layer", i,
+            ("let", "h", "hn" if i > 0 else ("rms_norm", "x", w("input_layernorm"))),
+            *qkv,
+            ("qkv_norm_rope", "q", "k", "v", w("self_attn.q_norm"), w("self_attn.k_norm"),
+             "cos." + kind, "sin." + kind, i),
+            *rot_before,
+            ("let", "row", ("-", "pos", base)),
+            ("kv_write", i, "k", "v", "row", qc),
+            *attn_forms,
+            *rot_after,
+            ("let", "o", ("int4", w("self_attn.o_proj"), "a")),
+            ("let", "hm", ("add_norm2", "x", "o", w("post_attention_layernorm"),
+                           w("pre_feedforward_layernorm"))),
+            ("let", ("g", "u"), ("int4_multi4", "hm", w("mlp.gate_proj"), w("mlp.up_proj"))),
+            ("let", "m", ("gelu_mul_int4", "g", "u", w("mlp.down_proj"))),
+            ("let", "xn" if last else "hn",
+             ("add_norm2", "x", "m", w("post_feedforward_layernorm"), wn, w("layer_scalar"))))
+
+
+def step_form(model, attn="qc", t=1, fused=False):
     """Return a whole decode step of t tokens: every layer, then the final
-    norm into xn."""
-    layers = [layer_form(model, i, attn, t) for i in range(model.cfg.num_hidden_layers)]
+    norm into xn. fused: see layer_form. A dense model in the fused form
+    makes xn in its last layer."""
+    layers = [layer_form(model, i, attn, t, fused) for i in range(model.cfg.num_hidden_layers)]
+    if fused and not model.cfg.enable_moe_block:
+        return ("seq", *layers)
     return ("seq", *layers, ("let", "xn", ("rms_norm", "x", ("w", None, "norm"))))
 
 
@@ -1215,11 +1796,9 @@ def ready(model, cache):
     tokens. Before that, the Python path runs the step, because the step
     that turns the int16 copy on also quantizes the old rows.
     """
-    if ops.attn_ready():
-        if all(cache.qc_ready(i) for i in range(model.cfg.num_hidden_layers)):
-            return "qc"
-        return None
-    return "f32"
+    # The cache keeps only quantized rows (KVCache), so a program reads them
+    # also with NP_GEMMA_ATTN=0.
+    return {"int8": "q8", "k16v8": "qv"}.get(getattr(cache, "kv", "int16"), "qc")
 
 
 def decode_step(model, cache, tokens, pos):
@@ -1232,7 +1811,11 @@ def decode_step(model, cache, tokens, pos):
     tokens = [int(x) for x in tokens]
     attn = ready(model, cache)
     n_parts = int(os.environ.get("NP_GEMMA_PARTS", "1"))
+    if getattr(cache, "split", False) and (n_parts < 2 or len(tokens) != 1):
+        raise ValueError("a PartKVCache needs a step of one token in parts")
     if n_parts > 1 and len(tokens) == 1:
+        if attn in ("q8", "qv"):
+            raise ValueError("NP_GEMMA_PARTS needs the int16 cache, not NP_GEMMA_KV_INT8")
         from . import parts
         return parts.decode_step(model, cache, tokens, pos, attn, n_parts)
     progs = model.__dict__.setdefault("_programs", {})
@@ -1263,14 +1846,13 @@ def step_params(prog, model, cache, pos):
     the program as a dict. See bind_step."""
     kw = {"pos": pos}
     keep = []
-    qc = getattr(prog, "attn", "qc") == "qc"
+    qc = getattr(prog, "attn", "qc") in ("qc", "q8", "qv")
     t = getattr(prog, "tokens", 1)
     for i in prog.layers:
         assert not qc or cache.qc_ready(i), "the program needs the int16 cache"
         cache.prepare(i, pos, t)
         cache.end[i] = pos + t
-        kw.update({"base.%d" % i: cache.base[i], "k.%d" % i: cache.k[i],
-                   "v.%d" % i: cache.v[i]})
+        kw["base.%d" % i] = cache.base[i]
         if qc:
             kw.update({"kq.%d" % i: cache.kq[i], "ks.%d" % i: cache.ks[i],
                        "vq.%d" % i: cache.vq[i], "vs.%d" % i: cache.vs[i]})
@@ -1396,12 +1978,14 @@ def e4b_step_form(model, fused=False):
               (("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))),)))
 
 
-def compile_e4b_step(model, t=1, fused=False):
+def compile_e4b_step(model, t=1, fused=False, q4_kq=False):
     """Compile a whole E4B step of t tokens. "x" and "tok" are the inputs;
     "xn" is the hidden state after the final norm. fused selects the fused
-    operations of e4b_layer_form (the GPU)."""
+    operations of e4b_layer_form (the GPU). q4_kq takes the Q4_0 matrices as
+    GGUF products (the GPU, Compiler "m")."""
     cfg = model.cfg
     c = Compiler(model)
+    c.q4_kq = q4_kq
     c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
@@ -1427,9 +2011,11 @@ def e4b_bind_step(prog, model, cache, pos):
     prog.bind(**e4b_step_params(prog, model, cache, pos))
 
 
-def e4b_step_params(prog, model, cache, pos):
+def e4b_step_params(prog, model, cache, pos, rope=None):
     """Prepare the E4B cache for the tokens of a step. Return the parameters
-    of the program as a dict."""
+    of the program as a dict. rope(kind, pos, t), if given, returns the
+    addresses of the cosine and the sine rows of the positions (tables on
+    the GPU, E4BGPU); else the dict holds the tables."""
     t = prog.tokens
     cache._reserve(pos + t)
     kw = {"pos": pos}
@@ -1437,10 +2023,14 @@ def e4b_step_params(prog, model, cache, pos):
         if plan.shared:
             continue
         k, v = cache.kv[i]
-        kw.update({"k.%d" % i: k, "v.%d" % i: v, "hs.%d" % i: k.shape[1] * k.shape[2]})
+        # position-major (positions, kv heads, head_dim): a head stride of head_dim
+        kw.update({"k.%d" % i: k, "v.%d" % i: v, "hs.%d" % i: k.shape[2]})
     cache.n = max(cache.n, pos + t)
     keep = []
     for kind, sliding in (("s", True), ("f", False)):
+        if rope is not None:
+            kw["cos." + kind], kw["sin." + kind] = rope(kind, pos, t)
+            continue
         plan = next(p for p in model.cfg.plan if p.is_sliding == sliding)
         cos, sin = model.rope_tables(plan, pos, t)
         cos = np.ascontiguousarray(cos, dtype=np.float32)

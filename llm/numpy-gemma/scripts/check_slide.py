@@ -28,7 +28,7 @@ from np_gemma.chat import render_chat
 from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 NTOK = 8
 
 

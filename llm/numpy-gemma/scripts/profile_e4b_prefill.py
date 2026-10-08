@@ -18,7 +18,7 @@ Run it with the thread settings of the model:
 
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=18 OMP_WAIT_POLICY=ACTIVE \
         PYTHONPATH=. $PY scripts/profile_e4b_prefill.py \
-        --gguf ~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf
+        --gguf models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf
 """
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from collections import defaultdict
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+GGUF_PATH = "models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
 
 from np_gemma import cops, ops  # noqa: E402
 from np_gemma import rope as rope_mod  # noqa: E402
@@ -65,7 +67,7 @@ def build(tokens):
     from np_gemma.e4b import E4B, E4BConfig
     from np_gemma.gguf import GGUF
 
-    g = GGUF(os.path.expanduser("~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf"))
+    g = GGUF(GGUF_PATH)
     cfg = E4BConfig({"text_config": g.text_config()})
     model = E4B(g, cfg, mode="int4")
     ids = (PROMPT * (tokens // len(PROMPT) + 1))[:tokens]
@@ -86,7 +88,7 @@ def time_pass(model, cfg, ids, reps):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", default="~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf")
+    ap.add_argument("--gguf", default=GGUF_PATH)
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--steps", type=int, default=3)

@@ -351,15 +351,456 @@ The limit raises the acceptance, but it gives no gain over two drafts
 without the limit. Prose still loses a little (0.94 times). The limit stays
 off, and two drafts stay the default.
 
+### The unsloth E4B file against llama.cpp
+
+The target is gemma-4-E4B-it UD-Q4_K_XL (unsloth). The drafter is
+gemma-4-E4B-it-assistant: the snapshot for numpy-gemma, and the bf16 GGUF
+file of models/assistants for llama.cpp. The four prompts of check_mtp.py
+and bench_mtp_llamacpp.py, 200 tokens, greedy. Tokens/s of the decode:
+
+    runtime                 plain   n=2            n=3
+    numpy-gemma CPU         15.12   20.68 (1.37)   22.49 (1.49)
+    llama.cpp CPU           13.44   19.72 (1.47)   22.50 (1.67)
+    numpy-gemma GPU         66.19   76.47 (1.16)   73.32 (1.11)
+    llama.cpp GPU           89.90   150.83 (1.68)  150.39 (1.67)
+
+The CPU runs use 18 threads (OMP_WAIT_POLICY=ACTIVE for numpy-gemma, the
+build-vnni binary for llama.cpp). The GPU runs use the RTX 5060 Ti, with
+the drafter on the GPU (check_mtp.py --gpu-drafter) and llama.cpp
+build-cuda with -ngl 99. The GPU also runs the display, so the GPU rates
+of numpy-gemma change by about 10 per cent from run to run. Another run
+gave 68.16 plain and 85.24 with two drafts (1.25).
+
+numpy-gemma gives the token ids of the plain decode on each prompt. This
+is true on the CPU and on the GPU. llama.cpp changed the text of the prose prompt on the
+CPU.
+
+On the CPU, MTP of numpy-gemma is as fast as that of llama.cpp. On the GPU,
+llama.cpp is 1.8 to 2 times faster. A verify group of 3 tokens of
+llama.cpp costs about one decode step. Here it costs about 1.4 steps, and
+a round also reads the logits of 3 rows (3.7 ms) and runs 2 draft steps
+(1.3 ms).
+
+The changes for the GPU:
+
+- A verify group of the E4B (MT_CPU tokens or less) has the form of the
+  decode step (fused 2, no reuse of the buffers). Before, it used the form
+  of the prompt, so its values were not those of the steps. Two prompts
+  then gave other tokens, and all drafts failed with the drafter of the
+  CPU, which reads a host cache that is not current.
+- k_mt_gemv_bf16 adds the terms of k_bf16_linear, so each token of a group
+  gets the bits of a step.
+- kq_rows_i8 does the int8 products of up to 4 tokens and unpacks each
+  weight word one time. Each token adds its terms in the order of one
+  token. A step uses the kernel of one token (58 registers). A group uses
+  one kernel for the counts 1 to 4. A kernel for each count, or a count
+  known only at run time, was 1.5 to 2.5 times slower.
+
+A group of 4 tokens (3 drafts) is still twice the time of a group of 3.
+Thus two drafts are the best on the GPU.
+
+### Why the GPU was behind, and the fixes
+
+An nsys profile of an MTP round (2 drafts) gave 25.8 ms: 21.5 ms of
+kernels and 4.1 ms with no work on the GPU. llama.cpp takes about 15 ms
+for a round. The causes and the fixes:
+
+1. The one-token products had few loads in flight. A lane read 4 bytes of
+   a superblock. Thus a warp had 128 bytes in flight, and it did the
+   scales of each block again for each 8 values. The kernel of 3 tokens
+   uses 96 to 108 registers, so fewer warps fit on an SM. A group of 3 took
+   1.5 to 2 times a step.
+
+   Now a lane reads 16 bytes of Q4_K and Q5_K (32 values). Q6_K (32 values) and Q8_0 (16 values) use 2-byte loads. The
+   test reads 8 matrices, more than the L2 of 32 MB. A Q4_K gate matrix
+   went from 0.051 to 0.046 ms for one token, and from 0.077 to 0.050 ms
+   for 3.
+2. The gate, the up matrix, and the GELU are one kernel (k_kq_glu_i8). The
+   lanes 0 to 15 of a warp take a row of the gate. The lanes 16 to 31 take
+   the same row of the up matrix. The two halves read the same x. A step
+   went from about 12.1 to 11.2 ms.
+
+   Against the f32 model on 255 steps of
+   the chat text, the KL (top 64) is 1.07e-3 with the kernel and 9.2e-4
+   without it. The two forms differ from each other by 8.9e-4. That is the
+   size of any change of the order of the float sums.
+3. The logits of 3 rows (3 MB) went to the host. The host applied the soft
+   cap and picked the tokens (1.7 ms). Now the GPU applies the soft cap
+   (GP_SOFTCAP) and finds the best token of each row (GP_ARGMAX). With a
+   greedy pick, mtp_stream copies only the tokens (E4B.argmax_rows). The
+   plain decode also takes the soft cap of the GPU. Thus the two decodes
+   pick from the same values.
+4. The host made the rows of the token tables with NumPy. That took 4
+   calls a round, 0.3 ms each. gemma_kq45_rows does it in C, with
+   the same bits.
+5. The rope tables of all the positions are on the GPU (E4BGPU._rope). A
+   step binds the address of its row and copies no table.
+
+llama.cpp, with the same nsys profile, takes about the same kernel time
+for a step. Its gate and up take 3.56 ms, o and down 3.07 ms, and the head
+1.18 ms. The first MTP decode of a process compiles the programs of the
+verify groups. It also records their graphs, and its scratch buffers
+grow. Thus check_mtp.py now runs each form once before it measures.
+
+The same four prompts, warm:
+
+    runtime            plain   n=2             n=3
+    numpy-gemma GPU    88.09   149.16 (1.69)   146.97 (1.67)
+    llama.cpp GPU      89.90   150.83 (1.68)   150.39 (1.67)
+
+Two drafts, for each prompt (numpy-gemma, llama.cpp): code 152.9 and
+154.5, prose 130.4 and 137.1, list 152.1 and 146.9, math 165.8 and 168.3.
+
+### The 26B verify group on the CPU
+
+MTP of the 26B on the CPU gave only 1.05 times the plain decode (20.2 tok/s
+plain), and llama.cpp gave 1.29. The drafts were accepted as often (76%).
+A group of 3 tokens cost about 2 steps:
+
+    part                     1 token   3 tokens   3 tokens now
+    experts (KQ_MOE)         13.9 ms   32.5 ms    25.5 ms
+    int4 products (dense)    14.3 ms   35.1 ms    18.1 ms
+    output head (Q6_K)       12.5 ms   27.5 ms    16.7 ms
+
+- kq_q4x_rows_f (the KQ_Q4X copies, float32 x) decoded the 16 rows of a
+  group again for each token. Now it decodes each step one time for up to
+  4 tokens.
+- The sums of each token were arrays with a count known only at run time,
+  so they stayed in memory. A copy of the kernel for each count (1 to 4,
+  and 1 to 8 for the Q6_K head) keeps them in registers.
+
+Each token adds its terms in the order of one token, so a group still
+gives the bits of the steps (check_mt.py). A group of 3 now costs about
+1.5 steps. The four prompts of check_mtp.py (the CPU at 50% of its clock):
+
+    runtime               plain   n=2            n=3
+    numpy-gemma CPU       20.03   28.37 (1.42)   28.81 (1.44)
+    llama.cpp CPU         17.89   23.07 (1.29)   24.60 (1.38)
+
+### The QAT file of the E4B on the GPU
+
+The target is the QAT file of Unsloth (gemma-4-E4B-it-qat-UD-Q4_K_XL, all
+Q4_0). The drafter is google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant.
+MTP works on the GPU and gives the token ids of the plain decode. The four
+prompts of check_mtp.py with --gpu-drafter, 200 tokens:
+
+    n    plain    MTP      gain   accepted
+    1    106.07   139.98   1.32   74%
+    2    106.07   134.83   1.27   64%
+    3    106.07   119.59   1.13   53%
+
+On the CPU (18 threads, the drafter in int4 on the CPU), the same prompts
+gave these values:
+
+    n    plain    MTP      gain   accepted
+    2    17.37    28.71    1.65   62%
+    3    17.37    27.80    1.60   51%
+
+llama.cpp (bench_mtp_llamacpp.py, -ngl 99 -fa off) with the drafter of
+Unsloth (mtp-gemma-4-E4B-it.gguf, Q4_0) gave these values:
+
+    n    plain    MTP      gain   accepted
+    1    100.09   149.16   1.49   74%
+    2    100.09   172.23   1.72   65%
+    3    100.09   178.05   1.78   55%
+
+The BF16 drafter of Unsloth gave 143.8, 164.9, and 165.4. The two runtimes
+accept the same share of the drafts. Thus the difference is the cost of a
+verify group:
+
+    tokens   1         2          3          4
+    time     9.25 ms   12.12 ms   16.23 ms   20.29 ms
+
+A group of 3 costs 1.75 steps. With the UD file of the E4B (K quants), a
+group of 3 cost about one step (see above). The K quants use int8 x and
+dp4a (kq_rows_i8). The Q4_0 matrices use float32 x. An nsys profile of a
+group of 3 gave 11.5 ms of int4 products, against 6.7 ms for one token.
+
+A test of the kernels (10240 x 2560, Q4_0, 14.7 MB) showed the cause. Each
+weight reads 4 bytes of x for each token from L1, 21 times the bytes of the
+weights for 3 tokens. Each token added about 13 us:
+
+    kernel                       1 token   3 tokens   4 tokens
+    read the weights only        41 us
+    float32 x (now)              51 us     78 us      90 us
+    x in shared memory           48 us     90 us
+    2 or 4 rows for each warp    47 us     67 us      64 us
+    int8 x and dp4a              48 us     53 us      56 us
+
+Changes:
+
+- k_mt_int4_rows replaces k_mt_gemv_n for a group of 1 to 4 tokens. It uses
+  the lanes and the order of the terms of a decode step (int4_part, then
+  the scale of the block). The old kernel multiplied each weight by the
+  scale first. Now check_mt.py --e4b on the GPU gives the same bits for a
+  group and for the steps. Before, it gave a difference of 1e-5. Thus a
+  verify group can change a token with the old kernel (k_mt_gemv_n,
+  NP_GEMMA_GPU_MT_ROWS=0).
+- int4_part makes the float of a nibble with two operations: the bits of
+  2^23 + nibble, minus 2^23 + 8. The value is the same.
+- ops.quantize_int4 finds the grid of a QAT block (the scale with the least
+  error of three). Before, the int4 weights of the drafter (and of any QAT
+  safetensors) had 5 to 8 per cent of error. Now they have 0.18 per cent,
+  as the Q4_0 drafter of Unsloth. gpu.quantize_q4_0 (the GPU drafter) uses
+  it too. The share of accepted drafts did not change (74%, 64%, 53%
+  before; 74%, 64%, 53% after).
+
+The 26B on the GPU does not give the same bits for a group and for the
+steps (check_mt.py: 5e-4 to 1.6e-3). That was so before these changes.
+
+### Int8 x for the Q4_0 matrices of the E4B and the E2B
+
+The GPU products of the K quants (GP_KQ_LINEAR, kq_rows_i8) now take Q4_0
+too (KQ_Q4_0). A lane takes 16 values of a block, from the low or the high
+4 bits of its 16 bytes. The first dp4a gives the sum of q x. The second
+dp4a gives the sum of x. The result is the sum of (q - 8) x.
+
+E4B.kq_q4 gives the Q4_0 matrices to these products. The GPU step and the verify
+groups use them. A prompt pass keeps the int4 records. NP_GEMMA_GPU_Q4_I8=0
+keeps float32 x. The data is a view of the int4 blocks, so the GPU holds
+one copy.
+
+Three kernels (k_kq_linear_i8, k_kq_multi_i8, k_kq_glu_i8) have a form with
+a fixed type (FT = KQ_Q4_0). The general form took 92 to 110 registers,
+and the step took 9.98 ms. The fixed form takes 40 to 48 registers. The
+step then takes 9.49 ms, and 9.25 ms with float32 x. Also, check_mt.py
+--e4b gives the same bits for a group and for the steps.
+
+The time of a verify group of the E4B:
+
+    tokens          1         2          3          4
+    float32 x       9.25 ms   12.12 ms   16.23 ms   20.29 ms
+    int8 x          9.49 ms   10.79 ms   13.10 ms   13.85 ms
+
+The four prompts of check_mtp.py with --gpu-drafter (E4B):
+
+    n    plain    MTP      gain   accepted   llama.cpp
+    1    105.65   154.64   1.46   75%        149.16
+    2    105.65   167.59   1.59   65%        172.23
+    3    105.65   177.84   1.68   54%        178.05
+
+Each prompt gives the token ids of the plain decode. The E2B with its QAT
+drafter (google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant):
+
+    x         plain    n=1      n=2      n=3
+    int8      165.70   221.21   222.70   221.50
+    float32   179.57   206.37   187.23   175.17
+
+The plain decode of the E2B is 8% slower with int8 x. Its matrices are
+small, so the quantization of x is a larger part of a step. MTP is faster
+with int8 x, and MTP is on by default for these models.
+
+The KL (top 64) against the float32 release, the three chat prompts:
+
+    model   float32 x                int8 x
+    E4B     0.00002, 363/364         0.0005, 363/364
+    E2B     0.00003, 363/364         0.0005, 360/364
+
+These values stay far below those of the Q4_0 files of Google (0.020 and
+0.025).
+
+### Drafts with sampling
+
+The drafter gives one token x, its best token. The target samples its token
+y, and x stays when y is x. Thus x stays with the probability p(x), and a
+rejected row emits y from p without x. That is the rule min(1, p/q) of
+speculative sampling for a drafter with one token, so the text follows p.
+
+A test measured the first draft of each row of sampled text. It used the
+E4B on the CPU, 4 prompts, and 400 rows for each setting:
+
+    settings                  current   sampled draft   in the set
+    T 1.0, top_k 64, p 0.95   61.0%     63.5%           83.2%
+    T 0.7, p 0.95             71.6%     73.1%           86.8%
+    T 1.0                     59.5%     63.5%           100%
+
+"sampled draft" samples x from the drafter (q) and keeps it with min(1,
+p/q). It keeps the distribution, but it gains only 1.5 to 4 points. "in the
+set" keeps x when the settings allow it. With the temperature alone, all the
+tokens are allowed, so every draft stays.
+
+The Sampler now has the option mtp_accept "in_set" (opt-in) and mtp_floor.
+A draft also stays when the settings allow it and its probability is at
+least mtp_floor times the best probability (Sampler.draft_ok). Without top_k,
+top_p, min_p, or mtp_floor, the rule is "exact". The server takes
+--mtp-accept and --mtp-floor, and a request can give "mtp_accept" and
+"mtp_floor".
+
+The test used the E4B and the drafter on the GPU, with T 1.0, top_k 64, and
+top_p 0.95. It ran 4 prompts and 4 seeds, 200 tokens each. The drift compares each emitted
+token with the distribution of its own row. "best" is the share of the best
+token less its expected share. "logP" is the mean log probability less its
+expected value. The noise is about 1.5% and 0.02:
+
+    rule          n=2 tok/s   n=3 tok/s   kept (n=2)   best    logP
+    exact         121.29      127.87      55%          -1.3%   -0.019
+    in_set        136.43      148.16      77%          -4.1%   -0.094
+    in_set 0.5                            65%          +2.1%   +0.053
+    in_set 0.3    128.03      136.31      68%          +1.0%   +0.038
+    in_set 0.1    129.87      144.69      71%          -1.9%   -0.013
+
+Without a floor, the text takes tokens with a low probability too often.
+The top_p set holds tokens of a few per cent, and a draft of such a token
+stays. A floor of 0.3 or 0.5 moves the text toward the best token. A floor
+of 0.1 shows no drift above the noise, and it keeps most of the gain: 1.13
+times the speed of "exact" with 3 drafts.
+
+The cost of sampling was then on the host. A verify group copied the logits
+of each row (1 MB), and a pick took 1.6 ms. The GPU now gives the
+candidates of each row (gg_topk, see README.md, "Sampling"). With 3 drafts,
+"exact" went from 127.4 to 174.2 tok/s (greedy: 175.8), and in_set with a
+floor of 0.1 from 142.8 to 214.6.
+
+The quality of in_set with a floor of 0.1. The tests used the E4B on the
+GPU, 3 drafts, T 1.0, top_k 64, and top_p 0.95:
+
+- GSM8K, the first 200 problems of the test split, at most 512 tokens:
+
+      rule          accuracy   finished   tok/s   tokens
+      greedy        67.5%      133        220.7   411
+      exact         68.0%      140        229.4   397
+      in_set 0.1    74.0%      151        259.1   378
+
+  Many answers did not finish in 512 tokens. All three rules finished 116
+  problems, and on those the accuracy was 98.3%, 97.4%, and 99.1%. Thus the
+  rule does not change the answers. Its answers are shorter, so more of them
+  finish. A kept draft moved 0.083 of the mass to the draft on average (the
+  median was 0).
+- Open text (4 prompts, 8 seeds, 300 tokens): the answers are less varied.
+  The test used the answer parts (after <channel|> when the model writes a
+  draft first). Their distinct-2 across the seeds was 0.815 for "exact" and
+  0.743 for in_set. "exact" at lower temperatures gave these values:
+
+      T                1.0     0.9     0.8     0.7
+      distinct-2       0.815   0.782   0.736   0.706
+      distinct-3       0.894   0.865   0.831   0.800
+
+  in_set (distinct-3 0.835) is thus like a temperature of about 0.8. A kept
+  draft moved 0.203 of the mass. The texts had no loops. The repeated
+  4-grams (0.021, against 0.002) come from texts in which the model writes a
+  draft and then copies it after <channel|> word for word. With "exact"
+  the copy changes some words.
+- Speed with 3 drafts: "exact" at T 1.0 gave 166.4 tok/s, "exact" at T 0.8
+  gave 171.6, and in_set 0.1 at T 1.0 gave 208.9.
+
+Thus in_set 0.1 suits tasks with one right answer (math, code, tools). For
+open text it acts as a lower temperature, so "exact" stays the default.
+
+### The 26B on the GPU with the QAT file
+
+The target is the QAT file of Unsloth (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL),
+with the hot experts on the GPU (the default budget). The drafter is
+google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant on the GPU. Four
+prompts, 200 tokens. MTP gained little, although the drafter is good:
+
+    mode            plain   n=1     n=2     n=3     accepted
+    greedy          94.0    101.2   103.0   100.8   80/70/62%
+    sample exact    88.8    100.9   105.6   106.7   81/70/63%
+    in_set 0.1              104.3   112.6   118.5   85/78/74%
+
+A verify group of 2, 3, and 4 tokens took 14.25, 18.37, and 22.36 ms, and a
+step 9.59 ms. An nsys profile of a group of 3 tokens gave three large parts:
+
+    int4 products                5.5 ms (3.3 ms for a step)
+    separate norms               2.2 ms (211 kernels)
+    waits for the cold experts   about 8 ms (the CPU computes them)
+ A group
+of more tokens takes more cold experts, so the last part does not go away.
+
+Changes:
+
+- Model.argmax_rows and ModelGPU.argmax: the greedy token of each row from
+  the GPU (gg_argmax_rows, the first index of the largest value, as
+  np.argmax). The E4B uses it too when its head is Q6_K or Q4_0. Before,
+  both copied the logits of the rows to the host. The tokens are the same
+  as those of np.argmax (120 steps and a group, on each model).
+- A small group (an MTP verify group) takes the fused forms of the step
+  (add_norm2 and ffn_out, compile_split_group). A group of 2, 3, and 4
+  tokens now takes 12.85, 16.61, and 20.41 ms. NP_GEMMA_GPU_GROUP_FUSED=0
+  keeps the separate norms. The KL of the test of the chat prompts did not
+  change.
+- The option NP_GEMMA_GPU_Q4_I8_DENSE=1 is off. It gives int8 x to the
+  dense Q4_0 matrices of the step and of the small groups. They then use
+  the products of the E4B (program._Q4KQ).
+
+The four prompts after the changes:
+
+    mode            plain   n=1     n=2     n=3
+    greedy          94.7    105.8   109.3   107.1
+    in_set 0.1              106.2   114.3   120.6
+    greedy, int8    91.7    106.6   116.4   118.1
+    in_set, int8            110.1   121.1   125.7
+
+With int8 x, a group of 3 tokens takes 15.08 ms. But the KL (top 64) of
+the chat prompts goes from 0.0001 to 0.0009, and 357/360 top tokens agree
+(359/360 with float32 x). The activations of the 26B have larger outliers,
+so int8 costs more than on the E4B. Thus the 26B keeps float32 x.
+
+A verify group of the 26B does not give the bits of the steps (that was so
+before these changes). At a context of 300, the logits differ by up to
+0.13, and in a group of 4 the best token of one row changed. Thus an MTP
+decode of the 26B can give other tokens than the plain decode.
+
+### The 12B on the GPU with the QAT file
+
+The 12B is dense, so it has no cold experts on the CPU. Its verify groups
+give the bits of its steps. But with float32 x, a group of 2, 3, and 4
+tokens took 25.11, 35.40, and 45.16 ms, and a step took 21.03 ms. That is
+the cost of the loads of x that the E4B had. With int8 x (program._Q4KQ, as on
+the 26B), they take 21.98, 24.93, and 25.39 ms. The four prompts with the
+drafter google/gemma-4-12B-it-qat-q4_0-unquantized-assistant on the GPU:
+
+    mode                plain   n=1     n=2     n=3
+    greedy, float32 x   46.0    65.1    61.0    56.6
+    greedy, int8 x      45.7    72.5    83.2    91.8
+    in_set 0.1, int8            76.1    89.0    99.3
+
+The KL (top 64) of the three chat prompts went from 0.00012 to 0.0004,
+and 376/376 top tokens agree in both forms. The image prompt went from
+0.00050 to 0.00062. These costs are like those of the E4B. Thus the int8
+form is now the default of a dense model, and the 26B keeps float32 x.
+NP_GEMMA_GPU_Q4_I8_DENSE=1 or 0 sets the form for both.
+
+### The 12B against llama.cpp
+
+The test used the four prompts of bench_mtp_llamacpp.py and 200 greedy
+tokens. The target was the 12B QAT file of Unsloth on the GPU. llama.cpp (build-cuda, -ngl 99) used the
+drafter of Unsloth (mtp-gemma-4-12B-it.gguf, Q4_0). llama-bench gave pp512
+2250 tok/s and tg128 52.8 tok/s.
+
+The template of Gemma 4 in llama-server turns thinking on when a request
+does not give enable_thinking. The text then holds a thought, which the
+drafter predicts better (90%, 84%, 74% for 1, 2, 3 drafts). The option
+--no-think of bench_mtp_llamacpp.py sends enable_thinking false, as
+check_mtp.py does. With thinking off:
+
+    runtime       plain   n=1     n=2     n=3     accepted
+    numpy-gemma   45.50   77.26   89.78   102.84  83/75/67%
+    llama.cpp     50.00   81.66   99.63   110.21  86/75/65%
+
+The two runtimes accept the same share of drafts. Each prompt of
+numpy-gemma gives the tokens of its plain decode. In llama.cpp, the text of
+MTP differed from its plain text on 3 of 4 prompts with 1 draft. The plain
+decode of llama.cpp is 10% faster (a step of 20.0 ms, against 22.0 ms), and
+the gap of MTP is 5% to 10%.
+
+Assistant and GPUDrafter take weights=GGUF: a drafter GGUF (arch
+gemma4-assistant, as the MTP files of unsloth) gives the weights. The
+snapshot still gives the config. check_mtp.py takes
+--drafter-gguf. The weights of the drafter of Unsloth differ from those of
+the release by 0.18 per cent, as those of our quantizer. With them, the
+drafts and the speed were the same (83/75/67%, 77.26/89.78/102.84 tok/s).
+The CPU drafter in float32 and in int4 also accepted 83% with 1 draft.
+
 ## What is left
 
-- Phase 5, the rule min(1, p/q) of speculative sampling. It accepts more
-  drafts with a temperature. It needs the drafter probabilities. The output
-  then follows the target distribution, but it does not give the exact
-  tokens of a plain run with the same seed.
 - The 26B verify batch. A group of four costs 1.9 decode steps, and 55 ms of
   its 137 ms reads the experts of the four tokens. The output head (27 ms)
   and the Python of the layer loop are the other large parts.
 - An MXFP4 drafter. In llama.cpp it is 6 per cent faster than q4_0. It needs
   a new kernel here.
-- The unsloth Q4_K files. The GGUF reader needs the Q4_K type first.
+- The E4B verify group on the GPU. The attention runs one record for each
+  query (2.7 ms of a round). A draft step waits for the host two times
+  (about 0.3 ms each).
+- The verify group of the 26B on the GPU. It does not give the bits of the
+  steps (see "The 26B on the GPU with the QAT file").

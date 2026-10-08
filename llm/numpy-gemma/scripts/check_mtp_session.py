@@ -26,7 +26,7 @@ from np_gemma.model import Session
 from np_gemma.sampling import Sampler
 from np_gemma.tokenizer import Tokenizer
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 HUB = "../gemma4-12b-qat-pytorch/.cache/huggingface/hub"
 REPO = "models--google--gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant"
 TURNS = ["Write a haiku about the sea, then explain the image in one sentence.",

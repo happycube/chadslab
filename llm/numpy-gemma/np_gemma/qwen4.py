@@ -34,7 +34,9 @@ import os
 import numpy as np
 
 from .gguf import open_gguf
-from .qwen import QwenCache, QwenConfig, QwenGGUF, kv_rows, kv_store, rms_norm, sigmoid, silu
+from .qwen import (QUANT_FORMS, QwenCache, QwenConfig, QwenGGUF, kv_arrays, kv_row_bytes, kv_rows,
+                   kv_store, layer_kv_form, media_inputs, rms_norm,
+                   rope_positions, sigmoid, silu)
 
 
 
@@ -47,7 +49,10 @@ def dense_mode(g, dense=None):
     the tensor cores, and the buffer of the expert copies keeps more room
     (a prompt of 32K: 351 tok/s with bf16; 131072 tokens: 424 with q8).
     "auto": q8 when a GPU is there and its free memory is less than the
-    bfloat16 dense part, the head, and 3 GB; else bf16."""
+    bfloat16 dense part, the head, and 3 GB; else bf16. The BF12 matrices
+    of a file of convert_q8_gguf.py --dense bf12 stay BF12 unless
+    NP_GEMMA_DENSE is q8, rq8 or bf16 (Qwen4CPU.K; rq8: rotated Q8_0, the
+    other bfloat16 matrices as q8)."""
     dense = dense or os.environ.get("NP_GEMMA_DENSE", "q8")
     if dense != "auto":
         return dense
@@ -97,6 +102,13 @@ def config_from_gguf(g):
     return cfg
 
 
+
+def mrope_sec(cfg):
+    """The M-RoPE sections of the row and the column for QSA_SELECT: s1 |
+    s2 << 8 (transformers mrope_section [11, 11, 10])."""
+    sec = getattr(cfg, "mrope_section", None) or [11, 11, 10]
+    return int(sec[1]) | int(sec[2]) << 8
+
 class Qwen4Cache(QwenCache):
     """QwenCache with the state of the n-gram layer: the last ngram - 1
     tokens, and the last (kernel - 1) * dilation inputs of its convolution."""
@@ -108,11 +120,25 @@ class Qwen4Cache(QwenCache):
         self.ple_conv = {i: np.zeros(((cfg.ple_conv_kernel - 1) * cfg.ple_ngram, hc_dim),
                                      np.float32) for i in cfg.ple_layers}
         # The raw keys of the indexer of each QSA layer (one for each position),
-        # and the key of each complete block (the C program keeps it).
-        self.idx_k = {i: np.zeros((max_len, cfg.indexer_dim), np.float32)
+        # and the key of each complete block (the C program keeps it). float16:
+        # the scores only rank the blocks.
+        self.idx_k = {i: np.zeros((max_len, cfg.indexer_dim), np.float16)
                       for i, t in enumerate(cfg.layer_types) if t == "full_attention"}
-        self.idx_blk = {i: np.zeros((max_len // 4 + 1, cfg.indexer_dim), np.float32)
+        self.idx_blk = {i: np.zeros((max_len // 4 + 1, cfg.indexer_dim), np.float16)
                         for i in self.idx_k}
+        # The M-RoPE positions of the rows as (max_len, 3) int32 for the keys
+        # of the blocks of QSA_SELECT (None: the row index); qpos_version
+        # counts the changes (the GPU copy).
+        self.qpos = None
+        self.qpos_version = 0
+
+    def set_rope(self, pos):
+        super().set_rope(pos)
+        if self.rpos is not None:
+            if self.qpos is None:
+                self.qpos = np.empty((self.max_len, 3), np.int32)
+            self.qpos[:] = self.rpos.T
+            self.qpos_version += 1
 
 
 class Qwen4MTPCache:
@@ -124,13 +150,13 @@ class Qwen4MTPCache:
         self.kv_form = kv or getattr(cfg, "kv_form", "f32")
         self.layer = cfg.num_hidden_layers
         per = cfg.num_kv_heads * cfg.head_dim
-        if self.kv_form == "int16":
-            self.kv = {self.layer: [np.zeros((max_len, per), np.int16),
-                                    np.zeros((max_len, per // 32), np.float32),
-                                    np.zeros((max_len, per), np.int16),
-                                    np.zeros((max_len, per // 32), np.float32)]}
+        if self.kv_form in QUANT_FORMS:
+            lf = layer_kv_form(self.kv_form, cfg, self.layer)
+            self.layer_form = {self.layer: lf}
+            self.kv = {self.layer: kv_arrays(lf, max_len, per)}
         else:
-            shape = (cfg.num_kv_heads, max_len, cfg.head_dim)
+            shape = (max_len, cfg.num_kv_heads, cfg.head_dim)      # position-major
+            self.layer_form = {}
             self.kv = {self.layer: [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]}
 
 
@@ -151,10 +177,25 @@ class Qwen4(QwenGGUF):
         logits = m.logits(h[-1:])
     """
 
-    def __init__(self, path, cfg=None, layers=None, mtp=None):
+    def __init__(self, path, cfg=None, layers=None, mtp=None, experts=None):
+        """experts: a file (or list) of experts in another form that takes
+        the place of those of path (scripts/convert_q8_gguf.py
+        --experts-only; NP_GEMMA_EXPERTS when None)."""
         from .st_qwen4 import NVFP4Source, is_checkpoint
         self.path = path
-        if is_checkpoint(path):
+        if experts is None and os.environ.get("NP_GEMMA_EXPERTS"):
+            experts = os.environ["NP_GEMMA_EXPERTS"].split(",")
+        if isinstance(experts, str):
+            # several files (a,b): the later ones over the earlier (GGUFOverlay),
+            # e.g. the NVFP4 experts, then the BF12 experts of the MTP layer
+            experts = [e for e in experts.split(",") if e]
+        if experts and not is_checkpoint(path):
+            from .gguf import GGUFOverlay
+            self.g = GGUFOverlay(path, experts)
+            if mtp is not None:
+                self.g.attach(mtp)
+            self.cfg = cfg or config_from_gguf(self.g)
+        elif is_checkpoint(path):
             # The safetensors checkpoint of ModelOpt (np_gemma/st_qwen4.py); it
             # has the MTP layer.
             self.g = NVFP4Source(path)
@@ -293,15 +334,17 @@ class Qwen4(QwenGGUF):
         budget = cfg.indexer_top_k // ratio
         if n // ratio <= budget:
             return None
-        cos, sin = self.rope(np.arange(0, n))
+        cos, sin = self.rope(rope_positions(cache, 0, n))
         q = (h @ self.G(p + "q_proj.weight").T).reshape(t, nh, d)
         q = self._rot(rms_norm(q, self.G(p + "q_norm.weight"), cfg.rms_norm_eps),
                       cos[pos:n], sin[pos:n])
         nb_all = n // ratio
-        pooled = cache.idx_k[i][:nb_all * ratio].reshape(nb_all, ratio, d).mean(axis=1)
+        pooled = cache.idx_k[i][:nb_all * ratio].astype(np.float32).reshape(
+            nb_all, ratio, d).mean(axis=1)
         starts = np.arange(nb_all) * ratio
         kb = self._rot(rms_norm(pooled, self.G(p + "k_norm.weight"), cfg.rms_norm_eps),
                        cos[starts], sin[starts])
+        kb = kb.astype(np.float16).astype(np.float32)     # the block keys of the C program
         mask = np.arange(n)[None, :] <= (pos + np.arange(t))[:, None]
         self.qsa_scores = {}
         for j in range(t):
@@ -333,7 +376,7 @@ class Qwen4(QwenGGUF):
         v = (h @ self.W(p + "v_proj").T).reshape(t, nk, hd)
         q = rms_norm(q, self.t(p + "q_norm.weight"), cfg.rms_norm_eps)
         k = rms_norm(k, self.t(p + "k_norm.weight"), cfg.rms_norm_eps)
-        cos, sin = self.rope(np.arange(pos, pos + t))
+        cos, sin = self.rope(rope_positions(cache, pos, t))
         q, k = self._rot(q, cos, sin), self._rot(k, cos, sin)
         kv_store(cache, i, k, v, pos)
         n = pos + t
@@ -369,12 +412,13 @@ class Qwen4(QwenGGUF):
         out = self.moe(i, x)
         return (H + out[:, None, :] * w[:, :, None]).astype(np.float32)
 
-    def forward(self, ids, cache, start_pos=0, hook=None):
+    def forward(self, ids, cache, start_pos=0, hook=None, media=None):
         """Run tokens from start_pos. Return the input of the head (t x
-        hidden). hook(name, value) gets the streams after each layer."""
+        hidden). hook(name, value) gets the streams after each layer.
+        media: spans (cache positions) whose rows replace the embeddings."""
         ids = list(ids)
         cfg = self.cfg
-        x = self.embed(ids)
+        x = media_inputs(self.embed(ids), start_pos, media)
         H = np.repeat(x[:, None, :], cfg.hc_count, axis=1).astype(np.float32)
         for i in range(self.n_layers):
             H = self.layer(i, H, ids, cache, start_pos)
@@ -461,6 +505,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
     qscr = prog.slot("qsa_scratch")
     keyn, qn, gated = f32(t, HD), f32(t, HD), f32(t, HD)
     mo, logits = f32(t, hid), f32(t, E)
+    # RQ8_0 experts (model.rot_experts): the experts read x rotated in each 32
+    # values (gguf.RQ8_0); the routers read x
+    mixr = f32(t, hid) if getattr(model, "rot_experts", False) else None
     val, idx, slog = f32(t, k), np.zeros((t, k), np.int32), f32(t, 1)
     scratch = model.moe_scratch4(t)
     gscr = f32(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0))
@@ -468,12 +515,31 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
     pos, cos, sin, scores = prog.slot("pos"), prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
     cur = {}
 
-    def quant(src, cols):
-        prog.emit(P.KQ_QUANT, src, t, cols, xq, xs, xm)
-        cur["src"] = src
+    # NP_GEMMA_DENSE=rq8 (model.dense_rot): those matrices read x rotated in
+    # each 32 values, a copy made at the first such product of each x
+    rot = getattr(model, "dense_rot", None)
+    xr, xqr, xsr, xmr = None, None, None, None
+
+    def quant(src, cols, rows=t):
+        prog.emit(P.KQ_QUANT, src, rows, cols, xq, xs, xm)
+        cur.update(src=src, rows=rows, cols=cols, rot=False)
 
     def lin(gname, out, src=None, rows=t):
-        xb = {"xq": xq, "xs": xs, "xm": xm, "src": cur["src"] if src is None else src, "t": rows}
+        nonlocal xr, xqr, xsr, xmr
+        if rot is not None and rot(gname):
+            assert src is None and rows == cur["rows"], gname
+            n = cur["rows"] * cur["cols"]
+            if xr is None:
+                xr, xqr = f32(t, wide), np.zeros((t, wide), np.int8)
+                xsr, xmr = f32(t, wide // 32), f32(t, wide // 16)
+            if not cur["rot"]:
+                prog.emit(P.COPY, cur["src"], xr, n * 4)
+                prog.emit(P.TQ_ROT, xr, n // 32, 0)
+                prog.emit(P.KQ_QUANT, xr, cur["rows"], cur["cols"], xqr, xsr, xmr)
+                cur["rot"] = True
+            xb = {"xq": xqr, "xs": xsr, "xm": xmr, "src": xr, "t": rows}
+        else:
+            xb = {"xq": xq, "xs": xs, "xm": xm, "src": cur["src"] if src is None else src, "t": rows}
         model.emit_lin4(prog, xb, gname, out)
 
     def scalar(op, a, b):
@@ -497,17 +563,40 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         lin(b + "attn_q.weight", o1)
         lin(b + "attn_k.weight", o2)
         lin(b + "attn_v.weight", o3)
-        prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(b + "attn_q_norm.weight"),
-                  model.F(b + "attn_k_norm.weight"), cos, sin, None, None, 0, pos, t, nq, nk, hd,
-                  cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate, kbuf)
-        base = [prog.slot("%s.%d" % (nm, i)) for nm in ("kq", "ks", "vq", "vs")]
-        per = nk * hd
-        rows = [scalar(P.S_ADD, bs, scalar(P.S_MUL, pos, step))
-                for bs, step in zip(base, (2 * per, per // 8, 2 * per, per // 8))]
-        prog.emit(P.KV_WRITE, kbuf, o3, None, None, *rows, t * per)
+        # the form of the cache of the layer (qwen.layer_kv_form): 0 int16, 1
+        # int8, 2 int16 keys and int8 values, 3 float32 rows (heads,
+        # positions, head_dim; the first full layer by default)
+        lf = layer_kv_form(getattr(cfg, "kv_form", "int16"), cfg, i)
+        form = {"int16": 0, "int8": 1, "k16v8": 2, "f32": 3, "tq6": 4}[lf]
+        if form == 3:
+            # ATTN_PREP writes the float rows of the key and the value
+            prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(b + "attn_q_norm.weight"),
+                      model.F(b + "attn_k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
+                      prog.slot("V.%d" % i), prog.slot("hs"), pos, t, nq, nk, hd,
+                      cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate)
+            base = [prog.slot("K.%d" % i), 0, prog.slot("V.%d" % i), 0]
+        else:
+            prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(b + "attn_q_norm.weight"),
+                      model.F(b + "attn_k_norm.weight"), cos, sin, None, None, 0, pos, t, nq, nk,
+                      hd, cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate, kbuf)
+            base = [prog.slot("%s.%d" % (nm, i)) for nm in ("kq", "ks", "vq", "vs")]
+            per = nk * hd
+            kb, vb = kv_row_bytes(lf, per)
+            rows = [scalar(P.S_ADD, bs, scalar(P.S_MUL, pos, step))
+                    for bs, step in zip(base, (kb, per // 8, vb, per // 8))]
+            write = {0: P.KV_WRITE, 1: P.KV_WRITE8, 2: P.KV_WRITEV8, 4: P.KV_WRITETQ}[form]
+            prog.emit(write, kbuf, o3, None, None, *rows, t * per)
+
+        def attn_qsa(c):
+            # TQ6: the queries and the output in the rotated form (tq6.py)
+            if form == 4:
+                prog.emit(P.TQ_ROT, qout, t * nq * hd // 32, 0)
+            model.emit_attn_qsa(prog, qout, base, scores, att, t, pos, sel, c, maxsel, form)
+            if form == 4:
+                prog.emit(P.TQ_ROT, att, t * nq * hd // 32, 1)
         if ratio(i) == 0:
             # A dense layer (the MTP layer).
-            model.emit_attn_qsa(prog, qout, base, scores, att, t, pos, sel, dense, maxsel)
+            attn_qsa(dense)
             prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
             lin(b + "attn_output.weight", o5)
@@ -519,8 +608,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
                   model.F(b + "indexer.q_norm.weight"), model.F(b + "indexer.k_norm.weight"),
                   cos, sin, pos, t, cfg.indexer_heads, cfg.indexer_dim, ratio(i), budget(i),
                   cfg.rotary_dim, float(cfg.rope_theta), eps, sel, cnt, maxsel, qscr,
-                  prog.slot("nbmax"))
-        model.emit_attn_qsa(prog, qout, base, scores, att, t, pos, sel, cnt, maxsel)
+                  prog.slot("nbmax"), prog.slot("qpos"), mrope_sec(cfg))
+        attn_qsa(cnt)
         prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
         quant(att, nq * hd)
         lin(b + "attn_output.weight", o5)
@@ -570,8 +659,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.HC_NORM, hin, model.F(b + "hnorm.weight"), hn, t, hc, hid, eps)
         prog.emit(P.HC_CAT, en, hn, cat, t, hc, hid)
         # eh_proj on each stream: t * hc rows of 2 hid values.
-        prog.emit(P.KQ_QUANT, cat, t * hc, 2 * hid, xq, xs, xm)
-        cur["src"] = cat
+        quant(cat, 2 * hid, rows=t * hc)
         lin(b + "eh_proj.weight", H, rows=t * hc)
         layers, head = [L], b + "hc_head"
     for i in layers:
@@ -590,7 +678,13 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         lin(b + "ffn_gate_inp.weight", logits)
         lin(b + "ffn_gate_inp_shexp.weight", slog)
         prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
-        xb = {"xq": xq, "xs": xs, "xm": xm, "src": mixed, "t": t}
+        xin = mixed
+        if mixr is not None:
+            prog.emit(P.COPY, mixed, mixr, mixed.nbytes)
+            prog.emit(P.TQ_ROT, mixr, t * hid // 32, 0)
+            quant(mixr, hid)
+            xin = mixr
+        xb = {"xq": xq, "xs": xs, "xm": xm, "src": xin, "t": t}
         model.emit_moe4(prog, i, xb, idx, val, slog, scratch, mo)
         prog.emit(P.HC_ADD, H, mo, inj, t, hc, hid, 1.0 / hc)
     hc_pre(head, xn, inject=False)
@@ -605,9 +699,21 @@ class Qwen4CPU(Qwen4):
 
     CHUNK = 512
 
-    def __init__(self, path, cfg=None, layers=None, mtp=None, dense=None):
-        super().__init__(path, cfg, layers, mtp)
+    def __init__(self, path, cfg=None, layers=None, mtp=None, dense=None, experts=None):
+        super().__init__(path, cfg, layers, mtp, experts)
         self.dense = dense_mode(self.g, dense)
+        # The RQ8_0 experts (scripts/convert_q8_gguf.py --experts rq8): all the
+        # experts of the file (routed, MTP, shared) or none. The kernels of
+        # the MoE then rotate the act of each pair before the down product
+        # (kq_set_moe_rot: a state of the process), and the program rotates
+        # the x of the experts (compile_qwen4_step).
+        from .gguf import RQ6_K, RQ8_0
+        kinds = {t in (RQ8_0, RQ6_K) for n, (_d, t, _o) in self.g.tensors.items()
+                 if "_exps." in n or "_shexp.weight" in n and "gate_inp" not in n}
+        assert len(kinds) <= 1, "RQ8_0 must be all the experts of the file, or none"
+        self.rot_experts = kinds == {True}
+        from . import cops
+        cops.kq_set_moe_rot(self.rot_experts)
         self._k = {}
         self._f = {}
         self.programs = {}
@@ -617,7 +723,34 @@ class Qwen4CPU(Qwen4):
         m = self._k.get(gname)
         if m is None:
             m = KMat(self.g, gname)
-            if m.type == 30 and self.dense == "q8" and ".indexer." not in gname and \
+            if m.type in (55, 56):
+                # RQ8_0 / RQ6_K: the blocks of Q8_0 / Q6_K (their kernels; the
+                # program rotates their x and act: rot_experts)
+                assert self.rot_experts, gname
+                m.type = {55: 8, 56: 14}[m.type]
+            if m.type == 57:
+                # BF12 (the dense matrices of a file of convert_q8_gguf.py
+                # --dense bf12): its kernels, unless NP_GEMMA_DENSE asks for
+                # q8, rq8 or bf16 (the bfloat16 bits, then as those modes).
+                # rq8: Q8_0 of the rows rotated in each 32 values (as RQ8_0),
+                # m.rot; the program rotates the x of their products
+                # (compile_qwen4_step, dense_rot). Not the head, which runs
+                # in its own program.
+                mode = os.environ.get("NP_GEMMA_DENSE", "bf12")
+                if mode == "rq8" and gname == "output.weight":
+                    mode = "bf12"
+                if mode in ("q8", "rq8", "bf16"):
+                    from . import cops
+                    bits = cops.kq_bf12_to_bf16(m.data, m.rows, m.cols)
+                    if mode == "q8":
+                        m.data, m.type = cops.kq_to_q8_0(bits, m.cols), 8
+                    elif mode == "rq8":
+                        f = (bits.astype(np.uint32) << 16).view(np.float32)
+                        m.data, m.type = cops.kq_to_q8_0(cops.tq6_rotate(f), m.cols), 8
+                        m.rot = True
+                    else:
+                        m.data, m.type = bits.reshape(-1).view(np.uint8), 30
+            if m.type == 30 and self.dense in ("q8", "rq8") and ".indexer." not in gname and \
                     gname != "token_embd.weight" and m.rows > 1 and m.cols % 32 == 0:
                 # A large bfloat16 matrix to Q8_0 (dense_mode): for the CPU and
                 # for the GPU (Qwen4GPU takes the matrices of the model).
@@ -629,6 +762,11 @@ class Qwen4CPU(Qwen4):
                 m.data, m.type = np.ascontiguousarray(a, np.float32).view(np.uint8).reshape(-1), 0
             self._k[gname] = m
         return m
+
+    def dense_rot(self, gname):
+        """True when the products of the matrix read x rotated in each 32
+        values (NP_GEMMA_DENSE=rq8)."""
+        return getattr(self.K(gname), "rot", False)
 
     def M(self, name, full=None):
         """A matrix by its GGUF name, or by the name of the Qwen3.6 modules
@@ -644,7 +782,15 @@ class Qwen4CPU(Qwen4):
         kquants.c), made at the first use: Q8_0 (16 n rows) as KQ_Q8X16,
         float32 as KQ_F32X16, bfloat16 as KQ_BF16X16 (the last two take x
         as float32; 64 rows or more: the smaller ones take the threads with
-        their tokens). NP_GEMMA_X16=0: as it is. The GPU takes K()."""
+        their tokens). NP_GEMMA_X16=0: as it is. The GPU takes K().
+
+        The cost in RAM: the packed copy is private memory, next to the
+        mapped file (the page cache). It has the bytes of the source (a
+        bfloat16 matrix stays 2 bytes a value). For Qwen3.8 (the NVFP4 GGUF)
+        the head (output.weight) is 1.2 GiB, and all the dense matrices of
+        the CPU program are about 8.2 GiB with bfloat16, or 4.5 GiB with Q8_0
+        (dense q8). NP_GEMMA_X16=0 saves that memory, and the CPU products
+        are then slower."""
         m = self._kp.get(gname) if hasattr(self, "_kp") else None
         if m is None:
             if not hasattr(self, "_kp"):
@@ -659,6 +805,8 @@ class Qwen4CPU(Qwen4):
                 elif m.type in (0, 30) and m.rows >= 64:
                     data = cops.kq_pack_x16f(m.data, m.type == 30, m.rows, m.cols)
                     t = 61 if m.type == 30 else 62
+                elif m.type == 57 and m.rows >= 64:
+                    data, t = cops.kq_pack_bf12x16(m.data, m.rows, m.cols), 63
                 if data is not None:
                     p = KMat.__new__(KMat)
                     p.data, p.type, p.rows, p.cols = data, t, m.rows, m.cols
@@ -687,15 +835,29 @@ class Qwen4CPU(Qwen4):
                                   for n in ("gate", "up", "down")),
                                 [self.K(b + "ffn_%s_shexp.weight" % n).c()
                                  for n in ("gate", "up", "down")])
+        # NP_GEMMA_MOE_XQ (a test of the precision of the activations of the
+        # experts): "8" (the default) the rows of NP_GEMMA_MOE_X16 (int16
+        # by default, int8 with 0); "16" the float rows rounded
+        # to int16 in each 32 values, and the GELU too, then float products;
+        # "f" float32 rows and products
+        xqm = os.environ.get("NP_GEMMA_MOE_XQ", "8")
+        # the float32 rows always (KQ_BF12 experts read them; no mode without
+        # its flag)
+        extra = (None, 0, xb["src"]) if xqm == "8" else (None, 2 | (16 if xqm == "16" else 0), xb["src"])
+        if xqm == "8" and os.environ.get("NP_GEMMA_MOE_X16", "1") == "1":
+            extra = (None, 32, xb["src"])       # two int8 planes (qwen_gpu.MOE_X16)
         prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
-                  cfg.num_experts, mats, slog, cfg.hidden_size, cfg.moe_inter, scratch, out)
+                  cfg.num_experts, mats, slog, cfg.hidden_size, cfg.moe_inter, scratch, out, *extra)
         prog.keep.append(mats)
 
-    def emit_attn_qsa(self, prog, q, base, scores, out, t, pos, sel, cnt, maxsel):
+    def emit_attn_qsa(self, prog, q, base, scores, out, t, pos, sel, cnt, maxsel, form=0):
+        """form: 0 the int16 cache, 1 int8, 2 int16 keys and int8 values, 3
+        float32 rows (heads, positions, head_dim; the head stride is the
+        slot hs), 4 TQ6 (q and out rotated)."""
         from . import program as P
         cfg = self.cfg
         prog.emit(P.ATTN_QSA, q, *base, scores, out, cfg.num_heads, cfg.num_kv_heads,
-                  cfg.head_dim, t, pos, sel, cnt, maxsel)
+                  cfg.head_dim, t, pos, sel, cnt, maxsel, form, prog.slot("hs"))
 
     def F(self, gname, shape=None):
         a = self._f.get((gname, shape))
@@ -742,6 +904,16 @@ class Qwen4CPU(Qwen4):
             r = rows.reshape(-1).astype(np.int64)
             raw = cops.kq_gather(m.data.ctypes.data + r * m.cols, m.cols)
             return (E4M3_VALUES[raw] * self._ple_scale).reshape(len(ids), -1)
+        if m.type == 8:
+            # Q8_0 rows (scripts/convert_q8_gguf.py, 170 bytes for 160
+            # values): the same gather, then the dequant of the rows
+            if not getattr(self, "_ple_advised", False):
+                self.g.advise_random("per_layer_token_embd.weight")
+                self._ple_advised = True
+            rb = m.cols // 32 * 34
+            r = rows.reshape(-1).astype(np.int64)
+            raw = cops.kq_gather(m.data.ctypes.data + r * rb, rb)
+            return cops.kq_rows(raw.reshape(-1), 8, m.cols, np.arange(len(r))).reshape(len(ids), -1)
         return cops.kq_rows(m.data, m.type, m.cols, rows.reshape(-1)).reshape(len(ids), -1)
 
     def program(self, t, kind=None):
@@ -757,9 +929,10 @@ class Qwen4CPU(Qwen4):
     def _bind(self, prog, cache, pos, t):
         from .qwen import cache_params, scores_buffer
         cfg = self.cfg
-        cos, sin = self.rope(np.arange(pos, pos + t))
+        cos, sin = self.rope(rope_positions(cache, pos, t))
         kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos),
-              "sin": np.ascontiguousarray(sin), "scores": scores_buffer(cfg, pos + t)}
+              "sin": np.ascontiguousarray(sin), "scores": scores_buffer(cfg, pos + t),
+              "qpos": cache.qpos if cache.qpos is not None else 0}
         kw.update(cache_params(self, cache))
         for i in cfg.ple_layers:
             kw["pleconv.%d" % i] = cache.ple_conv[i]
@@ -772,26 +945,27 @@ class Qwen4CPU(Qwen4):
         kw["qsa_scratch"], kw["nbmax"] = self._qscr, nbmax
         prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
 
-    def _run(self, prog, ids, cache, pos):
+    def _run(self, prog, ids, cache, pos, media=None):
         cfg = self.cfg
         self._bind(prog, cache, pos, len(ids))
-        x = self.embed(ids)
+        x = media_inputs(self.embed(ids), pos, media)
         prog.names["H"][:] = np.repeat(x[:, None, :], cfg.hc_count, axis=1).reshape(len(ids), -1)
         if cfg.ple_layers:
             prog.names["ple"][:] = self.ple_rows(ids, cache)
         prog.run()
 
-    def forward(self, ids, cache, start_pos=0, hook=None, streams=False):
+    def forward(self, ids, cache, start_pos=0, hook=None, streams=False, media=None):
         """Run tokens from start_pos. Return the input of the head (t x
         hidden); with streams, also the streams after the last layer (t x
-        hc * hidden, the input of the MTP layer)."""
+        hc * hidden, the input of the MTP layer). media: the spans of the
+        images (cache positions)."""
         ids = list(ids)
         out, hs = [], []
         c0 = 0
         while c0 < len(ids):
             chunk = ids[c0:c0 + self.CHUNK]
             prog = self.program(len(chunk))
-            self._run(prog, chunk, cache, start_pos + c0)
+            self._run(prog, chunk, cache, start_pos + c0, media)
             out.append(prog.names["xn"].copy())
             if streams:
                 hs.append(prog.names["H"].copy())
@@ -804,7 +978,8 @@ class Qwen4CPU(Qwen4):
     # ---- MTP: the verify group and the MTP layer (QWEN38_PLAN.md, phase 3) ----
 
     def verify(self, ids, cache, start_pos):
-        """Run a group of tokens from start_pos as an MTP verify group.
+        """Run a group of tokens from start_pos as an MTP verify group (see
+        the rule of qwen._QwenRuns.verify for the rows after the commit).
         Return the input of the head and the streams of each token. The
         keys (and the keys of the indexer) are written for all the tokens;
         the state of the linear layers and of the n-gram layer does not
@@ -842,7 +1017,7 @@ class Qwen4CPU(Qwen4):
         t = len(ids)
         prog = self.program(t, "mtp")
         L = cfg.num_hidden_layers
-        cos, sin = self.rope(np.arange(pos, pos + t))
+        cos, sin = self.rope(rope_positions(mcache, pos, t))
         kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos),
               "sin": np.ascontiguousarray(sin), "scores": scores_buffer(cfg, pos + t)}
         for nm, a in zip(("kq", "ks", "vq", "vs"), mcache.kv[L]):

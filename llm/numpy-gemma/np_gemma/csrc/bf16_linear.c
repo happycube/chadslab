@@ -31,12 +31,103 @@
  * Build this file with:
  *   cc -O3 -mavx2 -mfma -fopenmp -shared -fPIC -o libgemma.so bf16_linear.c
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE         /* sched_setaffinity, cpu_set_t (gp_team_pin) */
+#endif
+#include <sched.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <omp.h>
+#include <dlfcn.h>
+#include <pthread.h>
+
+/* ---- teams outside the planned ones (gemma_team_warn) ----
+ *
+ * Every parallel region of this library starts in GOMP_parallel; the build
+ * links it with -Wl,--wrap=GOMP_parallel, so each comes here first. The
+ * planned teams (gemma_run_task: the CPU experts of a step and of a mixed
+ * group; gemma_run_parts; gemma_run: the CPU model) mark themselves
+ * (gp_planned). Any other region of a team of gp_team_warn_min threads or
+ * more at the outer level, once warnings are on (gemma_team_warn: the
+ * servers turn them on after the load), is reported once for each place of
+ * the call: on the 2-socket Xeon such a team of 40 threads (kq_rows of the 64
+ * n-gram rows of an MTP verify group) waited 5.7 ms a call for cores that the
+ * team of the CPU experts spins on. gemma_team_warn_stats gives the places
+ * and the counts. */
+static __thread int gp_planned;
+static int gp_team_warn_min;
+#define GP_WARN_SITES 64
+static void *gp_warn_site[GP_WARN_SITES];
+static long gp_warn_count[GP_WARN_SITES];
+static int gp_warn_nsites;
+static pthread_mutex_t gp_warn_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void gemma_team_warn(int min_threads)
+{
+    gp_team_warn_min = min_threads;
+}
+
+/* The places (return addresses) and counts of the reported teams; returns
+ * their number. */
+int gemma_team_warn_stats(void **sites, long *counts, int max)
+{
+    pthread_mutex_lock(&gp_warn_mu);
+    int n = gp_warn_nsites < max ? gp_warn_nsites : max;
+    for (int i = 0; i < n; ++i) {
+        sites[i] = gp_warn_site[i];
+        counts[i] = gp_warn_count[i];
+    }
+    pthread_mutex_unlock(&gp_warn_mu);
+    return n;
+}
+
+static void gp_team_report(void *ra, unsigned n)
+{
+    int first = 0;
+    pthread_mutex_lock(&gp_warn_mu);
+    int i = 0;
+    while (i < gp_warn_nsites && gp_warn_site[i] != ra) {
+        ++i;
+    }
+    if (i == gp_warn_nsites && i < GP_WARN_SITES) {
+        gp_warn_site[i] = ra;
+        gp_warn_nsites++;
+        first = 1;
+    }
+    if (i < GP_WARN_SITES) {
+        gp_warn_count[i]++;
+    }
+    pthread_mutex_unlock(&gp_warn_mu);
+    if (first) {
+        Dl_info d;
+        const char *s = "?";
+        long off = 0;
+        if (dladdr(ra, &d) && d.dli_sname != NULL) {
+            s = d.dli_sname;
+            off = (long)((char *)ra - (char *)d.dli_saddr);
+        }
+        fprintf(stderr, "[np-gemma] WARNING: an OpenMP team of %u threads outside the planned teams, "
+                "from %s+%#lx (cpu %d); it competes with the cores of the CPU experts "
+                "(reported once a place; gemma_team_warn)\n", n, s, off, sched_getcpu());
+    }
+}
+
+extern void __real_GOMP_parallel(void (*fn)(void *), void *data, unsigned num_threads,
+                                 unsigned flags);
+void __wrap_GOMP_parallel(void (*fn)(void *), void *data, unsigned num_threads, unsigned flags)
+{
+    if (gp_team_warn_min > 0 && !gp_planned && omp_get_level() == 0) {
+        unsigned n = num_threads ? num_threads : (unsigned)omp_get_max_threads();
+        if ((int)n >= gp_team_warn_min) {
+            gp_team_report(__builtin_return_address(0), n);
+        }
+    }
+    __real_GOMP_parallel(fn, data, num_threads, flags);
+}
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -321,7 +412,11 @@ static int gemma_have_avx512(void)
 {
     static int state = -1;
     if (state < 0) {
-        state = (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")) ? 1 : 0;
+        /* NP_GEMMA_ARCH=avx2 also turns off these kernels, so a CPU with
+         * AVX-512 runs the code of an AVX2 CPU (a test for one). */
+        const char *arch = getenv("NP_GEMMA_ARCH");
+        state = (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+                 !(arch && strcmp(arch, "avx2") == 0)) ? 1 : 0;
     }
     return state;
 }
@@ -1718,6 +1813,305 @@ static inline void dot4_i4_f32(const uint8_t *w, int stride, const float *scales
 }
 #endif
 
+/* ---------- int8 x for the int4 products of a few tokens (AVX2) ----------
+ * AVX2 has no VNNI and 8 float lanes, so the float products above take a
+ * decode to float32 and 4 fma for each 32 weights and each row. Here x is
+ * int8 (a scale for each 32 values, as kq_quant_part), and a group of 32 is
+ * one vpmaddubsw and one vpmaddwd (the sign of w moves to x), then one fma
+ * with the scale of w times the scale of x. llama.cpp does the same on
+ * AVX2.
+ *
+ * A body that uses it quantizes its x rows first (i4q_begin: one thread,
+ * then the barrier of omp single) into the scratch of its team; the dot
+ * kernels find the int8 row of an x row by its address (i4q_find). An x
+ * row that is not in the scratch takes the float kernel. The kernel of one
+ * token and the kernel of a group do the same steps for each token, so a
+ * verify group gives the bits of the steps. NP_GEMMA_I4Q8=0 turns it off. */
+#if GEMMA_X86 && !defined(__AVX512F__)
+#define I4Q_TEAMS 8
+
+typedef struct {
+    const float *base;      /* the first x row, or NULL */
+    size_t stride;          /* floats from one x row to the next */
+    int rows, cols;
+    int8_t *q;              /* rows x cols */
+    float *s;               /* rows x cols / 32 */
+    int32_t *n;             /* -8 times the sum of each 32 (KQ_Q4X), stride cols / 16 */
+    size_t cap;             /* the values that q holds */
+    int16_t *q16;           /* NP_GEMMA_DECODE_X16: the int16 rows too (KQ_Q4X) */
+    float *s16;
+    int8_t *h16;            /* and their planes (kq_planes16_to): one row */
+    uint8_t *l16;
+    int32_t *n16;
+    size_t cap16;
+} i4q_reg;
+
+static i4q_reg i4q_regs[I4Q_TEAMS];
+
+static int i4q_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_I4Q8");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* The KQ_Q4X products of a step (and of a verify group) take int16 x
+ * (gemma_quant_group32_i16, kq_q4x_rows16), as the prompt with int16 x:
+ * twice the instructions of int8 x. The default; NP_GEMMA_DECODE_X16=0
+ * keeps int8 x. */
+static int i4q16_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_DECODE_X16");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+static inline float gemma_quant_group32_i16(const float *x, int16_t *q);
+static void kq_q4x_rows16(const uint8_t *wg, int cols, const int16_t *xq, const float *xs, int n,
+                          float *out, size_t ostride);
+static void kq_planes16_to(const int16_t *xq, int cols, int8_t *kp_h, uint8_t *kp_l, int32_t *kp_n);
+static void kq_q4x_rows_p16(const uint8_t *wg, int cols, const int8_t *kp_h, const uint8_t *kp_l,
+                            const int32_t *kp_n, const float *xs, float *out);
+
+/* The scratch of this team: the part of gemma_run_parts, or 0. */
+static inline i4q_reg *i4q_cur(void)
+{
+    int lvl = omp_get_level();
+    int p = lvl > 1 ? omp_get_ancestor_thread_num(lvl - 1) : 0;
+    return &i4q_regs[p % I4Q_TEAMS];
+}
+
+/* 32 values of x to int8: s = max |x| / 127, q = round(x / s). */
+static inline void i4q_quant32(const float *x, int8_t *q, float *s)
+{
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    __m256 v0 = _mm256_loadu_ps(x), v1 = _mm256_loadu_ps(x + 8);
+    __m256 v2 = _mm256_loadu_ps(x + 16), v3 = _mm256_loadu_ps(x + 24);
+    __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
+                             _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
+    __m128 h = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+    h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_max_ss(h, _mm_shuffle_ps(h, h, 1));
+    float mx = _mm_cvtss_f32(h);
+    float inv = mx > 0.f ? 127.f / mx : 0.f;
+    *s = mx / 127.f;
+    __m256 iv = _mm256_set1_ps(inv);
+    __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, iv)), i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, iv));
+    __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, iv)), i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, iv));
+    __m256i a = _mm256_packs_epi32(i0, i1), b = _mm256_packs_epi32(i2, i3);
+    __m256i c = _mm256_packs_epi16(a, b);
+    c = _mm256_permutevar8x32_epi32(c, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+    _mm256_storeu_si256((__m256i *)q, c);
+}
+
+/* Quantize rows x rows of cols values (stride floats apart) into the scratch
+ * of the team. All the threads of the team call it. */
+static void i4q_begin(const float *x, size_t stride, int rows, int cols)
+{
+    i4q_reg *R = i4q_cur();
+    #pragma omp single
+    {
+        R->base = NULL;
+        if (i4q_on() && cols % 32 == 0 && rows > 0) {
+            size_t need = (size_t)rows * (size_t)cols;
+            if (need > R->cap) {
+                free(R->q);
+                free(R->s);
+                free(R->n);
+                R->q = (int8_t *)malloc(need);
+                R->s = (float *)malloc(need / 32 * sizeof(float));
+                R->n = (int32_t *)malloc(need / 16 * sizeof(int32_t));
+                R->cap = R->q && R->s && R->n ? need : 0;
+            }
+            if (R->cap >= need) {
+                for (int r = 0; r < rows; ++r) {
+                    const float *xr = x + (size_t)r * stride;
+                    int8_t *qr = R->q + (size_t)r * cols;
+                    float *sr = R->s + (size_t)r * (cols / 32);
+                    int32_t *nr = R->n + (size_t)r * (cols / 16);
+                    for (int g = 0; g < cols / 32; ++g) {
+                        i4q_quant32(xr + 32 * g, qr + 32 * g, sr + g);
+                        int32_t sum = 0;
+                        for (int u = 0; u < 32; ++u) {
+                            sum += qr[32 * g + u];
+                        }
+                        nr[g] = -8 * sum;
+                    }
+                }
+                if (i4q16_on() && R->cap16 < need) {
+                    free(R->q16);
+                    free(R->s16);
+                    free(R->h16);
+                    free(R->l16);
+                    free(R->n16);
+                    R->q16 = (int16_t *)malloc(need * sizeof(int16_t));
+                    R->s16 = (float *)malloc(need / 32 * sizeof(float));
+                    R->h16 = (int8_t *)malloc(need + 64);
+                    R->l16 = (uint8_t *)malloc(need + 64);
+                    R->n16 = (int32_t *)malloc((need / 32 + 16) * sizeof(int32_t));
+                    R->cap16 = R->q16 && R->s16 && R->h16 && R->l16 && R->n16 ? need : 0;
+                }
+                if (i4q16_on() && R->cap16 >= need) {
+                    for (int r = 0; r < rows; ++r) {
+                        for (int g = 0; g < cols / 32; ++g) {
+                            R->s16[(size_t)r * (cols / 32) + g] = gemma_quant_group32_i16(
+                                x + (size_t)r * stride + 32 * g, R->q16 + (size_t)r * cols + 32 * g);
+                        }
+                    }
+                    if (rows == 1) {
+                        kq_planes16_to(R->q16, cols, R->h16, R->l16, R->n16);
+                    }
+                }
+                R->base = x;
+                R->stride = stride;
+                R->rows = rows;
+                R->cols = cols;
+            }
+        }
+    }
+}
+
+/* The int8 row and its scales for the x row x of n values, or NULL. xn
+ * (if not NULL) gets the sums for KQ_Q4X. */
+static inline const int8_t *i4q_find2(const float *x, int n, const float **xs,
+                                      const int32_t **xn)
+{
+    const i4q_reg *R = i4q_cur();
+    if (R->base == NULL || R->cols != n || x < R->base) {
+        return NULL;
+    }
+    size_t d = (size_t)(x - R->base);
+    size_t r = R->stride ? d / R->stride : 0;
+    if ((R->stride ? d % R->stride : d) != 0 || r >= (size_t)R->rows) {
+        return NULL;
+    }
+    *xs = R->s + r * (size_t)(n / 32);
+    if (xn != NULL) {
+        *xn = R->n + r * (size_t)(n / 16);
+    }
+    return R->q + r * (size_t)n;
+}
+
+static inline const int8_t *i4q_find(const float *x, int n, const float **xs)
+{
+    return i4q_find2(x, n, xs, NULL);
+}
+
+/* The int16 row (NP_GEMMA_DECODE_X16) and its scales for the x row x, or NULL. */
+static inline const int16_t *i4q_find16(const float *x, int n, const float **xs)
+{
+    const i4q_reg *R = i4q_cur();
+    const float *s8;
+    const int8_t *q = i4q_find2(x, n, &s8, NULL);
+    if (q == NULL || !i4q16_on() || R->cap16 < (size_t)R->rows * (size_t)R->cols) {
+        return NULL;
+    }
+    size_t r = (size_t)(q - R->q) / (size_t)n;
+    *xs = R->s16 + r * (size_t)(n / 32);
+    return R->q16 + r * (size_t)n;
+}
+
+/* The 32 signed values (-8 to 7) of a Q4_0 group, in the order of x. */
+static inline __m256i i4q_w32(const uint8_t *p)
+{
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    __m128i b = _mm_loadu_si128((const __m128i *)p);
+    __m256i w = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(b, 4), m4), _mm_and_si128(b, m4));
+    return _mm256_sub_epi8(w, _mm256_set1_epi8(8));
+}
+
+/* The int32 sums (8 lanes) of 32 products of w (signed, abs aw) and x. */
+static inline __m256 i4q_dot32(__m256i aw, __m256i w, __m256i x)
+{
+    __m256i p = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(p, _mm256_set1_epi16(1)));
+}
+
+/* One row, one token (the tail rows). */
+static inline float dot_i4_q8(const uint8_t *w, const float *scales, const int8_t *xq,
+                              const float *xs, int n)
+{
+    __m256 acc = _mm256_setzero_ps();
+    for (int g = 0; g < n / 32; ++g) {
+        __m256i wv = i4q_w32(w + (size_t)g * 18 + 2);
+        __m256i xv = _mm256_loadu_si256((const __m256i *)(xq + (size_t)g * 32));
+        acc = _mm256_fmadd_ps(i4q_dot32(_mm256_abs_epi8(wv), wv, xv),
+                              _mm256_set1_ps(scales[g] * xs[g]), acc);
+    }
+    return hsum256_ps(acc);
+}
+
+/* Four rows (stride bytes apart) for NT tokens (a constant 1 or 2, so the
+ * sums stay in registers). Each (row, token) adds its groups in the order
+ * of dot_i4_q8. */
+static inline __attribute__((always_inline)) void dot4_i4_q8_n(
+    const uint8_t *w, int stride, const float *scales, const int8_t *const *xq,
+    const float *const *xs, const int NT, int n, float *r)
+{
+    int groups = n / 32;
+    __m256 a[2][4];
+    for (int t = 0; t < NT; ++t) {
+        for (int j = 0; j < 4; ++j) {
+            a[t][j] = _mm256_setzero_ps();
+        }
+    }
+    for (int g = 0; g < groups; ++g) {
+        __m256i xv[2];
+        for (int t = 0; t < NT; ++t) {
+            xv[t] = _mm256_loadu_si256((const __m256i *)(xq[t] + (size_t)g * 32));
+        }
+        for (int j = 0; j < 4; ++j) {
+            __m256i wv = i4q_w32(w + (size_t)j * stride + (size_t)g * 18 + 2);
+            __m256i aw = _mm256_abs_epi8(wv);
+            float sw = scales[(size_t)j * groups + g];
+            for (int t = 0; t < NT; ++t) {
+                a[t][j] = _mm256_fmadd_ps(i4q_dot32(aw, wv, xv[t]), _mm256_set1_ps(sw * xs[t][g]),
+                                          a[t][j]);
+            }
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        for (int j = 0; j < 4; ++j) {
+            r[t * 4 + j] = hsum256_ps(a[t][j]);
+        }
+    }
+}
+#endif
+
+/* The four-row and one-row dots of the bodies below: on AVX2 the int8 x of
+ * i4q_begin when the body quantized x, else the float kernels. */
+#if GEMMA_X86 && !defined(__AVX512F__)
+static inline void I4_DOT4(const uint8_t *w, int stride, const float *scales, const float *x,
+                           int n, float *r)
+{
+    const float *xs;
+    const int8_t *q = i4q_find(x, n, &xs);
+    if (q != NULL) {
+        dot4_i4_q8_n(w, stride, scales, &q, &xs, 1, n, r);
+    } else {
+        dot4_i4_f32(w, stride, scales, x, n, r);
+    }
+}
+
+static inline float I4_DOT1(const uint8_t *w, const float *scales, const float *x, int n)
+{
+    const float *xs;
+    const int8_t *q = i4q_find(x, n, &xs);
+    return q != NULL ? dot_i4_q8(w, scales, q, xs, n) : dot_i4_f32(w, scales, x, n);
+}
+#define I4Q_BEGIN(x, stride, rows, cols) i4q_begin((x), (stride), (rows), (cols))
+#else
+#define I4_DOT4 dot4_i4_f32
+#define I4_DOT1 dot_i4_f32
+#define I4Q_BEGIN(x, stride, rows, cols) ((void)0)
+#endif
+
 /* ---------- int4 tile for a small group of tokens ----------
  * A mixture-of-experts layer gives a small group of tokens to each expert.
  * The group is often smaller than the token block of the multi-level GEMM. The
@@ -1908,15 +2302,66 @@ void gemma_int4_set_rows4(int on)
     gemma_int4_rows4 = on ? 1 : 0;
 }
 
+/* csrc/kquants.c (included later): the 16 rows of a KQ_Q4X group on float32 x,
+ * and on int8 x. */
+static void kq_q4x_rows_f(const uint8_t *wg, int cols, const float *x, size_t xstride, int n,
+                          float *out, size_t ostride);
+static void kq_q4x_rows(const uint8_t *wg, int cols, const int8_t *xq, const float *xs,
+                        const int32_t *xn, int n, float *out, size_t ostride);
+
+/* The 16 rows of a KQ_Q4X group on n rows of x (xstride == cols, the rows
+ * of one i4q_begin): on AVX2 the int8 x of i4q_begin, else float32 x. */
+static inline void q4x_rows_x(const uint8_t *wg, int cols, const float *x, size_t xstride, int n,
+                              float *out, size_t ostride)
+{
+#if GEMMA_X86 && !defined(__AVX512F__)
+    const float *xs, *xs_last;
+    const int32_t *xn;
+    const int8_t *q = xstride == (size_t)cols ? i4q_find2(x, cols, &xs, &xn) : NULL;
+    /* the n rows must all be in the scratch (they follow each other there) */
+    if (q != NULL && (n == 1 || i4q_find(x + (size_t)(n - 1) * xstride, cols, &xs_last) != NULL)) {
+        const float *s16;
+        const int16_t *q16 = i4q_find16(x, cols, &s16);
+        if (q16 != NULL) {
+            const i4q_reg *R = i4q_cur();
+            if (n == 1 && R->rows == 1) {
+                /* a step: the planes of i4q_begin */
+                kq_q4x_rows_p16(wg, cols, R->h16, R->l16, R->n16, s16, out);
+            } else {
+                kq_q4x_rows16(wg, cols, q16, s16, n, out, ostride);
+            }
+            return;
+        }
+        kq_q4x_rows(wg, cols, q, xs, xn, n, out, ostride);
+        return;
+    }
+#endif
+    kq_q4x_rows_f(wg, cols, x, xstride, n, out, ostride);
+}
+
+/* scales NULL: w is the KQ_Q4X copy of the matrix (ops.q4x_pack_model;
+ * program.py gives it to the records of one token on the CPU): groups of 16
+ * rows, float32 x, the same products. */
 static void gemma_int4_linear_body(const uint8_t *w, const float *scales, const float *x, float *out,
                        int rows, int cols, int tokens, int group)
 {
+    if (scales == NULL) {
+        size_t gb = (size_t)16 * (cols / 32) * 18;
+        I4Q_BEGIN(x, (size_t)cols, tokens, cols);
+        #pragma omp for schedule(static)
+        for (int g = 0; g < rows / 16; ++g) {
+            q4x_rows_x(w + (size_t)g * gb, cols, x, (size_t)cols, tokens, out + 16 * g,
+                       (size_t)rows);
+        }
+        return;
+    }
     /* The fast dot uses a group of 32 values. ops.linear_int4 sends only that
      * group size. */
     (void)group;
     int groups = cols / 32;
     int stride = (cols / 32) * 18;
     if (gemma_int4_rows4 && tokens == 1) {
+        I4Q_BEGIN(x, (size_t)cols, 1, cols);
         int blocks = (rows + 3) / 4;
         #pragma omp for schedule(static)
         for (int b = 0; b < blocks; ++b) {
@@ -1924,17 +2369,17 @@ static void gemma_int4_linear_body(const uint8_t *w, const float *scales, const 
             int left = rows - i;
             if (left >= 4) {
                 float r[4];
-                dot4_i4_f32(w + (size_t)i * (size_t)stride, stride,
-                            scales + (size_t)i * (size_t)groups, x, cols, r);
+                I4_DOT4(w + (size_t)i * (size_t)stride, stride,
+                        scales + (size_t)i * (size_t)groups, x, cols, r);
                 out[i] = r[0];
                 out[i + 1] = r[1];
                 out[i + 2] = r[2];
                 out[i + 3] = r[3];
             } else {
                 for (int j = 0; j < left; ++j) {
-                    out[i + j] = dot_i4_f32(w + (size_t)(i + j) * (size_t)stride,
-                                            scales + (size_t)(i + j) * (size_t)groups,
-                                            x, cols);
+                    out[i + j] = I4_DOT1(w + (size_t)(i + j) * (size_t)stride,
+                                         scales + (size_t)(i + j) * (size_t)groups,
+                                         x, cols);
                 }
             }
         }
@@ -1972,11 +2417,13 @@ static void gemma_int4_multi4_body(const uint8_t *w0, const float *s0, float *o0
 {
     int groups = cols / 32;
     size_t stride = (size_t)groups * 18;
-    int b0 = w0 ? (rows0 + 3) / 4 : 0;
-    int b1 = w1 ? (rows1 + 3) / 4 : 0;
-    int b2 = w2 ? (rows2 + 3) / 4 : 0;
-    int b3 = w3 ? (rows3 + 3) / 4 : 0;
+    /* a matrix with s NULL is a KQ_Q4X copy: a task is a group of 16 rows */
+    int b0 = w0 ? (s0 ? (rows0 + 3) / 4 : rows0 / 16) : 0;
+    int b1 = w1 ? (s1 ? (rows1 + 3) / 4 : rows1 / 16) : 0;
+    int b2 = w2 ? (s2 ? (rows2 + 3) / 4 : rows2 / 16) : 0;
+    int b3 = w3 ? (s3 ? (rows3 + 3) / 4 : rows3 / 16) : 0;
     long total = (long)b0 + (long)b1 + (long)b2 + (long)b3;
+    I4Q_BEGIN(x, (size_t)cols, 1, cols);
     #pragma omp for schedule(static)
     for (long t = 0; t < total; ++t) {
         const uint8_t *w = w0;
@@ -1998,19 +2445,24 @@ static void gemma_int4_multi4_body(const uint8_t *w0, const float *s0, float *o0
                 }
             }
         }
+        if (s == NULL) {
+            q4x_rows_x(w + (size_t)u * 16 * stride, cols, x, (size_t)cols, 1, o + 16 * u,
+                       (size_t)rows);
+            continue;
+        }
         int i = (int)u * 4;
         if (i + 4 <= rows) {
             float r[4];
-            dot4_i4_f32(w + (size_t)i * stride, (int)stride,
-                        s + (size_t)i * (size_t)groups, x, cols, r);
+            I4_DOT4(w + (size_t)i * stride, (int)stride,
+                    s + (size_t)i * (size_t)groups, x, cols, r);
             o[i] = r[0];
             o[i + 1] = r[1];
             o[i + 2] = r[2];
             o[i + 3] = r[3];
         } else {
             for (int q = i; q < rows; ++q) {
-                o[q] = dot_i4_f32(w + (size_t)q * stride,
-                                  s + (size_t)q * (size_t)groups, x, cols);
+                o[q] = I4_DOT1(w + (size_t)q * stride,
+                               s + (size_t)q * (size_t)groups, x, cols);
             }
         }
     }
@@ -2052,6 +2504,7 @@ static void gemma_int4_moe_gemv_body(const uint8_t *w, const float *scales,
     size_t expert_scales = (size_t)rows * (size_t)groups;
     int blocks = (rows + 3) / 4;
     long total = (long)jobs * (long)blocks;
+    I4Q_BEGIN(x, (size_t)xstride, xstride ? jobs : 1, cols);
     #pragma omp for schedule(static)
     for (long t = 0; t < total; ++t) {
         int j = (int)(t / blocks);
@@ -2064,16 +2517,16 @@ static void gemma_int4_moe_gemv_body(const uint8_t *w, const float *scales,
         int left = rows - i;
         if (left >= 4) {
             float r[4];
-            dot4_i4_f32(wj + (size_t)i * stride, (int)stride,
-                        sj + (size_t)i * (size_t)groups, xj, cols, r);
+            I4_DOT4(wj + (size_t)i * stride, (int)stride,
+                    sj + (size_t)i * (size_t)groups, xj, cols, r);
             oj[i] = r[0];
             oj[i + 1] = r[1];
             oj[i + 2] = r[2];
             oj[i + 3] = r[3];
         } else {
             for (int q = i; q < rows; ++q) {
-                oj[q] = dot_i4_f32(wj + (size_t)q * stride,
-                                   sj + (size_t)q * (size_t)groups, xj, cols);
+                oj[q] = I4_DOT1(wj + (size_t)q * stride,
+                                sj + (size_t)q * (size_t)groups, xj, cols);
             }
         }
     }
@@ -2101,6 +2554,7 @@ void gemma_int4_moe_gemv(const uint8_t *w, const float *scales,
  * r[t * 4 + j] for token t and weight row j.
  */
 #define I4MT_T 4
+#define I4MT_MAX 16
 
 #if GEMMA_X86 && defined(__AVX512F__)
 static inline void dot4_i4_f32_mt(const uint8_t *w, int stride, const float *scales,
@@ -2162,6 +2616,49 @@ static inline void i4_rows_mt(const uint8_t *w, const float *s, int rows, int co
 {
     int groups = cols / 32;
     size_t stride = (size_t)groups * 18;
+#if GEMMA_X86 && !defined(__AVX512F__)
+    {
+        /* int8 x of i4q_begin: 2 tokens at a time; each token has the steps
+         * of the one-token kernel */
+        const int8_t *q[I4MT_MAX];
+        const float *qs[I4MT_MAX];
+        int all = nt <= I4MT_MAX;
+        for (int t = 0; t < nt && all; ++t) {
+            q[t] = i4q_find(xs[t], cols, &qs[t]);
+            all = q[t] != NULL;
+        }
+        if (all) {
+            for (int t0 = 0; t0 < nt; t0 += 2) {
+                int n = nt - t0 < 2 ? nt - t0 : 2;
+                if (i + 4 <= rows) {
+                    float r[8];
+                    if (n == 2) {
+                        dot4_i4_q8_n(w + (size_t)i * stride, (int)stride, s + (size_t)i * groups,
+                                     q + t0, qs + t0, 2, cols, r);
+                    } else {
+                        dot4_i4_q8_n(w + (size_t)i * stride, (int)stride, s + (size_t)i * groups,
+                                     q + t0, qs + t0, 1, cols, r);
+                    }
+                    for (int t = 0; t < n; ++t) {
+                        float *o = outs[t0 + t];
+                        o[i] = r[t * 4];
+                        o[i + 1] = r[t * 4 + 1];
+                        o[i + 2] = r[t * 4 + 2];
+                        o[i + 3] = r[t * 4 + 3];
+                    }
+                } else {
+                    for (int t = 0; t < n; ++t) {
+                        for (int k = i; k < rows; ++k) {
+                            outs[t0 + t][k] = dot_i4_q8(w + (size_t)k * stride, s + (size_t)k * groups,
+                                                        q[t0 + t], qs[t0 + t], cols);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
     for (int t0 = 0; t0 < nt; t0 += I4MT_T) {
         int n = nt - t0 < I4MT_T ? nt - t0 : I4MT_T;
         if (i + 4 <= rows) {
@@ -2187,12 +2684,23 @@ static inline void i4_rows_mt(const uint8_t *w, const float *s, int rows, int co
     }
 }
 
-#define I4MT_MAX 16
 
 /* x is (tokens, cols) and out is (tokens, rows). */
 static void gemma_int4_linear_mt_body(const uint8_t *w, const float *scales, const float *x,
                           float *out, int rows, int cols, int tokens)
 {
+    if (scales == NULL) {
+        /* a KQ_Q4X copy (see gemma_int4_linear_body): each token has the
+         * operations of a step, so a verify group gives the bits of steps */
+        size_t gb = (size_t)16 * (cols / 32) * 18;
+        I4Q_BEGIN(x, (size_t)cols, tokens, cols);
+        #pragma omp for schedule(static)
+        for (int g = 0; g < rows / 16; ++g) {
+            q4x_rows_x(w + (size_t)g * gb, cols, x, (size_t)cols, tokens, out + 16 * g,
+                       (size_t)rows);
+        }
+        return;
+    }
     const float *xs[I4MT_MAX];
     float *outs[I4MT_MAX];
     for (int t = 0; t < tokens; ++t) {
@@ -2200,6 +2708,7 @@ static void gemma_int4_linear_mt_body(const uint8_t *w, const float *scales, con
         outs[t] = out + (size_t)t * (size_t)rows;
     }
     int blocks = (rows + 3) / 4;
+    I4Q_BEGIN(x, (size_t)cols, tokens, cols);
     #pragma omp for schedule(static)
     for (int b = 0; b < blocks; ++b) {
         i4_rows_mt(w, scales, rows, cols, b * 4, xs, outs, tokens);
@@ -2227,13 +2736,15 @@ static void gemma_int4_multi4_mt_body(const uint8_t *w0, const float *s0, float 
     long nb[4];
     long total = 0;
     for (int k = 0; k < 4; ++k) {
-        nb[k] = ws[k] ? (rs[k] + 3) / 4 : 0;
+        /* s NULL: a KQ_Q4X copy, a task is a group of 16 rows */
+        nb[k] = ws[k] ? (ss[k] ? (rs[k] + 3) / 4 : rs[k] / 16) : 0;
         total += nb[k];
     }
     const float *xs[I4MT_MAX];
     for (int t = 0; t < tokens; ++t) {
         xs[t] = x + (size_t)t * (size_t)cols;
     }
+    I4Q_BEGIN(x, (size_t)cols, tokens, cols);
     #pragma omp for schedule(static)
     for (long u = 0; u < total; ++u) {
         int k = 0;
@@ -2241,6 +2752,11 @@ static void gemma_int4_multi4_mt_body(const uint8_t *w0, const float *s0, float 
         while (v >= nb[k]) {
             v -= nb[k];
             ++k;
+        }
+        if (ss[k] == NULL) {
+            q4x_rows_x(ws[k] + (size_t)v * 16 * (cols / 32) * 18, cols, x, (size_t)cols, tokens,
+                       os[k] + 16 * v, (size_t)rs[k]);
+            continue;
         }
         float *outs[I4MT_MAX];
         for (int t = 0; t < tokens; ++t) {
@@ -2273,6 +2789,11 @@ static void gemma_int4_moe_gemv_mt_body(const uint8_t *w, const float *scales, c
     size_t expert_scales = (size_t)rows * (size_t)groups;
     int blocks = (rows + 3) / 4;
     long total = (long)jobs * (long)blocks;
+    int xrows = 1;
+    for (int p = 0; p < poff[jobs]; ++p) {
+        xrows = xi[p] + 1 > xrows ? xi[p] + 1 : xrows;
+    }
+    I4Q_BEGIN(x, (size_t)xstride, xrows, cols);
     #pragma omp for schedule(static)
     for (long u = 0; u < total; ++u) {
         int j = (int)(u / blocks);
@@ -2839,11 +3360,70 @@ void gemma_q6k_rows(const uint8_t *table, const int64_t *ids, int n, int cols, f
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
     int64_t total = (int64_t)n * (cols >> 8);
     /* One token (a decode step) is too little work for the threads. */
-    #pragma omp parallel for schedule(static) if (n > 4)
+    #pragma omp parallel for schedule(static) if ((size_t)n * cols > (1u << 18))
     for (int64_t i = 0; i < total; ++i) {
         int64_t r = i / (cols >> 8), b = i % (cols >> 8);
         q6k_decode_block(table + (size_t)ids[r] * row_bytes + (size_t)b * 210u,
                          out + (size_t)r * cols + (size_t)b * 256u);
+    }
+}
+
+/* The rows ids of a Q4_0 table as float32, as _dequant of gguf.py: (nibble -
+ * 8) times the float16 scale d, in float32. The same bits. The QAT files of
+ * unsloth keep the tables of the E2B and the E4B in Q4_0. */
+void gemma_q4_0_rows(const uint8_t *table, const int64_t *ids, int n, int cols, float *out)
+{
+    int nb = cols / 32;
+    size_t row_bytes = (size_t)nb * 18u;
+    int64_t total = (int64_t)n * nb;
+    #pragma omp parallel for schedule(static) if ((size_t)n * cols > (1u << 18))
+    for (int64_t i = 0; i < total; ++i) {
+        int64_t r = i / nb, b = i % nb;
+        const uint8_t *blk = table + (size_t)ids[r] * row_bytes + (size_t)b * 18u;
+        float d = fp16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        float *y = out + (size_t)r * cols + (size_t)b * 32u;
+        for (int l = 0; l < 16; ++l) {
+            y[l] = (float)((blk[2 + l] & 0xF) - 8) * d;
+            y[l + 16] = (float)((blk[2 + l] >> 4) - 8) * d;
+        }
+    }
+}
+
+/* The rows ids of a Q4_K (five 0) or Q5_K (five 1) table as float32, as
+ * _dequant of gguf.py: d sc q - dmin m in double (NumPy promotes the float32
+ * scale and the int32 values), then float32. The same bits. */
+void gemma_kq45_rows(const uint8_t *table, const int64_t *ids, int n, int cols, int five,
+                     float *out)
+{
+    size_t bs = five ? 176u : 144u, row_bytes = (size_t)(cols >> 8) * bs;
+    int64_t total = (int64_t)n * (cols >> 8);
+    #pragma omp parallel for schedule(static) if ((size_t)n * cols > (1u << 18))
+    for (int64_t i = 0; i < total; ++i) {
+        int64_t r = i / (cols >> 8), b = i % (cols >> 8);
+        const uint8_t *blk = table + (size_t)ids[r] * row_bytes + (size_t)b * bs;
+        const uint8_t *sc = blk + 4, *qh = blk + 16, *qs = blk + (five ? 48 : 16);
+        double d = fp16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        double dmin = fp16_to_f32((uint16_t)(blk[2] | (blk[3] << 8)));
+        float *y = out + (size_t)r * cols + (size_t)b * 256u;
+        for (int s = 0; s < 8; ++s) {
+            int sv, mv;
+            if (s < 4) {
+                sv = sc[s] & 63;
+                mv = sc[s + 4] & 63;
+            } else {
+                sv = (sc[s + 4] & 0xF) | ((sc[s - 4] >> 6) << 4);
+                mv = (sc[s + 4] >> 4) | ((sc[s] >> 6) << 4);
+            }
+            int j = s / 2, high = s % 2;
+            double ds = d * (double)sv, dm = dmin * (double)mv;
+            for (int l = 0; l < 32; ++l) {
+                int q = high ? qs[32 * j + l] >> 4 : qs[32 * j + l] & 0xF;
+                if (five) {
+                    q |= ((qh[l] >> (2 * j + high)) & 1) << 4;
+                }
+                y[32 * s + l] = (float)(ds * (double)q - dm);
+            }
+        }
     }
 }
 
@@ -2960,10 +3540,94 @@ static float dot_q6k_row_avx2(const uint8_t *w, const float *x, int cols)
 /* A group of tokens runs the one-token dot for each token. The weight row
  * stays in the cache between the tokens, so the memory reads one row. */
 __attribute__((target("avx2,fma")))
+#if GEMMA_X86 && !defined(__AVX512F__)
+/* One Q6_K row on NT int8 x rows (i4q_begin), NT a constant 1 or 2. Each
+ * quarter of a half block (32 values) is one group of x with two scales
+ * (one for each 16): the codes minus 32 (vpsignb moves their sign to x),
+ * vpmaddubsw, vpmaddwd with the two scales, and one fma with d times the
+ * scale of x. A token alone and in a group has the same operations. */
+static inline __attribute__((always_inline)) void q6k_row_q8_n(
+    const uint8_t *w, const int8_t *const *xq, const float *const *xs, const int NT, int cols,
+    float *sums)
+{
+    const __m256i m4 = _mm256_set1_epi8(0x0F), m2 = _mm256_set1_epi8(0x03);
+    const __m256i c32 = _mm256_set1_epi8(32);
+    __m256 acc[2];
+    for (int t = 0; t < NT; ++t) {
+        acc[t] = _mm256_setzero_ps();
+    }
+    for (int b = 0; b < (cols >> 8); ++b) {
+        const uint8_t *blk = w + (size_t)b * 210u;
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        float d = fp16_to_f32((uint16_t)((uint16_t)blk[208] | ((uint16_t)blk[209] << 8)));
+        for (int n = 0; n < 2; ++n) {
+            __m256i A = _mm256_loadu_si256((const __m256i *)(blk + 64 * n));
+            __m256i B = _mm256_loadu_si256((const __m256i *)(blk + 64 * n + 32));
+            __m256i H = _mm256_loadu_si256((const __m256i *)(blk + 128 + 32 * n));
+            __m256i q[4];
+            q[0] = _mm256_or_si256(_mm256_and_si256(A, m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(H, m2), 4));
+            q[1] = _mm256_or_si256(_mm256_and_si256(B, m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(H, 2), m2), 4));
+            q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(A, 4), m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(H, 4), m2), 4));
+            q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(B, 4), m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(H, 6), m2), 4));
+            for (int u = 0; u < 4; ++u) {
+                __m256i qs = _mm256_sub_epi8(q[u], c32);
+                __m256i aq = _mm256_abs_epi8(qs);
+                __m256i scv = _mm256_set_m128i(_mm_set1_epi16(sc[8 * n + 2 * u + 1]),
+                                               _mm_set1_epi16(sc[8 * n + 2 * u]));
+                int g = b * 8 + 4 * n + u;
+                for (int t = 0; t < NT; ++t) {
+                    __m256i xv = _mm256_loadu_si256((const __m256i *)(xq[t] + (size_t)g * 32));
+                    __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(xv, qs)), scv);
+                    acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * xs[t][g]), acc[t]);
+                }
+            }
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        sums[t] = hsum256_ps(acc[t]);
+    }
+}
+#endif
+
 static void gemma_q6k_avx2_body(const uint8_t *w, const float *x, float *out,
                     int rows, int cols, int tokens)
 {
     size_t row_bytes = (size_t)(cols >> 8) * 210u;
+#if GEMMA_X86 && !defined(__AVX512F__)
+    if (tokens <= 16 && cols % 256 == 0) {
+        /* int8 x (i4q_begin), 2 tokens at a time */
+        I4Q_BEGIN(x, (size_t)cols, tokens, cols);
+        const int8_t *q[16];
+        const float *qs[16];
+        int all = 1;
+        for (int t = 0; t < tokens && all; ++t) {
+            q[t] = i4q_find(x + (size_t)t * cols, cols, &qs[t]);
+            all = q[t] != NULL;
+        }
+        if (all) {
+            #pragma omp for schedule(static)
+            for (int i = 0; i < rows; ++i) {
+                const uint8_t *wi = w + (size_t)i * row_bytes;
+                for (int t0 = 0; t0 < tokens; t0 += 2) {
+                    float r[2];
+                    if (tokens - t0 >= 2) {
+                        q6k_row_q8_n(wi, q + t0, qs + t0, 2, cols, r);
+                        out[(size_t)t0 * rows + i] = r[0];
+                        out[(size_t)(t0 + 1) * rows + i] = r[1];
+                    } else {
+                        q6k_row_q8_n(wi, q + t0, qs + t0, 1, cols, r);
+                        out[(size_t)t0 * rows + i] = r[0];
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
     #pragma omp for schedule(static)
     for (int i = 0; i < rows; ++i) {
         for (int t = 0; t < tokens; ++t) {
@@ -2991,7 +3655,9 @@ __attribute__((target("avx512f,avx512bw,avx512vl")))
 static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
 {
     int nb = cols >> 8;
-    float sum = 0.0f;
+    /* A vector of sums over the blocks (d with one fma), the lanes added
+     * once at the end, as dot_q6k_rows_avx512 does for each token. */
+    __m512 tot = _mm512_setzero_ps();
     for (int b = 0; b < nb; ++b) {
         const uint8_t *blk = w + (size_t)b * 210u;
         const uint8_t *ql = blk;
@@ -3035,9 +3701,9 @@ static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
                 acc = _mm512_fmadd_ps(k, _mm512_loadu_ps(xh + 96 + l0), acc);
             }
         }
-        sum += d * _mm512_reduce_add_ps(acc);
+        tot = _mm512_fmadd_ps(acc, _mm512_set1_ps(d), tot);
     }
-    return sum;
+    return _mm512_reduce_add_ps(tot);
 }
 
 /* The dot of one Q6_K row with up to Q6K_TMAX token rows. The kernel decodes
@@ -3047,13 +3713,13 @@ static float dot_q6k_row_avx512(const uint8_t *w, const float *x, int cols)
  * gives the same logits as a decode step. */
 #define Q6K_TMAX 8
 
-__attribute__((target("avx512f,avx512bw,avx512vl")))
-static void dot_q6k_rows_avx512(const uint8_t *w, const float *x, int cols,
-                                int tokens, float *sums)
+__attribute__((target("avx512f,avx512bw,avx512vl"))) static inline __attribute__((always_inline))
+void dot_q6k_rows_n(const uint8_t *w, const float *x, int cols, const int tokens, float *sums)
 {
     int nb = cols >> 8;
+    __m512 tot[Q6K_TMAX];
     for (int t = 0; t < tokens; ++t) {
-        sums[t] = 0.0f;
+        tot[t] = _mm512_setzero_ps();
     }
     for (int b = 0; b < nb; ++b) {
         const uint8_t *blk = w + (size_t)b * 210u;
@@ -3105,9 +3771,31 @@ static void dot_q6k_rows_avx512(const uint8_t *w, const float *x, int cols,
                 }
             }
         }
+        __m512 dv = _mm512_set1_ps(d);
         for (int t = 0; t < tokens; ++t) {
-            sums[t] += d * _mm512_reduce_add_ps(acc[t]);
+            tot[t] = _mm512_fmadd_ps(acc[t], dv, tot[t]);
         }
+    }
+    for (int t = 0; t < tokens; ++t) {
+        sums[t] = _mm512_reduce_add_ps(tot[t]);
+    }
+}
+
+/* dot_q6k_rows_n with a constant count, so the sums of each token stay in
+ * registers. */
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static void dot_q6k_rows_avx512(const uint8_t *w, const float *x, int cols,
+                                int tokens, float *sums)
+{
+    switch (tokens) {
+    case 1: dot_q6k_rows_n(w, x, cols, 1, sums); break;
+    case 2: dot_q6k_rows_n(w, x, cols, 2, sums); break;
+    case 3: dot_q6k_rows_n(w, x, cols, 3, sums); break;
+    case 4: dot_q6k_rows_n(w, x, cols, 4, sums); break;
+    case 5: dot_q6k_rows_n(w, x, cols, 5, sums); break;
+    case 6: dot_q6k_rows_n(w, x, cols, 6, sums); break;
+    case 7: dot_q6k_rows_n(w, x, cols, 7, sums); break;
+    default: dot_q6k_rows_n(w, x, cols, Q6K_TMAX, sums); break;
     }
 }
 
@@ -3174,6 +3862,43 @@ void gemma_q6k_linear(const uint8_t *w, const float *x, float *out,
  * call of each small function than in the work. This kernel does the full
  * step. The parallel loop covers the experts.
  */
+/* The logit of one expert: r times a row of the router projection. The
+ * vector forms keep 4 accumulators and add them in one order; the router of
+ * a step and of a group (gemma_router_mt_body) both use it, so a group
+ * selects the experts of the steps. The scalar loop with 4 accumulators
+ * did not vectorize (gcc keeps the order of float sums), and the router
+ * took 95 us a layer on AVX2 with 6 threads. */
+static inline float router_dot(const float *r, const float *pe, int hidden)
+{
+    int k = 0;
+    float a = 0.0f;
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 c0 = _mm512_setzero_ps(), c1 = _mm512_setzero_ps();
+    __m512 c2 = _mm512_setzero_ps(), c3 = _mm512_setzero_ps();
+    for (; k + 64 <= hidden; k += 64) {
+        c0 = _mm512_fmadd_ps(_mm512_loadu_ps(r + k), _mm512_loadu_ps(pe + k), c0);
+        c1 = _mm512_fmadd_ps(_mm512_loadu_ps(r + k + 16), _mm512_loadu_ps(pe + k + 16), c1);
+        c2 = _mm512_fmadd_ps(_mm512_loadu_ps(r + k + 32), _mm512_loadu_ps(pe + k + 32), c2);
+        c3 = _mm512_fmadd_ps(_mm512_loadu_ps(r + k + 48), _mm512_loadu_ps(pe + k + 48), c3);
+    }
+    a = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(c0, c1), _mm512_add_ps(c2, c3)));
+#elif GEMMA_X86
+    __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+    __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+    for (; k + 32 <= hidden; k += 32) {
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(r + k), _mm256_loadu_ps(pe + k), c0);
+        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(r + k + 8), _mm256_loadu_ps(pe + k + 8), c1);
+        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(r + k + 16), _mm256_loadu_ps(pe + k + 16), c2);
+        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(r + k + 24), _mm256_loadu_ps(pe + k + 24), c3);
+    }
+    a = hsum256_ps(_mm256_add_ps(_mm256_add_ps(c0, c1), _mm256_add_ps(c2, c3)));
+#endif
+    for (; k < hidden; ++k) {
+        a += r[k] * pe[k];
+    }
+    return a;
+}
+
 static void gemma_router_body(const float *x, const float *scale, const float *proj,
                               const float *per_expert, int hidden, int experts,
                               int top_k, float eps, float hscale, float *val,
@@ -3192,20 +3917,7 @@ static void gemma_router_body(const float *x, const float *scale, const float *p
     }
     #pragma omp for schedule(static)
     for (int e = 0; e < experts; ++e) {
-        const float *pe = proj + (size_t)e * (size_t)hidden;
-        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-        int k = 0;
-        for (; k + 3 < hidden; k += 4) {
-            a0 += r[k] * pe[k];
-            a1 += r[k + 1] * pe[k + 1];
-            a2 += r[k + 2] * pe[k + 2];
-            a3 += r[k + 3] * pe[k + 3];
-        }
-        float a = (a0 + a1) + (a2 + a3);
-        for (; k < hidden; ++k) {
-            a += r[k] * pe[k];
-        }
-        logits[e] = a;
+        logits[e] = router_dot(r, proj + (size_t)e * (size_t)hidden, hidden);
     }
     #pragma omp single
     {
@@ -3285,20 +3997,8 @@ static void gemma_router_mt_body(const float *x, const float *scale, const float
     for (int e = 0; e < experts; ++e) {
         const float *pe = proj + (size_t)e * (size_t)hidden;
         for (int t = 0; t < tokens; ++t) {
-            const float *rt = r + (size_t)t * (size_t)hidden;
-            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-            int k = 0;
-            for (; k + 3 < hidden; k += 4) {
-                a0 += rt[k] * pe[k];
-                a1 += rt[k + 1] * pe[k + 1];
-                a2 += rt[k + 2] * pe[k + 2];
-                a3 += rt[k + 3] * pe[k + 3];
-            }
-            float a = (a0 + a1) + (a2 + a3);
-            for (; k < hidden; ++k) {
-                a += rt[k] * pe[k];
-            }
-            logits[(size_t)t * (size_t)experts + e] = a;
+            logits[(size_t)t * (size_t)experts + e] =
+                router_dot(r + (size_t)t * (size_t)hidden, pe, hidden);
         }
     }
     #pragma omp single
@@ -3551,6 +4251,14 @@ static inline float dot_f32_f32(const float *a, const float *b, int n)
 }
 #endif
 
+/* The row stride of a float32 KV cache from its head stride hs: position-
+ * major (positions, kv heads, hd) has hs == hd and rows of kvh hd values;
+ * head-major (kv heads, positions, hd) rows of hd (gpu.cu kv_rs). */
+static inline size_t gp_kv_rs(size_t hs, int kvh, int hd)
+{
+    return hs == (size_t)hd ? (size_t)kvh * (size_t)hd : (size_t)hd;
+}
+
 /* One query token against a float32 key and value cache.
  *
  * q is (q_heads, head_dim). k and v are (kv_heads, n, head_dim), which is the
@@ -3658,18 +4366,19 @@ static void gemma_attn_decode_f32_body(const float *q, const float *k, const flo
     }
 }
 
-/* The E4B cache keeps the keys of one head together: a row stride of
- * head_dim. */
+/* A float32 cache by its head strides: the row stride from them (gp_kv_rs:
+ * position-major, the form of all the caches now, or head-major). */
 void gemma_attn_decode_f32(const float *q, const float *k, const float *v,
                            float *scores, float *out,
                            int q_heads, int kv_heads, int head_dim, int n,
                            long k_head_stride, long v_head_stride,
                            int pos, int base, int window)
 {
+    long kr = (long)gp_kv_rs((size_t)k_head_stride, kv_heads, head_dim);
+    long vr = (long)gp_kv_rs((size_t)v_head_stride, kv_heads, head_dim);
     #pragma omp parallel
     gemma_attn_decode_f32_body(q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
-                               k_head_stride, v_head_stride, head_dim, head_dim,
-                               pos, base, window);
+                               k_head_stride, v_head_stride, kr, vr, pos, base, window);
 }
 
 /* The cache of Model keeps one row for each position: (rows, kv_heads,
@@ -3819,6 +4528,236 @@ void gemma_quantize_i16_groups(const float *x, int16_t *q, float *s, long groups
     gemma_quantize_i16_groups_body(x, q, s, groups);
 }
 
+/* The int8 cache (NP_GEMMA_KV_INT8): a group of 32 values gets the scale
+ * max |x| / 127, and each value is x / scale rounded to the nearest (ties
+ * to even, lrintf), as the int16 form. */
+static inline float gemma_quant_group32_i8(const float *x, int8_t *q)
+{
+    float amax = 0.0f;
+    for (int k = 0; k < 32; ++k) {
+        float a = fabsf(x[k]);
+        if (a > amax) {
+            amax = a;
+        }
+    }
+    float sc = amax > 0.0f ? amax / 127.0f : 1e-12f;
+    for (int k = 0; k < 32; ++k) {
+        long v = lrintf(x[k] / sc);
+        v = v > 127 ? 127 : (v < -127 ? -127 : v);
+        q[k] = (int8_t)v;
+    }
+    return sc;
+}
+
+/* The float32 values of groups of 32 int8 values times the scale of the
+ * group (the int8 cache: KVCache.read). */
+void gemma_dequantize_i8_groups(const int8_t *q, const float *s, float *out, long groups)
+{
+    #pragma omp parallel for schedule(static) if(groups >= 1024)
+    for (long g = 0; g < groups; ++g) {
+        for (int k = 0; k < 32; ++k) {
+            out[(size_t)g * 32 + k] = (float)q[(size_t)g * 32 + k] * s[g];
+        }
+    }
+}
+
+void gemma_quantize_i8_groups(const float *x, int8_t *q, float *s, long groups)
+{
+    #pragma omp parallel for schedule(static) if(groups >= 1024)
+    for (long g = 0; g < groups; ++g) {
+        s[g] = gemma_quant_group32_i8(x + (size_t)g * 32, q + (size_t)g * 32);
+    }
+}
+
+/* The TQ6 cache of the Qwen models (np_gemma/tq6.py has the description,
+ * csrc/tq6_tables.h the tables). A group of 32 values: the signs of
+ * TQ6_SIGNS, the Walsh-Hadamard transform divided by sqrt(32), then the L2
+ * norm (float32) and an index of 6 bits into tq6_cb for each value. The 24
+ * bytes of a group: byte j < 16 has the low 4 bits of index j and of index
+ * j + 16; byte 16 + j has the high 2 bits of indices j, j + 8, j + 16,
+ * j + 24. */
+#include "tq6_tables.h"
+static const float tq6_cb[64] = TQ6_CODEBOOK;
+static const float tq6_edges[63] = TQ6_EDGES;
+
+/* The rotation of 32 values in place (inverse 0), or its inverse. */
+static inline void tq6_rot32(float *x, int inverse)
+{
+    const float r = 0.17677669529663687f;    /* 1 / sqrt(32) */
+    if (!inverse) {
+        for (int i = 0; i < 32; ++i) {
+            x[i] = (TQ6_SIGNS >> i) & 1u ? -x[i] : x[i];
+        }
+    }
+    for (int h = 1; h < 32; h *= 2) {
+        for (int i = 0; i < 32; i += 2 * h) {
+            for (int j = i; j < i + h; ++j) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < 32; ++i) {
+        x[i] *= r;
+        if (inverse && ((TQ6_SIGNS >> i) & 1u)) {
+            x[i] = -x[i];
+        }
+    }
+}
+
+/* Quantize a group of 32 values to 24 bytes; return the norm. No fused
+ * multiply-add: the GPU (k_kv_write_tq) gives the same bits. */
+__attribute__((optimize("fp-contract=off")))
+static float tq6_quant_group(const float *x, uint8_t *b)
+{
+    float y[32];
+    memcpy(y, x, sizeof(y));
+    tq6_rot32(y, 0);
+    /* the sum of the squares in the order of the warp of the GPU (a sum
+     * with xor shuffles), so both give the same bits */
+    float s[32];
+    for (int i = 0; i < 32; ++i) {
+        s[i] = y[i] * y[i];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        for (int i = 0; i < off; ++i) {
+            s[i] = s[i] + s[i + off];
+        }
+    }
+    float nrm = sqrtf(s[0]);
+    float inv = 1.0f / (nrm > 1e-30f ? nrm : 1e-30f);
+    uint8_t idx[32];
+    for (int i = 0; i < 32; ++i) {
+        float u = y[i] * inv;
+        /* the count of the edges below u (numpy searchsorted, side left) */
+        int lo = 0, hi = 63;
+        while (lo < hi) {
+            int m = (lo + hi) / 2;
+            if (tq6_edges[m] < u) {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        idx[i] = (uint8_t)lo;
+    }
+    for (int j = 0; j < 16; ++j) {
+        b[j] = (uint8_t)((idx[j] & 15) | ((idx[j + 16] & 15) << 4));
+    }
+    for (int j = 0; j < 8; ++j) {
+        b[16 + j] = (uint8_t)((idx[j] >> 4) | ((idx[j + 8] >> 4) << 2) |
+                              ((idx[j + 16] >> 4) << 4) | ((idx[j + 24] >> 4) << 6));
+    }
+    return nrm;
+}
+
+/* The 32 rotated values of a group: norm * tq6_cb[index]. */
+static inline __attribute__((always_inline)) void tq6_deq32(const uint8_t *b, float nrm,
+                                                            float *out)
+{
+#if GEMMA_X86
+    __m128i x = _mm_loadu_si128((const __m128i *)b);
+    __m128i m15 = _mm_set1_epi8(15);
+    __m256i nib = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(x, 4), m15),
+                                   _mm_and_si128(x, m15));
+    int64_t h8;
+    memcpy(&h8, b + 16, 8);
+    __m256i hb = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(h8),
+                                                    _mm256_set_epi64x(6, 4, 2, 0)),
+                                  _mm256_set1_epi8(3));
+    __m256i idx = _mm256_or_si256(nib, _mm256_slli_epi16(hb, 4));
+    __m128i i0 = _mm256_castsi256_si128(idx), i1 = _mm256_extracti128_si256(idx, 1);
+#if defined(__AVX512F__)
+    __m512 t0 = _mm512_loadu_ps(tq6_cb), t1 = _mm512_loadu_ps(tq6_cb + 16);
+    __m512 t2 = _mm512_loadu_ps(tq6_cb + 32), t3 = _mm512_loadu_ps(tq6_cb + 48);
+    __m512 s5 = _mm512_set1_ps(nrm);
+    __m512i k32 = _mm512_set1_epi32(32);
+    for (int h = 0; h < 2; ++h) {
+        __m512i iv = _mm512_cvtepu8_epi32(h ? i1 : i0);
+        __mmask16 up = _mm512_test_epi32_mask(iv, k32);
+        __m512 v = _mm512_mask_blend_ps(up, _mm512_permutex2var_ps(t0, iv, t1),
+                                        _mm512_permutex2var_ps(t2, iv, t3));
+        _mm512_storeu_ps(out + 16 * h, _mm512_mul_ps(v, s5));
+    }
+#else
+    /* the codebook is symmetric: index i >= 32 has the value tq6_cb[i] and
+     * index i < 32 the value -tq6_cb[63 - i]. Four permutes of the 32
+     * positive values and two blends find the value, then the sign. */
+    __m256 s8 = _mm256_set1_ps(nrm);
+    __m256 t0 = _mm256_loadu_ps(tq6_cb + 32), t1 = _mm256_loadu_ps(tq6_cb + 40);
+    __m256 t2 = _mm256_loadu_ps(tq6_cb + 48), t3 = _mm256_loadu_ps(tq6_cb + 56);
+    for (int h = 0; h < 4; ++h) {
+        __m128i src = h < 2 ? i0 : i1;
+        __m256i iv = _mm256_cvtepu8_epi32(h % 2 ? _mm_srli_si128(src, 8) : src);
+        /* t: 0 for i >= 32, all ones for i < 32; m: the index of the positive value */
+        __m256i t = _mm256_sub_epi32(_mm256_srli_epi32(iv, 5), _mm256_set1_epi32(1));
+        __m256i m = _mm256_xor_si256(iv, t);
+        __m256 b3 = _mm256_castsi256_ps(_mm256_slli_epi32(m, 28));
+        __m256 lo = _mm256_blendv_ps(_mm256_permutevar8x32_ps(t0, m),
+                                     _mm256_permutevar8x32_ps(t1, m), b3);
+        __m256 hi = _mm256_blendv_ps(_mm256_permutevar8x32_ps(t2, m),
+                                     _mm256_permutevar8x32_ps(t3, m), b3);
+        __m256 v = _mm256_blendv_ps(lo, hi, _mm256_castsi256_ps(_mm256_slli_epi32(m, 27)));
+        v = _mm256_xor_ps(v, _mm256_castsi256_ps(_mm256_slli_epi32(t, 31)));
+        _mm256_storeu_ps(out + 8 * h, _mm256_mul_ps(v, s8));
+    }
+#endif
+#else
+    for (int j = 0; j < 32; ++j) {
+        int lo4 = j < 16 ? b[j] & 15 : b[j - 16] >> 4;
+        int hi2 = (b[16 + j % 8] >> (2 * (j / 8))) & 3;
+        out[j] = nrm * tq6_cb[lo4 | (hi2 << 4)];
+    }
+#endif
+}
+
+/* The NumPy forms of the tests: groups of 32 values. */
+void gemma_tq6_quantize(const float *x, uint8_t *b, float *nrm, long groups)
+{
+    #pragma omp parallel for schedule(static) if(groups >= 1024)
+    for (long g = 0; g < groups; ++g) {
+        nrm[g] = tq6_quant_group(x + (size_t)g * 32, b + (size_t)g * 24);
+    }
+}
+
+void gemma_tq6_dequantize_rotated(const uint8_t *b, const float *nrm, float *out, long groups)
+{
+    for (long g = 0; g < groups; ++g) {
+        tq6_deq32(b + (size_t)g * 24, nrm[g], out + (size_t)g * 32);
+    }
+}
+
+void gemma_tq6_rotate(float *x, long groups, int inverse)
+{
+    #pragma omp parallel for schedule(static) if(groups >= 1024)
+    for (long g = 0; g < groups; ++g) {
+        tq6_rot32(x + (size_t)g * 32, inverse);
+    }
+}
+
+/* The float32 values of groups of 32 int16 values: q times the scale of
+ * the group, as numpy gives them (KVCache.write_q). */
+static void gemma_dequantize_i16_groups_body(const int16_t *q, const float *s, float *out,
+                                             long groups)
+{
+    #pragma omp for schedule(static)
+    for (long g = 0; g < groups; ++g) {
+        const int16_t *qg = q + (size_t)g * 32;
+        float *og = out + (size_t)g * 32;
+        float sc = s[g];
+        for (int k = 0; k < 32; ++k) {
+            og[k] = (float)qg[k] * sc;
+        }
+    }
+}
+
+void gemma_dequantize_i16_groups(const int16_t *q, const float *s, float *out, long groups)
+{
+    #pragma omp parallel if(groups >= 1024)
+    gemma_dequantize_i16_groups_body(q, s, out, groups);
+}
+
 /* The dot product of 32 float32 values and 32 int16 values. */
 static inline float dot32_f32_i16(const float *a, const int16_t *b)
 {
@@ -3958,13 +4897,25 @@ static void gemma_attn_decode_i16_body(const float *q, const int16_t *kq, const 
     }
 }
 
+static int gemma_attn_split_i16_body(const float *q, const int16_t *kq, const float *ks,
+                                     const int16_t *vq, const float *vs, float *scores,
+                                     float *out, int q_heads, int kv_heads, int head_dim,
+                                     const int *lo, const int *n, int nmax, int tokens);
+
+/* The split form when it fits (the attention of the MTP drafter over the
+ * target cache), else one head for each thread. */
 void gemma_attn_decode_i16(const float *q, const int16_t *kq, const float *ks,
                            const int16_t *vq, const float *vs, float *scores,
                            float *out, int q_heads, int kv_heads, int head_dim, int n)
 {
     #pragma omp parallel
-    gemma_attn_decode_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
-                               head_dim, n);
+    {
+        if (!gemma_attn_split_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                       head_dim, NULL, &n, n, 1)) {
+            gemma_attn_decode_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                       head_dim, n);
+        }
+    }
 }
 
 /* The same for a group of queries. Query t reads the rows lo[t] to
@@ -3995,14 +4946,845 @@ static void gemma_attn_decode_i16_mt_body(const float *q, const int16_t *kq,
     }
 }
 
+/* ---- the decode attention over the int16 cache, split by keys ----
+ *
+ * As the attention of a decode step on the GPU (k_attn_fd): an item is a
+ * query token, a key head, and a chunk of AS_LEN(n) keys. It does all the
+ * query heads of that key head, so it reads each key and value row once.
+ * It converts a row to float32 times the scale of each group of 32 values
+ * once (as_row), and each query head then takes one dot product with one
+ * sum across the lanes (AVX2 summed each group of 32 before). The item
+ * writes, for each of its query heads, the sum of exp(score - m) times the
+ * value rows, m, and l (the sum of exp(score - m)) to the scratch. A second
+ * pass joins the chunks of each query head, in the order of the chunks.
+ *
+ * The chunk length depends only on n, so a query of a group gives the bits
+ * of the same query in a step. Many items keep all the threads busy: the
+ * 16 query heads of the 26B over 6 threads left two threads idle. */
+#define AS_MAXC 32
+#define AS_MINLEN 64
+#define AS_LEN(n) ((n) <= AS_MINLEN * AS_MAXC ? AS_MINLEN : ((n) + AS_MAXC - 1) / AS_MAXC)
+/* the query values of the heads of an item: 8192 takes the 16 query heads of
+ * 512 values of a global layer of the 12B (one key head) */
+#define AS_MAXQ 8192
+
+/* The scratch of the split attention, one set for each team: the team of
+ * one program (slot 0), or the team of each part of gemma_run_parts (slot
+ * part + 1), because the parts run it at the same time. */
+#define AS_SLOTS 9
+typedef struct {
+    float *parts;
+    size_t parts_n;
+    float *isc;                       /* the scores of the items, by thread */
+    size_t isc_n;
+    int16_t *qq;                      /* the int16 queries (AVX2) */
+    float *sq;
+    size_t q_n, sq_n;
+} as_scratch;
+static as_scratch as_scr[AS_SLOTS];
+
+static as_scratch *as_team(void)
+{
+    int slot = omp_get_level() >= 2 ? omp_get_ancestor_thread_num(1) + 1 : 0;
+    return &as_scr[slot >= 0 && slot < AS_SLOTS ? slot : 0];
+}
+
+static int as_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_ATTN_SPLIT");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+#if GEMMA_X86
+/* 8 values as floats; 16 values as int16 lanes. */
+static inline __attribute__((always_inline)) __m256 as_load8f(const void *p, const int I8)
+{
+    return _mm256_cvtepi32_ps(I8 ? _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)p))
+                                 : _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *)p)));
+}
+
+static inline __attribute__((always_inline)) __m256i as_load16(const void *p, const int I8)
+{
+    return I8 ? _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)p))
+              : _mm256_loadu_si256((const __m256i *)p);
+}
+#endif
+
+/* The cache values are int16 (I8 0), int8 (I8 1, NP_GEMMA_KV_INT8), or TQ6
+ * (I8 2, 3 bytes for 4 values, the rotated form; tq6_deq32): the helpers
+ * below take the element size as a constant, and the bodies
+ * (gemma_attn_split_i16_body, gemma_attn_split_i8_body, ...) inline them. */
+#define AS_ATE(p, idx, i8) ((const void *)((const char *)(p) + \
+    ((i8) == 2 ? (size_t)(idx) * 3 / 4 : (size_t)(idx) * ((i8) ? 1 : 2))))
+#define AS_AT(p, idx) AS_ATE(p, idx, I8)
+#define AS_EL(p, i) (I8 ? (float)((const int8_t *)(p))[i] : (float)((const int16_t *)(p))[i])
+
+/* out[i] = (float)row[i] * scale of the group of i, for hd values. */
+static inline __attribute__((always_inline)) void as_row(const void *row, const float *sc, int hd,
+                                                         float *out, const int I8)
+{
+    if (I8 == 2) {
+        for (int gg = 0; gg < hd / 32; ++gg) {
+            tq6_deq32((const uint8_t *)row + (size_t)gg * 24, sc[gg], out + (size_t)gg * 32);
+        }
+        return;
+    }
+    for (int gg = 0; gg < hd / 32; ++gg) {
+        const void *rp = AS_AT(row, (size_t)gg * 32);
+        float *op = out + (size_t)gg * 32;
+#if GEMMA_X86 && defined(__AVX512F__)
+        __m512 s5 = _mm512_set1_ps(sc[gg]);
+        for (int i = 0; i < 32; i += 16) {
+            __m512 v = _mm512_cvtepi32_ps(I8 ?
+                _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)AS_AT(rp, i))) :
+                _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *)AS_AT(rp, i))));
+            _mm512_storeu_ps(op + i, _mm512_mul_ps(v, s5));
+        }
+#elif GEMMA_X86
+        __m256 s8 = _mm256_set1_ps(sc[gg]);
+        for (int i = 0; i < 32; i += 8) {
+            __m256 v = as_load8f(AS_AT(rp, i), I8);
+            _mm256_storeu_ps(op + i, _mm256_mul_ps(v, s8));
+        }
+#else
+        for (int i = 0; i < 32; ++i) {
+            op[i] = AS_EL(rp, i) * sc[gg];
+        }
+#endif
+    }
+}
+
+static inline float as_dot(const float *a, const float *b, int hd)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    for (int i = 0; i < hd; i += 32) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif GEMMA_X86
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    for (int i = 0; i < hd; i += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
+    }
+    return hsum256_ps(_mm256_add_ps(acc0, acc1));
+#else
+    float acc = 0.0f;
+    for (int i = 0; i < hd; ++i) {
+        acc += a[i] * b[i];
+    }
+    return acc;
+#endif
+}
+
+/* o += p b, hd values. */
+static inline void as_axpy(float *o, float p, const float *b, int hd)
+{
+#if GEMMA_X86 && defined(__AVX512F__)
+    __m512 p5 = _mm512_set1_ps(p);
+    for (int i = 0; i < hd; i += 16) {
+        _mm512_storeu_ps(o + i, _mm512_fmadd_ps(p5, _mm512_loadu_ps(b + i), _mm512_loadu_ps(o + i)));
+    }
+#elif GEMMA_X86
+    __m256 p8 = _mm256_set1_ps(p);
+    for (int i = 0; i < hd; i += 8) {
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(p8, _mm256_loadu_ps(b + i), _mm256_loadu_ps(o + i)));
+    }
+#else
+    for (int i = 0; i < hd; ++i) {
+        o[i] += p * b[i];
+    }
+#endif
+}
+
+#if GEMMA_X86 && !defined(__AVX512F__)
+/* The AVX2 forms of the two passes of an item (nh query heads, cn keys).
+ *
+ * The scores: the queries are int16 with a scale for each group of 32
+ * values (qq, sq: as_quant_q), and vpmaddwd multiplies them with the int16
+ * keys. Each vpmaddwd result (8 sums of 2 products) goes to float on its
+ * own, so no int32 sum can overflow. A group adds into a float
+ * accumulator with the scale of the key group times that of the query
+ * group, and one sum across the lanes ends a key. The keys of the item are
+ * loaded once for all its heads.
+ *
+ * The values: the item keeps the output of a block of 8 U values of each
+ * head in registers over all its keys, so it loads and stores the output
+ * once, not once for each key. The weight of a key times the scale of the
+ * value group is one broadcast. */
+/* The rows of the cache are kv_heads * head_dim values apart (4 KB for
+ * the layers of the 26B with a window), so each row of an item starts a
+ * new page, where the hardware prefetch stops. The passes fetch the row
+ * AS_PF keys ahead. */
+#define AS_PF 10
+static inline __attribute__((always_inline)) void as_prefetch_row(const void *row, int hd,
+                                                                  const int I8)
+{
+    for (int i = 0; i < hd * (I8 ? 1 : 2); i += 64) {
+        _mm_prefetch((const char *)row + i, _MM_HINT_T0);
+    }
+}
+
+/* exp(x) of 8 floats: the polynomial of Cephes expf (about 1 ulp), with the
+ * power of two in the exponent bits. libm expf took most of the time of an
+ * item outside its two passes. */
+static inline __m256 as_exp256(__m256 x)
+{
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.3762626647949f));
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
+    __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f),
+                                                _mm256_set1_ps(0.5f)));
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), x);
+    y = _mm256_add_ps(y, _mm256_set1_ps(1.0f));
+    __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
+}
+
+/* sc[j] = exp(sc[j] - m), or 0 below exp(-64) (as the scalar loop); return
+ * the sum. */
+static inline float as_softmax_avx2(float *sc, int cn, float m)
+{
+    __m256 m8 = _mm256_set1_ps(m), lim = _mm256_set1_ps(-64.0f), acc = _mm256_setzero_ps();
+    int j = 0;
+    for (; j + 8 <= cn; j += 8) {
+        __m256 d = _mm256_sub_ps(_mm256_loadu_ps(sc + j), m8);
+        __m256 ev = _mm256_and_ps(as_exp256(d), _mm256_cmp_ps(d, lim, _CMP_GE_OQ));
+        _mm256_storeu_ps(sc + j, ev);
+        acc = _mm256_add_ps(acc, ev);
+    }
+    float l = hsum256_ps(acc);
+    for (; j < cn; ++j) {
+        float d = sc[j] - m;
+        sc[j] = d < -64.0f ? 0.0f : expf(d);
+        l += sc[j];
+    }
+    return l;
+}
+
+/* The query of one head as int16 with one scale (14 bits: |q| <= 16383),
+ * so the two vpmaddwd results of a group of 32 add as int32 with no
+ * overflow (at most 2 * 2 * 16383 * 32767 < 2^31). */
+static inline void as_quant_q(const float *q, int hd, int16_t *qq, float *sq)
+{
+    float m = 0.0f;
+    for (int i = 0; i < hd; ++i) {
+        float a = fabsf(q[i]);
+        m = a > m ? a : m;
+    }
+    float inv = m > 0.0f ? 16383.0f / m : 0.0f;
+    *sq = m > 0.0f ? m / 16383.0f : 0.0f;
+    for (int i = 0; i < hd; i += 8) {
+        __m256i v = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(q + i), _mm256_set1_ps(inv)));
+        __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        _mm_storeu_si128((__m128i *)(qq + i), p16);
+    }
+}
+
+static inline __attribute__((always_inline)) void as_scores_avx2(const int16_t *qq, const float *sq, int nh, const void *kp,
+                                  const float *ksp, int hd, float *out, size_t ostride,
+                                  const int I8)
+{
+    __m256 acc[8];
+    for (int h = 0; h < nh; ++h) {
+        acc[h] = _mm256_setzero_ps();
+    }
+    for (int gg = 0; gg < hd / 32; ++gg) {
+        __m256i k0 = as_load16(AS_AT(kp, (size_t)gg * 32), I8);
+        __m256i k1 = as_load16(AS_AT(kp, (size_t)gg * 32 + 16), I8);
+        __m256 kscale = _mm256_set1_ps(ksp[gg]);
+        for (int h = 0; h < nh; ++h) {
+            const int16_t *qh = qq + (size_t)h * hd + (size_t)gg * 32;
+            __m256i d = _mm256_add_epi32(_mm256_madd_epi16(k0, _mm256_loadu_si256((const __m256i *)qh)),
+                                         _mm256_madd_epi16(k1, _mm256_loadu_si256((const __m256i *)(qh + 16))));
+            acc[h] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), kscale, acc[h]);
+        }
+    }
+    for (int h = 0; h < nh; ++h) {
+        out[(size_t)h * ostride] = hsum256_ps(acc[h]) * sq[h];
+    }
+}
+
+/* as_scores_avx2 for a TQ6 key row: the row goes to float32 (tq6_deq32),
+ * then nh float32 queries (q, rotated) read each 8 values once. */
+static inline __attribute__((always_inline)) void as_scores_tq_avx2(const float *q, int nh,
+                                                                   const uint8_t *kp,
+                                                                   const float *ksp, int hd,
+                                                                   float *out, size_t ostride)
+{
+    float row[1024] __attribute__((aligned(32)));
+    for (int gg = 0; gg < hd / 32; ++gg) {
+        tq6_deq32(kp + (size_t)gg * 24, ksp[gg], row + (size_t)gg * 32);
+    }
+    __m256 acc[8];
+    for (int h = 0; h < nh; ++h) {
+        acc[h] = _mm256_setzero_ps();
+    }
+    for (int i = 0; i < hd; i += 8) {
+        __m256 k = _mm256_load_ps(row + i);
+        for (int h = 0; h < nh; ++h) {
+            acc[h] = _mm256_fmadd_ps(_mm256_loadu_ps(q + (size_t)h * hd + i), k, acc[h]);
+        }
+    }
+    for (int h = 0; h < nh; ++h) {
+        out[(size_t)h * ostride] = hsum256_ps(acc[h]);
+    }
+}
+
+/* o (nh rows of hd, row stride ostride) = the sum over the cn keys of
+ * p[h][j] (row stride pstride) times the value rows. */
+#endif
+
+#if GEMMA_X86 && !defined(__AVX512F__)
+#define AS_VBLOCK(U)                                                                         \
+    for (int d0 = 0; d0 < hd; d0 += 8 * (U)) {                                               \
+        __m256 acc[8][U];                                                                    \
+        for (int h = 0; h < nh; ++h)                                                         \
+            for (int u = 0; u < (U); ++u)                                                    \
+                acc[h][u] = _mm256_setzero_ps();                                             \
+        int gg = d0 / 32;                                                                    \
+        for (int j = 0; j < cn; ++j) {                                                       \
+            if (d0 == 0 && j + AS_PF < cn)                                                   \
+                as_prefetch_row(AS_AT(vq, (base + j + AS_PF) * kv_stride + (size_t)kv * hd), \
+                                hd, I8);                                                     \
+            if (!live[j]) continue;                                                          \
+            size_t r = base + (size_t)j;                                                     \
+            const void *vp = AS_AT(vq, r * kv_stride + (size_t)kv * hd + d0);                \
+            float vsc = vs[r * ks_stride + (size_t)kv * (hd / 32) + gg];                     \
+            __m256 v[U];                                                                     \
+            for (int u = 0; u < (U); ++u)                                                    \
+                v[u] = as_load8f(AS_AT(vp, 8 * u), I8);                                      \
+            for (int h = 0; h < nh; ++h) {                                                   \
+                float pw = p[(size_t)h * pstride + j];                                       \
+                if (pw == 0.0f) continue;                                                    \
+                __m256 b = _mm256_set1_ps(pw * vsc);                                         \
+                for (int u = 0; u < (U); ++u)                                                \
+                    acc[h][u] = _mm256_fmadd_ps(b, v[u], acc[h][u]);                         \
+            }                                                                                \
+        }                                                                                    \
+        for (int h = 0; h < nh; ++h)                                                         \
+            for (int u = 0; u < (U); ++u)                                                    \
+                _mm256_storeu_ps(o + (size_t)h * ostride + d0 + 8 * u, acc[h][u]);           \
+    }
+
+static inline __attribute__((always_inline)) void
+as_values_avx2_n(const float *p, size_t pstride, const unsigned char *live, int nh,
+                 const void *vq, const float *vs, size_t kv_stride, size_t ks_stride, int kv,
+                 int hd, size_t base, int cn, float *o, size_t ostride, const int I8)
+{
+    if (nh <= 2) {
+        AS_VBLOCK(4)
+    } else if (nh <= 4) {
+        AS_VBLOCK(2)
+    } else {
+        AS_VBLOCK(1)
+    }
+}
+
+/* The value pass by groups of 32 values: the rows of up to AS_VSUB keys go
+ * to float32 times the scale of the group once (vf, in L1), and then each
+ * pair of heads reads them: one broadcast of the weight and 4 fma for each
+ * key. as_values_avx2 converted a row once for each pair of
+ * heads (4 times for the 8 heads of a global layer of the 26B). */
+#define AS_VSUB 128
+static inline __attribute__((always_inline)) void
+as_values_avx2_g(const float *p, size_t pstride, const unsigned char *live, int nh,
+                 const void *vq, const float *vs, size_t kv_stride, size_t ks_stride, int kv,
+                 int hd, size_t base, int cn, float *o, size_t ostride, const int I8)
+{
+    float vf[AS_VSUB * 32] __attribute__((aligned(32)));
+    int idx[AS_VSUB];
+    int nb = hd / 32;
+    for (int gg = 0; gg < nb; ++gg) {
+        for (int j0 = 0; j0 < cn; j0 += AS_VSUB) {
+            int jn = cn - j0 < AS_VSUB ? cn - j0 : AS_VSUB;
+            int m = 0;                                     /* the live keys */
+            for (int j = 0; j < jn; ++j) {
+                if (!live[j0 + j]) {
+                    continue;
+                }
+                size_t r = base + (size_t)(j0 + j);
+                const void *vp = AS_AT(vq, r * kv_stride + (size_t)kv * hd + (size_t)gg * 32);
+                if (I8 == 2) {
+                    tq6_deq32((const uint8_t *)vp, vs[r * ks_stride + (size_t)kv * nb + gg],
+                              vf + (size_t)m * 32);
+                } else {
+                    __m256 vsc = _mm256_set1_ps(vs[r * ks_stride + (size_t)kv * nb + gg]);
+                    for (int u = 0; u < 4; ++u) {
+                        _mm256_store_ps(vf + (size_t)m * 32 + 8 * u,
+                                        _mm256_mul_ps(as_load8f(AS_AT(vp, 8 * u), I8), vsc));
+                    }
+                }
+                idx[m] = j0 + j;
+                ++m;
+            }
+            for (int h0 = 0; h0 < nh; h0 += 2) {
+                int two = nh - h0 >= 2;
+                float *o0 = o + (size_t)h0 * ostride + (size_t)gg * 32;
+                float *o1 = two ? o0 + ostride : o0;
+                __m256 a0[4], a1[4];
+                for (int u = 0; u < 4; ++u) {
+                    a0[u] = j0 ? _mm256_loadu_ps(o0 + 8 * u) : _mm256_setzero_ps();
+                    a1[u] = (j0 && two) ? _mm256_loadu_ps(o1 + 8 * u) : _mm256_setzero_ps();
+                }
+                const float *p0 = p + (size_t)h0 * pstride;
+                const float *p1 = p + (size_t)(two ? h0 + 1 : h0) * pstride;
+                for (int k = 0; k < m; ++k) {
+                    const float *v = vf + (size_t)k * 32;
+                    __m256 b0 = _mm256_broadcast_ss(p0 + idx[k]), b1 = _mm256_broadcast_ss(p1 + idx[k]);
+                    for (int u = 0; u < 4; ++u) {
+                        __m256 vv = _mm256_load_ps(v + 8 * u);
+                        a0[u] = _mm256_fmadd_ps(b0, vv, a0[u]);
+                        a1[u] = _mm256_fmadd_ps(b1, vv, a1[u]);
+                    }
+                }
+                for (int u = 0; u < 4; ++u) {
+                    _mm256_storeu_ps(o0 + 8 * u, a0[u]);
+                    if (two) {
+                        _mm256_storeu_ps(o1 + 8 * u, a1[u]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void
+as_values_avx2(const float *p, size_t pstride, const unsigned char *live, int nh,
+               const void *vq, const float *vs, size_t kv_stride, size_t ks_stride, int kv,
+               int hd, size_t base, int cn, float *o, size_t ostride, const int I8)
+{
+    if (nh > 2 && nh <= 8) {
+        as_values_avx2_g(p, pstride, live, nh, vq, vs, kv_stride, ks_stride, kv, hd, base, cn,
+                         o, ostride, I8);
+        return;
+    }
+    /* Two heads at a time: 8 accumulators of 4 vectors each fit the 16
+     * registers, and the 8 converted values serve two heads. Eight heads in
+     * one pass (1 vector each) took 268 us for a global layer of the 26B. */
+    for (int h0 = 0; h0 < nh; h0 += 2) {
+        if (nh - h0 >= 2) {
+            as_values_avx2_n(p + (size_t)h0 * pstride, pstride, live, 2, vq, vs, kv_stride,
+                             ks_stride, kv, hd, base, cn, o + (size_t)h0 * ostride, ostride, I8);
+        } else {
+            as_values_avx2_n(p + (size_t)h0 * pstride, pstride, live, 1, vq, vs, kv_stride,
+                             ks_stride, kv, hd, base, cn, o + (size_t)h0 * ostride, ostride, I8);
+        }
+    }
+}
+#undef AS_VBLOCK
+#endif
+
+/* The attention of tokens queries over the int16 cache (call it inside a
+ * parallel region). Query t reads the rows lo[t] to lo[t] + n[t] - 1 (lo
+ * null: rows 0 to n[t] - 1). q and out are (tokens, q_heads, head_dim).
+ * The kernel keeps the scores in its own scratch (a block for each thread),
+ * so it does not read the scores operand of the record: the callers size it
+ * in other ways (the prompt of Qwen3.6 gives a block of nmax for each
+ * thread). Return 0 when the shape does not fit (the caller then uses
+ * gemma_attn_decode_i16_mt_body). */
+static inline __attribute__((always_inline)) int
+as_split_body(const float *q, const void *kq, const float *ks, const void *vq, const float *vs,
+              float *scores, float *out, int q_heads, int kv_heads, int head_dim, const int *lo,
+              const int *n, int nmax, int tokens, const int KI8,
+              const int VI8, int row_heads)
+{
+    as_scratch *S = as_team();
+    int n_rep = q_heads / kv_heads;
+    /* TQ6 (KI8 = VI8 = 2): the generic passes over float rows (as_row) */
+    const int TQ = KI8 == 2;
+    /* the int8 cache has no other kernel, so NP_GEMMA_ATTN_SPLIT=0 keeps
+     * this one for it */
+    if ((!KI8 && !VI8 && !as_on()) || head_dim % 32 != 0 || head_dim > 1024 ||
+        n_rep * head_dim > AS_MAXQ) {
+        return 0;
+    }
+    /* a row of the cache holds row_heads heads; kq and ks point at the first
+     * head of this call */
+    size_t kv_stride = (size_t)row_heads * (size_t)head_dim;
+    size_t ks_stride = (size_t)row_heads * (size_t)(head_dim / 32);
+    int g = head_dim / 32;
+    size_t pw = (size_t)head_dim + 2;
+    size_t need = (size_t)tokens * (size_t)q_heads * AS_MAXC * pw;
+    /* the scores of an item: n_rep rows of the longest chunk, a block for
+     * each thread (the scores operand of the callers has other sizes) */
+    int ilen = 0;
+    for (int j = 0; j < tokens; ++j) {
+        int l2 = AS_LEN(n[j]);
+        ilen = l2 > ilen ? l2 : ilen;
+    }
+    size_t ineed = (size_t)omp_get_num_threads() * (size_t)n_rep * (size_t)ilen;
+    #pragma omp single
+    {
+        if (S->isc_n < ineed) {
+            free(S->isc);
+            S->isc = (float *)malloc(ineed * sizeof(float));
+            S->isc_n = S->isc ? ineed : 0;
+        }
+        if (S->parts_n < need) {
+            free(S->parts);
+            S->parts = (float *)malloc(need * sizeof(float));
+            S->parts_n = S->parts ? need : 0;
+        }
+#if GEMMA_X86 && !defined(__AVX512F__)
+        /* the values and the scales grow on their own: a group of 2 tokens
+         * with heads of 512 values needs the values of 4 tokens with heads
+         * of 256, but half the scales */
+        size_t nq = (size_t)tokens * q_heads;
+        if (S->q_n < nq * head_dim) {
+            free(S->qq);
+            S->qq = (int16_t *)malloc(nq * head_dim * sizeof(int16_t));
+            S->q_n = S->qq ? nq * head_dim : 0;
+        }
+        if (S->sq_n < nq) {
+            free(S->sq);
+            S->sq = (float *)malloc(nq * sizeof(float));
+            S->sq_n = S->sq ? nq : 0;
+            if (S->sq == NULL) {
+                S->q_n = 0;
+            }
+        }
+#endif
+    }
+    if (S->parts == NULL || S->isc == NULL) {
+        return 0;
+    }
+    float *isc = S->isc + (size_t)omp_get_thread_num() * (size_t)n_rep * (size_t)ilen;
+    (void)scores;
+    (void)nmax;
+#if GEMMA_X86 && !defined(__AVX512F__)
+    if (S->q_n == 0) {
+        return 0;
+    }
+    /* the int16 queries, once for each token and head (the items of the
+     * chunks of a head share them) */
+    if (!TQ) {
+        #pragma omp for schedule(static)
+        for (int u = 0; u < tokens * q_heads; ++u) {
+            as_quant_q(q + (size_t)u * head_dim, head_dim, S->qq + (size_t)u * head_dim,
+                       S->sq + u);
+        }
+    }
+#endif
+    /* the items: (token, key head, chunk); token t has cdiv(n[t], AS_LEN) */
+    int per = kv_heads * AS_MAXC;
+    int total = tokens * per;
+    #pragma omp for schedule(dynamic, 1)
+    for (int u = 0; u < total; ++u) {
+        int t = u / per, kv = (u % per) / AS_MAXC, c = u % AS_MAXC;
+        int nt = n[t], len = AS_LEN(nt);
+        int r0 = c * len;
+        if (r0 >= nt) {
+            continue;
+        }
+        int cn = nt - r0 < len ? nt - r0 : len;
+        size_t base = (size_t)(lo ? lo[t] : 0) + (size_t)r0;
+        float row[1024];
+        int h0 = kv * n_rep;
+        const float *qt = q + ((size_t)t * q_heads + h0) * head_dim;
+#if GEMMA_X86 && !defined(__AVX512F__)
+        const int16_t *qq = S->qq + ((size_t)t * q_heads + h0) * head_dim;
+        const float *sq = S->sq + (size_t)t * q_heads + h0;
+/* as_scores_avx2 keeps one accumulator for each head, up to 8: more heads
+ * (the 16 of a global layer of the 12B) go in blocks of 8, with the same
+ * values for each head */
+#define AS_SC(NH)                                                                           \
+        for (int j = 0; j < cn; ++j) {                                                      \
+            size_t r = base + (size_t)j;                                                    \
+            if (j + AS_PF < cn) {                                                           \
+                as_prefetch_row(AS_ATE(kq, (r + AS_PF) * kv_stride + (size_t)kv * head_dim, \
+                                       KI8), head_dim, KI8);                                \
+                as_prefetch_row(AS_ATE(vq, (r + AS_PF) * kv_stride + (size_t)kv * head_dim, \
+                                       VI8), head_dim, VI8);                                \
+            }                                                                               \
+            for (int hb = 0; hb < (NH); hb += 8) {                                          \
+                as_scores_avx2(qq + (size_t)hb * head_dim, sq + hb,                         \
+                               (NH) - hb < 8 ? (NH) - hb : 8,                               \
+                               AS_ATE(kq, r * kv_stride + (size_t)kv * head_dim, KI8),      \
+                               ks + r * ks_stride + (size_t)kv * g, head_dim,               \
+                               isc + (size_t)hb * ilen + j, ilen, KI8);                     \
+            }                                                                               \
+        }
+        if (!TQ) {
+            switch (n_rep) {
+            case 1: AS_SC(1) break;
+            case 2: AS_SC(2) break;
+            case 4: AS_SC(4) break;
+            case 8: AS_SC(8) break;
+            default: AS_SC(n_rep)
+            }
+        }
+#undef AS_SC
+        for (int j = 0; TQ && n_rep <= 8 && j < cn; ++j) {
+            size_t r = base + (size_t)j;
+            as_scores_tq_avx2(qt, n_rep, (const uint8_t *)AS_ATE(kq, r * kv_stride +
+                                                                  (size_t)kv * head_dim, 2),
+                              ks + r * ks_stride + (size_t)kv * g, head_dim, isc + j, ilen);
+        }
+        for (int j = 0; TQ && n_rep > 8 && j < cn; ++j) {
+#else
+        for (int j = 0; j < cn; ++j) {
+#endif
+            size_t r = base + (size_t)j;
+            as_row(AS_ATE(kq, r * kv_stride + (size_t)kv * head_dim, KI8),
+                   ks + r * ks_stride + (size_t)kv * g, head_dim, row, KI8);
+            for (int hh = 0; hh < n_rep; ++hh) {
+                isc[(size_t)hh * ilen + j] =
+                    as_dot(qt + (size_t)hh * head_dim, row, head_dim);
+            }
+        }
+        for (int hh = 0; hh < n_rep; ++hh) {
+            float *sc = isc + (size_t)hh * ilen;
+            float m = sc[0];
+            for (int j = 1; j < cn; ++j) {
+                m = sc[j] > m ? sc[j] : m;
+            }
+            /* A weight below exp(-64) (2e-28 of the largest) is 0. Its
+             * product with a value scale can be a denormal, and a product
+             * with a denormal takes a slow microcode path on x86. The value
+             * pass then skips the key. */
+#if GEMMA_X86 && !defined(__AVX512F__)
+            float l = as_softmax_avx2(sc, cn, m);
+#else
+            float l = 0.0f;
+            for (int j = 0; j < cn; ++j) {
+                float d = sc[j] - m;
+                sc[j] = d < -64.0f ? 0.0f : expf(d);
+                l += sc[j];
+            }
+#endif
+            float *pp = S->parts + (((size_t)t * q_heads + h0 + hh) * AS_MAXC + c) * pw;
+            for (int d = 0; d < head_dim; ++d) {
+                pp[d] = 0.0f;
+            }
+            pp[head_dim] = m;
+            pp[head_dim + 1] = l;
+        }
+#if GEMMA_X86 && !defined(__AVX512F__)
+        unsigned char live[1 << 12];
+        if ((!TQ || (n_rep > 2 && n_rep <= 8)) && cn <= (1 << 12)) {
+            for (int j = 0; j < cn; ++j) {
+                int any = 0;
+                for (int hh = 0; hh < n_rep; ++hh) {
+                    any |= isc[(size_t)hh * ilen + j] != 0.0f;
+                }
+                live[j] = (unsigned char)any;
+            }
+            as_values_avx2(isc, ilen, live, n_rep,
+                           vq, vs, kv_stride, ks_stride, kv, head_dim, base, cn,
+                           S->parts + (((size_t)t * q_heads + h0) * AS_MAXC + c) * pw,
+                           AS_MAXC * pw, VI8);
+            continue;
+        }
+#endif
+        for (int j = 0; j < cn; ++j) {
+            size_t r = base + (size_t)j;
+            int any = 0;
+            for (int hh = 0; hh < n_rep; ++hh) {
+                any |= isc[(size_t)hh * ilen + j] != 0.0f;
+            }
+            if (!any) {
+                continue;
+            }
+            as_row(AS_ATE(vq, r * kv_stride + (size_t)kv * head_dim, VI8),
+                   vs + r * ks_stride + (size_t)kv * g, head_dim, row, VI8);
+            for (int hh = 0; hh < n_rep; ++hh) {
+                float p = isc[(size_t)hh * ilen + j];
+                if (p != 0.0f) {
+                    float *pp = S->parts + (((size_t)t * q_heads + h0 + hh) * AS_MAXC + c) * pw;
+                    as_axpy(pp, p, row, head_dim);
+                }
+            }
+        }
+    }
+    /* the join of the chunks of each query head */
+    #pragma omp for schedule(static)
+    for (int u = 0; u < tokens * q_heads; ++u) {
+        int t = u / q_heads;
+        int nc = (n[t] + AS_LEN(n[t]) - 1) / AS_LEN(n[t]);
+        const float *pp = S->parts + (size_t)u * AS_MAXC * pw;
+        float M = pp[head_dim];
+        for (int c = 1; c < nc; ++c) {
+            float mc = pp[(size_t)c * pw + head_dim];
+            M = mc > M ? mc : M;
+        }
+        float den = 0.0f;
+        float w[AS_MAXC];
+        for (int c = 0; c < nc; ++c) {
+            float d = pp[(size_t)c * pw + head_dim] - M;
+            w[c] = d < -64.0f ? 0.0f : expf(d);
+            den += w[c] * pp[(size_t)c * pw + head_dim + 1];
+        }
+        float inv = 1.0f / den;
+        float *o = out + (size_t)u * head_dim;
+#if GEMMA_X86
+        /* the chunks in their order for each value, 8 values at a time */
+        for (int d = 0; d < head_dim; d += 8) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int c = 0; c < nc; ++c) {
+                if (w[c] != 0.0f) {
+                    acc = _mm256_fmadd_ps(_mm256_set1_ps(w[c]),
+                                          _mm256_loadu_ps(pp + (size_t)c * pw + d), acc);
+                }
+            }
+            _mm256_storeu_ps(o + d, _mm256_mul_ps(acc, _mm256_set1_ps(inv)));
+        }
+#else
+        for (int d = 0; d < head_dim; ++d) {
+            float acc = 0.0f;
+            for (int c = 0; c < nc; ++c) {
+                if (w[c] != 0.0f) {
+                    acc += w[c] * pp[(size_t)c * pw + d];
+                }
+            }
+            o[d] = acc * inv;
+        }
+#endif
+    }
+    return 1;
+}
+
+static int gemma_attn_split_i16_body(const float *q, const int16_t *kq, const float *ks,
+                                     const int16_t *vq, const float *vs, float *scores,
+                                     float *out, int q_heads, int kv_heads, int head_dim,
+                                     const int *lo, const int *n, int nmax, int tokens)
+{
+    return as_split_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, lo, n,
+                         nmax, tokens, 0, 0, kv_heads);
+}
+
+/* gemma_attn_split_i16_body for the heads of a part: a row of the cache holds
+ * row_heads heads, and kq, ks, vq, vs point at the first head of the part
+ * (GP_ATTN_QC_H). Each head has the bits of gemma_attn_split_i16_body. */
+static int gemma_attn_split_i16_rows_body(const float *q, const int16_t *kq, const float *ks,
+                                          const int16_t *vq, const float *vs, float *out,
+                                          int q_heads, int kv_heads, int head_dim, int n,
+                                          int row_heads)
+{
+    return as_split_body(q, kq, ks, vq, vs, NULL, out, q_heads, kv_heads, head_dim, NULL, &n,
+                         n, 1, 0, 0, row_heads);
+}
+
+/* The same over the int8 cache (NP_GEMMA_KV_INT8): values int8 with a scale
+ * of max |x| / 127 for each group of 32 (gemma_quant_group32_i8). */
+static int gemma_attn_split_i8_body(const float *q, const int8_t *kq, const float *ks,
+                                    const int8_t *vq, const float *vs, float *scores,
+                                    float *out, int q_heads, int kv_heads, int head_dim,
+                                    const int *lo, const int *n, int nmax, int tokens)
+{
+    return as_split_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, lo, n,
+                         nmax, tokens, 1, 1, kv_heads);
+}
+
+/* The same over the cache with int16 keys and int8 values (NP_GEMMA_KV_INT8
+ * v: KVCache kv="k16v8"). */
+static int gemma_attn_split_v8_body(const float *q, const int16_t *kq, const float *ks,
+                                    const int8_t *vq, const float *vs, float *scores,
+                                    float *out, int q_heads, int kv_heads, int head_dim,
+                                    const int *lo, const int *n, int nmax, int tokens)
+{
+    return as_split_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, lo, n,
+                         nmax, tokens, 0, 1, kv_heads);
+}
+
+/* The same over the TQ6 cache (np_gemma/tq6.py): q has the rotation, and so
+ * has out (GP_TQ_ROT gives them and takes it away). */
+static int gemma_attn_split_tq6_body(const float *q, const uint8_t *kq, const float *ks,
+                                     const uint8_t *vq, const float *vs, float *scores,
+                                     float *out, int q_heads, int kv_heads, int head_dim,
+                                     const int *lo, const int *n, int nmax, int tokens)
+{
+    return as_split_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, head_dim, lo, n,
+                         nmax, tokens, 2, 2, kv_heads);
+}
+#undef AS_AT
+#undef AS_ATE
+#undef AS_EL
+
+/* gemma_attn_split_i16_body in its own parallel region (a test). Return 1
+ * when it ran. */
+int gemma_attn_split_i16(const float *q, const int16_t *kq, const float *ks, const int16_t *vq,
+                         const float *vs, float *scores, float *out, int q_heads, int kv_heads,
+                         int head_dim, int n)
+{
+    int ok = 0;
+    #pragma omp parallel
+    {
+        int r = gemma_attn_split_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                          head_dim, NULL, &n, n, 1);
+        #pragma omp master
+        ok = r;
+    }
+    return ok;
+}
+
+/* The attention of one query (lo null, n[0] keys) or of a group of queries
+ * over the int8 cache (k16: the int16 keys of the form k16v8), in its own
+ * parallel region (the Python paths and the drafter). Return 0 when the
+ * shape does not fit. */
+int gemma_attn_decode_q8(const float *q, const void *kq, const float *ks, const int8_t *vq,
+                         const float *vs, float *scores, float *out, int q_heads, int kv_heads,
+                         int head_dim, const int *lo, const int *n, int nmax, int tokens,
+                         int k16)
+{
+    int ok = 0;
+    #pragma omp parallel
+    {
+        int r = k16 ? gemma_attn_split_v8_body(q, (const int16_t *)kq, ks, vq, vs, scores, out,
+                                               q_heads, kv_heads, head_dim, lo, n, nmax, tokens)
+                    : gemma_attn_split_i8_body(q, (const int8_t *)kq, ks, vq, vs, scores, out,
+                                               q_heads, kv_heads, head_dim, lo, n, nmax, tokens);
+        #pragma omp master
+        ok = r;
+    }
+    return ok;
+}
+
+/* gemma_attn_decode_q8 over the TQ6 cache (a test): q and out in the
+ * rotated form. */
+int gemma_attn_decode_tq6(const float *q, const uint8_t *kq, const float *ks, const uint8_t *vq,
+                          const float *vs, float *out, int q_heads, int kv_heads, int head_dim,
+                          const int *lo, const int *n, int nmax, int tokens)
+{
+    int ok = 0;
+    #pragma omp parallel
+    {
+        int r = gemma_attn_split_tq6_body(q, kq, ks, vq, vs, NULL, out, q_heads, kv_heads,
+                                          head_dim, lo, n, nmax, tokens);
+        #pragma omp master
+        ok = r;
+    }
+    return ok;
+}
+
+/* The split form when it fits, as GP_ATTN_QC_MT, so the Python path of a
+ * group (ops.attn_decode_mt) gives the bits of the program. */
 void gemma_attn_decode_i16_mt(const float *q, const int16_t *kq, const float *ks,
                               const int16_t *vq, const float *vs, float *scores,
                               float *out, int q_heads, int kv_heads, int head_dim,
                               const int *lo, const int *n, int nmax, int tokens)
 {
     #pragma omp parallel
-    gemma_attn_decode_i16_mt_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
-                                  head_dim, lo, n, nmax, tokens);
+    {
+        if (!gemma_attn_split_i16_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                       head_dim, lo, n, nmax, tokens)) {
+            gemma_attn_decode_i16_mt_body(q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
+                                          head_dim, lo, n, nmax, tokens);
+        }
+    }
 }
 
 /* The fused decode attention for a small group of query tokens in one
@@ -4254,6 +6036,56 @@ static inline __m512 gemma_tanh_ps(__m512 x)
 }
 #endif
 
+/* The AVX2 build (no AVX-512): gemma_tanh_ps on 8 floats, the same steps
+ * (2 ** n in the exponent bits: n is at most 88), so the same bits. The
+ * GELU of the dense part, of the experts and the soft cap took libm tanhf
+ * there (about 20 ns a value; the GELU of the dense part on one thread). */
+#if GEMMA_X86 && !defined(__AVX512F__)
+static inline __m256 gemma_tanh_avx2(__m256 x)
+{
+    const __m256i sign_bits = _mm256_set1_epi32((int)0x80000000u);
+    __m256i xi = _mm256_castps_si256(x);
+    __m256i sign = _mm256_and_si256(xi, sign_bits);
+    __m256 z = _mm256_castsi256_ps(_mm256_andnot_si256(sign_bits, xi));
+    __m256 t = _mm256_mul_ps(z, _mm256_set1_ps(2.8853900817779268f));
+    t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
+    __m256 n = _mm256_round_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 f = _mm256_sub_ps(t, n);
+    __m256 p = _mm256_set1_ps(1.540353039338161e-4f);
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.3333558146428443e-3f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(9.618129107628477e-3f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.550410866482158e-2f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(2.402265069591007e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(6.931471805599453e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
+    __m256i e2 = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    __m256 e = _mm256_mul_ps(p, _mm256_castsi256_ps(e2));
+    __m256 r = _mm256_sub_ps(_mm256_set1_ps(1.0f),
+                             _mm256_div_ps(_mm256_set1_ps(2.0f), _mm256_add_ps(e, _mm256_set1_ps(1.0f))));
+    return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(r), sign));
+}
+
+/* o = gelu(g) * u (the tanh GELU) for the first n & ~7 values; return that
+ * count (the caller does the rest). o may be g. */
+static inline int gemma_gelu_mul_avx2(const float *g, const float *u, float *o, int n)
+{
+    const __m256 cv = _mm256_set1_ps(0.7978845608028654f), half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f), k3 = _mm256_set1_ps(0.044715f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(g + i);
+        __m256 v3 = _mm256_mul_ps(_mm256_mul_ps(v, v), v);
+        __m256 th = gemma_tanh_avx2(_mm256_mul_ps(cv, _mm256_fmadd_ps(k3, v3, v)));
+        __m256 r = _mm256_mul_ps(_mm256_mul_ps(half, v), _mm256_add_ps(one, th));
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(r, _mm256_loadu_ps(u + i)));
+    }
+    return i;
+}
+#define GELU_MUL_VEC(g, u, o, n) gemma_gelu_mul_avx2((g), (u), (o), (n))
+#else
+#define GELU_MUL_VEC(g, u, o, n) 0
+#endif
+
 /* Apply the tanh approximation of GELU to n values. */
 /* Limit the size of the logits: out = tanh(x / cap) * cap.
  *
@@ -4272,6 +6104,19 @@ static void gemma_softcap_body(const float *x, float *out, int n, float cap)
     for (int i = 0; i < nv; i += 16) {
         const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(x + i), rcap);
         _mm512_storeu_ps(out + i, _mm512_mul_ps(gemma_tanh_ps(v), cv));
+    }
+    #pragma omp single
+    for (int i = nv; i < n; ++i) {
+        out[i] = tanhf(x[i] / cap) * cap;
+    }
+#elif GEMMA_X86
+    const __m256 rcap = _mm256_set1_ps(1.0f / cap);
+    const __m256 cv = _mm256_set1_ps(cap);
+    const int nv = n & ~7;
+    #pragma omp for schedule(static)
+    for (int i = 0; i < nv; i += 8) {
+        const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + i), rcap);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(gemma_tanh_avx2(v), cv));
     }
     #pragma omp single
     for (int i = nv; i < n; ++i) {
@@ -5663,7 +7508,7 @@ static void gemma_gelu_mul_body(const float *x, float *out, int rows, int inner)
         const float *g = x + (size_t)i * 2 * (size_t)inner;
         const float *u = g + inner;
         float *o = out + (size_t)i * (size_t)inner;
-        for (int j = 0; j < inner; ++j) {
+        for (int j = GELU_MUL_VEC(g, u, o, inner); j < inner; ++j) {
             float v = g[j];
             o[j] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[j];
         }
@@ -5741,7 +7586,7 @@ void gemma_gelu_mul_pair(const float *g, const float *u, float *out, int n)
         out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[i];
     }
 #else
-    for (int i = 0; i < n; ++i) {
+    for (int i = GELU_MUL_VEC(g, u, out, n); i < n; ++i) {
         const float v = g[i];
         out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v))) * u[i];
     }
@@ -5995,6 +7840,197 @@ static inline __m512 gemma_attn_exp_avx512(__m512 x)
 #define ATTN5_MR 8
 #define ATTN5_MC 64
 
+/* The tasks of gemma_attn_prefill_avx512: the threads of the enclosing OpenMP region split
+ * them (an orphaned omp for). kt is the transposed keys. */
+/* limit (null, or t int32): the last key position of each query in place of
+ * its position (the tokens of one image see each other, Model._media_limit);
+ * the window still counts from the position. limit does not decrease over
+ * the tokens. */
+static void gemma_attn_prefill_avx512_tasks(const float *q, const float *v, const float *kt, const int32_t *positions, int base, int window, float *out, int n, int q_heads, int kv_heads, int hd, int n_rep, int lo_key, int ld, long rows, long last, int nrb, int tasks, const int32_t *limit)
+{
+    float *acc = (float *)malloc((size_t)ATTN5_MC * hd * sizeof(float));
+    float *sp = (float *)malloc((size_t)ATTN5_MC * ATTN5_NC * sizeof(float));
+    if (acc != NULL && sp != NULL) {
+        const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7,
+                                               8, 9, 10, 11, 12, 13, 14, 15);
+        const __m512 ninf = _mm512_set1_ps(-INFINITY);
+        #pragma omp for schedule(static)
+        for (int task = 0; task < tasks; ++task) {
+            const int h = task / nrb;
+            const long r0 = (long)(task % nrb) * ATTN5_MC;
+            const int tok0 = (int)(r0 / n_rep);
+            long t1r = r0 + ATTN5_MC - 1;
+            if (t1r > last) {
+                t1r = last;
+            }
+            const int tok1 = (int)(t1r / n_rep);
+            const int pos_max = limit != NULL ? limit[tok1] : positions[tok1];
+            int jhi = pos_max - base + 1;
+            if (jhi > n) {
+                jhi = n;
+            }
+            int jlo = 0;
+            if (window > 0) {
+                jlo = positions[tok0] - window + 1 - base;
+                if (jlo < 0) {
+                    jlo = 0;
+                }
+            }
+            if (jlo < lo_key) {
+                jlo = lo_key;
+            }
+            float mrow[ATTN5_MC];
+            float lrow[ATTN5_MC];
+            for (int i = 0; i < ATTN5_MC; ++i) {
+                float *aci = acc + (size_t)i * hd;
+                for (int d = 0; d < hd; ++d) {
+                    aci[d] = 0.0f;
+                }
+                mrow[i] = -INFINITY;
+                lrow[i] = 0.0f;
+            }
+            const float *kth = kt + (size_t)h * hd * ld;
+            for (int j0 = jlo; j0 < jhi; j0 += ATTN5_NC) {
+                const int jn = jhi - j0 < ATTN5_NC ? jhi - j0 : ATTN5_NC;
+                /* The score of ATTN5_MR rows over ATTN5_NC keys. The key
+                 * vector is read one time for the whole micro tile. */
+                for (int i0 = 0; i0 < ATTN5_MC; i0 += ATTN5_MR) {
+                    __m512 sv[ATTN5_MR][ATTN5_NB];
+                    for (int i = 0; i < ATTN5_MR; ++i) {
+                        for (int b = 0; b < ATTN5_NB; ++b) {
+                            sv[i][b] = _mm512_setzero_ps();
+                        }
+                    }
+                    /* The row pointers stay fixed for the whole key
+                     * block, so the inner loop needs no index product. */
+                    const float *qrp[ATTN5_MR];
+                    for (int i = 0; i < ATTN5_MR; ++i) {
+                        long row = r0 + i0 + i;
+                        if (row > last) {
+                            row = last;
+                        }
+                        const int tok = (int)(row / n_rep);
+                        const int g = (int)(row - (long)tok * n_rep);
+                        qrp[i] = q + ((size_t)tok * q_heads + h * n_rep + g) * hd;
+                    }
+                    for (int d = 0; d < hd; ++d) {
+                        const float *kd = kth + (size_t)d * ld + (j0 - lo_key);
+                        __m512 kv[ATTN5_NB];
+                        for (int b = 0; b < ATTN5_NB; ++b) {
+                            kv[b] = _mm512_loadu_ps(kd + b * 16);
+                        }
+                        for (int i = 0; i < ATTN5_MR; ++i) {
+                            const __m512 qb = _mm512_set1_ps(qrp[i][d]);
+                            for (int b = 0; b < ATTN5_NB; ++b) {
+                                sv[i][b] = _mm512_fmadd_ps(qb, kv[b], sv[i][b]);
+                            }
+                        }
+                    }
+                    for (int i = 0; i < ATTN5_MR; ++i) {
+                        long row = r0 + i0 + i;
+                        if (row > last) {
+                            row = last;
+                        }
+                        const int tok = (int)(row / n_rep);
+                        const int pos = positions[tok];
+                        const int lpos = limit != NULL ? limit[tok] : pos;
+                        float *srow = sp + (size_t)(i0 + i) * ATTN5_NC;
+                        for (int b = 0; b < ATTN5_NB; ++b) {
+                            const int jb = j0 + b * 16;
+                            __mmask16 keep = 0;
+                            if (jb < jhi) {
+                                const __m512i kp = _mm512_add_epi32(
+                                    _mm512_set1_epi32(base + jb), lane);
+                                keep = _mm512_cmp_epi32_mask(kp,
+                                    _mm512_set1_epi32(lpos), _MM_CMPINT_LE);
+                                if (window > 0) {
+                                    const __m512i dist = _mm512_sub_epi32(
+                                        _mm512_set1_epi32(pos), kp);
+                                    keep = _mm512_kand(keep, _mm512_cmp_epi32_mask(
+                                        dist, _mm512_set1_epi32(window), _MM_CMPINT_LT));
+                                }
+                                const int lim = jhi - jb;
+                                if (lim < 16) {
+                                    keep = _mm512_kand(keep,
+                                        (__mmask16)((1u << lim) - 1u));
+                                }
+                            }
+                            _mm512_storeu_ps(srow + b * 16,
+                                _mm512_mask_blend_ps(keep, ninf, sv[i][b]));
+                        }
+                    }
+                }
+                /* The online softmax and the weighted sum. */
+                for (int i = 0; i < ATTN5_MC; ++i) {
+                    float *srow = sp + (size_t)i * ATTN5_NC;
+                    const int nv = (jn + 15) / 16;
+                    __m512 mx = ninf;
+                    for (int b = 0; b < nv; ++b) {
+                        mx = _mm512_max_ps(mx, _mm512_loadu_ps(srow + b * 16));
+                    }
+                    const float smax = _mm512_reduce_max_ps(mx);
+                    const float mnew = mrow[i] > smax ? mrow[i] : smax;
+                    float alpha = 0.0f;
+                    if (mrow[i] == -INFINITY && mnew == -INFINITY) {
+                        alpha = 1.0f;
+                    } else if (mrow[i] != -INFINITY && mnew != -INFINITY) {
+                        alpha = expf(mrow[i] - mnew);
+                    }
+                    const __m512 mv = _mm512_set1_ps(mnew);
+                    const __m512 av = _mm512_set1_ps(alpha);
+                    __m512 lsum = _mm512_setzero_ps();
+                    for (int b = 0; b < nv; ++b) {
+                        const __m512 sv2 = _mm512_loadu_ps(srow + b * 16);
+                        __m512 pv = gemma_attn_exp_avx512(_mm512_sub_ps(sv2, mv));
+                        pv = _mm512_maskz_mov_ps(
+                            _mm512_cmp_ps_mask(sv2, ninf, _CMP_GT_OQ), pv);
+                        _mm512_storeu_ps(srow + b * 16, pv);
+                        lsum = _mm512_add_ps(lsum, pv);
+                    }
+                    lrow[i] = lrow[i] * alpha + _mm512_reduce_add_ps(lsum);
+                    mrow[i] = mnew;
+                    float *aci = acc + (size_t)i * hd;
+                    for (int d0 = 0; d0 < hd; d0 += 64) {
+                        const int nb = (hd - d0) >= 64 ? 4 : (hd - d0) / 16;
+                        __m512 a[4];
+                        for (int b = 0; b < nb; ++b) {
+                            a[b] = _mm512_mul_ps(_mm512_loadu_ps(aci + d0 + b * 16), av);
+                        }
+                        for (int j = 0; j < jn; ++j) {
+                            const __m512 pv = _mm512_set1_ps(srow[j]);
+                            const float *vr = v +
+                                ((size_t)(j0 + j) * kv_heads + h) * hd + d0;
+                            for (int b = 0; b < nb; ++b) {
+                                a[b] = _mm512_fmadd_ps(pv,
+                                    _mm512_loadu_ps(vr + b * 16), a[b]);
+                            }
+                        }
+                        for (int b = 0; b < nb; ++b) {
+                            _mm512_storeu_ps(aci + d0 + b * 16, a[b]);
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < ATTN5_MC; ++i) {
+                const long row = r0 + i;
+                if (row >= rows) {
+                    break;
+                }
+                const int tok = (int)(row / n_rep);
+                const int g = (int)(row - (long)tok * n_rep);
+                const float inv = lrow[i] > 0.0f ? 1.0f / lrow[i] : 0.0f;
+                const float *aci = acc + (size_t)i * hd;
+                float *op = out + ((size_t)tok * q_heads + h * n_rep + g) * hd;
+                for (int d = 0; d < hd; ++d) {
+                    op[d] = aci[d] * inv;
+                }
+            }
+        }
+    }
+    free(acc);
+    free(sp);
+}
+
 void gemma_attn_prefill_avx512(const float *q, const float *k, const float *v,
                                const int32_t *positions, int base, int window,
                                float *out, int t, int n, int q_heads,
@@ -6028,188 +8064,7 @@ void gemma_attn_prefill_avx512(const float *q, const float *k, const float *v,
     const int nrb = (int)((rows + ATTN5_MC - 1) / ATTN5_MC);
     const int tasks = kv_heads * nrb;
     #pragma omp parallel
-    {
-        float *acc = (float *)malloc((size_t)ATTN5_MC * hd * sizeof(float));
-        float *sp = (float *)malloc((size_t)ATTN5_MC * ATTN5_NC * sizeof(float));
-        if (acc != NULL && sp != NULL) {
-            const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7,
-                                                   8, 9, 10, 11, 12, 13, 14, 15);
-            const __m512 ninf = _mm512_set1_ps(-INFINITY);
-            #pragma omp for schedule(static)
-            for (int task = 0; task < tasks; ++task) {
-                const int h = task / nrb;
-                const long r0 = (long)(task % nrb) * ATTN5_MC;
-                const int tok0 = (int)(r0 / n_rep);
-                long t1r = r0 + ATTN5_MC - 1;
-                if (t1r > last) {
-                    t1r = last;
-                }
-                const int tok1 = (int)(t1r / n_rep);
-                const int pos_max = positions[tok1];
-                int jhi = pos_max - base + 1;
-                if (jhi > n) {
-                    jhi = n;
-                }
-                int jlo = 0;
-                if (window > 0) {
-                    jlo = positions[tok0] - window + 1 - base;
-                    if (jlo < 0) {
-                        jlo = 0;
-                    }
-                }
-                if (jlo < lo_key) {
-                    jlo = lo_key;
-                }
-                float mrow[ATTN5_MC];
-                float lrow[ATTN5_MC];
-                for (int i = 0; i < ATTN5_MC; ++i) {
-                    float *aci = acc + (size_t)i * hd;
-                    for (int d = 0; d < hd; ++d) {
-                        aci[d] = 0.0f;
-                    }
-                    mrow[i] = -INFINITY;
-                    lrow[i] = 0.0f;
-                }
-                const float *kth = kt + (size_t)h * hd * ld;
-                for (int j0 = jlo; j0 < jhi; j0 += ATTN5_NC) {
-                    const int jn = jhi - j0 < ATTN5_NC ? jhi - j0 : ATTN5_NC;
-                    /* The score of ATTN5_MR rows over ATTN5_NC keys. The key
-                     * vector is read one time for the whole micro tile. */
-                    for (int i0 = 0; i0 < ATTN5_MC; i0 += ATTN5_MR) {
-                        __m512 sv[ATTN5_MR][ATTN5_NB];
-                        for (int i = 0; i < ATTN5_MR; ++i) {
-                            for (int b = 0; b < ATTN5_NB; ++b) {
-                                sv[i][b] = _mm512_setzero_ps();
-                            }
-                        }
-                        /* The row pointers stay fixed for the whole key
-                         * block, so the inner loop needs no index product. */
-                        const float *qrp[ATTN5_MR];
-                        for (int i = 0; i < ATTN5_MR; ++i) {
-                            long row = r0 + i0 + i;
-                            if (row > last) {
-                                row = last;
-                            }
-                            const int tok = (int)(row / n_rep);
-                            const int g = (int)(row - (long)tok * n_rep);
-                            qrp[i] = q + ((size_t)tok * q_heads + h * n_rep + g) * hd;
-                        }
-                        for (int d = 0; d < hd; ++d) {
-                            const float *kd = kth + (size_t)d * ld + (j0 - lo_key);
-                            __m512 kv[ATTN5_NB];
-                            for (int b = 0; b < ATTN5_NB; ++b) {
-                                kv[b] = _mm512_loadu_ps(kd + b * 16);
-                            }
-                            for (int i = 0; i < ATTN5_MR; ++i) {
-                                const __m512 qb = _mm512_set1_ps(qrp[i][d]);
-                                for (int b = 0; b < ATTN5_NB; ++b) {
-                                    sv[i][b] = _mm512_fmadd_ps(qb, kv[b], sv[i][b]);
-                                }
-                            }
-                        }
-                        for (int i = 0; i < ATTN5_MR; ++i) {
-                            long row = r0 + i0 + i;
-                            if (row > last) {
-                                row = last;
-                            }
-                            const int tok = (int)(row / n_rep);
-                            const int pos = positions[tok];
-                            float *srow = sp + (size_t)(i0 + i) * ATTN5_NC;
-                            for (int b = 0; b < ATTN5_NB; ++b) {
-                                const int jb = j0 + b * 16;
-                                __mmask16 keep = 0;
-                                if (jb < jhi) {
-                                    const __m512i kp = _mm512_add_epi32(
-                                        _mm512_set1_epi32(base + jb), lane);
-                                    keep = _mm512_cmp_epi32_mask(kp,
-                                        _mm512_set1_epi32(pos), _MM_CMPINT_LE);
-                                    if (window > 0) {
-                                        const __m512i dist = _mm512_sub_epi32(
-                                            _mm512_set1_epi32(pos), kp);
-                                        keep = _mm512_kand(keep, _mm512_cmp_epi32_mask(
-                                            dist, _mm512_set1_epi32(window), _MM_CMPINT_LT));
-                                    }
-                                    const int lim = jhi - jb;
-                                    if (lim < 16) {
-                                        keep = _mm512_kand(keep,
-                                            (__mmask16)((1u << lim) - 1u));
-                                    }
-                                }
-                                _mm512_storeu_ps(srow + b * 16,
-                                    _mm512_mask_blend_ps(keep, ninf, sv[i][b]));
-                            }
-                        }
-                    }
-                    /* The online softmax and the weighted sum. */
-                    for (int i = 0; i < ATTN5_MC; ++i) {
-                        float *srow = sp + (size_t)i * ATTN5_NC;
-                        const int nv = (jn + 15) / 16;
-                        __m512 mx = ninf;
-                        for (int b = 0; b < nv; ++b) {
-                            mx = _mm512_max_ps(mx, _mm512_loadu_ps(srow + b * 16));
-                        }
-                        const float smax = _mm512_reduce_max_ps(mx);
-                        const float mnew = mrow[i] > smax ? mrow[i] : smax;
-                        float alpha = 0.0f;
-                        if (mrow[i] == -INFINITY && mnew == -INFINITY) {
-                            alpha = 1.0f;
-                        } else if (mrow[i] != -INFINITY && mnew != -INFINITY) {
-                            alpha = expf(mrow[i] - mnew);
-                        }
-                        const __m512 mv = _mm512_set1_ps(mnew);
-                        const __m512 av = _mm512_set1_ps(alpha);
-                        __m512 lsum = _mm512_setzero_ps();
-                        for (int b = 0; b < nv; ++b) {
-                            const __m512 sv2 = _mm512_loadu_ps(srow + b * 16);
-                            __m512 pv = gemma_attn_exp_avx512(_mm512_sub_ps(sv2, mv));
-                            pv = _mm512_maskz_mov_ps(
-                                _mm512_cmp_ps_mask(sv2, ninf, _CMP_GT_OQ), pv);
-                            _mm512_storeu_ps(srow + b * 16, pv);
-                            lsum = _mm512_add_ps(lsum, pv);
-                        }
-                        lrow[i] = lrow[i] * alpha + _mm512_reduce_add_ps(lsum);
-                        mrow[i] = mnew;
-                        float *aci = acc + (size_t)i * hd;
-                        for (int d0 = 0; d0 < hd; d0 += 64) {
-                            const int nb = (hd - d0) >= 64 ? 4 : (hd - d0) / 16;
-                            __m512 a[4];
-                            for (int b = 0; b < nb; ++b) {
-                                a[b] = _mm512_mul_ps(_mm512_loadu_ps(aci + d0 + b * 16), av);
-                            }
-                            for (int j = 0; j < jn; ++j) {
-                                const __m512 pv = _mm512_set1_ps(srow[j]);
-                                const float *vr = v +
-                                    ((size_t)(j0 + j) * kv_heads + h) * hd + d0;
-                                for (int b = 0; b < nb; ++b) {
-                                    a[b] = _mm512_fmadd_ps(pv,
-                                        _mm512_loadu_ps(vr + b * 16), a[b]);
-                                }
-                            }
-                            for (int b = 0; b < nb; ++b) {
-                                _mm512_storeu_ps(aci + d0 + b * 16, a[b]);
-                            }
-                        }
-                    }
-                }
-                for (int i = 0; i < ATTN5_MC; ++i) {
-                    const long row = r0 + i;
-                    if (row >= rows) {
-                        break;
-                    }
-                    const int tok = (int)(row / n_rep);
-                    const int g = (int)(row - (long)tok * n_rep);
-                    const float inv = lrow[i] > 0.0f ? 1.0f / lrow[i] : 0.0f;
-                    const float *aci = acc + (size_t)i * hd;
-                    float *op = out + ((size_t)tok * q_heads + h * n_rep + g) * hd;
-                    for (int d = 0; d < hd; ++d) {
-                        op[d] = aci[d] * inv;
-                    }
-                }
-            }
-        }
-        free(acc);
-        free(sp);
-    }
+    gemma_attn_prefill_avx512_tasks(q, v, kt, positions, base, window, out, n, q_heads, kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb, tasks, NULL);
     free(kt);
 }
 
@@ -6267,6 +8122,202 @@ static inline float gemma_attn_hsum8(__m256 x)
 #define ATTN2_MR 4
 #define ATTN2_MC 32
 
+/* The tasks of gemma_attn_prefill_avx2: the threads of the enclosing OpenMP region split
+ * them (an orphaned omp for). kt is the transposed keys. */
+static void gemma_attn_prefill_avx2_tasks(const float *q, const float *v, const float *kt, const int32_t *positions, int base, int window, float *out, int n, int q_heads, int kv_heads, int hd, int n_rep, int lo_key, int ld, long rows, long last, int nrb, int tasks, const int32_t *limit)
+{
+    float *acc = (float *)malloc((size_t)ATTN2_MC * hd * sizeof(float));
+    float *sp = (float *)malloc((size_t)ATTN2_MC * ATTN2_NC * sizeof(float));
+    if (acc != NULL && sp != NULL) {
+        const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        const __m256 ninf = _mm256_set1_ps(-INFINITY);
+        #pragma omp for schedule(static)
+        for (int task = 0; task < tasks; ++task) {
+            const int h = task / nrb;
+            const long r0 = (long)(task % nrb) * ATTN2_MC;
+            const int tok0 = (int)(r0 / n_rep);
+            long t1r = r0 + ATTN2_MC - 1;
+            if (t1r > last) {
+                t1r = last;
+            }
+            const int tok1 = (int)(t1r / n_rep);
+            const int pos_max = limit != NULL ? limit[tok1] : positions[tok1];
+            int jhi = pos_max - base + 1;
+            if (jhi > n) {
+                jhi = n;
+            }
+            int jlo = 0;
+            if (window > 0) {
+                jlo = positions[tok0] - window + 1 - base;
+                if (jlo < 0) {
+                    jlo = 0;
+                }
+            }
+            if (jlo < lo_key) {
+                jlo = lo_key;
+            }
+            float mrow[ATTN2_MC];
+            float lrow[ATTN2_MC];
+            for (int i = 0; i < ATTN2_MC; ++i) {
+                float *aci = acc + (size_t)i * hd;
+                for (int d = 0; d < hd; ++d) {
+                    aci[d] = 0.0f;
+                }
+                mrow[i] = -INFINITY;
+                lrow[i] = 0.0f;
+            }
+            const float *kth = kt + (size_t)h * hd * ld;
+            for (int j0 = jlo; j0 < jhi; j0 += ATTN2_NC) {
+                const int jn = jhi - j0 < ATTN2_NC ? jhi - j0 : ATTN2_NC;
+                for (int i0 = 0; i0 < ATTN2_MC; i0 += ATTN2_MR) {
+                    __m256 sv[ATTN2_MR][ATTN2_NB];
+                    for (int i = 0; i < ATTN2_MR; ++i) {
+                        for (int b = 0; b < ATTN2_NB; ++b) {
+                            sv[i][b] = _mm256_setzero_ps();
+                        }
+                    }
+                    const float *qrp[ATTN2_MR];
+                    for (int i = 0; i < ATTN2_MR; ++i) {
+                        long row = r0 + i0 + i;
+                        if (row > last) {
+                            row = last;
+                        }
+                        const int tok = (int)(row / n_rep);
+                        const int g = (int)(row - (long)tok * n_rep);
+                        qrp[i] = q + ((size_t)tok * q_heads + h * n_rep + g) * hd;
+                    }
+                    for (int d = 0; d < hd; ++d) {
+                        const float *kd = kth + (size_t)d * ld + (j0 - lo_key);
+                        __m256 kv[ATTN2_NB];
+                        for (int b = 0; b < ATTN2_NB; ++b) {
+                            kv[b] = _mm256_loadu_ps(kd + b * 8);
+                        }
+                        for (int i = 0; i < ATTN2_MR; ++i) {
+                            const __m256 qb = _mm256_set1_ps(qrp[i][d]);
+                            for (int b = 0; b < ATTN2_NB; ++b) {
+                                sv[i][b] = _mm256_fmadd_ps(qb, kv[b], sv[i][b]);
+                            }
+                        }
+                    }
+                    for (int i = 0; i < ATTN2_MR; ++i) {
+                        long row = r0 + i0 + i;
+                        if (row > last) {
+                            row = last;
+                        }
+                        const int tok = (int)(row / n_rep);
+                        const int pos = positions[tok];
+                        const int lpos = limit != NULL ? limit[tok] : pos;
+                        float *srow = sp + (size_t)(i0 + i) * ATTN2_NC;
+                        for (int b = 0; b < ATTN2_NB; ++b) {
+                            const int jb = j0 + b * 8;
+                            __m256i keep = _mm256_setzero_si256();
+                            if (jb < jhi) {
+                                const __m256i kp = _mm256_add_epi32(
+                                    _mm256_set1_epi32(base + jb), lane);
+                                const __m256i pq = _mm256_set1_epi32(pos);
+                                keep = _mm256_cmpgt_epi32(
+                                    _mm256_set1_epi32(lpos + 1), kp);
+                                if (window > 0) {
+                                    const __m256i dist = _mm256_sub_epi32(pq, kp);
+                                    keep = _mm256_and_si256(keep, _mm256_cmpgt_epi32(
+                                        _mm256_set1_epi32(window), dist));
+                                }
+                                const int lim = jhi - jb;
+                                if (lim < 8) {
+                                    keep = _mm256_and_si256(keep,
+                                        _mm256_cmpgt_epi32(_mm256_set1_epi32(lim), lane));
+                                }
+                            }
+                            _mm256_storeu_ps(srow + b * 8,
+                                _mm256_blendv_ps(ninf, sv[i][b],
+                                    _mm256_castsi256_ps(keep)));
+                        }
+                    }
+                }
+                /* The softmax of each row, then the values for two rows at a
+                 * time: a load of 4 value vectors serves both rows. Each row
+                 * keeps its operations and their order. */
+                float alpha_row[ATTN2_MC];
+                for (int i = 0; i < ATTN2_MC; ++i) {
+                    float *srow = sp + (size_t)i * ATTN2_NC;
+                    const int nv = (jn + 7) / 8;
+                    __m256 mx = ninf;
+                    for (int b = 0; b < nv; ++b) {
+                        mx = _mm256_max_ps(mx, _mm256_loadu_ps(srow + b * 8));
+                    }
+                    const float smax = gemma_attn_hmax8(mx);
+                    const float mnew = mrow[i] > smax ? mrow[i] : smax;
+                    float alpha = 0.0f;
+                    if (mrow[i] == -INFINITY && mnew == -INFINITY) {
+                        alpha = 1.0f;
+                    } else if (mrow[i] != -INFINITY && mnew != -INFINITY) {
+                        alpha = expf(mrow[i] - mnew);
+                    }
+                    const __m256 mv = _mm256_set1_ps(mnew);
+                    __m256 lsum = _mm256_setzero_ps();
+                    for (int b = 0; b < nv; ++b) {
+                        const __m256 sv2 = _mm256_loadu_ps(srow + b * 8);
+                        __m256 pv = gemma_attn_exp_avx2(_mm256_sub_ps(sv2, mv));
+                        pv = _mm256_and_ps(pv, _mm256_cmp_ps(sv2, ninf, _CMP_GT_OQ));
+                        _mm256_storeu_ps(srow + b * 8, pv);
+                        lsum = _mm256_add_ps(lsum, pv);
+                    }
+                    lrow[i] = lrow[i] * alpha + gemma_attn_hsum8(lsum);
+                    mrow[i] = mnew;
+                    alpha_row[i] = alpha;
+                }
+                for (int i = 0; i < ATTN2_MC; i += 2) {
+                    const float *s0 = sp + (size_t)i * ATTN2_NC;
+                    const float *s1 = s0 + ATTN2_NC;
+                    float *ac0 = acc + (size_t)i * hd;
+                    float *ac1 = ac0 + hd;
+                    const __m256 av0 = _mm256_set1_ps(alpha_row[i]);
+                    const __m256 av1 = _mm256_set1_ps(alpha_row[i + 1]);
+                    for (int d0 = 0; d0 < hd; d0 += 32) {
+                        const int nb = (hd - d0) >= 32 ? 4 : (hd - d0) / 8;
+                        __m256 a0[4], a1[4];
+                        for (int b = 0; b < nb; ++b) {
+                            a0[b] = _mm256_mul_ps(_mm256_loadu_ps(ac0 + d0 + b * 8), av0);
+                            a1[b] = _mm256_mul_ps(_mm256_loadu_ps(ac1 + d0 + b * 8), av1);
+                        }
+                        for (int j = 0; j < jn; ++j) {
+                            const __m256 p0 = _mm256_set1_ps(s0[j]);
+                            const __m256 p1 = _mm256_set1_ps(s1[j]);
+                            const float *vr = v +
+                                ((size_t)(j0 + j) * kv_heads + h) * hd + d0;
+                            for (int b = 0; b < nb; ++b) {
+                                const __m256 vv = _mm256_loadu_ps(vr + b * 8);
+                                a0[b] = _mm256_fmadd_ps(p0, vv, a0[b]);
+                                a1[b] = _mm256_fmadd_ps(p1, vv, a1[b]);
+                            }
+                        }
+                        for (int b = 0; b < nb; ++b) {
+                            _mm256_storeu_ps(ac0 + d0 + b * 8, a0[b]);
+                            _mm256_storeu_ps(ac1 + d0 + b * 8, a1[b]);
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < ATTN2_MC; ++i) {
+                const long row = r0 + i;
+                if (row >= rows) {
+                    break;
+                }
+                const int tok = (int)(row / n_rep);
+                const int g = (int)(row - (long)tok * n_rep);
+                const float inv = lrow[i] > 0.0f ? 1.0f / lrow[i] : 0.0f;
+                const float *aci = acc + (size_t)i * hd;
+                float *op = out + ((size_t)tok * q_heads + h * n_rep + g) * hd;
+                for (int d = 0; d < hd; ++d) {
+                    op[d] = aci[d] * inv;
+                }
+            }
+        }
+    }
+    free(acc);
+    free(sp);
+}
+
 void gemma_attn_prefill_avx2(const float *q, const float *k, const float *v,
                              const int32_t *positions, int base, int window,
                              float *out, int t, int n, int q_heads,
@@ -6300,182 +8351,7 @@ void gemma_attn_prefill_avx2(const float *q, const float *k, const float *v,
     const int nrb = (int)((rows + ATTN2_MC - 1) / ATTN2_MC);
     const int tasks = kv_heads * nrb;
     #pragma omp parallel
-    {
-        float *acc = (float *)malloc((size_t)ATTN2_MC * hd * sizeof(float));
-        float *sp = (float *)malloc((size_t)ATTN2_MC * ATTN2_NC * sizeof(float));
-        if (acc != NULL && sp != NULL) {
-            const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-            const __m256 ninf = _mm256_set1_ps(-INFINITY);
-            #pragma omp for schedule(static)
-            for (int task = 0; task < tasks; ++task) {
-                const int h = task / nrb;
-                const long r0 = (long)(task % nrb) * ATTN2_MC;
-                const int tok0 = (int)(r0 / n_rep);
-                long t1r = r0 + ATTN2_MC - 1;
-                if (t1r > last) {
-                    t1r = last;
-                }
-                const int tok1 = (int)(t1r / n_rep);
-                const int pos_max = positions[tok1];
-                int jhi = pos_max - base + 1;
-                if (jhi > n) {
-                    jhi = n;
-                }
-                int jlo = 0;
-                if (window > 0) {
-                    jlo = positions[tok0] - window + 1 - base;
-                    if (jlo < 0) {
-                        jlo = 0;
-                    }
-                }
-                if (jlo < lo_key) {
-                    jlo = lo_key;
-                }
-                float mrow[ATTN2_MC];
-                float lrow[ATTN2_MC];
-                for (int i = 0; i < ATTN2_MC; ++i) {
-                    float *aci = acc + (size_t)i * hd;
-                    for (int d = 0; d < hd; ++d) {
-                        aci[d] = 0.0f;
-                    }
-                    mrow[i] = -INFINITY;
-                    lrow[i] = 0.0f;
-                }
-                const float *kth = kt + (size_t)h * hd * ld;
-                for (int j0 = jlo; j0 < jhi; j0 += ATTN2_NC) {
-                    const int jn = jhi - j0 < ATTN2_NC ? jhi - j0 : ATTN2_NC;
-                    for (int i0 = 0; i0 < ATTN2_MC; i0 += ATTN2_MR) {
-                        __m256 sv[ATTN2_MR][ATTN2_NB];
-                        for (int i = 0; i < ATTN2_MR; ++i) {
-                            for (int b = 0; b < ATTN2_NB; ++b) {
-                                sv[i][b] = _mm256_setzero_ps();
-                            }
-                        }
-                        const float *qrp[ATTN2_MR];
-                        for (int i = 0; i < ATTN2_MR; ++i) {
-                            long row = r0 + i0 + i;
-                            if (row > last) {
-                                row = last;
-                            }
-                            const int tok = (int)(row / n_rep);
-                            const int g = (int)(row - (long)tok * n_rep);
-                            qrp[i] = q + ((size_t)tok * q_heads + h * n_rep + g) * hd;
-                        }
-                        for (int d = 0; d < hd; ++d) {
-                            const float *kd = kth + (size_t)d * ld + (j0 - lo_key);
-                            __m256 kv[ATTN2_NB];
-                            for (int b = 0; b < ATTN2_NB; ++b) {
-                                kv[b] = _mm256_loadu_ps(kd + b * 8);
-                            }
-                            for (int i = 0; i < ATTN2_MR; ++i) {
-                                const __m256 qb = _mm256_set1_ps(qrp[i][d]);
-                                for (int b = 0; b < ATTN2_NB; ++b) {
-                                    sv[i][b] = _mm256_fmadd_ps(qb, kv[b], sv[i][b]);
-                                }
-                            }
-                        }
-                        for (int i = 0; i < ATTN2_MR; ++i) {
-                            long row = r0 + i0 + i;
-                            if (row > last) {
-                                row = last;
-                            }
-                            const int tok = (int)(row / n_rep);
-                            const int pos = positions[tok];
-                            float *srow = sp + (size_t)(i0 + i) * ATTN2_NC;
-                            for (int b = 0; b < ATTN2_NB; ++b) {
-                                const int jb = j0 + b * 8;
-                                __m256i keep = _mm256_setzero_si256();
-                                if (jb < jhi) {
-                                    const __m256i kp = _mm256_add_epi32(
-                                        _mm256_set1_epi32(base + jb), lane);
-                                    const __m256i pq = _mm256_set1_epi32(pos);
-                                    keep = _mm256_cmpgt_epi32(
-                                        _mm256_add_epi32(pq, _mm256_set1_epi32(1)), kp);
-                                    if (window > 0) {
-                                        const __m256i dist = _mm256_sub_epi32(pq, kp);
-                                        keep = _mm256_and_si256(keep, _mm256_cmpgt_epi32(
-                                            _mm256_set1_epi32(window), dist));
-                                    }
-                                    const int lim = jhi - jb;
-                                    if (lim < 8) {
-                                        keep = _mm256_and_si256(keep,
-                                            _mm256_cmpgt_epi32(_mm256_set1_epi32(lim), lane));
-                                    }
-                                }
-                                _mm256_storeu_ps(srow + b * 8,
-                                    _mm256_blendv_ps(ninf, sv[i][b],
-                                        _mm256_castsi256_ps(keep)));
-                            }
-                        }
-                    }
-                    for (int i = 0; i < ATTN2_MC; ++i) {
-                        float *srow = sp + (size_t)i * ATTN2_NC;
-                        const int nv = (jn + 7) / 8;
-                        __m256 mx = ninf;
-                        for (int b = 0; b < nv; ++b) {
-                            mx = _mm256_max_ps(mx, _mm256_loadu_ps(srow + b * 8));
-                        }
-                        const float smax = gemma_attn_hmax8(mx);
-                        const float mnew = mrow[i] > smax ? mrow[i] : smax;
-                        float alpha = 0.0f;
-                        if (mrow[i] == -INFINITY && mnew == -INFINITY) {
-                            alpha = 1.0f;
-                        } else if (mrow[i] != -INFINITY && mnew != -INFINITY) {
-                            alpha = expf(mrow[i] - mnew);
-                        }
-                        const __m256 mv = _mm256_set1_ps(mnew);
-                        const __m256 av = _mm256_set1_ps(alpha);
-                        __m256 lsum = _mm256_setzero_ps();
-                        for (int b = 0; b < nv; ++b) {
-                            const __m256 sv2 = _mm256_loadu_ps(srow + b * 8);
-                            __m256 pv = gemma_attn_exp_avx2(_mm256_sub_ps(sv2, mv));
-                            pv = _mm256_and_ps(pv, _mm256_cmp_ps(sv2, ninf, _CMP_GT_OQ));
-                            _mm256_storeu_ps(srow + b * 8, pv);
-                            lsum = _mm256_add_ps(lsum, pv);
-                        }
-                        lrow[i] = lrow[i] * alpha + gemma_attn_hsum8(lsum);
-                        mrow[i] = mnew;
-                        float *aci = acc + (size_t)i * hd;
-                        for (int d0 = 0; d0 < hd; d0 += 32) {
-                            const int nb = (hd - d0) >= 32 ? 4 : (hd - d0) / 8;
-                            __m256 a[4];
-                            for (int b = 0; b < nb; ++b) {
-                                a[b] = _mm256_mul_ps(_mm256_loadu_ps(aci + d0 + b * 8), av);
-                            }
-                            for (int j = 0; j < jn; ++j) {
-                                const __m256 pv = _mm256_set1_ps(srow[j]);
-                                const float *vr = v +
-                                    ((size_t)(j0 + j) * kv_heads + h) * hd + d0;
-                                for (int b = 0; b < nb; ++b) {
-                                    a[b] = _mm256_fmadd_ps(pv,
-                                        _mm256_loadu_ps(vr + b * 8), a[b]);
-                                }
-                            }
-                            for (int b = 0; b < nb; ++b) {
-                                _mm256_storeu_ps(aci + d0 + b * 8, a[b]);
-                            }
-                        }
-                    }
-                }
-                for (int i = 0; i < ATTN2_MC; ++i) {
-                    const long row = r0 + i;
-                    if (row >= rows) {
-                        break;
-                    }
-                    const int tok = (int)(row / n_rep);
-                    const int g = (int)(row - (long)tok * n_rep);
-                    const float inv = lrow[i] > 0.0f ? 1.0f / lrow[i] : 0.0f;
-                    const float *aci = acc + (size_t)i * hd;
-                    float *op = out + ((size_t)tok * q_heads + h * n_rep + g) * hd;
-                    for (int d = 0; d < hd; ++d) {
-                        op[d] = aci[d] * inv;
-                    }
-                }
-            }
-        }
-        free(acc);
-        free(sp);
-    }
+    gemma_attn_prefill_avx2_tasks(q, v, kt, positions, base, window, out, n, q_heads, kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb, tasks, NULL);
     free(kt);
 }
 
@@ -6517,6 +8393,223 @@ void gemma_attn_prefill(const float *q, const float *k, const float *v,
     gemma_attn_prefill_scalar(q, k, v, positions, base, window, out,
                               t, n, q_heads, kv_heads, hd);
 #endif
+}
+
+/* gemma_attn_prefill inside an OpenMP region (a program record): every thread
+ * of the region calls it. One thread makes the transposed keys (kt), and the
+ * threads split the tasks of the AVX-512 or AVX2 version (an orphaned omp
+ * for). The scalar version runs on one thread. */
+static void gemma_attn_prefill_region_lim(const float *q, const float *k, const float *v,
+                                          const int32_t *positions, int base, int window,
+                                          float *out, int t, int n, int q_heads, int kv_heads,
+                                          int hd, const int32_t *limit)
+{
+#if GEMMA_X86
+    int wide = 0;           /* 16 floats (AVX-512) or 8 (AVX2) */
+#if defined(__AVX512F__)
+    /* a head of 8k values that is not 16k (72 in the 26B vision) takes AVX2 */
+    wide = (gemma_attn_impl == 2 || hd % 16 != 0) ? 8 : 16;
+#else
+    wide = 8;
+#endif
+    if (gemma_attn_impl == 1 || t <= 0 || n <= 0 || hd <= 0 || q_heads < kv_heads ||
+        (hd % wide) != 0) {
+        #pragma omp single
+        gemma_attn_prefill_scalar(q, k, v, positions, base, window, out, t, n, q_heads,
+                                  kv_heads, hd);
+        return;
+    }
+    const int n_rep = q_heads / kv_heads;
+    int lo_key = 0;
+    if (window > 0) {
+        lo_key = positions[0] - window + 1 - base;
+        if (lo_key < 0) {
+            lo_key = 0;
+        }
+    }
+    const int nvis = n - lo_key;
+    if (nvis <= 0) {
+        #pragma omp single
+        memset(out, 0, (size_t)t * q_heads * hd * sizeof(float));
+        return;
+    }
+    const int ld = ((nvis + wide - 1) / wide) * wide;
+    const long rows = (long)t * n_rep;
+    const long last = rows - 1;
+    float *kt = NULL;
+    #pragma omp single copyprivate(kt)
+    {
+        kt = (float *)malloc((size_t)kv_heads * hd * ld * sizeof(float));
+        if (kt != NULL) {
+            gemma_attn_transpose_k(k, kt, nvis, ld, kv_heads, hd, lo_key);
+        }
+    }
+    if (kt == NULL) {
+        return;
+    }
+#if defined(__AVX512F__)
+    if (wide == 16) {
+        const int nrb = (int)((rows + ATTN5_MC - 1) / ATTN5_MC);
+        gemma_attn_prefill_avx512_tasks(q, v, kt, positions, base, window, out, n, q_heads,
+                                        kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb,
+                                        kv_heads * nrb, limit);
+    } else
+#endif
+    {
+        const int nrb = (int)((rows + ATTN2_MC - 1) / ATTN2_MC);
+        gemma_attn_prefill_avx2_tasks(q, v, kt, positions, base, window, out, n, q_heads,
+                                      kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb,
+                                      kv_heads * nrb, limit);
+    }
+    #pragma omp single
+    free(kt);
+#else
+    #pragma omp single
+    gemma_attn_prefill_scalar(q, k, v, positions, base, window, out, t, n, q_heads, kv_heads, hd);
+#endif
+}
+
+/* limit: see gemma_attn_prefill_avx512_tasks (the AVX-512 and AVX2 versions) */
+void gemma_attn_prefill_region(const float *q, const float *k, const float *v,
+                               const int32_t *positions, int base, int window,
+                               float *out, int t, int n, int q_heads, int kv_heads, int hd)
+{
+    gemma_attn_prefill_region_lim(q, k, v, positions, base, window, out, t, n, q_heads, kv_heads,
+                                  hd, NULL);
+}
+
+/* ---------- the prompt attention over the int16 cache ----------
+ *
+ * gemma_attn_prefill on the quantized cache (KVCache: int16 values and a
+ * float32 scale for each group of 32), with no float copy of the cache:
+ * the team dequantizes the keys while it transposes them (kt), and the
+ * values of the visible rows only (vf), then runs the tasks of
+ * gemma_attn_prefill. A value is (float)q * scale, as KVCache.read gives
+ * it, and the tasks are the same: the bits of KVCache.read and
+ * gemma_attn_prefill. The scratch is one set for each team (the parts run
+ * this at the same time). */
+typedef struct {
+    float *kt, *vf;
+    size_t kt_n, vf_n;
+} aq_scratch;
+static aq_scratch aq_scr[AS_SLOTS];
+
+static void gemma_attn_prefill_qc_body(const float *q, const int16_t *kq, const float *ks,
+                                       const int16_t *vq, const float *vs,
+                                       const int32_t *positions, int base, int window,
+                                       float *out, int t, int n, int q_heads, int kv_heads,
+                                       int hd, const int32_t *limit)
+{
+#if GEMMA_X86
+#if defined(__AVX512F__)
+    const int wide = (gemma_attn_impl == 2 || hd % 16 != 0) ? 8 : 16;
+#else
+    const int wide = 8;
+#endif
+    if (t <= 0 || n <= 0 || hd <= 0 || q_heads < kv_heads || hd % 32 != 0 || hd % wide != 0 ||
+        gemma_attn_impl == 1) {
+        return;
+    }
+    const int n_rep = q_heads / kv_heads;
+    int lo_key = 0;
+    if (window > 0) {
+        lo_key = positions[0] - window + 1 - base;
+        if (lo_key < 0) {
+            lo_key = 0;
+        }
+    }
+    const int nvis = n - lo_key;
+    if (nvis <= 0) {
+        #pragma omp for schedule(static)
+        for (long i = 0; i < (long)t * q_heads * hd; ++i) {
+            out[i] = 0.0f;
+        }
+        return;
+    }
+    const int ld = ((nvis + wide - 1) / wide) * wide;
+    const int g = hd / 32;
+    const size_t row = (size_t)kv_heads * (size_t)hd;
+    aq_scratch *S = &aq_scr[omp_get_level() >= 2 ? omp_get_ancestor_thread_num(1) + 1 : 0];
+    #pragma omp single
+    {
+        size_t need = (size_t)kv_heads * hd * ld;
+        if (S->kt_n < need) {
+            free(S->kt);
+            S->kt = (float *)aligned_alloc(64, ((need * 4 + 63) / 64) * 64);
+            S->kt_n = need;
+        }
+        need = (size_t)n * row;     /* rows lo_key to n - 1 are written */
+        if (S->vf_n < need) {
+            free(S->vf);
+            S->vf = (float *)aligned_alloc(64, ((need * 4 + 63) / 64) * 64);
+            S->vf_n = need;
+        }
+    }
+    float *kt = S->kt, *vf = S->vf;
+    /* the keys: the transposed float rows of each head, blocks of 16 keys */
+    const int jbs = (nvis + 15) / 16;
+    #pragma omp for schedule(static)
+    for (int it = 0; it < kv_heads * jbs; ++it) {
+        const int h = it / jbs, jb = (it % jbs) * 16;
+        const int je = jb + 16 < nvis ? jb + 16 : nvis;
+        float *dsth = kt + (size_t)h * (size_t)hd * (size_t)ld;
+        for (int j = jb; j < je; ++j) {
+            const size_t r = (size_t)(lo_key + j);
+            const int16_t *src = kq + r * row + (size_t)h * hd;
+            const float *sc = ks + (r * kv_heads + h) * (size_t)g;
+            for (int d = 0; d < hd; ++d) {
+                dsth[(size_t)d * ld + j] = (float)src[d] * sc[d / 32];
+            }
+        }
+    }
+    /* the values of the visible rows, in groups of 32 */
+    #pragma omp for schedule(static)
+    for (long gi = (long)lo_key * kv_heads * g; gi < (long)n * kv_heads * g; ++gi) {
+        const int16_t *src = vq + (size_t)gi * 32;
+        float *dst = vf + (size_t)gi * 32;
+        const float sc = vs[gi];
+        for (int e = 0; e < 32; ++e) {
+            dst[e] = (float)src[e] * sc;
+        }
+    }
+    const long rows = (long)t * n_rep, last = rows - 1;
+#if defined(__AVX512F__)
+    if (wide == 16) {
+        const int nrb = (int)((rows + ATTN5_MC - 1) / ATTN5_MC);
+        gemma_attn_prefill_avx512_tasks(q, vf, kt, positions, base, window, out, n, q_heads,
+                                        kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb,
+                                        kv_heads * nrb, limit);
+        return;
+    }
+#endif
+    const int nrb = (int)((rows + ATTN2_MC - 1) / ATTN2_MC);
+    gemma_attn_prefill_avx2_tasks(q, vf, kt, positions, base, window, out, n, q_heads,
+                                  kv_heads, hd, n_rep, lo_key, ld, rows, last, nrb,
+                                  kv_heads * nrb, limit);
+#endif
+}
+
+/* 1 when gemma_attn_prefill_qc takes this shape (else the caller reads the
+ * float rows and runs gemma_attn_prefill). */
+int gemma_attn_prefill_qc_ok(int q_heads, int kv_heads, int hd)
+{
+#if GEMMA_X86
+    return gemma_attn_impl != 1 && hd > 0 && hd % 32 == 0 && q_heads >= kv_heads &&
+           q_heads % kv_heads == 0;
+#else
+    (void)q_heads; (void)kv_heads; (void)hd;
+    return 0;
+#endif
+}
+
+void gemma_attn_prefill_qc(const float *q, const int16_t *kq, const float *ks, const int16_t *vq,
+                           const float *vs, const int32_t *positions, int base, int window,
+                           float *out, int t, int n, int q_heads, int kv_heads, int hd,
+                           const int32_t *limit)
+{
+    #pragma omp parallel
+    gemma_attn_prefill_qc_body(q, kq, ks, vq, vs, positions, base, window, out, t, n, q_heads,
+                               kv_heads, hd, limit);
 }
 
 /* ---------- the compressed-tensors packed layout ----------
@@ -6885,7 +8978,6 @@ void gemma_ct_linear(const uint32_t *w, const float *scale, const float *x,
  * own calls, so the result of the Python path does not change.
  */
 
-__attribute__((unused))
 static void gemma_q6k_linear_body(const uint8_t *w, const float *x, float *out,
                                   int rows, int cols, int tokens)
 {
@@ -7075,8 +9167,9 @@ static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
                  * stores the key and the value. */
                 dst = kout + ((size_t)j * nk + kh) * hd;
             } else {
-                dst = K + (size_t)kh * hs + (size_t)(pos + j) * hd;
-                memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * hd,
+                size_t rs = gp_kv_rs((size_t)hs, nk, hd);
+                dst = K + (size_t)kh * hs + (size_t)(pos + j) * rs;
+                memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * rs,
                        vv + ((size_t)j * nk + kh) * hd, (size_t)hd * 4);
             }
             w = kn;
@@ -7115,6 +9208,10 @@ typedef struct {
 
 enum { GP_T_NONE = 0, GP_T_INT = 1, GP_T_F32 = 2, GP_T_SLOT = 3 };
 
+/* Set by a record that cannot run its shape (the int8 cache has one
+ * kernel); gemma_run then returns -3. */
+static volatile int gp_fail;
+
 enum {
     GP_S_MOV = 1, GP_S_ADD = 2, GP_S_SUB = 3, GP_S_MUL = 4, GP_S_MAX = 5,
     GP_S_MIN = 6,
@@ -7126,7 +9223,11 @@ enum {
     GP_QKV_NORM_ROPE = 48, GP_KV_WRITE = 49, GP_ATTN_QC = 50, GP_ATTN_F32 = 51,
     GP_ATTN_QC_MT = 52, GP_ATTN_F32_MT = 53, GP_QKV_NORM = 54, GP_ROPE = 55,
     GP_KV_WRITE_HEADS = 56, GP_ATTN_F32H = 57,
+    GP_KV_WRITE8 = 58, GP_ATTN_Q8 = 59, GP_ATTN_Q8_MT = 60,
+    GP_KV_WRITEV8 = 61, GP_ATTN_V8 = 62, GP_ATTN_V8_MT = 63,
     GP_ROUTER = 64, GP_MOE = 65, GP_ROUTER_MT = 66, GP_MOE_MT = 67, GP_MOE_N = 68,
+    /* the TQ6 cache of the Qwen models (np_gemma/tq6.py) */
+    GP_KV_WRITETQ = 69, GP_ATTN_TQ = 70, GP_ATTN_TQ_MT = 71, GP_TQ_ROT = 72,
     GP_XBAR = 80, GP_MOE_PART = 81, GP_ATTN_QC_H = 82, GP_ATTN_F32_H = 83,
     /* The MLX affine format, the Gated DeltaNet, and the small operations of
      * Qwen3.5 (QWEN_PLAN.md). */
@@ -7137,6 +9238,23 @@ enum {
     GP_HC_NORM = 114, GP_HC_ACT = 115, GP_HC_MIX = 116, GP_HC_ADD = 117, GP_PLE_GATE = 118,
     GP_PLE_CONV = 119, GP_QSA_SELECT = 120, GP_ATTN_QSA = 121, GP_HC_CAT = 122,
     GP_MOE_PLAN = 123,
+    /* The media encoders (np_gemma/gemma4_encoders.py, program form) */
+    GP_ENC_LINEAR = 133, GP_ENC_RMS = 134, GP_ENC_GELU_MUL = 135, GP_ENC_ADD = 136,
+    GP_ENC_ROPE2D = 137, GP_ENC_ATTN = 138, GP_ENC_SILU = 139, GP_ENC_MUL_VEC = 140,
+    GP_ENC_GLU = 141, GP_ENC_DWCONV = 142, GP_ENC_LOCAL_ATTN = 143, GP_ENC_CLAMP = 144,
+    GP_ENC_BIAS_CLAMP = 145, GP_ENC_LNORM = 146, GP_ENC_GELU = 147,
+    /* The rows of a Q6_K matrix (gemma_q6k_linear_body): the output head of
+     * the parts (np_gemma/parts.py) */
+    GP_Q6K_LINEAR = 148,
+    /* The attention of a prompt block for the KV heads of one part, with the
+     * cache of the part (np_gemma/parts.py, PartKVCache) */
+    GP_PART_PREFILL = 149,
+    /* The attention of a prompt block over the int16 cache of a layer, as
+     * gemma_attn_prefill_qc (np_gemma/prompt.py) */
+    GP_ATTN_PREFILL_QC = 150,
+    /* The int16 x of a prompt block and its product with a KQ_Q4X matrix
+     * (kq_quant16_body, kq_linear16_body; NP_GEMMA_INT4_Q8=16) */
+    GP_KQ_QUANT16 = 151, GP_KQ_LINEAR16 = 152,
 };
 
 int gemma_gp_record_size(void)
@@ -7348,32 +9466,98 @@ static void gp_moe_group(const gp_rec *r, const int64_t *e)
  *
  * A barrier across the parts (GP_XBAR) comes before an operation that reads
  * the output of a different part. The barrier is an int64 array of the
- * caller. The
- * value b[0] counts the parts that arrived. The value b[8] is the generation.
- * It is on a different cache line.
+ * caller, with a flag for each part: b[8 (p + 1)], on a cache line of its
+ * own. A flag counts the barriers that its part passed.
  *
- * The last part to arrive sets the count to 0 and increments the
- * generation. The other parts wait until the generation changes.
+ * At a barrier, a part stores its count plus one in its flag (a release
+ * store), then waits until the flag of each other part is that count or
+ * more (acquire loads). Only a part writes its flag, so no line takes an
+ * atomic read-modify-write of all the parts. A count grows at each barrier,
+ * so a flag needs no reset within a run; gemma_run_parts sets the flags to
+ * 0 before a run.
  *
  * The OpenMP barrier at the start makes sure that each thread of the team
- * finished its writes. The atomic operations then make those writes visible
- * to the other parts. */
-static void gp_xbar(int64_t *b, int n)
+ * finished its writes. The release store then makes those writes visible to
+ * the other parts. */
+/* The measures of the barriers (gemma_xbar_stats): for each part (the
+ * thread of the outer region), the time its team waited for the other
+ * parts, the time of its team barrier, and the count. */
+#define GP_XS_PARTS 8
+static double gp_xs_wait[GP_XS_PARTS], gp_xs_team[GP_XS_PARTS];
+static int64_t gp_xs_n[GP_XS_PARTS];
+
+int gemma_xbar_stats(double *out)
 {
+    for (int p = 0; p < GP_XS_PARTS; ++p) {
+        out[3 * p] = gp_xs_wait[p];
+        out[3 * p + 1] = gp_xs_team[p];
+        out[3 * p + 2] = (double)gp_xs_n[p];
+        gp_xs_wait[p] = gp_xs_team[p] = 0.0;
+        gp_xs_n[p] = 0;
+    }
+    return GP_XS_PARTS;
+}
+
+/* The count of the barriers that a thread passed. Each thread of a part
+ * passes the same barriers, so each finds the same count; the runners of
+ * the parts set it to 0 at the start of a run, as the flags. */
+static __thread int64_t gp_xcnt;
+
+/* The prefetch of a thread during the wait of a barrier: at most this many
+ * bytes (L2 is 1 MB on the Xeon of the parts). */
+#define GP_XPF_MAX (512 * 1024)
+
+/* After the team barrier, the first thread of the team stores the count of
+ * the part (release), and every thread waits for the flags of the other
+ * parts itself (acquire). The barrier of the team makes the writes of the
+ * team come before the store, so a thread that sees the flags of the other
+ * parts sees their writes: no second team barrier.
+ *
+ * pf and pf_bytes (or null) are the weights of the next operation of the
+ * part (parts.py, _xbar_prefetch). During the wait, each thread prefetches
+ * its share of them (the share of the static schedule of the next kernel),
+ * so a part that waits loads its next rows into its caches. */
+static void gp_xbar(int64_t *b, int n, const uint8_t *pf, int64_t pf_bytes)
+{
+    double t0 = omp_get_wtime();
+    int p = omp_get_ancestor_thread_num(1);
+    int64_t v = ++gp_xcnt;
     #pragma omp barrier
-    #pragma omp single
-    {
-        int64_t gen = __atomic_load_n(&b[8], __ATOMIC_ACQUIRE);
-        if (__atomic_add_fetch(&b[0], 1, __ATOMIC_ACQ_REL) == n) {
-            __atomic_store_n(&b[0], 0, __ATOMIC_RELAXED);
-            __atomic_store_n(&b[8], gen + 1, __ATOMIC_RELEASE);
-        } else {
-            while (__atomic_load_n(&b[8], __ATOMIC_ACQUIRE) == gen) {
-#if GEMMA_X86
-                _mm_pause();
-#endif
-            }
+    const int first = omp_get_thread_num() == 0;
+    double t1 = omp_get_wtime();
+    if (first) {
+        __atomic_store_n(b + 8 * (p + 1), v, __ATOMIC_RELEASE);
+    }
+    const uint8_t *q = NULL, *qe = NULL;
+    if (pf != NULL && pf_bytes > 0) {
+        size_t nt = (size_t)omp_get_num_threads(), t = (size_t)omp_get_thread_num();
+        size_t per = ((size_t)pf_bytes + nt - 1) / nt, lo = per * t;
+        size_t len = lo >= (size_t)pf_bytes ? 0 : (size_t)pf_bytes - lo;
+        len = len < per ? len : per;
+        len = len < GP_XPF_MAX ? len : GP_XPF_MAX;
+        q = pf + lo;
+        qe = q + len;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (k == p) {
+            continue;
         }
+        while (__atomic_load_n(b + 8 * (k + 1), __ATOMIC_ACQUIRE) < v) {
+#if GEMMA_X86
+            if (q < qe) {
+                for (int j = 0; j < 8 && q < qe; ++j, q += 64) {
+                    _mm_prefetch((const char *)q, _MM_HINT_T1);
+                }
+            } else {
+                _mm_pause();
+            }
+#endif
+        }
+    }
+    if (first && p >= 0 && p < GP_XS_PARTS) {
+        gp_xs_wait[p] += omp_get_wtime() - t1;
+        gp_xs_team[p] += t1 - t0;
+        ++gp_xs_n[p];
     }
 }
 
@@ -7421,6 +9605,66 @@ static void gp_moe_part(const gp_rec *r, const int64_t *e)
     int c0 = GP_I(20);
     int64_t *bar = GP_P(int64_t, 21);
     int nparts = GP_I(22);
+    if (gu_s == NULL) {
+        /* The KQ_Q4X copies of the rows of this part (np_gemma/parts.py):
+         * the operations of GP_KQ_MOE with float32 activations (the step of
+         * one part), row by row: the same bits. gu_w holds 2 ni rows for
+         * each expert (the gate rows, then the up rows), dn_w nd rows. */
+        size_t rbh = (size_t)(cols / 32) * 18, rbi = (size_t)(inner / 32) * 18;
+        int ggu = gu_rows / 16, gdn = nd / 16;
+        /* AVX2: int8 x, as GP_KQ_MOE on that CPU (q4x_rows_x) */
+        I4Q_BEGIN(h, (size_t)cols, 1, cols);
+        #pragma omp for schedule(static)
+        for (int x = 0; x < top_k * ggu; ++x) {
+            int j = x / ggu, g = x % ggu;
+            q4x_rows_x(gu_w + ((size_t)idx[j] * gu_rows + 16 * g) * rbh, cols, h, (size_t)cols, 1,
+                       act + (size_t)j * gu_rows + 16 * g, (size_t)gu_rows);
+        }
+        #pragma omp for schedule(static)
+        for (int j = 0; j < top_k; ++j) {
+            const float *a = act + (size_t)j * gu_rows;
+            float *o = act2 + (size_t)j * inner + a0;
+            int i = 0;
+#if GEMMA_X86 && defined(__AVX512F__)
+            /* the GELU of kq_moe_body, 16 values at a time */
+            const __m512 cv = _mm512_set1_ps(0.7978845608028654f), half = _mm512_set1_ps(0.5f);
+            const __m512 one = _mm512_set1_ps(1.0f), k3 = _mm512_set1_ps(0.044715f);
+            for (; i + 16 <= ni; i += 16) {
+                __m512 v = _mm512_loadu_ps(a + i);
+                __m512 v3 = _mm512_mul_ps(_mm512_mul_ps(v, v), v);
+                __m512 th = gemma_tanh_ps(_mm512_mul_ps(cv, _mm512_fmadd_ps(k3, v3, v)));
+                __m512 rr = _mm512_mul_ps(_mm512_mul_ps(half, v), _mm512_add_ps(one, th));
+                _mm512_storeu_ps(o + i, _mm512_mul_ps(rr, _mm512_loadu_ps(a + ni + i)));
+            }
+#else
+            i = GELU_MUL_VEC(a, a + ni, o, ni);
+#endif
+            for (; i < ni; ++i) {
+                float v = a[i];
+                o[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))) *
+                       a[ni + i];
+            }
+        }
+        gp_xbar(bar, nparts, NULL, 0);
+        I4Q_BEGIN(act2, (size_t)inner, top_k, inner);
+        #pragma omp for schedule(static)
+        for (int x = 0; x < top_k * gdn; ++x) {
+            int j = x / gdn, g = x % gdn;
+            q4x_rows_x(dn_w + ((size_t)idx[j] * nd + 16 * g) * rbi, inner, act2 + (size_t)j * inner,
+                       (size_t)inner, 1, de + (size_t)j * nd + 16 * g, (size_t)nd);
+        }
+        /* the sum of moe_combine: from 0, the experts in the order of the
+         * router */
+        #pragma omp for schedule(static)
+        for (int c = 0; c < nd; ++c) {
+            float o = 0.f;
+            for (int j = 0; j < top_k; ++j) {
+                o += val[j] * de[(size_t)j * nd + c];
+            }
+            out[c0 + c] = o;
+        }
+        return;
+    }
     #pragma omp single
     {
         for (int j = 0; j < top_k; ++j) {
@@ -7442,7 +9686,7 @@ static void gp_moe_part(const gp_rec *r, const int64_t *e)
         memcpy(act2 + (size_t)j * (size_t)inner + a0, act2p + (size_t)j * (size_t)ni,
                (size_t)ni * sizeof(float));
     }
-    gp_xbar(bar, nparts);
+    gp_xbar(bar, nparts, NULL, 0);
     gemma_int4_moe_gemv_body(dn_w, dn_s, act2, ids, top_k, de, nd, inner, inner);
     #pragma omp single
     {
@@ -7531,7 +9775,7 @@ static void gp_step(const gp_rec *r, int64_t *e)
         moe_plan_body(GP_P(const int32_t, 0), GP_P(const int64_t, 1), GP_I(2), GP_I(3), GP_I(4),
                       GP_P(const int32_t, 5), GP_P(const int64_t, 6), gp_i(r, e, 7),
                       gp_i(r, e, 8), gp_i(r, e, 9), GP_P(int64_t, 10), GP_P(int32_t, 11),
-                      GP_P(int32_t, 12), GP_P(int64_t, 13), GP_P(int64_t, 14));
+                      GP_P(int32_t, 12), GP_P(int64_t, 13), GP_P(int64_t, 14), GP_P(int32_t, 15));
         break;
     case GP_HC_CAT:
         /* e, hn, out, t, hc, hid */
@@ -7540,24 +9784,34 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_QSA_SELECT:
         /* iq, ik, idxk, blk, qn, kn, cos, sin, pos, t, heads, d, ratio, budget, rot, theta,
-         * eps, sel, cnt, maxsel, scratch, nbmax */
-        qsa_select_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_P(float, 3),
+         * eps, sel, cnt, maxsel, scratch, nbmax, qpos (or 0), sec */
+        qsa_select_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(uint16_t, 2),
+                        GP_P(uint16_t, 3),
                         GP_P(const float, 4), GP_P(const float, 5), GP_P(const float, 6),
                         GP_P(const float, 7), gp_i(r, e, 8), GP_I(9), GP_I(10), GP_I(11), GP_I(12),
                         GP_I(13), GP_I(14), gp_f(r, e, 15), gp_f(r, e, 16), GP_P(int32_t, 17),
-                        GP_P(int32_t, 18), GP_I(19), GP_P(uint8_t, 20), gp_i(r, e, 21));
+                        GP_P(int32_t, 18), GP_I(19), GP_P(uint8_t, 20), gp_i(r, e, 21),
+                        GP_P(const int32_t, 22), GP_I(23));
         break;
     case GP_ATTN_QSA:
-        /* q, kq, ks, vq, vs, scores, out, nq, nk, hd, t, pos, sel, cnt, maxsel */
-        attn_qsa_body(GP_P(const float, 0), GP_P(const int16_t, 1), GP_P(const float, 2),
-                      GP_P(const int16_t, 3), GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+        /* q, kq, ks, vq, vs, scores, out, nq, nk, hd, t, pos, sel, cnt, maxsel,
+         * form (0 int16, 1 int8, 2 int16 keys and int8 values, 3 float32
+         * rows), hs (form 3: the head stride) */
+        attn_qsa_body(GP_P(const float, 0), GP_P(const void, 1), GP_P(const float, 2),
+                      GP_P(const void, 3), GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
                       GP_I(7), GP_I(8), GP_I(9), GP_I(10), gp_i(r, e, 11), GP_P(const int32_t, 12),
-                      GP_P(const int32_t, 13), GP_I(14));
+                      GP_P(const int32_t, 13), GP_I(14), GP_I(15), gp_i(r, e, 16));
         break;
     case GP_KQ_QUANT:
-        /* x, t, cols, xq, xs, xm */
-        kq_quant_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3), GP_P(float, 4),
-                      GP_P(float, 5));
+        /* x, t, cols, xq, xs, xm, then (or none) ids and k: only the rows
+         * with a selected expert */
+        if (GP_P(const int32_t, 6) != NULL) {
+            kq_quant_rows_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3),
+                               GP_P(float, 4), GP_P(float, 5), GP_P(const int32_t, 6), GP_I(7));
+        } else {
+            kq_quant_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3),
+                          GP_P(float, 4), GP_P(float, 5));
+        }
         break;
     case GP_KQ_LINEAR:
         /* xq, xs, xm, x, w, type, rows, cols, t, out */
@@ -7567,12 +9821,16 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_KQ_MOE:
         /* hq, hs, hm, ids, val, t, k, experts, mats, shared_logit, hidden, inner, scratch,
-         * out, kcount (null, or the count of experts of one token) */
+         * out, kcount (null, or the count of experts of one token), act, hf, mats1 (the
+         * copy of node 1, or null), slot1 (a partial mats1: the slot of each expert, or -1;
+         * null: a full copy), slot0 (null: mats holds every expert; else the slot of each
+         * expert in mats, or -1: a split of the experts over the nodes) */
         kq_moe_body(GP_P(const int8_t, 0), GP_P(const float, 1), GP_P(const float, 2),
                     GP_P(const int32_t, 3), GP_P(const float, 4), GP_I(5), GP_I(6), GP_I(7),
                     GP_P(const int64_t, 8), GP_P(const float, 9), GP_I(10), GP_I(11),
                     GP_P(uint8_t, 12), GP_P(float, 13),
-                    GP_P(const int32_t, 14));
+                    GP_P(const int32_t, 14), GP_I(15), GP_P(const float, 16),
+                    GP_P(const int64_t, 17), GP_P(const int32_t, 18), GP_P(const int32_t, 19));
         break;
     case GP_ATTN_PREP:
         /* qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps, scale,
@@ -7612,20 +9870,25 @@ static void gp_step(const gp_rec *r, int64_t *e)
         float *out = GP_P(float, 2);
         int rows = GP_I(3), cols = GP_I(4);
         float eps = gp_f(r, e, 5);
-        #pragma omp single
-        for (int i = 0; i < rows; ++i) {
-            gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
-                               out + (size_t)i * (size_t)cols, cols, eps);
+        if (rows < 8) {
+            #pragma omp single
+            for (int i = 0; i < rows; ++i) {
+                gemma_rms_norm_row(x + (size_t)i * (size_t)cols, w,
+                                   out + (size_t)i * (size_t)cols, cols, eps);
+            }
+        } else {
+            /* the rows of a prompt over the team, as gemma_rms_norm */
+            gemma_rms_norm_body(x, w, out, rows, cols, eps);
         }
         break;
     }
     case GP_ADD: {
-        /* a, b, out, n */
+        /* a, b, out, n: the team adds (each value as one thread did) */
         const float *a = GP_P(const float, 0);
         const float *b = GP_P(const float, 1);
         float *out = GP_P(float, 2);
         int n = GP_I(3);
-        #pragma omp single
+        #pragma omp for schedule(static)
         for (int i = 0; i < n; ++i) {
             out[i] = a[i] + b[i];
         }
@@ -7637,7 +9900,7 @@ static void gp_step(const gp_rec *r, int64_t *e)
         float sc = gp_f(r, e, 1);
         float *out = GP_P(float, 2);
         int n = GP_I(3);
-        #pragma omp single
+        #pragma omp for schedule(static)
         for (int i = 0; i < n; ++i) {
             out[i] = x[i] * sc;
         }
@@ -7665,12 +9928,11 @@ static void gp_step(const gp_rec *r, int64_t *e)
         float *out = GP_P(float, 2);
         int rows = GP_I(3), cols = GP_I(4);
         size_t bs = (size_t)gp_i(r, e, 5);
-        #pragma omp single
-        for (int i = 0; i < rows; ++i) {
-            for (int c = 0; c < cols; ++c) {
-                out[(size_t)i * (size_t)cols + c] =
-                    a[(size_t)i * (size_t)cols + c] * b[(size_t)i * bs + c];
-            }
+        /* the values over the team (a row of a prompt has 15360) */
+        #pragma omp for schedule(static)
+        for (long ic = 0; ic < (long)rows * cols; ++ic) {
+            const long i = ic / cols, c = ic % cols;
+            out[(size_t)ic] = a[(size_t)ic] * b[(size_t)i * bs + (size_t)c];
         }
         break;
     }
@@ -7760,28 +10022,197 @@ static void gp_step(const gp_rec *r, int64_t *e)
         int16_t *vqd = GP_P(int16_t, 6);
         float *vsd = GP_P(float, 7);
         int n = GP_I(8);
+        if (kd != NULL) {
+            #pragma omp single nowait
+            {
+                memcpy(kd, k, (size_t)n * sizeof(float));
+                memcpy(vd, v, (size_t)n * sizeof(float));
+            }
+        }
+        if (kqd != NULL) {
+            /* the groups over the team (the rows of a prompt block): each
+             * group as one thread did it */
+            #pragma omp for schedule(static)
+            for (int g = 0; g < n / 32; ++g) {
+                ksd[g] = gemma_quant_group32_i16(k + (size_t)g * 32, kqd + (size_t)g * 32);
+                vsd[g] = gemma_quant_group32_i16(v + (size_t)g * 32, vqd + (size_t)g * 32);
+            }
+        } else {
+            #pragma omp barrier
+        }
+        break;
+    }
+    case GP_KV_WRITE8: {
+        /* Operands: k, v, kd, vd, kqd, ksd, vqd, vsd, n.
+         * GP_KV_WRITE for the int8 cache (NP_GEMMA_KV_INT8). */
+        const float *k = GP_P(const float, 0);
+        const float *v = GP_P(const float, 1);
+        float *kd = GP_P(float, 2);
+        float *vd = GP_P(float, 3);
+        int8_t *kqd = GP_P(int8_t, 4);
+        float *ksd = GP_P(float, 5);
+        int8_t *vqd = GP_P(int8_t, 6);
+        float *vsd = GP_P(float, 7);
+        int n = GP_I(8);
         #pragma omp single
         {
             if (kd != NULL) {
                 memcpy(kd, k, (size_t)n * sizeof(float));
                 memcpy(vd, v, (size_t)n * sizeof(float));
             }
-            for (int g = 0; kqd != NULL && g < n / 32; ++g) {
-                ksd[g] = gemma_quant_group32_i16(k + (size_t)g * 32, kqd + (size_t)g * 32);
-                vsd[g] = gemma_quant_group32_i16(v + (size_t)g * 32, vqd + (size_t)g * 32);
+            for (int g = 0; g < n / 32; ++g) {
+                ksd[g] = gemma_quant_group32_i8(k + (size_t)g * 32, kqd + (size_t)g * 32);
+                vsd[g] = gemma_quant_group32_i8(v + (size_t)g * 32, vqd + (size_t)g * 32);
             }
         }
         break;
     }
-    case GP_ATTN_QC:
+    case GP_KV_WRITEV8: {
+        /* Operands: those of GP_KV_WRITE8. The keys int16, the values int8,
+         * no float rows (KVCache kv="k16v8"). */
+        const float *k = GP_P(const float, 0);
+        const float *v = GP_P(const float, 1);
+        int16_t *kqd = GP_P(int16_t, 4);
+        float *ksd = GP_P(float, 5);
+        int8_t *vqd = GP_P(int8_t, 6);
+        float *vsd = GP_P(float, 7);
+        int n = GP_I(8);
+        #pragma omp single
+        for (int g = 0; g < n / 32; ++g) {
+            ksd[g] = gemma_quant_group32_i16(k + (size_t)g * 32, kqd + (size_t)g * 32);
+            vsd[g] = gemma_quant_group32_i8(v + (size_t)g * 32, vqd + (size_t)g * 32);
+        }
+        break;
+    }
+    case GP_KV_WRITETQ: {
+        /* Operands: those of GP_KV_WRITE8; the bytes of the TQ6 groups and
+         * their norms (tq6_quant_group), no float rows. */
+        const float *k = GP_P(const float, 0);
+        const float *v = GP_P(const float, 1);
+        uint8_t *kqd = GP_P(uint8_t, 4);
+        float *ksd = GP_P(float, 5);
+        uint8_t *vqd = GP_P(uint8_t, 6);
+        float *vsd = GP_P(float, 7);
+        int n = GP_I(8);
+        #pragma omp for schedule(static)
+        for (int g = 0; g < n / 32; ++g) {
+            ksd[g] = tq6_quant_group(k + (size_t)g * 32, kqd + (size_t)g * 24);
+            vsd[g] = tq6_quant_group(v + (size_t)g * 32, vqd + (size_t)g * 24);
+        }
+        break;
+    }
+    case GP_TQ_ROT: {
+        /* Operands: x, groups, inverse. The rotation of TQ6 (tq6_rot32) of
+         * each group of 32 values of x, in place, or its inverse. */
+        float *x = GP_P(float, 0);
+        int groups = GP_I(1), inv = GP_I(2);
+        #pragma omp for schedule(static)
+        for (int g = 0; g < groups; ++g) {
+            tq6_rot32(x + (size_t)g * 32, inv);
+        }
+        break;
+    }
+    case GP_ATTN_TQ: {
+        /* Operands: those of GP_ATTN_QC, over the TQ6 cache; q and out in
+         * the rotated form (GP_TQ_ROT). */
+        int n1 = (int)GP_I(10);
+        if (!gemma_attn_split_tq6_body(GP_P(const float, 0), GP_P(const uint8_t, 1),
+                                       GP_P(const float, 2), GP_P(const uint8_t, 3),
+                                       GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                       GP_I(7), GP_I(8), GP_I(9), NULL, &n1, n1, 1)) {
+            gp_fail = 1;
+        }
+        break;
+    }
+    case GP_ATTN_TQ_MT: {
+        /* Operands: those of GP_ATTN_QC_MT, over the TQ6 cache (GP_ATTN_TQ). */
+        int tokens = GP_I(10), window = GP_I(13);
+        int64_t pos = gp_i(r, e, 11), base = gp_i(r, e, 12);
+        int *lo = GP_P(int, 14);
+        int *n = GP_P(int, 15);
+        #pragma omp single
+        for (int j = 0; j < tokens; ++j) {
+            gp_rows(pos, base, window, j, lo + j, n + j);
+        }
+        int nmax = 0;
+        for (int j = 0; j < tokens; ++j) {
+            nmax = n[j] > nmax ? n[j] : nmax;
+        }
+        if (!gemma_attn_split_tq6_body(GP_P(const float, 0), GP_P(const uint8_t, 1),
+                                       GP_P(const float, 2), GP_P(const uint8_t, 3),
+                                       GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                       GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens)) {
+            gp_fail = 1;
+        }
+        break;
+    }
+    case GP_ATTN_Q8:
+    case GP_ATTN_V8: {
+        /* Operands: those of GP_ATTN_QC, over the int8 cache (GP_ATTN_V8: the
+         * keys int16). */
+        int n1 = (int)GP_I(10);
+        if (r->op == GP_ATTN_V8) {
+            if (!gemma_attn_split_v8_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                          GP_P(const float, 2), GP_P(const int8_t, 3),
+                                          GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                          GP_I(7), GP_I(8), GP_I(9), NULL, &n1, n1, 1)) {
+                gp_fail = 1;
+            }
+        } else if (!gemma_attn_split_i8_body(GP_P(const float, 0), GP_P(const int8_t, 1),
+                                      GP_P(const float, 2), GP_P(const int8_t, 3),
+                                      GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                      GP_I(7), GP_I(8), GP_I(9), NULL, &n1, n1, 1)) {
+            gp_fail = 1;
+        }
+        break;
+    }
+    case GP_ATTN_Q8_MT:
+    case GP_ATTN_V8_MT: {
+        /* Operands: those of GP_ATTN_QC_MT, over the int8 cache (GP_ATTN_V8_MT:
+         * the keys int16). */
+        int tokens = GP_I(10), window = GP_I(13);
+        int64_t pos = gp_i(r, e, 11), base = gp_i(r, e, 12);
+        int *lo = GP_P(int, 14);
+        int *n = GP_P(int, 15);
+        #pragma omp single
+        for (int j = 0; j < tokens; ++j) {
+            gp_rows(pos, base, window, j, lo + j, n + j);
+        }
+        int nmax = 0;
+        for (int j = 0; j < tokens; ++j) {
+            nmax = n[j] > nmax ? n[j] : nmax;
+        }
+        int ok = r->op == GP_ATTN_V8_MT ?
+            gemma_attn_split_v8_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                     GP_P(const float, 2), GP_P(const int8_t, 3),
+                                     GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                     GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens) :
+            gemma_attn_split_i8_body(GP_P(const float, 0), GP_P(const int8_t, 1),
+                                     GP_P(const float, 2), GP_P(const int8_t, 3),
+                                     GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                     GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens);
+        if (!ok) {
+            gp_fail = 1;
+        }
+        break;
+    }
+    case GP_ATTN_QC: {
         /* Operands: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
          * head_dim, n.
-         * The attention of one float32 query over the int16 cache. */
-        gemma_attn_decode_i16_body(GP_P(const float, 0), GP_P(const int16_t, 1),
-                                   GP_P(const float, 2), GP_P(const int16_t, 3),
-                                   GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
-                                   GP_I(7), GP_I(8), GP_I(9), GP_I(10));
+         * The attention of one float32 query over the int16 cache: split by
+         * keys (gemma_attn_split_i16_body), or one head for each thread. */
+        int n1 = (int)GP_I(10);
+        if (!gemma_attn_split_i16_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                       GP_P(const float, 2), GP_P(const int16_t, 3),
+                                       GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                       GP_I(7), GP_I(8), GP_I(9), NULL, &n1, n1, 1)) {
+            gemma_attn_decode_i16_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                       GP_P(const float, 2), GP_P(const int16_t, 3),
+                                       GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                       GP_I(7), GP_I(8), GP_I(9), GP_I(10));
+        }
         break;
+    }
     case GP_ATTN_F32:
         /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
          * pos, base, window.
@@ -7810,10 +10241,17 @@ static void gp_step(const gp_rec *r, int64_t *e)
         for (int j = 0; j < tokens; ++j) {
             nmax = n[j] > nmax ? n[j] : nmax;
         }
-        gemma_attn_decode_i16_mt_body(GP_P(const float, 0), GP_P(const int16_t, 1),
-                                      GP_P(const float, 2), GP_P(const int16_t, 3),
-                                      GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
-                                      GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens);
+        /* The scores buffer of a group holds tokens * q_heads * (pos +
+         * tokens) values (program.step_params), so the split form fits. */
+        if (!gemma_attn_split_i16_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                       GP_P(const float, 2), GP_P(const int16_t, 3),
+                                       GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                       GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens)) {
+            gemma_attn_decode_i16_mt_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                          GP_P(const float, 2), GP_P(const int16_t, 3),
+                                          GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                          GP_I(7), GP_I(8), GP_I(9), lo, n, nmax, tokens);
+        }
         break;
     }
     case GP_ATTN_F32_MT: {
@@ -7859,8 +10297,8 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_KV_WRITE_HEADS: {
         /* Operands: k, v, kbuf, vbuf, head_stride, pos, tokens, kv_heads,
-         * head_dim. The E4B cache keeps (heads, positions, head_dim), so
-         * each head of each token goes to its own place. */
+         * head_dim. A float32 cache (the E4B): each head of each token goes
+         * to its place (gp_kv_rs: position-major or head-major). */
         const float *k = GP_P(const float, 0);
         const float *v = GP_P(const float, 1);
         float *kb = GP_P(float, 2);
@@ -7872,7 +10310,7 @@ static void gp_step(const gp_rec *r, int64_t *e)
         for (int j = 0; j < tokens; ++j) {
             for (int h = 0; h < kv_heads; ++h) {
                 size_t src = ((size_t)j * (size_t)kv_heads + (size_t)h) * (size_t)head_dim;
-                size_t dst = (size_t)h * hs + (size_t)(pos + j) * (size_t)head_dim;
+                size_t dst = (size_t)h * hs + (size_t)(pos + j) * gp_kv_rs(hs, kv_heads, head_dim);
                 memcpy(kb + dst, k + src, (size_t)head_dim * sizeof(float));
                 memcpy(vb + dst, v + src, (size_t)head_dim * sizeof(float));
             }
@@ -7894,6 +10332,7 @@ static void gp_step(const gp_rec *r, int64_t *e)
         int tokens = GP_I(8), window = GP_I(11), slide = GP_I(12);
         int64_t pos = gp_i(r, e, 9);
         long hs = (long)gp_i(r, e, 10);
+        long rs = (long)gp_kv_rs((size_t)hs, kv_heads, head_dim);
         size_t qd = (size_t)q_heads * (size_t)head_dim;
         for (int j = 0; j < tokens; ++j) {
             int64_t p = pos + j;
@@ -7901,10 +10340,10 @@ static void gp_step(const gp_rec *r, int64_t *e)
             if (lo < 0) {
                 lo = 0;
             }
-            gemma_attn_decode_f32_body(q + j * qd, k + (size_t)lo * (size_t)head_dim,
-                                       v + (size_t)lo * (size_t)head_dim, GP_P(float, 3),
+            gemma_attn_decode_f32_body(q + j * qd, k + (size_t)lo * (size_t)rs,
+                                       v + (size_t)lo * (size_t)rs, GP_P(float, 3),
                                        out + j * qd, q_heads, kv_heads, head_dim,
-                                       (int)(p + 1 - lo), hs, hs, head_dim, head_dim,
+                                       (int)(p + 1 - lo), hs, hs, rs, rs,
                                        (int)p, (int)lo, window);
         }
         break;
@@ -7935,23 +10374,38 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     /* ---- programs in parts ---- */
     case GP_XBAR:
-        /* bar, parts */
-        gp_xbar(GP_P(int64_t, 0), GP_I(1));
+        /* bar, parts, then (or null) the weights to prefetch and their bytes */
+        gp_xbar(GP_P(int64_t, 0), GP_I(1), GP_P(const uint8_t, 2), gp_i(r, e, 3));
         break;
     case GP_MOE_PART:
         gp_moe_part(r, e);
         break;
-    case GP_ATTN_QC_H:
+    case GP_ATTN_QC_H: {
         /* Operands: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads,
-         * head_dim, n, kv_stride, ks_stride.
+         * head_dim, n, kv_stride, ks_stride, rep.
          * GP_ATTN_QC for some heads. The strides are the values of a whole
-         * cache row. */
-        gemma_attn_decode_i16_s_body(GP_P(const float, 0), GP_P(const int16_t, 1),
-                                     GP_P(const float, 2), GP_P(const int16_t, 3),
-                                     GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
-                                     GP_I(7), GP_I(8), GP_I(9), GP_I(10),
-                                     (size_t)gp_i(r, e, 11), (size_t)gp_i(r, e, 12));
+         * cache row. rep is the query heads of a key head in the layer. As
+         * GP_ATTN_QC: split by keys over the threads of the team, or one
+         * head for each thread. The choice is that of GP_ATTN_QC for the
+         * whole layer (rep heads of an item), so each head has its bits: a
+         * part with fewer query heads of a key head (parts.head_split) does
+         * not take the split form where the layer does not. */
+        const int hd = GP_I(9);
+        const size_t kvs = (size_t)gp_i(r, e, 11);
+        if (GP_I(13) * hd > AS_MAXQ ||
+            kvs % (size_t)hd != 0 || (size_t)gp_i(r, e, 12) != kvs / 32 ||
+            !gemma_attn_split_i16_rows_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                            GP_P(const float, 2), GP_P(const int16_t, 3),
+                                            GP_P(const float, 4), GP_P(float, 6), GP_I(7),
+                                            GP_I(8), hd, GP_I(10), (int)(kvs / (size_t)hd))) {
+            gemma_attn_decode_i16_s_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                         GP_P(const float, 2), GP_P(const int16_t, 3),
+                                         GP_P(const float, 4), GP_P(float, 5), GP_P(float, 6),
+                                         GP_I(7), GP_I(8), hd, GP_I(10), kvs,
+                                         (size_t)gp_i(r, e, 12));
+        }
         break;
+    }
     case GP_ATTN_F32_H:
         /* Operands: q, k, v, scores, out, q_heads, kv_heads, head_dim, n,
          * pos, base, window, row.
@@ -7963,6 +10417,414 @@ static void gp_step(const gp_rec *r, int64_t *e)
                                    GP_I(7), GP_I(7), (long)gp_i(r, e, 12),
                                    (long)gp_i(r, e, 12), GP_I(9), GP_I(10), GP_I(11));
         break;
+    /* ---- the media encoders: rows split over the threads ---- */
+    case GP_ENC_LINEAR: {
+        /* x, w, wbf, b, y, n, m, k, imin, imax, omin, omax, scratch, x16:
+         * y (n, m) = clamp(clamp(x, imin, imax) W^T + b, omin, omax). The
+         * scratch (n k floats, or 0) holds the clamped x. x16 (or 0) is W in
+         * groups of 16 rows (KQ_BF16X16 or KQ_F32X16, kq_pack_x16f): the
+         * product of many rows (kq_x16f_body). */
+        const float *x = GP_P(const float, 0);
+        const float *b = GP_P(const float, 3);
+        float *y = GP_P(float, 4);
+        int n = GP_I(5), m = GP_I(6), k = GP_I(7);
+        float imin = gp_f(r, e, 8), imax = gp_f(r, e, 9);
+        float omin = gp_f(r, e, 10), omax = gp_f(r, e, 11);
+        float *xs = GP_P(float, 12);
+        if (xs != NULL) {
+            int64_t nk = (int64_t)n * k;
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < nk; ++i) {
+                xs[i] = fminf(fmaxf(x[i], imin), imax);
+            }
+            x = xs;
+        }
+        const uint8_t *x16 = GP_P(const uint8_t, 13);
+        if (x16 != NULL) {
+            kq_x16f_body(x16, GP_I(2) ? KQ_BF16X16 : KQ_F32X16, m, k, x, n, y);
+        } else if (GP_I(2)) {
+            gemma_bf16_linear_body(GP_P(const uint16_t, 1), x, y, m, k, n);
+        } else {
+            const float *w = GP_P(const float, 1);
+            #pragma omp for schedule(static)
+            for (int c = 0; c < m; ++c) {
+                const float *wc = w + (size_t)c * k;
+                for (int t = 0; t < n; ++t) {
+                    const float *xt = x + (size_t)t * k;
+                    float acc = 0.0f;
+                    for (int q = 0; q < k; ++q) {
+                        acc += xt[q] * wc[q];
+                    }
+                    y[(size_t)t * m + c] = acc;
+                }
+            }
+        }
+        if (b != NULL || omin > -INFINITY || omax < INFINITY) {
+            int64_t nm = (int64_t)n * m;
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < nm; ++i) {
+                float v = y[i] + (b != NULL ? b[i % m] : 0.0f);
+                y[i] = fminf(fmaxf(v, omin), omax);
+            }
+        }
+        break;
+    }
+    case GP_ENC_RMS: {
+        /* x, w (0 for none), y, rows, cols, eps */
+        const float *x = GP_P(const float, 0);
+        const float *w = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        int rows = GP_I(3), cols = GP_I(4);
+        float eps = gp_f(r, e, 5);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            gemma_rms_norm_row(x + (size_t)i * cols, w, y + (size_t)i * cols, cols, eps);
+        }
+        break;
+    }
+    case GP_ENC_LNORM: {
+        /* x, w, b, y, rows, cols, eps: the LayerNorm of each row (w and b may
+         * be 0). y may be x. */
+        const float *x = GP_P(const float, 0);
+        const float *w = GP_P(const float, 1);
+        const float *b = GP_P(const float, 2);
+        float *y = GP_P(float, 3);
+        int rows = GP_I(4), cols = GP_I(5);
+        float eps = gp_f(r, e, 6);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            const float *p = x + (size_t)i * cols;
+            float *q = y + (size_t)i * cols;
+            float s = 0.f;
+            for (int j = 0; j < cols; ++j) {
+                s += p[j];
+            }
+            float mean = s / (float)cols, v = 0.f;
+            for (int j = 0; j < cols; ++j) {
+                float d = p[j] - mean;
+                v += d * d;
+            }
+            float rs = 1.0f / sqrtf(v / (float)cols + eps);
+            for (int j = 0; j < cols; ++j) {
+                float t = (p[j] - mean) * rs;
+                q[j] = t * (w != NULL ? w[j] : 1.0f) + (b != NULL ? b[j] : 0.0f);
+            }
+        }
+        break;
+    }
+    case GP_Q6K_LINEAR:
+        /* w, x, out, rows, cols, tokens: as gemma_q6k_linear. A row has the
+         * bits of that call, so a range of rows gives the same values. */
+        gemma_q6k_linear_body(GP_P(const uint8_t, 0), GP_P(const float, 1), GP_P(float, 2),
+                              GP_I(3), GP_I(4), GP_I(5));
+        break;
+    case GP_KQ_QUANT16:
+        /* x, t, cols, xq (int16, t x cols), xs (t x cols / 32) */
+        kq_quant16_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int16_t, 3), GP_P(float, 4));
+        break;
+    case GP_KQ_LINEAR16:
+        /* w (KQ_Q4X), rows, cols, xq, xs, t, out (t x rows) */
+        kq_linear16_body(GP_P(const uint8_t, 0), GP_I(1), GP_I(2), GP_P(const int16_t, 3),
+                         GP_P(const float, 4), GP_I(5), GP_P(float, 6));
+        #pragma omp barrier
+        break;
+    case GP_ATTN_PREFILL_QC:
+        /* q, kq, ks, vq, vs (the cache from row 0), positions (t int32),
+         * base, window, out, t, n (the buffer rows after the block), q
+         * heads, kv heads, head_dim, limit (null, or the last key of each
+         * query: media) */
+        gemma_attn_prefill_qc_body(GP_P(const float, 0), GP_P(const int16_t, 1),
+                                   GP_P(const float, 2), GP_P(const int16_t, 3),
+                                   GP_P(const float, 4), GP_P(const int32_t, 5), GP_I(6),
+                                   GP_I(7), GP_P(float, 8), GP_I(9), GP_I(10), GP_I(11),
+                                   GP_I(12), GP_I(13), GP_P(const int32_t, 14));
+        #pragma omp barrier
+        break;
+    case GP_PART_PREFILL: {
+        /* q (t, qh, hd), k, v (t, kvh, hd): the block after the norms and the
+         * rope; out (t, qh, hd); kq, ks, vq, vs: the int16 cache of the part,
+         * rows of nk = g1 - g0 heads; kf, vf: (rows, nk, hd) float scratch;
+         * qp, op: (t, nq, hd) float scratch; positions (t int32); ip (int32):
+         * t, start (the buffer row of the block), rows (the buffer rows after
+         * the block), base, window, qh, kvh, hd, g0, g1 (the key and value
+         * heads of the part), h0, h1 (its query heads, nq = h1 - h0); limit
+         * (null, or the last key of each query: media).
+         *
+         * As KVCache.write, KVCache.read, and gemma_attn_prefill for the
+         * heads g0 to g1 - 1 and their query heads: each value has the
+         * operations of the run of all heads, so the bits are the same. */
+        const int32_t *ip = GP_P(const int32_t, 13);
+        const int t = ip[0], start = ip[1], rows = ip[2], base = ip[3], window = ip[4];
+        const int qh = ip[5], kvh = ip[6], hd = ip[7], g0 = ip[8], g1 = ip[9];
+        const int h0 = ip[10], h1 = ip[11];
+        const int nk = g1 - g0, nq = h1 - h0, gpr = hd / 32;
+        const float *q = GP_P(const float, 0), *k = GP_P(const float, 1);
+        const float *v = GP_P(const float, 2);
+        float *out = GP_P(float, 3);
+        int16_t *kq = GP_P(int16_t, 4), *vq = GP_P(int16_t, 6);
+        float *ks = GP_P(float, 5), *vs = GP_P(float, 7);
+        float *kf = GP_P(float, 8), *vf = GP_P(float, 9);
+        float *qp = GP_P(float, 10), *op = GP_P(float, 11);
+        const long ng = (long)nk * gpr;
+        /* the rows of the block into the cache of the part */
+        #pragma omp for schedule(static)
+        for (long i = 0; i < (long)t * ng; ++i) {
+            const long j = i / ng, r = i % ng;
+            const size_t src = ((size_t)j * kvh + g0) * hd + (size_t)r * 32;
+            const size_t row = (size_t)(start + j) * ng + r;
+            ks[row] = gemma_quant_group32_i16(k + src, kq + row * 32);
+            vs[row] = gemma_quant_group32_i16(v + src, vq + row * 32);
+        }
+        /* the query heads of the part, adjacent */
+        #pragma omp for schedule(static)
+        for (long i = 0; i < (long)t * nq; ++i) {
+            const long j = i / nq, h = i % nq;
+            memcpy(qp + (size_t)i * hd, q + ((size_t)j * qh + (size_t)h0 + h) * hd,
+                   (size_t)hd * sizeof(float));
+        }
+        /* the attention over the int16 cache of the part (no float copy) */
+        (void)kf;
+        (void)vf;
+        if (gemma_attn_prefill_qc_ok(nq, nk, hd)) {
+            gemma_attn_prefill_qc_body(qp, kq, ks, vq, vs, GP_P(const int32_t, 12), base, window,
+                                       op, t, rows, nq, nk, hd, GP_P(const int32_t, 14));
+        } else {
+            #pragma omp for schedule(static)
+            for (long g = 0; g < (long)rows * ng; ++g) {
+                const float sk = ks[g], sv = vs[g];
+                for (int e = 0; e < 32; ++e) {
+                    kf[g * 32 + e] = (float)kq[g * 32 + e] * sk;
+                    vf[g * 32 + e] = (float)vq[g * 32 + e] * sv;
+                }
+            }
+            gemma_attn_prefill_region_lim(qp, kf, vf, GP_P(const int32_t, 12), base, window, op,
+                                          t, rows, nq, nk, hd, GP_P(const int32_t, 14));
+        }
+        #pragma omp barrier
+        #pragma omp for schedule(static)
+        for (long i = 0; i < (long)t * nq; ++i) {
+            const long j = i / nq, h = i % nq;
+            memcpy(out + ((size_t)j * qh + (size_t)h0 + h) * hd, op + (size_t)i * hd,
+                   (size_t)hd * sizeof(float));
+        }
+        break;
+    }
+    case GP_ENC_GELU: {
+        /* x, y, n, erf: y = gelu(x), the tanh form (erf 0) or the erf form */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2);
+        int use_erf = GP_I(3);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            float v = x[i];
+            y[i] = use_erf ? 0.5f * v * (1.0f + erff(v * 0.7071067811865476f))
+                           : 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+        }
+        break;
+    }
+    case GP_ENC_GELU_MUL: {
+        /* g, u, y, n: y = gelu_tanh(g) u, in blocks of 4096 values */
+        const float *g = GP_P(const float, 0);
+        const float *u = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        int64_t n = gp_i(r, e, 3);
+        int64_t nb = (n + 4095) / 4096;
+        #pragma omp for schedule(static)
+        for (int64_t bi = 0; bi < nb; ++bi) {
+            int64_t o = bi * 4096, len = n - o < 4096 ? n - o : 4096;
+            gemma_gelu_mul_pair(g + o, u + o, y + o, (int)len);
+        }
+        break;
+    }
+    case GP_ENC_ADD: {
+        /* x, y, n, s: x += s y */
+        float *x = GP_P(float, 0);
+        const float *y = GP_P(const float, 1);
+        int64_t n = gp_i(r, e, 2);
+        float sc = gp_f(r, e, 3);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            x[i] += sc * y[i];
+        }
+        break;
+    }
+    case GP_ENC_CLAMP: {
+        /* x, y, n, lo, hi: y = clamp(x, lo, hi) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2);
+        float lo = gp_f(r, e, 3), hi = gp_f(r, e, 4);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            y[i] = fminf(fmaxf(x[i], lo), hi);
+        }
+        break;
+    }
+    case GP_ENC_BIAS_CLAMP: {
+        /* y, b (or 0), rows, cols, lo, hi: y = clamp(y + b, lo, hi) in place */
+        float *y = GP_P(float, 0);
+        const float *b = GP_P(const float, 1);
+        int rows = GP_I(2), cols = GP_I(3);
+        float lo = gp_f(r, e, 4), hi = gp_f(r, e, 5);
+        int64_t n = (int64_t)rows * cols;
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            y[i] = fminf(fmaxf(y[i] + (b != NULL ? b[i % cols] : 0.0f), lo), hi);
+        }
+        break;
+    }
+    case GP_ENC_SILU: {
+        /* x, y, n: y = x sigmoid(x) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            y[i] = x[i] / (1.0f + expf(-x[i]));
+        }
+        break;
+    }
+    case GP_ENC_MUL_VEC: {
+        /* x, vec, y, rows, cols: y = x vec (vec of cols values for each row) */
+        const float *x = GP_P(const float, 0);
+        const float *vec = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        int rows = GP_I(3), cols = GP_I(4);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            for (int c = 0; c < cols; ++c) {
+                y[(size_t)i * cols + c] = x[(size_t)i * cols + c] * vec[c];
+            }
+        }
+        break;
+    }
+    case GP_ENC_GLU: {
+        /* x (rows, 2 cols), y (rows, cols), rows, cols: y = a sigmoid(b) with
+         * a the first half of a row and b the second */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int rows = GP_I(2), cols = GP_I(3);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            const float *xa = x + (size_t)i * 2 * cols;
+            for (int c = 0; c < cols; ++c) {
+                y[(size_t)i * cols + c] = xa[c] / (1.0f + expf(-xa[cols + c]));
+            }
+        }
+        break;
+    }
+    case GP_ENC_DWCONV: {
+        /* x (t, c), w (c, kw), y (t, c), t, c, kw: the causal depthwise conv
+         * y[i, c] = sum_j w[c, j] x[i - kw + 1 + j, c] (0 before the start) */
+        const float *x = GP_P(const float, 0);
+        const float *w = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        int t = GP_I(3), c = GP_I(4), kw = GP_I(5);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < t; ++i) {
+            for (int ch = 0; ch < c; ++ch) {
+                float acc = 0.0f;
+                for (int j = 0; j < kw; ++j) {
+                    int src = i - kw + 1 + j;
+                    if (src >= 0) {
+                        acc += w[(size_t)ch * kw + j] * x[(size_t)src * c + ch];
+                    }
+                }
+                y[(size_t)i * c + ch] = acc;
+            }
+        }
+        break;
+    }
+    case GP_ENC_LOCAL_ATTN: {
+        /* q, k, v (t, heads, hd), r (span + 1, heads, hd), valid (t int32), o,
+         * t, heads, hd, span, cap: query i sees the keys i - span + 1 .. i;
+         * key j of that list adds q r[1 + j] (the relative position); the
+         * scores get the soft cap, and an invalid key -1e9 (gemma4a). */
+        const float *q = GP_P(const float, 0), *k = GP_P(const float, 1);
+        const float *v = GP_P(const float, 2), *rr = GP_P(const float, 3);
+        const int32_t *valid = GP_P(const int32_t, 4);
+        float *o = GP_P(float, 5);
+        int t = GP_I(6), heads = GP_I(7), hd = GP_I(8), span = GP_I(9);
+        float cap = gp_f(r, e, 10);
+        int64_t rows = (int64_t)t * heads;
+        #pragma omp for schedule(static)
+        for (int64_t row = 0; row < rows; ++row) {
+            int i = (int)(row / heads), h = (int)(row % heads);
+            const float *qi = q + row * hd;
+            float sc[64];
+            float m = -INFINITY;
+            for (int j = 0; j < span && j < 64; ++j) {
+                int kp = i - span + 1 + j;
+                float sv = -1e9f;
+                if (kp >= 0 && valid[kp]) {
+                    const float *kk = k + ((size_t)kp * heads + h) * hd;
+                    const float *rj = rr + ((size_t)(1 + j) * heads + h) * hd;
+                    float a = 0.0f;
+                    for (int d = 0; d < hd; ++d) {
+                        a += qi[d] * (kk[d] + rj[d]);
+                    }
+                    sv = tanhf(a / cap) * cap;
+                }
+                sc[j] = sv;
+                m = fmaxf(m, sv);
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < span; ++j) {
+                sc[j] = expf(sc[j] - m);
+                sum += sc[j];
+            }
+            float *oi = o + row * hd;
+            for (int d = 0; d < hd; ++d) {
+                oi[d] = 0.0f;
+            }
+            for (int j = 0; j < span; ++j) {
+                int kp = i - span + 1 + j;
+                if (kp < 0) {
+                    continue;
+                }
+                float pj = sc[j] / sum;
+                const float *vv = v + ((size_t)kp * heads + h) * hd;
+                for (int d = 0; d < hd; ++d) {
+                    oi[d] += pj * vv[d];
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_ROPE2D: {
+        /* x (n, heads, hd), pos (n, 2) int32, inv (hd / 4), n, heads, hd: the
+         * axial 2D RoPE of gemma4v in place (see k_enc_rope2d of gpu.cu). */
+        float *x = GP_P(float, 0);
+        const int32_t *pos = GP_P(const int32_t, 1);
+        const float *inv = GP_P(const float, 2);
+        int n = GP_I(3), heads = GP_I(4), hd = GP_I(5), q4 = hd / 4, h2 = hd / 2;
+        int64_t rows = (int64_t)n * heads;
+        #pragma omp for schedule(static)
+        for (int64_t row = 0; row < rows; ++row) {
+            int patch = (int)(row / heads);
+            for (int part = 0; part < 2; ++part) {
+                float *p = x + row * hd + part * h2;
+                for (int j = 0; j < q4; ++j) {
+                    float ang = (float)pos[2 * patch + part] * inv[j];
+                    float c = cosf(ang), sn = sinf(ang);
+                    float a = p[j], bb = p[j + q4];
+                    p[j] = a * c - bb * sn;
+                    p[j + q4] = bb * c + a * sn;
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_ATTN: {
+        /* q, k, v, o, n, heads, hd, positions: the attention of every query
+         * over every key, scale 1. positions (n int32) holds n - 1 for each
+         * query, so the causal limit of the prompt kernel keeps every key. */
+        gemma_attn_prefill_region(GP_P(const float, 0), GP_P(const float, 1),
+                                  GP_P(const float, 2), GP_P(const int32_t, 7), 0, 0,
+                                  GP_P(float, 3), GP_I(4), GP_I(4), GP_I(5), GP_I(5), GP_I(6));
+        break;
+    }
     default:
         break;
     }
@@ -7982,6 +10844,33 @@ static void gp_exec(const int64_t *prog, int limit)
     memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
     for (int pc = 0; pc < n_code; ++pc) {
         gp_step(code + pc, e);
+    }
+    free(e);
+}
+
+/* gp_exec with the time of each record: the first thread of the team adds
+ * the ms of record pc to ms[pc]. No barrier is added. Most records end with
+ * the barrier of their omp for or omp single, so the time of the first
+ * thread is the time of the team; a record with no barrier gives only the
+ * share of the first thread, and the next record with a barrier gets the
+ * rest. */
+static void gp_exec_prof(const int64_t *prog, double *ms)
+{
+    const int n_env = (int)prog[1];
+    const int n_code = (int)prog[2];
+    const int64_t *env0 = prog + 4;
+    const gp_rec *code = (const gp_rec *)(env0 + n_env);
+    int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
+    memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
+    const int first = omp_get_thread_num() == 0;
+    double t0 = omp_get_wtime();
+    for (int pc = 0; pc < n_code; ++pc) {
+        gp_step(code + pc, e);
+        if (first) {
+            double t1 = omp_get_wtime();
+            ms[pc] += (t1 - t0) * 1e3;
+            t0 = t1;
+        }
     }
     free(e);
 }
@@ -8024,9 +10913,210 @@ int gemma_run(const int64_t *prog, int limit)
     if (prog[0] != GP_MAGIC) {
         return -1;
     }
+    gp_fail = 0;
+    int was = gp_planned;
+    gp_planned = 1;
     #pragma omp parallel
     gp_exec(prog, limit);
-    return 0;
+    gp_planned = was;
+    return gp_fail ? -3 : 0;
+}
+
+/* The CPU programs that a GPU program runs (GP_CPU_TASK, GP_CPU_JOIN: the
+ * cold experts of a step, gg_set_cpu_runner): a team of gp_task_threads
+ * threads bound spread over the places. On the 2-socket Xeon (48 cores),
+ * Qwen3.8 on the GPU decoded 26.0 tok/s with 24 threads spread, 21.3 with
+ * all 48 bound close (OMP_PROC_BIND close, the default of np_gemma): the
+ * threads of the GPU runner and of Python keep cores, and the experts read
+ * the memory of both nodes. 0 (the default) takes OMP_NUM_THREADS.
+ * gemma_set_task_threads sets it (np_gemma/gpu.py, NP_GEMMA_GPU_CPU_THREADS). */
+static int gp_task_threads;
+void gemma_set_task_threads(int n)
+{
+    gp_task_threads = n;
+}
+
+/* The team of gemma_run_task on a machine of two or more NUMA nodes, pinned
+ * with the same count of threads on each node (as far as the CPUs of a node
+ * allow; NP_GEMMA_TEAM_BALANCE, default 1), out of NP_GEMMA_RESERVED_CPUS. proc_bind(spread) over the 40
+ * CPUs of taskset 0-19,24-43 put 24 threads as 10 on node 0 and 14 on node 1
+ * (it takes the places in pairs, then one by one), while kq_share_range
+ * gives the tasks of node 0 to the first half of the team. Here thread i <
+ * n0 takes a CPU of node 0 (evenly spaced in the allowed CPUs of the node),
+ * the others those of node 1, ...; the allowed CPUs are those of the places
+ * of OpenMP (OMP_PLACES, made from the affinity of the process when the
+ * runtime starts; the main thread of Python is pinned later). A thread pins itself
+ * when sched_getcpu is not its CPU: one call at the first region of a team
+ * size, then none. 0: proc_bind(spread) only. */
+/* The CPUs of the places of OpenMP (all of them; 0 when there are none). */
+static int gp_place_cpus(cpu_set_t *m)
+{
+    CPU_ZERO(m);
+    int np = omp_get_num_places(), any = 0;
+    for (int p = 0; p < np; ++p) {
+        int k = omp_get_place_num_procs(p);
+        int ids[256];
+        if (k <= 0 || k > 256) {
+            continue;
+        }
+        omp_get_place_proc_ids(p, ids);
+        for (int i = 0; i < k; ++i) {
+            if (ids[i] >= 0 && ids[i] < CPU_SETSIZE) {
+                CPU_SET(ids[i], m);
+                any = 1;
+            }
+        }
+    }
+    return any;
+}
+
+static int gp_team_balance_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("NP_GEMMA_TEAM_BALANCE");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+#define GP_TEAM_MAX 256
+static int gp_team_cpu[GP_TEAM_MAX];
+static int gp_team_n = -1;          /* the size gp_team_cpu is made for; 0: no plan */
+
+/* gp_team_cpu for n threads; return 0 when there is no plan (one node, too
+ * few CPUs, or no mask). Called by the master before the region. */
+static int gp_team_plan(int n)
+{
+    if (n == gp_team_n) {
+        return gp_team_n > 0;
+    }
+    gp_team_n = 0;
+    cpu_set_t gp_start_mask;
+    if (!gp_team_balance_on() || n < 2 || n > GP_TEAM_MAX || !gp_place_cpus(&gp_start_mask)) {
+        return 0;
+    }
+    pthread_once(&kq_cpu_node_once, kq_cpu_node_init);
+    /* the allowed CPUs of each node, in order */
+    static int cpus[64][GP_TEAM_MAX];
+    int cnt[64] = {0}, nodes = 0, total = 0;
+    /* NP_GEMMA_RESERVED_CPUS ("1,19"): the CPUs of the main thread and of the
+     * copy workers (np_gemma.gpu), out of the teams */
+    static unsigned char rsv[4096];
+    memset(rsv, 0, sizeof(rsv));
+    const char *rv = getenv("NP_GEMMA_RESERVED_CPUS");
+    for (const char *q = rv; q != NULL && *q;) {
+        char *e;
+        int k = (int)strtol(q, &e, 10);
+        if (e == q) {
+            break;
+        }
+        if (k >= 0 && k < 4096) {
+            rsv[k] = 1;
+        }
+        if (*e != ',') {
+            break;
+        }
+        q = e + 1;
+    }
+    for (int c = 0; c < 4096 && c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &gp_start_mask) || rsv[c]) {
+            continue;
+        }
+        int nd = kq_cpu_node_tab[c];
+        if (nd < 0 || nd >= 64 || cnt[nd] >= GP_TEAM_MAX) {
+            continue;
+        }
+        cpus[nd][cnt[nd]++] = c;
+        ++total;
+        nodes = nd + 1 > nodes ? nd + 1 : nodes;
+    }
+    int used = 0;
+    for (int nd = 0; nd < nodes; ++nd) {
+        used += cnt[nd] > 0;
+    }
+    if (used < 2 || n > total) {
+        return 0;
+    }
+    /* the same count of threads on each node (n / nodes), a node with too
+     * few CPUs giving the rest to the others (the prompt team of 38 with
+     * CPUs 1 and 19 reserved: 18 and 20) */
+    int want[64] = {0}, left = n, room = 0;
+    for (int nd = 0; nd < nodes; ++nd) {
+        room += cnt[nd] > 0;
+    }
+    while (left > 0 && room > 0) {
+        int share = (left + room - 1) / room, given = 0;
+        for (int nd = 0; nd < nodes && left > 0; ++nd) {
+            int free_nd = cnt[nd] - want[nd];
+            if (free_nd <= 0) {
+                continue;
+            }
+            int g = share < free_nd ? share : free_nd;
+            g = g < left ? g : left;
+            want[nd] += g;
+            left -= g;
+            given += g;
+        }
+        room = 0;
+        for (int nd = 0; nd < nodes; ++nd) {
+            room += cnt[nd] > want[nd];
+        }
+        if (given == 0) {
+            break;
+        }
+    }
+    int k = 0;
+    for (int nd = 0; nd < nodes; ++nd) {
+        int m = want[nd];
+        for (int i = 0; i < m && k < n; ++i) {
+            gp_team_cpu[k++] = cpus[nd][(int)((int64_t)i * cnt[nd] / m)];
+        }
+    }
+    if (k != n) {
+        return 0;
+    }
+    gp_team_n = n;
+    return 1;
+}
+
+/* In the region: pin this thread to its CPU of the plan, if it is not there. */
+static inline void gp_team_pin(void)
+{
+    int tid = omp_get_thread_num(), want = gp_team_cpu[tid];
+    if (sched_getcpu() != want) {
+        cpu_set_t m;
+        CPU_ZERO(&m);
+        CPU_SET(want, &m);
+        sched_setaffinity(0, sizeof(m), &m);
+    }
+}
+
+int gemma_run_task(const int64_t *prog, int limit)
+{
+    if (prog[0] != GP_MAGIC) {
+        return -1;
+    }
+    /* word 3 of the header: the team of this program, or 0 (program.Program
+     * threads; the CPU part of a mixed prompt group takes more threads than
+     * the step) */
+    int n = prog[3] > 0 ? (int)prog[3] : gp_task_threads;
+    if (n <= 0) {
+        return gemma_run(prog, limit);
+    }
+    gp_fail = 0;
+    int plan = gp_team_plan(n);
+    int was = gp_planned;
+    gp_planned = 1;
+    #pragma omp parallel num_threads(n) proc_bind(spread)
+    {
+        if (plan && omp_get_num_threads() == n) {
+            gp_team_pin();
+        }
+        gp_exec(prog, limit);
+    }
+    gp_planned = was;
+    return gp_fail ? -3 : 0;
 }
 
 /* Run nparts programs at the same time. Each program runs in a team of team
@@ -8037,6 +11127,39 @@ int gemma_run(const int64_t *prog, int limit)
  * A team of 0 divides the threads of OMP_NUM_THREADS by the parts. The array
  * bar is the barrier of the programs (see gp_xbar). This function sets it to
  * 0 first. */
+/* gemma_run_parts with the time of each record of each part (gp_exec_prof):
+ * part p adds to ms[p * stride + pc]. With gemma_xbar_stats, this gives the
+ * time of each operation of each part and the wait at the barriers. */
+int gemma_run_parts_prof(const int64_t *const *progs, int nparts, int team, int64_t *bar,
+                         double *ms, int stride)
+{
+    for (int p = 0; p < nparts; ++p) {
+        if (progs[p][0] != GP_MAGIC) {
+            return -1;
+        }
+    }
+    if (team <= 0) {
+        team = omp_get_max_threads() / nparts;
+        if (team < 1) {
+            team = 1;
+        }
+    }
+    for (int p = 0; p <= nparts; ++p) {
+        bar[8 * p] = 0;
+    }
+    omp_set_max_active_levels(2);
+    #pragma omp parallel num_threads(nparts) proc_bind(spread)
+    {
+        const int p = omp_get_thread_num();
+        #pragma omp parallel num_threads(team) proc_bind(close)
+        {
+            gp_xcnt = 0;
+            gp_exec_prof(progs[p], ms + (size_t)p * (size_t)stride);
+        }
+    }
+    return 0;
+}
+
 int gemma_run_parts(const int64_t *const *progs, int nparts, int team, int64_t *bar)
 {
     for (int p = 0; p < nparts; ++p) {
@@ -8050,15 +11173,52 @@ int gemma_run_parts(const int64_t *const *progs, int nparts, int team, int64_t *
             team = 1;
         }
     }
-    bar[0] = 0;
-    bar[8] = 0;
+    for (int p = 0; p <= nparts; ++p) {
+        bar[8 * p] = 0;
+    }
     omp_set_max_active_levels(2);
     #pragma omp parallel num_threads(nparts) proc_bind(spread)
     {
         const int64_t *prog = progs[omp_get_thread_num()];
         #pragma omp parallel num_threads(team) proc_bind(close)
-        gp_exec(prog, -1);
+        {
+            gp_xcnt = 0;
+            gp_exec(prog, -1);
+        }
     }
     return 0;
+}
+
+extern int sched_getcpu(void);
+
+/* The CPU of each thread of gemma_run_parts, with the same teams: cpus[p *
+ * team + t] for thread t of part p, or -1 for a thread that did not run. The
+ * threads are bound (OMP_PLACES, OMP_PROC_BIND), so a run of the parts uses
+ * these CPUs too. np_gemma/numa.py gives each part the node of its CPUs.
+ * Return the team. */
+int gemma_part_cpus(int nparts, int team, int *cpus)
+{
+    if (team <= 0) {
+        team = omp_get_max_threads() / nparts;
+        if (team < 1) {
+            team = 1;
+        }
+    }
+    for (int i = 0; i < nparts * team; ++i) {
+        cpus[i] = -1;
+    }
+    omp_set_max_active_levels(2);
+    #pragma omp parallel num_threads(nparts) proc_bind(spread)
+    {
+        const int p = omp_get_thread_num();
+        #pragma omp parallel num_threads(team) proc_bind(close)
+        {
+            const int t = omp_get_thread_num();
+            if (t < team) {
+                cpus[p * team + t] = sched_getcpu();
+            }
+        }
+    }
+    return team;
 }
 

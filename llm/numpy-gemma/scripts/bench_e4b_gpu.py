@@ -30,7 +30,7 @@ from np_gemma.e4b import E4B, E4BCache, E4BConfig  # noqa: E402
 from np_gemma.gguf import GGUF  # noqa: E402
 from np_gemma.tokenizer import Tokenizer  # noqa: E402
 
-GGUF_PATH = os.path.expanduser("~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf")
+GGUF_PATH = "models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
 
 
 def main():

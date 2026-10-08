@@ -95,7 +95,8 @@ def main():
     ap.add_argument("--tokens", type=int, default=131072, help="the tokens of the prompt")
     ap.add_argument("--gen", type=int, default=4096, help="the most new tokens")
     ap.add_argument("--backend", choices=("gpu", "cpu"), default="gpu")
-    ap.add_argument("--hot-gb", type=float, default=0.5, help="gpu: GB of hot experts")
+    ap.add_argument("--hot-gb", type=float, default=None,
+                    help="gpu: GB of hot experts (default: the free memory after the cache)")
     ap.add_argument("--question", default=QUESTION)
     ap.add_argument("--files", nargs="*", default=FILES,
                     help="glob patterns of the files, from the root of the project")
@@ -119,7 +120,7 @@ def main():
     g = None
     if args.backend == "gpu":
         from np_gemma.qwen4_gpu import Qwen4GPU
-        g = Qwen4GPU(m, hot_gb=args.hot_gb)
+        g = Qwen4GPU(m, hot_gb=args.hot_gb, ctx=len(ids) + args.gen + 16)
         g.attach(cache)
     print("model: %.0f s (dense %s%s)" % (time.time() - t0, m.dense,
                                            ", %d hot experts in each layer" % g.n_slots if g else ""))

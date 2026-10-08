@@ -35,7 +35,7 @@ from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 from np_gemma.tokenizer import Tokenizer
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 
 
 def build_cache(model, cfg, ids, real, context):
@@ -44,8 +44,7 @@ def build_cache(model, cfg, ids, real, context):
     cache = KVCache(cfg, max_len=context + 64)
     model.prefill(ids[:real], cache)
     for i in range(cfg.num_hidden_layers):
-        k = cache.k[i][:real - cache.base[i]].copy()
-        v = cache.v[i][:real - cache.base[i]].copy()
+        k, v, _ = cache.read(i, real)          # dequantized rows (new arrays)
         pos = cache.end[i]
         while pos < context:
             n = min(len(k), context - pos)

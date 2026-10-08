@@ -14,3 +14,6 @@ models2/
 scripts/membw
 long_qwen4_out.txt
 serve_qwen4.log
+empty-*.txt
+last-answer.txt
+debug-turns/

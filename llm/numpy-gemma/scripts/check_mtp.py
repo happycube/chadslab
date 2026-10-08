@@ -24,7 +24,7 @@ from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 from np_gemma.tokenizer import Tokenizer
 
-GGUF_PATH = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+GGUF_PATH = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 HUB = "../gemma4-12b-qat-pytorch/.cache/huggingface/hub"
 REPO = "models--google--gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant"
 
@@ -63,6 +63,11 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=200)
     ap.add_argument("--prompts", nargs="+", default=[p[0] for p in PROMPTS])
     ap.add_argument("--e4b", action="store_true", help="The GGUF file is an E4B model.")
+    ap.add_argument("--drafter-gguf", default=None,
+                    help="A drafter GGUF (unsloth MTP file) for the weights; the snapshot gives"
+                         " the config.")
+    ap.add_argument("--gpu-drafter", action="store_true",
+                    help="The drafter on the GPU (gpu.GPUDrafter), with NP_GEMMA_GPU=1.")
     args = ap.parse_args()
     path = args.assistant or sorted(glob.glob(os.path.join(HUB, REPO, "snapshots", "*")))[-1]
 
@@ -77,8 +82,23 @@ def main():
         cfg = Config({"text_config": g.text_config()})
         model = Model(g, cfg).load_all(dtype="int4")
         new_cache = lambda n: KVCache(cfg, max_len=n)  # noqa: E731
-    drafter = Assistant(path, dtype=args.drafter_dtype)
+    if args.gpu_drafter:
+        from np_gemma.gpu import GPUDrafter
+        drafter = GPUDrafter(path, model, weights=args.drafter_gguf)
+    else:
+        drafter = Assistant(path, dtype=args.drafter_dtype, weights=args.drafter_gguf)
     eos = set(tok.stop_ids)
+
+    # An untimed run of each form first, as long as a timed run: the first
+    # MTP decode compiles the programs of the verify groups (and on the GPU
+    # records their graphs), and the scratch buffers grow with the position.
+    msg = tok.apply_chat_template([{"role": "user", "content": PROMPTS[0][1]}],
+                                  add_generation_prompt=True, thinking=False)
+    ids = tok.encode(msg)
+    n_warm = len(ids) + args.max_new_tokens + 16
+    plain(model, ids, new_cache(n_warm), args.max_new_tokens, eos)
+    for n in args.n_draft:
+        mtp_generate(model, drafter, ids, new_cache(n_warm), args.max_new_tokens, n, eos, {})
 
     print("%-6s %4s %8s %8s %6s %7s %9s  %s" % ("prompt", "n", "plain", "mtp", "gain",
                                                "drafts", "accepted", "same ids"))

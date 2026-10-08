@@ -1093,6 +1093,687 @@ of 14% for a group of 40 tokens came from this cause too.
 - MTP gives the same tokens as the plain decode only when the verify group
   and the decode step use the same kernels. Keep both on the same places.
 
+### Node-local weights (phase 2, first part)
+
+np_gemma/numa.py finds the node of the team of each part (gemma_part_cpus
+gives the CPU of each thread, with the teams of gemma_run_parts). The rows of
+the int4 matrices and of the experts that a part reads are copies, made with
+an anonymous mmap and mbind (MPOL_PREFERRED) before the first write. Thus
+each page is on the node of the part, also when the main thread makes the
+copy. move_pages checks the place of each page. NP_GEMMA_NUMA=0 turns it
+off. The cache and the small weights of the place all stay where they are.
+
+The machine: two Xeon Platinum 8268 (24 cores each, two nodes), 251 GB. The
+26B Q4_0, 48 threads, a context of about 60 tokens, the median of a step
+(forward) and of the output head (logits):
+
+    form                          forward    logits
+    one team                      32.0 ms    5.1 ms
+    2 parts, NP_GEMMA_NUMA=0      32.8 ms    7.8 ms
+    2 parts, node-local           28.5 ms    7.9 ms
+    4 parts, node-local           26.2 ms    7.3 ms
+
+At a context of 200, a step of 2 parts goes from 43.1 ms (views) to 26.6 ms
+(node-local), and the 3.36 million pages of the copies are all on their
+node. The bits of the parts are the same with and without the copies.
+
+The one team is already near the parts, because the parallel first touch of
+the load spreads its pages over both nodes. The output head runs after the
+parts in one team and takes 2 to 3 ms more than after a step of one team.
+That takes most of the gain: tg128 is 23 to 25 tokens/s in each form.
+
+On this machine scripts/check_parts.py fails before and after this change:
+the hidden state of the parts differs from that of one part by up to 7e-4
+(the top token is the same in 12 of 12 steps). It passed on jackal. This
+is still open.
+
+### The output head in the parts
+
+Each part now computes its range of the rows of the tied head after the final
+norm, from a copy of those rows on its node: Q6K_LINEAR (a new record for
+gemma_q6k_linear_body) for a Q6_K head, or KQ_QUANT and KQ_LINEAR for a Q4_0
+head with a KQ_Q4X copy. The parts write their rows into one logits buffer.
+Its pages are on the node of part 0 (numa.empty_on), so the parts copy their
+results to that node when they finish. The main thread reads the logits (the
+softcap, the choice of the token), and numa.pin_thread keeps it on that node;
+OpenMP had already bound it to CPU 0. Model.logits gives the buffer when x is
+the hidden state of the last step of the parts. NP_GEMMA_PART_HEAD=0 turns
+this off.
+
+The logits are the same bits as Model.logits on the same hidden state (12 of
+12 steps), and the 256 pages of the buffer are on node 0. The median of a
+token (forward with the head, then logits: the copy and the softcap):
+
+    form                 forward    logits    sum
+    one team             31.5 ms    5.0 ms    36.5 ms
+    2 parts with head    29.4 ms    2.3 ms    31.7 ms
+    4 parts with head    29.6 ms    2.1 ms    31.7 ms
+
+tg128 (3 runs; clickhouse and sshfs also ran, and runs of the same form
+differ by up to 30 per cent): one team 20.5 and 24.0, 2 parts 20.3 and 26.6,
+4 parts 28.8 and 25.8 tokens/s.
+
+### The router on each node, and a cache for each part
+
+A measure of the bytes that each part reads on the other node (the arrays of
+the records of each part, and the node of their pages) gave, for part 1 at
+a context of 1000: the router 43.9 MB for each token (the float32
+projection, 2816 x 128 for each of the 30 layers, which each part runs whole),
+the cache (304 MB of 347 MB on node 0), and some MB of norms, scratch, and
+shared rows. Two changes follow:
+
+- The router: each part reads a copy of the projection and its two scales
+  on its node (pk_router).
+- PartKVCache (np_gemma/parts.py): a subclass of KVCache with buffers for
+  each part. Part p holds the rows of its KV heads (the ranges of the place
+  heads) on its node. The buffers of one position of all heads were one
+  page (8 heads x 256 x 2 bytes for a sliding layer of the 26B), so a page
+  cannot go to two nodes; each part needs its own buffers. The records of
+  the parts read their buffer with a row of their heads only (_cache_row).
+  With NP_GEMMA_PARTS of 2 or more and the int16 form, KVCache(...) makes a
+  PartKVCache (KVCache.__new__); NP_GEMMA_PART_KV=0 turns it off.
+- The prompt: Model._attention gives a block to
+  PartKVCache.prefill_attention. One record for each part (PART_PREFILL)
+  runs in the team of the part: it quantizes the rows of its heads into its
+  buffers, makes their float rows, and runs gemma_attn_prefill_region for
+  its query heads. The projections, the experts, and the norms of the
+  prompt stay in one team.
+- The other users of a KVCache (KVCache.read, read_qc, write, write_q: the
+  small groups, the GPU) gather or scatter the heads with a copy.
+- A layer with fewer KV heads than parts leaves a part with no head in that
+  layer. The global layers of the 12B have one KV head, so with 2 parts one
+  part runs all of their attention.
+
+The checks (the 26B, a prompt of 2600 tokens, 2 parts): the hidden state of
+the prompt and every row of the cache are the same as with one KVCache, and
+8 decode steps of the parts give the same hidden states and logits with
+either cache. The 152460 pages of the buffers of the parts are all on their
+node.
+
+### The profile of the parts (the 12B)
+
+scripts/profile_parts.py gives the time of each operation of a decode step.
+In parts, the first thread of each team adds the time of each record
+(gemma_run_parts_prof, with no added barrier), and gemma_xbar_stats splits
+the barriers into the wait for the team and the wait for the other part. One
+team and one node use gemma_profile, which adds a barrier after each record
+(about 19 ms for the step of the one team on both nodes: the many small
+records each wait for 48 threads).
+
+The 12B (Unsloth UD-Q4_K_XL), a context of 2048, 32 steps, ms a token:
+
+    operation                  part 0   part 1   one node   rate (GB/s)
+    rms_norm + gate/up            24.6     24.7       47.9   65 (parts), 67 (node)
+    gelu_mul + down               13.6     13.4       24.7   59, 65
+    q, k, v projections            5.7      7.9       13.3   63, 65
+    o projection                   4.9      4.4        8.4   51-56, 59
+    head (KQ_LINEAR)               4.2      4.4          -   65-68
+    attention, sliding            16.6     17.1       10.5
+    attention, global                -      6.2        7.7
+    XBAR (192 a token)            14.1      5.2          -
+    of it, wait for the other     12.3      3.7
+    of it, wait for the team       1.1      0.9
+    sum of the records            86.5     86.7      120.1
+    the step (head, Python)       93.9               129.5
+
+The counters (perf stat, uncore) agree: each socket reads 3.6 GB a token,
+with almost no remote reads.
+
+- The matrices of each part run at the rate of one node (60 to 68 GB/s for
+  a socket). The placement is right, and the bandwidth is not the limit.
+- The attention of the sliding layers (ATTN_QC_H, 4 KV heads of the part)
+  takes 16.6 ms in each part, more than one node takes for all 8 heads
+  (10.5 ms). It reads 4 MB of cache for each layer, 9.6 GB/s. The kernel of
+  the heads is not parallel enough for a team of 24 threads.
+- The global layers of the 12B have one KV head, so part 1 runs their
+  attention (6.2 ms) and their q, k, and v rows (2.3 ms more), and part 0
+  waits 12.3 ms at the barriers.
+- The wait for the team (1 ms) is small. The rest of the step (7.4 ms) is
+  outside the records: the bind, the embedding, the copy of the logits, the
+  softcap, and the choice of the token.
+
+The next steps for the 12B: a parallel form of ATTN_QC_H (the keys split
+over the threads of the team, as ATTN_QC_MT), and the balance of the global
+layers (the query heads split over the parts with the one KV head in both,
+or the positions split).
+
+### The attention of the parts, and the global layers of the 12B
+
+- ATTN_QC_H now takes the split form of GP_ATTN_QC (the keys of a head in
+  chunks over the threads of the team, gemma_attn_split_i16_rows_body), with
+  a row of the cache of row_heads heads. The scratch of the split form is
+  one set for each team (as_team: the part + 1 in gemma_run_parts), because
+  the parts run it at the same time. The form is the choice of GP_ATTN_QC
+  for the whole layer (the operand rep), so each head has its bits: with
+  it, scripts/check_parts.py passes on this machine for the 12B and the
+  26B (contexts 200 and 1100). It failed before, because the parts used one
+  head for each thread and one team used the split form.
+- head_split: with a PartKVCache, a layer with fewer key and value heads
+  than parts splits the query heads. Each part computes the key and value
+  head of its query heads (in its own buffers, head_out) and keeps it in
+  its cache. The global layers of the 12B then give 8 query heads to each
+  part. PART_PREFILL takes the query heads (h0, h1). The decode with a
+  PartKVCache has the bits of the decode with one KVCache.
+
+The 12B, a context of 2048, ms a token in each part:
+
+    operation                 before (0 / 1)    now (0 / 1)
+    attention, sliding          16.6 / 17.1      6.6 / 6.4
+    attention, global              - / 6.2       6.3 / 6.7
+    XBAR, wait for the other    12.3 / 3.7      11.7 / 3.6
+    sum of the records          86.5 / 86.7     84.6 / 84.6
+    the step                       93.9            92.1
+
+The sliding layers gained 10 ms. The global layers have each 8 query heads
+in each part, but the form of one head for each thread takes as long for
+8 heads as for 16 (one thread a head, 4 MB of cache for a head at 2048), so
+part 0 now spends the time that it waited before. The split form does not
+take the global layers of the 12B: 16 query heads of 512 values exceed
+AS_MAXQ (4096). In this run part 1 also read its matrices at 54 to 56 GB/s
+against 59 to 64 for part 0 (24.7 ms in the run before), so part 0 still
+waits.
+
+pp2048 and tg128 at 2048 (tokens/s, 2 reps; the load from a local copy):
+
+    2 parts (PartKVCache)        104.4, 121.3      10.18, 11.70
+    one team on node 0           115.6, 121.5       8.24,  8.24
+    one team on both nodes       117.2, 138.3      10.16,  8.77
+
+AS_MAXQ is now 8192, so the split form takes the 16 query heads of 512
+values of a global layer of the 12B, in one team and in the parts. The AVX2
+form of the scores (as_scores_avx2, 8 accumulators) takes the heads of an
+item in blocks of 8, with the same values for each head. The values of
+those layers change (the split form in place of one head for each thread);
+the parts keep the bits of one team: scripts/check_parts.py passes for the
+12B and the 26B, and for the 12B with NP_GEMMA_ARCH=avx2.
+
+    operation                 before (0 / 1)    AS_MAXQ 8192 (0 / 1)
+    attention, global            6.3 / 6.7         3.0 / 3.0
+    XBAR, wait for the other    11.7 / 3.6         4.7 / 9.0
+    sum of the records          84.6 / 84.6       79.3 / 79.8
+    the step                       92.1              89.7
+
+A download ran during the benchmark of this change (about 30 MB/s to the
+disk), and the matrices of part 0 read at 52 to 59 GB/s in this run; all
+three forms were slower than in the run before:
+
+    2 parts (PartKVCache)         88.3,  99.7       9.66,  9.71
+    one team on node 0           105.2, 110.3       7.36,  7.39
+    one team on both nodes       113.9, 129.3       9.00,  8.83
+
+### Locked clocks, and the links between the sockets
+
+With turbo, the clock of each socket moved between 2.6 and 3.5 GHz in a run
+(the count of active cores, the AVX-512 license, and the power limit; the
+thermal counters showed no throttle). scripts/lock_clocks.sh locks the core
+and the uncore clocks (sudo scripts/lock_clocks.sh lock [CORE_MHZ]
+[UNCORE_MHZ]; restore puts the settings back).
+
+The links: the UPI counters (uncore_upi_N, event 0x1, the clock of each
+link; a clock of 1.3 GHz is 10.4 GT/s) give links 0 and 1 at 10.4 GT/s on
+each socket, and link 2 at a clock of 9.6 GT/s with no data (the data flits,
+event 0x2, are 0 on both sockets in a run of one team). The machine thus
+has 2 links: 2 x 20.8 GB/s raw in each direction, about 28 GB/s of data.
+
+The 12B at a context of 2048 with the core and the uncore at 2.0 GHz (the
+clocks stayed at 2000 MHz, the lowest sample 1816):
+
+    form                         pp2048 (tok/s)    tg128 at 2048
+    2 parts (PartKVCache)          73.6,  79.7       8.96,  8.23
+    one team on node 0             90.9,  97.3       7.79,  7.80
+    one team on both nodes         77.9,  92.2       6.33,  6.45
+
+The parts: 98.0 ms a token, records 86.7 / 86.5 ms; the matrices read at
+52 to 61 GB/s (37 to 45 for the o projection); the wait for the other part
+6.6 ms in part 0 and 11.3 ms in part 1, with the clocks fixed. Each part
+waits for the other at some barriers, so the wait is not one slow part:
+the time of an operation differs from one part to the other at each
+barrier.
+
+### The paired split (NP_GEMMA_PART_PAIRED=1)
+
+The output projection splits by the columns of the query heads of each
+part (head_split), and the down map by the columns of the rows of the gate
+and the up map of each part. Each part multiplies only the values that it
+computed itself, so neither product needs a barrier before it. Each part
+writes its sum of the whole output into its row of a shared buffer, and
+after one barrier each part adds the rows in the order of the parts (ADD),
+so the parts keep the same x. The copies of the columns are KQ_Q4X on the
+node of the part (PartCompiler.mat_cols). The place cols marks these
+operations. A layer has two barriers in place of four (96 a token for the
+12B, not 192). The experts of the 26B keep the rows.
+
+The sums change the order of the additions. Against one team over 16
+steps (a context of 1100): the 12B 5.5e-4 of the largest value of the
+hidden state, 0.054 in the logits; the 26B 1.7e-5 and 0.010. The top token
+is the same in 16 of 16 steps, and 32 tokens of a greedy run are the same,
+for both. The default stays the split by rows, with the bits of one team
+(scripts/check_parts.py passes).
+
+The 12B at a context of 2048, the clocks at 2.0 GHz:
+
+    form                         records (part 0 / 1)   wait for the other   step
+    rows (four barriers)             86.7 / 86.5           6.6 / 11.3        98.0
+    paired (two barriers)            84.9 / 84.7           4.8 / 12.2        95.4
+
+    form                         pp2048 (tok/s)    tg128 at 2048
+    2 parts, paired                71.7,  82.1       7.72,  8.11
+    2 parts, rows                  67.0,  54.7       8.05,  8.46
+    one team on node 0             92.9,  97.3       7.81,  7.82
+
+Half the barriers did not shorten the wait. The sum of the waits of the two
+parts is 17 ms a token in both forms, so it is not the skew of each
+operation; it is one steady difference: part 0 computes for 78.7 ms a token
+and part 1 for 71.8 ms (the records less XBAR) on the same work. Node 0 is
+about 9 per cent slower in this run: its matrices read at 54 to 57 GB/s,
+those of node 1 at 58 to 61. Node 0 holds CPU 0 (the Python thread, most
+interrupts) and the other processes of the machine. The next steps: a run
+of one team on node 1 against one on node 0, the interrupts and the other
+processes away from the cores of the parts, or a split of the rows by the
+measured rate of each node.
+
+### The balance: the shares of the rows from a measure
+
+The first steps of a new program of the parts run with the time of each
+record (NP_GEMMA_PART_BALANCE, 8 after 2 to warm up). The compiler gives
+each record a kind: rows (an operation split by rows, the experts, the
+output head, and with the paired split the down map), fixed (the heads, the
+norms, the other operations), or xbar. Part p took F_p fixed and R_p rows
+at the share s_p; with u_p = R_p / s_p the shares s'_p = (T - F_p) / u_p,
+T = (1 + sum F_p / u_p) / sum 1 / u_p, end the parts at the same time
+(balance_shares). The wait inside MOE_PART (the barriers less the XBAR
+records) leaves R. The program is then compiled with those shares (ranges
+with weights, cuts at multiples of 32) and the copies of the old ranges go.
+NP_GEMMA_PART_WEIGHTS gives the shares with no measure. The same measure
+serves a GPU paired with a CPU: a part reports F and R, and the shares then
+differ much more.
+
+scripts/check_parts.py with the shares 0.45 and 0.55 passes for the 12B
+and the 26B: a split by rows gives the bits of one part at each cut.
+
+The 12B at a context of 2048, the clocks at 2.0 GHz:
+
+    form      measure (F; R, ms a step)     shares         records     wait      step
+    rows      23.2, 23.2; 51.0, 51.5        the same       79.6/79.0   4.7/5.2   91.2
+    paired    28.6, 30.4; 42.4, 45.9        0.530/0.470    81.9/81.3   6.4/8.8   90.8
+
+    form                         pp2048 (tok/s)    tg128 at 2048 (the measure in rep 0)
+    2 parts, rows                  86.8,  87.6       6.59, 10.49
+    2 parts, paired                87.0,  75.6       6.71, 11.22
+    one team on node 0             93.4,  96.4       7.59,  7.78
+
+In this run the two nodes were near the same rate (the run before had node 0
+9 per cent slower), so the rows kept the same shares. With the balance the
+records of the parts are the same, and each part still waits 5 to 9 ms a
+token: the wait of each barrier goes to one part or the other, so it is the
+spread of each operation, which shares cannot move. The rate of a node
+changes from one run to the next (the other processes, the interrupts),
+which is a reason for a measure at the start; a measure from time to time
+in a long run is a next step.
+
+### The barriers: one team barrier, the prefetch in the wait, the sums
+
+- gp_xbar has one team barrier, not two: after it, the first thread stores
+  the count of the part (release), and each thread waits for the flags of
+  the other parts itself (acquire). Each thread counts its barriers
+  (gp_xcnt, 0 at the start of a run).
+- The prefetch (NP_GEMMA_PART_PREFETCH): an XBAR record carries the weights
+  of the next operation of the part (_xbar_prefetch: the first copy that the
+  records after the barrier read). During the wait, each thread prefetches
+  its share of them into L2 (up to 512 KB).
+- The paired sums: GP_ADD is an omp for of the team (it was one thread),
+  and each part copies its sum into the copy of the sums on the node of each
+  other part before the barrier (COPY), so the add reads its node only.
+
+The bits do not change: scripts/check_parts.py passes for the 12B and the
+26B, and the paired split gives its values of before (the 12B, 5.53e-4).
+The wait for the team stays about 1 ms a token (rows) and 0.4 ms (paired),
+so the second team barrier cost little. The prefetch, off and on in turn
+(the 12B, a context of 2048, the shares 0.49 and 0.51, 48 steps, the
+records of part 0 / 1 in ms a token):
+
+    prefetch off      89.3 / 89.3      93.0 / 92.5
+    prefetch on       85.5 / 85.0      90.7 / 88.8
+
+The prefetch takes 2.3 to 4.3 ms a token (3 to 4 per cent). A run against
+the run before shows no change, because the rate of the machine moves by as
+much from one run to the next; only a measure in turn shows it.
+
+### The prompt pass on the two nodes (scripts/profile_prefill.py)
+
+The 12B, 2048 tokens in blocks of 256, the clocks at 2.0 GHz, the own time
+of each function and the traffic of each socket (perf stat, uncore):
+
+    form                     tok/s        q4x_linear   flash     the rest   DRAM S0/S1   remote reads S0/S1
+    one team (48 threads)    118.5, 100.4   10.8 s     3.7 s     3.8 s      119/97 GB    260M/252M lines
+    one node (24 threads)     97.5,  89.9   13.7 s     4.7 s     2.9 s      195/3 GB     ~0
+
+- The products (_q4x_linear, KQ_Q4X with int8 x) are 53 to 60 per cent of
+  the time. On one node they run at about 1.8 T int8 products a second,
+  about 15 per cent of VNNI on 24 cores at 2 GHz, with about 9 GB/s of DRAM:
+  not the bandwidth. 48 threads make them only 1.07 to 1.27 times faster.
+- The KQ_Q4X copy of one team on the nodes of the threads of a static
+  schedule (each group of 16 rows on the node of the thread that reads it,
+  mbind MPOL_MF_MOVE) made the DRAM of the two sockets the same (112/114
+  GB) but not the remote reads (201M/352M lines), and the pass was not
+  faster; a step of one team was slower (8.49 and 8.27 tok/s against 9.04
+  and 8.90 in turn). So the remote reads are not the weights; they are
+  most likely the int8 x of each product, which every thread reads and
+  threads of both nodes wrote. The placement was taken out.
+- Blocks of 512 (102.1, 112.5 tok/s) and 1024 (85.5, 104.0) did not differ
+  from 256 beyond the spread of the runs.
+- The prompt of the parts (NP_GEMMA_PARTS=2): PART_PREFILL took 6.4 s, the
+  attention of one team (cache.write, cache.read, flash_prefill) about
+  4.5 s.
+
+The next steps for the prompt: a copy of the int8 x on each node (each team
+quantizes x for itself), a kernel of the products nearer to the rate of
+VNNI (the weights of a group unpacked one time for all the tokens of a
+block, or a layout for the prompt as the 8x8 Q4_0 of llama.cpp), an
+attention that reads the int16 cache with no float copy of it, and the
+prompt as a program of the parts (one barrier for each product, no Python
+between the operations).
+
+### The prompt pass: the kernel, the attention, the program
+
+The four changes that the measure of the prompt pass gave (the 12B, the
+clocks at 2.0 GHz). Each keeps the bits.
+
+1. The products (kq_q4x_gemm in csrc/kquants.c). The counters of one
+   thread (perf stat, 3 s in the loop) showed 2.3 instructions a cycle, the
+   two vector ports of 512 bits half busy (1.12 a cycle), and the back end
+   full (resource_stalls 35 per cent), with few misses: kq_q4x_rows kept the
+   float sums of its 16 tokens in an array that the compiler put on the
+   stack (36 zmm loads and stores of the stack), and it unpacked the codes
+   once for each 16 tokens. The new kernel unpacks the codes of a group of
+   16 rows once for a block of tokens (a scratch of the thread in L2), and
+   keeps a tile of 2 groups and 6 tokens in registers (12 chains of
+   vpdpbusd, 24 sums, no spill). The items are a block of tokens and a pair
+   of groups, with blocks of the same size, so a matrix of few rows (the
+   down map, 240 groups) still gives each thread the same work. The int32
+   sum of a block is exact in any order and the float operations are those
+   of kq_q4x_rows, block after block: the same bits
+   (scripts/bench_q4x_gemm.py --check against the kernel of one token).
+
+       matrix, 256 tokens       kq_q4x_rows (24 threads)   new (24)    new (48)
+       3840 x 15360 (down)          9.49 ms                6.48 ms     5.13 ms
+       15360 x 3840 (gate, up)      8.20 ms                5.26 ms     3.06 ms
+       3840 x 4096 (o)              2.91 ms                1.78 ms     1.07 ms
+
+   The old kernel gained 1.17 times from the second node; the new one 1.3
+   to 1.7 times, with about 44 MB/s of remote reads (the x of a block stays
+   in L2).
+
+2. A copy of x on each node: not needed. With the new kernel the remote
+   reads of the products are small (above).
+
+3. The attention over the int16 cache (gemma_attn_prefill_qc,
+   ops.flash_prefill_qc, and the attention of PART_PREFILL). The team
+   dequantizes the keys while it transposes them, and the values of the
+   visible rows only, into a scratch of the team, then runs the tasks of
+   gemma_attn_prefill. KVCache.read made a float copy of the whole cache
+   for each block (new arrays, a page fault for each page), and the
+   transpose of the keys ran on the 8 key heads only, or on one thread in
+   a team (a nested region). The same bits for each of the 48 layers of the
+   12B; a block of 256 at a context of 1100 takes 603 ms in place of 739.
+
+4. A prompt block as one program (np_gemma/prompt.py): the step form of t
+   tokens with the kernels of the Python path (KQ_QUANT and KQ_LINEAR on
+   the KQ_Q4X copies, RMS_NORM, GELU then MUL, ADD, MUL_S, KV_WRITE,
+   QKV_NORM_ROPE, and ATTN_PREFILL_QC for the attention). The buffers of a
+   layer are those of the layer before (about 120 MB for 256 tokens, not
+   5.8 GB). The profile of the program showed two records that ran on one
+   thread, as the Python path did: KV_WRITE (17 per cent of a block) and
+   MUL (16 per cent); both now run over the team (and RMS_NORM takes
+   gemma_rms_norm_body, MUL_S an omp for), with the same values. With a
+   PartKVCache the attention is one PART_PREFILL record for each part (the
+   team writes the rows of the heads of the part on its node). The products
+   stay in one team (see 1). A dense model only: the experts of the 26B
+   take other kernels in a program, so its prompt keeps the Python path
+   (with 1 and 3).
+
+   The hidden state of a prompt of 2600 tokens, every row of the cache,
+   and the logits of 4 steps after it are the same with the program and
+   with the Python path; a PartKVCache gives the rows and the steps of one
+   KVCache (2048 tokens, 8 steps), with every page on its node.
+
+The prompt of 2048 tokens of the 12B (tokens/s):
+
+    form                                   before    kernel, attention    program
+    one team (48 threads)                  100-118       122-130          167-171
+    one node (24 threads)                   90-97        115-120             -
+    2 parts (PartKVCache)                   75-88            -              163
+
+llama.cpp on this machine gives 101 to 112 (two nodes) and 63 (one node).
+
+The benchmark after the four changes (pp2048, then tg128 at a depth of
+2048, 2 reps, the clocks at 2.0 GHz):
+
+    model   form                       pp2048 (tok/s)    tg128 (tok/s)
+    12B     2 parts (PartKVCache)       159.8, 176.2      10.02,  9.40
+    12B     one team on node 0          146.8, 150.5       7.89,  7.94
+    12B     one team on both nodes      187.1, 163.8       8.12,  7.72
+    26B     2 parts                      57.5,  58.1       3.69, 14.07 (rep 0 has the balance)
+    26B     one team on node 0           72.7,  74.3      19.51, 19.59
+
+The prompt of the 26B keeps the Python path (its experts: kq_moe, not the
+new kernel), and the parts are slower than one node for it, in the prompt
+and in the steps. That is the next work on the CPU.
+
+The prompt of the 12B on the GPU (RTX 3090): the products already take
+the int8 tensor cores (k_gemm_q8, 84 per cent of the time of the kernels;
+NP_GEMMA_GPU_TC=8 changes nothing), and the GPU is busy for 791 of the 792
+ms of the pass. A run with a new KVCache for each rep took 1.45 s, not
+0.79: _gpu_attach detaches the cache of the rep before (kv.detach copies
+its rows from the GPU into that host cache, 607 ms), and no one reads that
+cache again. With one KVCache cut to 0 between the reps, as llama-bench
+does, the pass gives 2425 to 2478 tok/s against 2718 for llama.cpp. A weak
+reference to the attached cache would skip the copy for a cache that the
+caller no longer holds.
+
+Done: Model._gpu_cache (and E4B) is a weak reference now. The cache that
+was on the GPU before gets its rows only when the caller still holds it (a
+Session of the server does); a dropped cache needs no copy. A new KVCache
+for each rep then gives 2337 to 2488 tok/s. Model.gpu_sync(cache) (and
+E4B.gpu_sync) writes the rows of the GPU into the host cache and keeps the
+cache on the GPU, so a server can read or save a cache at any time: the
+rows of a held cache after another cache came are those of gpu_sync, and 8
+GPU steps with gpu_sync between them give the logits of steps without it.
+
+### The prompt of the 26B as a program, and the int8 activations
+
+np_gemma/prompt.py now takes a model with experts: the router is ROUTER_MT
+(the fused router of a step, for each token of the block) and the experts
+are KQ_QUANT and KQ_MOE with the GELU (as ops._q4x_moe). The router of the
+Python path for a prompt block is a float32 product of NumPy (BLAS) and the
+NumPy softmax, which a record cannot give again, so the program has the
+bits of the Python path with ops.router_mt as its router: the hidden state
+and every row of the cache are the same (2048 tokens). The two routers
+select the same experts for every token of every layer of a block (their
+weights differ by at most 2e-6), and a call of one does not change the
+other (checked).
+
+The 26B, a prompt of 2048 tokens, one team, 2.0 GHz:
+
+    Python path                     32.0 s     64 tok/s
+    Python path with router_mt      10.8 s    190 tok/s
+    program                         9.3-10.0 s  205-221 tok/s
+
+The router of the Python path cost most of the time: its BLAS product runs
+on the threads of OpenBLAS (OPENBLAS_NUM_THREADS is min(8, cores) by
+default, np_gemma/__init__.py), which spin next to the threads of OpenMP;
+the norms after the router then took 6 to 10 ms in place of 0.2. With
+OPENBLAS_NUM_THREADS=1 the Python path takes 2.5 s for 512 tokens, as the
+program (2.4 s). The program has no BLAS in the prompt.
+
+The values of the 26B prompt differ from those of the Python path by 18 to
+23 per cent of the largest value of the hidden state, and the top token by
+12 to 22 per cent, although the routers differ by 2e-6. The cause is the
+int8 activations of the prompt (NP_GEMMA_INT4_Q8=1, the Q8_0 form of
+llama.cpp): the weights of the router times (1 + 1e-6 noise) move the
+hidden state of a block of 256 tokens by these amounts:
+
+    activations    median row    top token the same
+    int8           1.15e-1       202/256
+    int16          1.6e-3        253/256
+    float32        2.2e-4        256/256
+
+A small change moves an int8 value across a rounding step, and the 30
+layers of the 26B make it grow (the 12B does not show it: 5.5e-4 in the
+check of the paired split). The NLL of the last 255 tokens of a prompt of
+1024 (lower is better):
+
+    text          float32   int16    int8     top token as float (int16, int8)
+    README        3.167     3.161    3.541    254, 205
+    SPLIT_PLAN    4.732     4.714    4.650    252, 183
+    parts.py      5.211     5.154    5.347    218, 191
+
+    README, int8 or int16 for the dense products and the experts:
+    dense int8,  experts int8     3.541   205/255   6.3 s
+    dense int8,  experts int16    3.265   231/255  14.3 s
+    dense int16, experts int8     3.310   218/255  10.5 s
+    dense int16, experts int16    3.161   254/255  17.7 s
+
+int16 for both gives the NLL of float32; the products of both kinds add to
+the noise of int8. The int16 path of the prompt was the Python one (about 3
+times the time of int8).
+
+### The int16 prompt of the 26B
+
+The prompt program now takes int16 x (np_gemma/prompt.py, c.q16):
+
+- KQ_QUANT16 (151): the int16 rows of x, a scale of max |x| / 32767 for
+  each 32 values (gemma_quant_group32_i16, as the cache).
+- KQ_LINEAR16 (152): kq_q4x_gemm16 on the KQ_Q4X copy. A block of 32 codes
+  of a group of 16 rows becomes 16 vectors of int16 (code - 8, the pairs of
+  vpdpwssd), once for 2 groups of rows; a tile of 2 groups x 4 tokens
+  takes them. The columns go in chunks of 128 blocks, so the codes of a
+  chunk stay in L2, and the tile goes on from the sums of the chunk before.
+- KQ_MOE with act bit 2: the int16 rows of h and of the GELU for each pair
+  of token and expert (kq_q4x_rows16, 1 group x up to 8 tokens). A matrix
+  that is not KQ_Q4X takes int8 rows, as before.
+
+A product of 256 tokens on 24 threads of node 0 (2.0 GHz), and its error
+against float64 (max |d| / max):
+
+    matrix            int16      int8
+    15360 x 3840     11.8 ms    5.3 ms     error 2.1e-5 (int8 5.3e-3)
+    3840 x 15360     14.9 ms    6.5 ms     (26 ms before the chunks)
+    2816 x 8192       5.4 ms
+    4224 x 2816       2.7 ms
+
+The NLL of the first 1024 tokens of each text (the 26B, all positions):
+
+    form                         README   SPLIT_PLAN   parts.py   prompt tok/s
+    float32 (Python)             4.374    5.117        5.126       38-40
+    int16, Python                4.371    5.110        5.099       40-44
+    int16, program               4.415    5.127        5.095      141-253
+    int8, program                4.442    5.408        5.160      199-319
+
+A prompt of 2048 tokens, 3 runs (one team, 2.0 GHz):
+
+    26B   int16 194, 173, 215 tok/s    int8 202, 200, 241
+    26B   int16, 2 parts: 230, 234, 244
+    12B   int16 102, 84, 101 tok/s     int8 145, 202, 215
+
+The products of the 26B are a smaller part of its prompt (an expert
+takes a few tokens of each block, and the router, the attention and the
+sums stay as they were), so int16 costs it about 10 per cent; the 12B
+spends most of its prompt in dense products, which take twice the time. ops.prompt_act now gives "16" to a
+model with experts when the library has the int16 kernels (VNNI), and "1"
+(int8) to the rest; NP_GEMMA_INT4_Q8 sets one form for all. The int16
+program and the int16 Python path are not the same bits (the Python path
+takes float32 for the dense matrices, and the BLAS router): their hidden
+states differ by a median of 4.4e-2 of the largest value, as the routers
+choose another expert where two are near.
+
+### Media in the prompt program
+
+A prompt with media (the soft rows of an image or a clip) ran in Python on
+the CPU. The program now takes it: prompt_step puts the soft rows in x after
+the embedding, and binds the slot "limit", the last key of each query
+(Model._media_limit; 0 without media). ATTN_PREFILL_QC and PART_PREFILL
+pass it to gemma_attn_prefill_qc_body, whose tasks (AVX-512 and AVX2) take
+the limit in place of the position for the causal mask and for the last
+key of a tile; the window still counts from the position. The Python path takes the same kernel with the
+limit (ops.flash_prefill_qc), in place of the NumPy attention.
+
+Two spans of 280 random rows (bidirectional) in 1100 tokens, one across a
+block, at 2.0 GHz:
+
+    12B int8, program against Python             the same bits (one team, 2 parts)
+    12B int16 Python, flash with limit against   1e-4 median of max |d| / max
+        the NumPy attention (float products)
+    12B int16: program 9.3 s, Python 36.9 s
+    26B int16: program 4.7 s (2 parts 8.0 s, the same bits), Python 20.9 s
+
+scripts/check_mm_prompt.py on the 12B (--source gguf, against
+transformers; mean KL over the top 64, top token, the prompt and the
+answer):
+
+    reference   int8 Python        int8 program       int16 Python       int16 program
+    image       0.00079 40/40 2.7s  0.00079 40/40 2.1s  0.00005 40/40 11.7s  0.00005 40/40 2.7s
+    audio       0.00015 48/48 4.4s  0.00015 48/48 2.7s  0.00001 48/48 14.8s  0.00001 48/48 4.1s
+    video       0.00273 42/44 20.4s 0.00273 42/44 13.1s 0.00012 44/44 79.8s  0.00013 44/44 20.0s
+
+int16 takes the KL of the 12B down by 10 to 20 times on media, for the time
+of the int8 Python path.
+
+### The int16 prompt on the GPU
+
+The tensor cores of the RTX 3090 take no int16 x. The GPU program of a
+prompt with Model.prompt_act "16" (the 26B) gives x the int16 form instead
+(gg_load flag 16, g->i8 2): k_quant_x2 makes q = round(x / s) with s =
+max |x| / 16256 for each 32 values, and two int8 planes, hi = round(q / 128)
+and lo = q - 128 hi. A block of 32 columns takes mma of hi, times 128, then
+mma of lo into the same int32 sums (mma16832_x2): 128 sum(hi w) + sum(lo w)
+= sum(q w), exact, and below 2^22 for i2f_exact (16256 x 8 x 32). x keeps
+about 15 bits. k_gemm_q8 (the dense products) and kt_tile of KT_Q4X
+(k_moe_gemm_q4x, the experts) take it with X2: a row of a step holds the
+hi values and then the lo values, in 2 buffers of shared memory in place
+of 3. The fused int8 x of the record before (qx_fuse) is off in this form.
+
+The 26B on the GPU, the NLL of the first 1024 tokens and a prompt of 4096:
+
+    form                              README   SPLIT_PLAN   parts.py   pp4096
+    int16                             4.421    5.167        5.071      2754 tok/s
+    int8                              4.358    5.344        5.193      3154
+    int16, float32 attention          4.364    5.164        5.070      1437
+    int8, float32 attention           4.427    5.188        5.154      1537
+    CPU float32                       4.374    5.117        5.126
+
+The hidden state of README against CPU float32 (max |d| / max of a row):
+
+    GPU int16                     median 9.7e-2
+    GPU int8                      median 1.1e-1
+    GPU int16, float32 attention  median 2.1e-2
+    GPU int8, float32 attention   median 1.3e-1
+    CPU int16 program             median 4.3e-2
+    CPU int8 program              median 1.3e-1
+
+The int16 products are right: with the float32 attention the GPU is nearer
+float32 than the CPU program. With the float16 attention of the tensor
+cores (NP_GEMMA_GPU_ATTN_TC=1, the default) that attention is most of what
+is left, and the float32 kernel takes twice the time; a split of the
+query into two float16 values would be the next step. check_gpu_prompt
+(11962 tokens, then 32 steps) passes.
+
+### int16 for the 12B?
+
+The 12B, the same texts (NLL of the first 1024 tokens; tok/s of each):
+
+    CPU float32 (Python)       5.506  5.430  6.731     32-35 tok/s
+    CPU int16 program          5.508  5.431  6.729    121-140
+    CPU int8 program           5.546  5.380  6.697    205-234
+    GPU int16                  5.518  5.429  6.731    pp4096 1650
+    GPU int8                   5.543  5.407  6.709    pp4096 2340
+
+int16 gives the NLL of float32 on the 12B too, and the KL to transformers
+on media falls 10 to 20 times (check_mm_prompt above); int8 moves the NLL
+by up to 0.05 either way. It costs the 12B 1.7 times the prompt time on the
+CPU and 1.4 times on the GPU, since its prompt is mostly dense products.
+The default of the 12B stays int8; NP_GEMMA_INT4_Q8=16 gives int16.
+
 ## Phases
 
 - Phase 0: measure. The latency and the rate of a copy over the PCIe link,

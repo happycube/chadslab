@@ -81,6 +81,9 @@ The runtime does five tasks:
         ├── bench_numba.py      Compare the NumPy path and the Numba path.
         ├── bench_kernels.py    Compare the NumPy, Numba, and C paths.
         ├── profile_token.py    Time the parts of one decode step.
+        ├── profile_parts.py    The time of each operation of a step in parts, one team, or one node.
+        ├── profile_prefill.py  The time of each function of a prompt pass, and the traffic of each socket.
+        ├── bench_q4x_gemm.py   The products of a prompt (KQ_Q4X, int8 x) alone: the rate, and a check of the bits.
         ├── profile_int8.py     Time each int8 matrix. Show the bandwidth.
         ├── bench_decode.py     Time each decode step. Show the warm-up.
         ├── bench_ram_cache.py  Compare the memory map and the local memory.
@@ -245,7 +248,9 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     OMP_WAIT_POLICY        system                  ACTIVE keeps the threads awake. The median time is better under load.
     OMP_PLACES             cores                   The places of the OpenMP threads. The package sets cores when the variable is not set.
     OMP_PROC_BIND          close                   close, with OMP_PLACES=cores, keeps each thread on one core. A step in parts (NP_GEMMA_PARTS) needs it. For a step of one program the change is small (see SPLIT_PLAN.md). The package sets close when the variable is not set. Set false to turn the binding off.
-    NP_GEMMA_ATTN          1                       1 uses the fused attention over an int16 copy of the cache, with a float query. 0 uses the float cache. The two give about the same result. The server uses 1 (--kv-attn int16).
+    NP_GEMMA_ATTN          1                       1 uses the fused attention over the quantized cache, with a float query. 0 runs the float attention of Python over dequantized rows (the cache keeps no float rows). The step programs read the quantized rows in both cases.
+    NP_GEMMA_KV_INT8       0                       The form of the cache (KVCache kv=), which keeps only quantized rows with a float32 scale for each group of 32 values, never float32 rows. 0: int16 (a scale of max |x| / 32767). 1: int8 (max |x| / 127). v: int16 keys and int8 values (kv="k16v8"). The readers of float rows (the prompt attention on the CPU) get dequantized rows. On the CPU and the GPU; the GPU drafter of MTP reads each form. The 26B on AVX2 (6 threads) at 4300 tokens: 17.73 (int8) in place of 16.19 tok/s. The 12B on the GPU at 32768 tokens: 44.35 (int8), 43.74 (v), 43.41 (int16) tok/s. KL of the decode of the 12B against float x (160 steps): int16 6.8e-4 (the int8 x), v 2.0e-3, int8 2.1e-3; the NLL of the text does not move (within 0.01). NP_GEMMA_PARTS takes only int16. The server takes --kv-attn int8 or k16v8.
+    NP_GEMMA_QWEN_KV       int8                    The cache of the Qwen models: int8 (int8 keys and values), int16, k16v8 (int16 keys, int8 values), tq6 (TurboQuant, 6 bits and a norm for each 32 values: 22% smaller than int8, for very long contexts; np_gemma/tq6.py), or f32. The first full attention layer keeps the form of NP_GEMMA_QWEN_KV_FIRST: f32 (the default), int16, int8, or "same" (the form of the other layers). CPU and GPU, QSA of Qwen3.8 too (QWEN_PLAN.md).
     NP_GEMMA_FUSED_QKV     1                       1 gives the query, the key, and the value their norm in one call, and the query and the key their rope in one call. 0 gives each tensor its own call.
     NP_GEMMA_CACHE_RAM     0                       1 copies the cache into local memory with large pages.
     NP_GEMMA_CACHE         ~/.cache/np_gemma/weights  The cache directory.
@@ -254,11 +259,13 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_INT8_INT      0                       1 uses the integer int8 kernel. That kernel is less accurate.
     NP_GEMMA_PREFILL_CHUNK 256                     The prompt pass uses blocks of this many tokens.
     NP_GEMMA_SLIDE         1                       1 drops the keys that no query in the block can see. 0 keeps every key.
-    NP_GEMMA_FLASH         0                       1 runs the C flash attention kernel. ref runs the NumPy reference. 0 uses the batched matmul.
+    NP_GEMMA_FLASH         1                       1 runs the C flash attention kernel. ref runs the NumPy reference. 0 uses the batched matmul.
     NP_GEMMA_ATTN_IMPL     auto                    c, avx2, or avx512 forces one version of the flash kernel.
-    NP_GEMMA_FLASH         0 for the 12B,         1 sends a prompt of more than one token to the C flash kernel. "slide" uses it for a sliding layer only.
-                           1 for E4B
-    NP_GEMMA_INT4_Q8       per model               The activations of the int4 products of a prompt pass. 1 uses int8 for every product, as llama.cpp does. 16 uses float32 for the attention and dense matrices and int16 for the experts: 99.7 per cent of the tokens agree with float32, at 1.4 times the time of 1. 0 uses float32 for every product, at 1.9 times the time of 1. Without the variable, a model with experts (the 26B) uses 16 and a dense model uses 1.
+    NP_GEMMA_FLASH         1                       1 sends a prompt of more than one token to the C flash kernel. "slide" uses it for a sliding layer only.
+    NP_GEMMA_INT4_Q8       1 (16 for the 26B)      The activations of the int4 products of a prompt pass. 1 uses int8 for every product, as llama.cpp does; the default of a dense model. 16 uses int16 (a scale for each 32 values): in the prompt program every product (KQ_LINEAR16, kq_q4x_gemm16 with vpdpwssd; KQ_MOE with int16 rows), in the Python path float32 for the dense matrices and int16 for the experts. It gives the NLL of float32, and is the default of a model with experts when the library has the int16 kernels (VNNI, and AVX2 with vpmaddwd): the prompt of the 26B takes about 1.1 times the time of int8 on VNNI (the 12B about 2 times), 1.45 times on AVX2 (6 cores of the Xeon at 2.4 GHz: pp512 64.2 -> 44.3 tok/s; the KL of 40 decode steps after a prompt of 64 tokens against the NumPy decode 0.22 -> 0.052). 0 uses float32 for every product.
+    NP_GEMMA_Q4X           1                       1 keeps a copy of each int4 matrix in groups of 16 rows (KQ_Q4X) for the CPU: the prompt, the decode, the parts, and the cold experts of the GPU. 0 turns it off.
+    NP_GEMMA_Q4X_INT8_DECODE AVX2 1, else 0     The int8 x of the KQ_Q4X experts of a decode step (KQ_QUANT, then KQ_MOE). 1 or 0 sets it on any build; VNNI with 1: the experts of the 26B (6 cores, 2.4 GHz) 27.0 -> 15.1 ms a token.
+    NP_GEMMA_DECODE_X16    1                       1 (AVX2 with the int8 decode): int16 x in place of int8 for the KQ_Q4X products of a step and of a verify group (the dense matrices, the experts, the head), as the prompt with int16 x; one token takes two int8 planes of x (kq_q4x_rows_p16), a group the unpacked codes (kq_q4x_tile16): the same bits. The 26B, 6 cores of the Xeon at 2.4 GHz: tg64 22.4 -> 19.2 tok/s, the KL of 40 steps after a prompt of 64 tokens against the NumPy decode 0.052 -> 0.0105 (the float decode of VNNI: 0.0135), the top token 35 -> 39 of 40. 0 keeps int8 x.
     NP_GEMMA_INT4_Q8_TOKENS 2                       The smallest token count for the int8 tile. A lower value is slower for one token.
     NP_GEMMA_INT4_MULTI4   1                       1 runs the query, key, and value in one call, and the gate with the up projection. 0 gives one call for each matrix.
     NP_GEMMA_INT4_Q8_GEMV  0                       1 uses the int8 activation for the matrices of one token, on a machine with VNNI. It is not faster. See "What llama.cpp does differently".
@@ -272,19 +279,92 @@ Compare the file gen_np_int8.json with gen_hf.json. The ids must be equal.
     NP_GEMMA_MTP_PMIN      0                       The drafter stops when its best token has a lower probability than this value. 0 turns the test off.
     NP_GEMMA_PARTS         1                       2 or more runs a decode step of one token as that many programs, each in its own team of threads (np_gemma/parts.py, SPLIT_PLAN.md). This is for a machine with NUMA. The result has the same bits.
     NP_GEMMA_PART_TEAM     0                       The thread count of each part. 0 divides OMP_NUM_THREADS by the count of parts.
+    NP_GEMMA_NUMA          1                       With NP_GEMMA_PARTS on a machine with two or more NUMA nodes, each part reads copies of its rows of the weights in the memory of the node of its team (np_gemma/numa.py, mbind). 0 gives the views of the model. The bits are the same.
+    NP_GEMMA_PART_HEAD     1                       With NP_GEMMA_PARTS, the parts also run the output head (a Q6_K head, or a Q4_0 head with its KQ_Q4X copy): each part computes its rows from a copy on its node into one logits buffer on the node of part 0, and the main thread is pinned to that node. Model.logits gives that buffer, with the same bits. 0 runs the head in one team after the step.
+    NP_GEMMA_PART_KV       1                       With NP_GEMMA_PARTS and the int16 cache, KVCache(...) gives a parts.PartKVCache: the KV heads of each part in its own buffers, on its node. A decode step of the parts and the attention of a prompt block (PART_PREFILL, in the team of each part) use only the buffers of the part. Other readers gather the heads (a copy). The bits are the same. 0 gives one KVCache.
+    NP_GEMMA_PART_BALANCE  8                       The steps that a new program of the parts measures (after 2 to warm up) for the balance: the shares of the rows that make the parts end at the same time, from the time of the records that move with the rows and of those that do not. The program is then compiled again with those shares (when they differ by more than 0.5 per cent). The bits stay those of one part. 0 keeps the same share for each part.
+    NP_GEMMA_PART_WEIGHTS  -                       The shares of the rows of the parts, as "0.45,0.55": no measure.
+    NP_GEMMA_PROMPT_PROGRAM 1                      A block of a prompt runs as one program (np_gemma/prompt.py): the kernels of the Python path with no Python between them, the same bits for the 12B; with a PartKVCache the attention writes and reads the cache of each part (PART_PREFILL). The 26B takes the router of the steps (ROUTER_MT) and kq_moe for its experts: the bits of the Python path with ops.router_mt. With NP_GEMMA_INT4_Q8=16 (the 26B) the products take int16 x (KQ_QUANT16, KQ_LINEAR16, KQ_MOE act bit 2). A prompt with media takes the program too: the soft rows in x, and the last key of each query (Model._media_limit) in the attention (ATTN_PREFILL_QC, PART_PREFILL). 0 keeps the Python path.
+    NP_GEMMA_Q4X_GEMM      1                       The products of a prompt (KQ_Q4X, 4 tokens or more) take the tile kernel kq_q4x_gemm (2 groups of 16 rows and 6 tokens in registers, the codes unpacked once for a block of tokens). The same bits as kq_q4x_rows. 0 keeps kq_q4x_rows.
+    NP_GEMMA_PART_PREFETCH 1                       The threads of a part that waits at a barrier of the parts prefetch their share of the next weights of the part (up to 512 KB each). 0 turns it off.
+    NP_GEMMA_PART_PAIRED   0                       1: the paired split of a step in parts. The output projection and the down map split by columns (the heads and the gate rows of each part), and the parts add their sums: two barriers a layer in place of four. The order of the sums changes, so the bits are not those of one part (the 12B: 5.5e-4 of the hidden state, the same top token in 16 of 16 steps).
     NP_GEMMA_GPU           0                       1 runs the decode steps, the prompt pass, and the output head on a CUDA GPU (np_gemma/gpu.py, SPLIT_PLAN.md). The E4B model runs wholly on the GPU (decode only). The 26B model keeps its cold experts on the CPU. It needs nvcc. The first step copies the weights to the GPU.
     NP_GEMMA_GPU_HOT       the 26B counts          A file of expert counts (scripts/expert_use.py). With NP_GEMMA_GPU=1, the GPU holds the most used experts of the 26B and runs them. 0 keeps all the experts on the CPU. The default is np_gemma/data/gemma-4-26B-expert-counts.npz.
     NP_GEMMA_GPU_HOT_GB    free less 6 GB          The GPU memory for the hot experts, in GB.
+    NP_GEMMA_GPU_CPU_THREADS half the cores (2+ nodes)  The team of the CPU programs of a GPU program (the cold experts of a step, gemma_run_task), bound spread over the places. Default: OMP_NUM_THREADS / 2 on a machine of two or more NUMA nodes, else OMP_NUM_THREADS. Qwen3.8 on the 2-socket Xeon and the 3090: 26.0 tok/s with 24 spread, 21.3 with all 48 bound close.
+    NP_GEMMA_TEAM_BALANCE  1                       1: the team of the CPU programs of a GPU program (gemma_run_task: the cold experts of a step, the CPU part of a prompt group) pinned with the same count of threads on each NUMA node for the same count of allowed CPUs (the places of OpenMP), evenly spaced, the threads of node 0 first (kq_share_range gives the tasks of node 0 to the first half). proc_bind(spread) alone put a team of 24 on taskset -c 0-19,24-43 as 10 on node 0 and 14 on node 1. 0: proc_bind(spread). scripts/cpu_fence.sh keeps the other processes off the CPUs of the model (status, fence, restore): with java, chromium, and a ClickHouse container on all the cores, decode fell to 4-9 tok/s; fenced to 20-23,44-47, 31-32 tok/s.
+    NP_GEMMA_GPU_BF16_NT   1                       1: the bfloat16 products of a small group (an MTP verify group) read each weight once for all its tokens (k_kq_linear_bf16, k_kq_multi_bf16), with the bits of the one-token kernel for each token. 0: the loop over the tokens.
+    NP_GEMMA_MOE_X16       1                       1: the experts of Qwen3.8 read x and the GELU with the precision of int16: the CPU parts as int16 in each 32 values split in two int8 planes in the VNNI tile (kq_quant_part16, kq_t2_tile: one decode of each weight block), the GPU experts of a prompt group in float32 (NP_GEMMA_GPU_MOE_F32), those of a step in float32 as before. Real text against float32 activations: KL 5.9e-3, the same top token 99.2% (int8: 1.28e-2, 96.9%); plain decode the same rate, MTP 3 drafts 6% slower, the 8K prompt 2-11% slower. 0: int8.
+    NP_GEMMA_GPU_MOE_F32   1 with NP_GEMMA_MOE_X16  1: the experts of a prompt group (GP_KQ_GROUP_MOE) in float32 (k_qmoe_gu, k_qmoe_dn), not on the int8 tensor cores. The prompt rate was the same either way.
+    NP_GEMMA_GPU_BF12_TC   1                       1: the BF12 dense matrices of a step and of a group of up to 8 tokens on the tensor cores (k_kq_bf12_tc, mma tf32; x as hi + lo tf32): the same time for 1 and for 4 tokens, below bfloat16, and the bits of a step in a verify group. 0: the CUDA-core kernels (k_kq_linear_bf12, k_kq_multi_bf16).
+    NP_GEMMA_GPU_SYNC_CHECK 0                      1: no CUDA graphs, and a wait after each record of a GPU program, so that a kernel error names its record (slow; scripts/replay_crash.py --sync). Without it an error names the record queued last (np_gemma.gpu.where): the one at fault is at or before it.
+    NP_GEMMA_GPU_BF12_FUSED 1                      1: the BF12 matrices of a prompt group decoded in the tile of k_gemm_bf16_tc. 0: chunks of bfloat16 rows in a scratch, then gg_gemm_bf16 (the same prompt rate).
+    NP_GEMMA_DENSE         bf12 for a BF12 file     The dense matrices of a file of convert_q8_gguf.py --dense bf12 stay BF12 (the bfloat16 values in 12.25 bits); q8 or bf16 converts them at the load.
+    NP_GEMMA_GPU_STAGE     1                       1: the copies of experts to the GPU (HotCache, the prompt) go through two pinned buffers of 4 MB of each worker (a memcpy, then DMA), not a cudaMemcpyAsync from the pageable map of the file, which held the driver: Qwen3.8 q8 decode 32 -> 37 tok/s (with NP_GEMMA_GPU_COPY_CPU 44.6). 0: the plain call.
+    NP_GEMMA_GPU_COPY_CPU  the last CPU of the GPU node  The CPU of the copy workers of the GPU (pthread affinity); by default the last CPU of local_cpulist of the GPU, which the team of the CPU tasks (bound spread) leaves free. -1: no binding (Qwen3.8 MTP 41.0 in place of 58.7 tok/s).
+    NP_GEMMA_GPU_KQH_NVX   1                       1: the KQ_NVX hot experts of a step with a block for each group of 16 rows (k_kqh_nvx): 4.8 -> 1.7 ms a step. 0: a warp for each group.
+    NP_GEMMA_GPU_ZC        0                       n > 0: the GPU computes the first n cold experts of each layer of a step from a pinned copy of the experts in host memory (about 68 GB, over PCIe), the CPU the others. NP_GEMMA_GPU_ZC_MT: the same for the verify groups. NP_GEMMA_GPU_PIN=1: the copy alone (the CPU and HotCache read it). Slower on the Xeon and the 3090 (plain 44.6 -> 33.7 tok/s): an expert takes 0.25 ms over PCIe 3.0, more than the share of the CPU.
+    NP_GEMMA_GPU_HC_FUSE   1                       1: GP_HC_ADD and the GP_HC_NORM of the same H in one kernel (k_hc_add_norm, the same bits), and GP_HC_NORM, GP_HC_ACT, and GP_HC_MIX write the int8 x of the product that follows (qx_fuse past the GP_KQ_QUANT records): Qwen3.8 plain 45.4 -> 46.7 tok/s (q8), 38.3 -> 39.6 (bf16). 0: separate kernels.
+    NP_GEMMA_GPU_TOPK_SPLIT 1                      1: GP_ROUTER_TOPK and the GP_HOT_SPLIT of a step in one kernel. 0: two.
+    NP_GEMMA_GPU_NUMA_COPY auto                    A copy of the experts of Qwen3.8 on each NUMA node; each thread of the CPU part reads the copy of its node (KQ_MOE mats1). auto: on when the file was staged from a DAX mount (NP_GEMMA_DAX_STAGE: the staged copy is the copy of its node, the other comes from it at about 16 GB/s). 1: also from the map of a file; 0: off. From Optane: plain 52.7 tok/s with both copies, 32.2 with the staged copy alone.
+    NP_GEMMA_DAX_STAGE     1                       A GGUF on a DAX mount (persistent memory, Optane in App Direct mode): the tensors go into memory of the process on the node of the module, copied by threads of that node (9-10 GB/s; a thread of the other socket reads the module at 0.4 GB/s), in huge pages. NP_GEMMA_DAX_KEEP (per_layer_token_embd.weight) stays on the module: a step reads a few rows of it. NP_GEMMA_DAX_PLACE=interleave: the copy over all the nodes. Qwen3.8 loads in 36 s (127 s with the plain map). 0: the map.
+    NP_GEMMA_GPU_EXPERT_COPY auto                  auto: the experts in memory of the process when the file is on a DAX mount and the reader did not stage it; 1 always; 0 never. NP_GEMMA_GPU_EXPERT_NODE: interleave (the default) or a node.
+    NP_GEMMA_CPU_NODE_SHARE 0.5                    The share of node 0 in the tasks of the cold experts of a decode step (the threads of each node take their share). "auto": measured at the start (kq_calib_nodes; it gave 0.62-0.64 on the Xeon and 50.3 tok/s against 51.8 with 0.5); a number sets it.
+    NP_GEMMA_GPU_REGISTER  1                       1: page-lock the copy of the experts that the GPU copies from (when it is in memory of the process: staged from a DAX mount, or a copy on each node); the copies of a prompt group are then DMA at the rate of the bus (bf16 8K prompt 564 -> 649 tok/s). The copies of HotCache in the decode stay staged: DMA at the full rate slowed MTP (66.7 -> 58.8 tok/s).
+    NP_GEMMA_QWEN_KV       int8 (tq6 with NP_GEMMA_DENSE=bf16)  The form of the cache of Qwen3.8; see NP_GEMMA_QWEN_KV above. tq6 is 18.7 KB a token in place of 21.8 (the first full attention layer stays float32).
+    NP_GEMMA_GPU_CTX       0                       The tokens of the largest cache that a QwenGPU will attach (the ctx argument; serve_qwen4.py gives --ctx): the hot experts leave room for its cache. Qwen3.8: 20.6 KB a token and 118 MB of state; bf16 dense with 262144 tokens leaves 42 hot experts in each layer.
+    NP_GEMMA_GPU_BF16_TC   1                       The bfloat16 matrices of a prompt group (KQ_LINEAR, more than 16 tokens) on the tensor cores (k_gemm_bf16_tc, float32 sums). 1: x as two bfloat16 planes, hi + lo (about 16 bits; error of a product 1e-5, float32 2e-6; 18-26 TFLOPS); 8: one plane (8 bits, 1.6e-3, 31-53 TFLOPS); 0: float32 products (k_kq_gemm, 12-14 TFLOPS). Qwen3.8 bf16, 8192 tokens: 469 (1), 504 (8), 406 tok/s (0); KL to float32 0.0104, 0.0128 (q8 dense 0.0191; two float32 runs 0.0066).
+    NP_GEMMA_GPU_QMOE_SORT_PAR 1                   1: the sort of the pairs of a group MoE on a block of 1024 threads (5 ms -> well under 1 ms a layer of 2048 tokens). 0: one thread.
+    NP_GEMMA_CPU_MOE_SMALL 1                       1: the cold experts of a GPU step or verify group (t <= 4) take kq_moe_small_body: the int8 x, the sort, and the rows of the pairs in one single, the act by the thread that ends the last gate/up task of an expert, and the down tasks waiting for their expert (3 barriers in place of 7; the same bits). About +1% on Qwen3.8. 0: KQ_QUANT and kq_moe_body.
     NP_GEMMA_GPU_HOT_DYN   1                       0 keeps the first set of hot experts. 1 lets the set follow the text (HotCache, SPLIT_PLAN.md).
     NP_GEMMA_GPU_HOT_DECAY 0.97                    The decay of the scores of HotCache for each step.
     NP_GEMMA_GPU_HOT_INS   8                       The most experts that HotCache copies to the GPU in each step.
     NP_GEMMA_GPU_HOT_ADMIT 2                       HotCache copies a cold expert to the GPU only from this use on; the first uses run on the CPU.
     NP_GEMMA_GPU_HOT_SEED  0                       The experts that HotCache can change after a prompt pass, from the routers of the prompt. 0 changes none (a test gave no gain).
-    NP_GEMMA_GPU_TC        1                       1 runs the int4 products and the attention of a large group (a prompt pass) on the tensor cores, with float16 inputs. 8 gives int8 inputs to the products (the Q8_0 form): about 45% faster for the E4B, and 98.6% of the top tokens agree with float32, against 99.9%. 0 keeps float32 kernels. The 26B uses float32 kernels unless NP_GEMMA_GPU_TC_MOE=1.
+    NP_GEMMA_GPU_TC        1                       1 runs the int4 products and the attention of a large group (a prompt pass) on the tensor cores, with float16 inputs. 8 gives int8 inputs to the products (the Q8_0 form): about 45% faster for the E4B, and 98.6% of the top tokens agree with float32, against 99.9%. 0 keeps float32 kernels. The 26B uses float32 kernels (with int8 for its int4 products, NP_GEMMA_GPU_I8_MOE) unless NP_GEMMA_GPU_TC_MOE=1.
     NP_GEMMA_GPU_PDL       1                       0 turns off programmatic dependent launch in the CUDA graphs, for a test. See SPLIT_PLAN.md.
     NP_GEMMA_GPU_FLASH     0                       1 selects the old attention kernel of a prompt pass (k_flash_tc), for a test.
-    NP_GEMMA_GPU_CHUNK     1024                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.9 s for the 26B), so a longer chunk is faster.
+    NP_GEMMA_GPU_FLASH512  4                       The query heads in a block of k_flash_qc_h, the attention of a prompt pass for a head of 512 values (the global layers). 4 is the fastest: 475 ms in place of 714 ms for the global layers of the 12B and 8192 tokens. 2 is for a test. 0 keeps k_flash_qc_tc.
+    NP_GEMMA_GPU_FLASH256  4                       The tiles of 16 queries in a block of k_flash_qc_h for a head of 256 values (the layers with a window), with 2 query heads. 4: 250 ms in place of 329 ms for the 40 layers of the 12B and 8192 tokens. 0 keeps k_flash_qc_tc.
+    NP_GEMMA_GPU_FLASH_FK  32                      The keys of a step of k_flash_qc_h for a head of 256 values: 16 or 32. 32: 235 ms in place of 255 ms for the 40 layers of the 12B with a window and 8192 tokens.
+    NP_GEMMA_GPU_CHUNK     2048                    The tokens of a chunk of a prompt pass on the GPU. Each chunk copies the cold experts to the GPU (about 1.6 s for the 26B). With 2048 the copy is hidden behind the other work of the layers.
     NP_GEMMA_GPU_PREFILL_MIN 128                   A shorter part of a prompt runs on the GPU in groups of 16 tokens, with the experts on the CPU.
+    NP_GEMMA_GPU_MIX       1                       1 runs the prompt of the 26B in mixed groups: each layer copies only some cold experts to the GPU, and the CPU computes the others. 0 copies all the cold experts.
+    NP_GEMMA_GPU_MIX_PRE   auto                    The cold experts that each layer of a mixed group copies. auto uses the model of the time in ModelGPU.plan_mix. A number gives the count; -1 copies all.
+    NP_GEMMA_GPU_MIX_CAL   1                       1 measures the model of the time of the mixed groups again after each group (ModelGPU.calibrate_mix). 0 keeps the first values.
+    NP_GEMMA_GPU_PREFETCH  1                       A mixed group copies, during the layer before, the experts each layer will likely copy (those the plan of its last group would copy, the most tokens first, not hot now) into one of two sets of pool blocks; the plan takes them as on the GPU and copies the rest, and the GPU runs the hot, the prefetched, and the copied experts in turn. Qwen3.8 8K real text: copy waits 1.73 -> 0.63 s a group, 600 -> 618 tok/s (99% of the prefetched experts used). 0: no prefetch.
+    NP_GEMMA_GPU_PREFETCH_FRAC 1.0                 The share of the experts of the last group to prefetch (0.7: 604 tok/s, 1.3: 595).
+    NP_GEMMA_GPU_PREFETCH_COST 1.0                 The cost of a prefetched copy for the size of the prediction, as a share of the calibrated cost of a copy (moe.c stats[7], desc[23]). Qwen3.8 8K real text: 1.0 is the best measured; 0.6 and 0.35 (more prefetched) 2-15% slower, 1.5 and 2.0 within the noise.
+    NP_GEMMA_GPU_SHARE     1                       The KV caches of every model (gpumm.DeviceCache, position-major) lend GpuMem the rows past those a run needs and a margin; the pool of HotCache places segments there, which go when the cache takes the rows back (anything still locked after the runs is an AssertionError). Qwen3.8 at 256K: 3.4 GB more experts (2632 on the GPU), decode 166 cold experts a step (202). 0 lends nothing.
+    NP_GEMMA_GPU_SHARE_MARGIN 4096                 The positions past those of a run that a cache keeps; the lent memory changes only when a run passes them.
+    NP_GEMMA_GPU_C_RESERVE 0.8e9                   The free memory that GpuMem keeps for the C side (the code, environment, and graphs of a program, temporary copies): the pool and the other blocks leave it.
+    NP_GEMMA_GPU_MIX_THREADS auto                  The team of the CPU part of a mixed group of a prompt (word 3 of its program, gemma_run_task). auto: OMP_NUM_THREADS - 8 on a machine of two or more NUMA nodes (40 of 48), the rest for the GPU runner, the copies, and other processes; 0: the team of a step (NP_GEMMA_GPU_CPU_THREADS). A layer of a real-text group of 2048 rows (Q8_0): 45.3 ms with 24, 38.7 with 40.
+    NP_GEMMA_GPU_MIX_NUMA  1                       The CPU part of a mixed group reads the copy of the experts on node 1 (NP_GEMMA_GPU_NODE1_GB) on the threads there, as a step does. A layer of a real-text group, 40 threads: 38.9 -> 31.8 ms. 0: all read the experts' node.
+    NP_GEMMA_KQ_TILE2      1                       The tiles of Q8_0 and Q6_K of a prompt (kq_rows4_t2): the scales of 4 rows one time for all the tokens, x + 128 times w from -128 sum(w) (no sign steps), short tiles of 1 to 3 tokens, the next 4 rows prefetched; the same bits as kq_tile4. A layer of a real-text group, 24 threads: 59.4 -> 45.3 ms (Q8_0). 0 keeps kq_tile4.
+    NP_GEMMA_KQ_TILE2_MIN  2                       The fewest tokens of an expert for kq_rows4_t2 (fewer: kq_dot4_q8_0, kq_dot1).
+    NP_GEMMA_MOE_GPROF     0                       1: the times of the phases of the CPU part of a prompt group (kquants.c kq_moe_gprof): the sort, the copy, gate and up, the act, down, the sum.
+    NP_GEMMA_GPU_GDN_PAR   4                       The DeltaNet of a group of 64 tokens or more with no log (a prompt group): the convolution for each token and channel at once, the norms of q and k and the gates before the state, 4 (or 8) threads for each column of the state, then the norm of the output (k_gdn_conv_par, k_gdn_prep, k_gdn_scan, k_gdn_out). Qwen3.8 bf16 8K prompt 757 -> 837 tok/s (1.43 s -> 0.34 s of kernels). 0 keeps k_gdn_heads (one block for each head, 4 us a token).
+    NP_GEMMA_GPU_QSA_TC    1                       The attention of the QSA layers of a large group (int8 and TQ6 caches) on the tensor cores (k_attn_qsa_tc): the 12 query heads of a key head are the rows of an mma tile, q as two float16 planes. 2: one plane. 0: k_attn_qsa_mt (float32). Qwen3.8 bf16 8K prompt 860 -> 910 tok/s, KL to float32 0.0120.
+    NP_GEMMA_DAX_EXPERTS   auto                    The node of the routed experts when gguf._stage_dax stages a file from a DAX mount: auto takes the module's node if the staged tensors fit 85% of it, else the other node (the Q8_0 experts of Qwen3.8, 131 GB), copied through buffers on the module's node (9.9 GB/s). Or a node.
+    NP_GEMMA_GPU_NODE1_GB  auto                    The experts on one node only (they do not fit the other): a copy of the most used experts of each layer on the other node, read by its threads (KQ_MOE slot1). auto: 70% of that node less the tensors staged there (329 of 512 Q8_0 experts of Qwen3.8, 84 GB). 0: none. Qwen3.8 Q8_0 decode 25.4 -> 30.2 tok/s.
+    NP_GEMMA_EXPERT_COUNTS (none)                  An .npy of the uses of each expert (layers + 1, experts; HotCache.profile()) that picks the experts of NP_GEMMA_GPU_NODE1_GB. Without it, the experts after the first hot ones.
+    NP_GEMMA_GPU_WARM      lend                    The warm experts of HotCache in the blocks of its pool (gpumm.ExpertPool: segments of 8 experts: the first hot experts, the room lent by the image encoder, the rows of the KV cache past those in use (NP_GEMMA_GPU_SHARE), and the free memory; the copies of the mixed groups take blocks of it too, the warm experts of the lowest scores giving theirs). lend: the lent room (serve_qwen4 --mmproj-gpu lend) and the free memory the prompts took, until a program needs it; free: also the free memory at the first decode step; 0: the pool holds only the copies of the prompts.
+    NP_GEMMA_MOE_PROF      0                       1: the times of the phases of the CPU part of a decode step (kquants.c kq_moe_prof).
+    NP_GEMMA_GPU_MIX_SPLIT 1                       1 splits the GPU experts of a mixed group of Qwen3.8 in two group MoEs: the hot experts and the shared expert run before the wait for the copies (GP_FETCH_WAIT), the copied experts after it (the plan gives their pairs in gidx2), and an add joins the two. 0 runs one group MoE after the wait.
+    NP_GEMMA_GPU_MIX_LOG   0                       1 prints the waits, the plan, and the measures of each mixed group.
+    NP_GEMMA_GPU_FLAGS     1                       1 makes the decode step one graph: the CPU parts wait on flags in pinned memory (GP_SIGNAL, GP_AWAIT, GP_CPU_TASK). 0 gives the boundary records.
+    NP_GEMMA_GPU_FUSED     1                       1 puts the norms and the adds of the end of the attention and of the end of a layer of the 26B step in two kernels (GP_ADD_NORM, GP_FFN_OUT). 0 keeps the separate kernels.
+    NP_GEMMA_GPU_ATTN_TC   1                       1 runs the attention of a prompt pass of the 26B on the tensor cores (k_flash_qc_tc, float16 inputs, float32 sums). 0 keeps the float32 kernel.
+    NP_GEMMA_GPU_I8_MOE    1                       1 gives int8 x to the int4 dense products of a prompt pass of the 26B (k_gemm_q8), and the rest keeps float32. 0 gives float32 products. With the int16 prompt (Model.prompt_act "16", the default of the 26B) the dense products and the KQ_Q4X experts take the int16 form: x as two int8 planes (q = 128 hi + lo, k_quant_x2) and two int8 products of the tensor cores for each block, exact in int32. The 26B prompt: about 2750 tok/s in place of 3150 (int8).
+    NP_GEMMA_GPU_Q4X       1                       1 gives the experts of the 26B to the GPU in groups of 16 rows (KQ_Q4X). 0 gives the old int4 layout. It has no effect when NP_GEMMA_Q4X=0.
+    NP_GEMMA_GPU_Q4_I8     1                       1 runs the Q4_0 matrices of a decode step and of an MTP verify group of the E4B and the E2B with int8 x and dp4a (E4B.kq_q4, GP_KQ_LINEAR). A verify group of 3 tokens then costs 1.4 steps, not 1.75. The KL against float32 goes from 0.00002 to 0.0005 (MTP_PLAN.md). 0 keeps float32 x. A prompt pass keeps the int4 records.
+    NP_GEMMA_GPU_GROUP_FUSED 1                     1 gives a small group of the 26B (an MTP verify group) the fused norms of the step (GP_ADD_NORM, GP_FFN_OUT). A group of 3 tokens takes 16.6 ms, not 18.4 ms. 0 keeps the separate norms.
+    NP_GEMMA_GPU_PREFILL_FUSED 1                   1 gives a prompt pass of a dense model (the 12B) the fused layer of the step (two GP_ADD_NORM in each layer). 0 keeps the separate norms.
+    NP_GEMMA_GPU_EMBED     1                       1 makes the token rows of a prompt pass on the GPU from the Q4_0 token table (gg_embed_q4_rows), in place of Model.embed and a copy of the rows. 12B: about 40 ms less for each chunk of 2048 tokens. 0 keeps the host rows.
+    NP_GEMMA_GPU_QKV_FUSE  1                       1 runs the norms of q, k, and v and the rope in one kernel (k_qkv_norm_rope). 0 keeps k_qkv_norm and k_rope.
+    NP_GEMMA_GPU_Q4_I8_DENSE auto                  int8 x and dp4a for the dense Q4_0 matrices of a step and a small group of the 12B and the 26B. auto: on for the 12B (MTP with 3 drafts: 56.6 to 91.8 tok/s; KL 0.00012 to 0.0004), off for the 26B (KL 0.0001 to 0.0009). 1 or 0 sets it for both (MTP_PLAN.md).
+    NP_GEMMA_GPU_MT_ROWS   1                       1 runs the int4 products of a group of 1 to 4 tokens with the lanes and the order of a decode step (k_mt_int4_rows), so a group gives the bits of the steps. 0 selects the old kernel (k_mt_gemv_n), for a test.
+    NP_GEMMA_SPARSE        1                       1 samples a row from the candidates of the GPU (the k best logits, gg_topk) when they settle the result. 0 copies the whole row of logits to the host.
     NP_GEMMA_GPU_KV        int16                   The form of the cache of the 26B on the GPU. int16 keeps the int16 copy of the CPU program: about half of the float form. float keeps float32 rows.
     NP_GEMMA_PART_ATTN     heads                   heads gives each part a range of the attention heads. one runs the attention in part 0 only, the first form.
 
@@ -962,9 +1042,13 @@ The mode "int4" is the one to use. The lines below give the numbers.
 The same runtime reads the Q4_0 GGUF file of this model. Put the file on the
 local disk and set the path:
 
-    GGUF4B=~/.cache/e4b-gguf/gemma-4-E4B_q4_0-it.gguf
+    GGUF4B=models2/gemma-4-E4B-unsloth-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf
 
-The GGUF file holds Q4_0 weights, Q6_K embedding tables, and one F16 matrix.
+Use the QAT file of Unsloth (see "The Unsloth Q4_0 files of the E4B and the
+E2B"). All its tensors are Q4_0.
+
+The file of Google holds Q4_0 weights, Q6_K embedding tables, and one F16
+matrix.
 The block layout of Q4_0 is the layout that the int4 kernel of the 12B model
 already takes. Thus the mode "int4" needs no new kernel. The class `E4B` takes
 either source and selects the kernel from it. The check compares the GGUF run
@@ -1425,8 +1509,7 @@ tokens then took 3.86 s in place of 10.51 s.
 `NP_GEMMA_FLASH=1` sends a prompt of more than one token to the C flash kernel.
 That kernel walks only the keys that the mask leaves visible, and it uses the
 OpenMP pool in place of one BLAS thread. E4B measures the kernel ahead at
-every prompt length. The default for E4B is 1, and the 12B model keeps its own
-default of 0.
+every prompt length. The default is now 1 for every model.
 
     tokens   matmul    flash   ratio
         14   0.274 s  0.283 s   0.97
@@ -1561,6 +1644,226 @@ Two changes follow from the profile:
 
 The attention of this model already used the fused kernel, and it is 1.28
 times faster than the batched matmul here.
+
+#### The int4 matrices in groups of 16 rows (KQ_Q4X)
+
+Model.load_all (int4) makes a second copy of each int4 matrix in groups of 16
+rows (ops.q4x_pack_model, KQ_Q4X in csrc/kquants.c). This is the layout of
+the NVFP4 experts of Qwen3.8 (KQ_NVX), with Q4_0 codes and one float16 scale
+for each row and block. A lane of vpdpbusd is a row. The copy is in memory
+and takes the int4 bytes again (13 GB for the 26B). NP_GEMMA_Q4X=0 turns it
+off.
+
+- The prompt: the experts and the dense matrices use it with int8
+  activations. The experts of a layer with 512 tokens take 18 ms, not 67.
+- The default of the prompt activations was then int8 for every model
+  (NP_GEMMA_INT4_Q8=1, the form of llama.cpp). The 26B now takes int16
+  again, for every product of the prompt program (SPLIT_PLAN.md, "The int16
+  prompt of the 26B").
+- The decode: the records of one token and of a verify group read the copy
+  with float32 activations. The products agree with those of the old
+  kernels to 3e-6, and a verify group gives the bits of steps
+  (scripts/check_mt.py). The experts go from 16.3 to 13.8 ms for each
+  token, and the step from 56 to 51 ms.
+- The parts of a step (np_gemma/parts.py) read the rows of the copies. Their
+  copies of the experts are KQ_Q4X too, and they give the bits of one part. The
+  cold experts of the GPU steps are on the CPU with KQ_Q4X.
+- The GPU (NP_GEMMA_GPU_Q4X=1, the default): the hot experts and the
+  experts of a prompt pass use the copy too. The kernel of a step reads a
+  group of 16 rows with one warp. The prompt pass gives int8 activations to
+  the tensor cores (k_moe_gemm_q4x), also when NP_GEMMA_GPU_TC_MOE is 0. The
+  26B with 2 GB of hot experts: pp2048 429 to 444 t/s, decode 46.8 and
+  46.7 t/s. The gain is small, because the experts are not the limit on the
+  GPU. The logits agree with those of the CPU as well as those of the old
+  kernels (scripts/check_gpu_split.py passes).
+- On the GPU, the dense products of a prompt pass of the 26B also take int8
+  x (k_gemm_q8). NP_GEMMA_GPU_I8_MOE=0 turns it off. The attention stays float32, because
+  float16 has overflow in the global layers. pp2048 goes from 1010 to
+  1628 t/s.
+- A prompt of the GPU now goes in chunks of 2048 tokens. Then the copy of
+  the cold experts is hidden behind the other work of the layers, also with
+  2 GB of hot experts. The limits of a prompt pass are then the attention
+  (53%) and the dense products.
+- The attention of a prompt pass of the 26B now runs on the tensor cores
+  (k_flash_qc_tc). The kernel is k_flash_f32h for the int16 cache. It copies
+  the int16 rows and their scales with cp.async. The query heads of a key
+  head share them.
+- The queries and the keys have a norm, so float16 has no overflow. The
+  attention of a group of 2048 goes from 1325 ms to 128 ms. Its
+  result has the bits of k_flash_tc<0> (a prompt of 8192 tokens).
+- Then the copy of the cold experts is the limit again: FETCH_WAIT takes
+  38% of a group. Chunks of 4096 do not fit with the default hot experts.
+
+The 26B on the GPU, default hot experts:
+
+    prompt       float32 attention   tensor cores
+    4096         1312 t/s            1943 t/s
+    8192         1022 t/s            1929 t/s
+
+#### The decode of the 26B on the GPU
+
+An nsys trace of the decode (600 tokens of context, default hot experts)
+gave these changes:
+
+- The hot experts (k_hot_gu, k_hot_dn) had one warp for each KQ_Q4X group
+  of 16 rows. Half of the blocks of the grid had no group. Now a block
+  of 8 warps takes one group, and each warp takes one eighth of the
+  columns. The gate and up rows go from 70 to 42 us for each layer, and the
+  down rows from 31 to 23 us. The step goes from 15.4 to 14.2 ms.
+- The attention of a step used k_attn_part, which has three phases and
+  keeps the scores in memory. The new kernel k_attn_fdt is k_attn_fd (one
+  pass) for the shapes of the 26B. These are head_dim 256 with 2 query heads for each key
+  head, and 512 with 8. The
+  attention of a step goes from 1.2 to 0.67 ms at 600 tokens. At 8192
+  tokens the step goes from 16.4 to 14.7 ms.
+
+The step is then about 14 ms. The GPU works about 11 ms of it. The rest is
+waits:
+
+    the GPU waits for the cold experts of the CPU    about 1.3 ms
+    the launch of the segment after each join        about 0.9 ms
+    between the steps (the head, the logits)         about 1.5 ms
+
+About 2 of the 8 experts of a layer are cold. The CPU takes about 60 us for
+one (3.35 MB at the rate of the memory). The dense matrices read 926 MB for
+each token at 81% of the rate of the GPU memory.
+
+#### The step as one graph, and the fused norms
+
+The step handed the experts of the CPU over with boundary records
+(GP_TO_HOST, GP_CPU_JOIN, GP_TO_DEV). The host ran them between the graphs
+of the step, so it launched a graph after each join. Now the step uses
+flags in pinned memory, and it is one graph:
+
+- GP_SIGNAL: a kernel writes the input of the CPU part to pinned memory.
+  Then it writes the value of the run (the slot seq) to the flag in.
+- GP_CPU_TASK: no kernel. After the launch, the host waits for the flag in,
+  runs the CPU program, and writes the flag out.
+- GP_AWAIT: a kernel waits for the flag out, then copies the output of the
+  CPU part (loads with no cache). Its last operand is the count of the cold
+  experts. With 0, it writes zeros and does not wait.
+
+A copy node of a graph costs more than a kernel, so the kernels copy the
+data. NP_GEMMA_GPU_FLAGS=0 gives the boundary records.
+
+The step of the GPU uses the fused forms of layer_form. The norms and the
+add of the end of the attention go in GP_ADD_NORM. The norms, the adds, and
+the scale of the end of the layer go in GP_FFN_OUT.
+
+GP_FFN_OUT also gives the input norm of the next layer. A layer then has 2 norm kernels, not about 10. The
+CPU keeps the separate records. NP_GEMMA_GPU_FUSED=0 turns it off.
+
+With a fixed set of hot experts, the logits of the four forms have the
+same bits. The default set depends on the free memory of the GPU, so two
+runs can differ. The 26B, 7 GB of hot experts, 600 tokens of context:
+
+    form                        forward   step with the head
+    boundary records            12.10 ms  14.78 ms
+    flags                       11.72 ms  14.44 ms
+    fused norms                 11.00 ms  13.58 ms
+    flags and fused norms       10.76 ms  13.32 ms
+
+The barrier of the parts of a CPU step (np_gemma/parts.py, GP_XBAR) now
+uses flags too. Each part has a flag on a cache line of its own, and it
+stores the count of its barriers there. It then waits until the flags of
+the other parts have that count. Before, all the parts added to one shared
+count.
+
+A step of 2 parts crosses 150 barriers. On jackal (one NUMA node) it
+goes from 42.0 ms to 40.8 ms. The bits stay the same (scripts/check_parts.py).
+gemma_xbar_stats gives the time that each part waits.
+
+The runner still waits for the GPU work before each CPU part (about 200 us
+for each layer). The CPU part (about 137 us, about 2 cold experts) is longer
+than the GPU work that runs with it.
+
+#### The mixed groups of a prompt on the GPU
+
+Each group of a prompt copied all the cold experts of each layer to the GPU.
+The fast attention made that copy the limit. A mixed group
+(SplitCompiler.moe_group_mix) copies only some cold experts. The CPU computes
+the other cold experts during the GPU experts:
+
+1. Before a group, ModelGPU.plan_mix selects the cold experts to copy for
+   each layer: the ones that the routers of the group before selected most.
+   The first group uses the file of counts. The copies go on two layers
+   ahead, as before.
+2. GP_HOT_SPLIT_MT gives the pairs of the experts that are not on the GPU
+   to the CPU. GP_MOE_GPU gets -1 for them. The CPU computes its
+   pairs with the KQ_Q4X experts and int8 activations, as the prompt of the
+   CPU does. It uses a helper thread (GP_CPU_START). It starts before the wait
+   for the copies, and it quantizes only the rows with a CPU pair.
+3. The count for each layer comes from a model of the time of a layer:
+
+       max(copies, other work + max(GPU experts, CPU part))
+
+   The CPU part costs a fixed time, a time for each expert (the read of its
+   weights), and a time for each pair. Where the model is flat, the plan
+   takes the most copies, as a margin.
+4. Each mixed group measures the model again (ModelGPU.calibrate_mix). The
+   copy thread times its copies. Events on the stream time the waits for
+   the copies and for the CPU part, and the work between them. The helper
+   thread times the CPU part. A least-squares fit gives the three costs of
+   the CPU part. Thus the plan follows the machine and other load on the CPU.
+
+The plan of the Qwen models (after the router of each layer) does not suit
+the 26B. A group of 2048 tokens uses 47 of the 53 cold experts of a layer.
+Also, that plan cannot copy during the other work of the layer. A simulation gave 7%
+for it and 20% for this form.
+
+The 26B, default hot experts, README text. Each prompt came after another
+text, so the plan of its first group comes from that text:
+
+    prompt       all copied    mixed, fixed model   mixed, calibrated
+    1024         811 t/s       1645 t/s             1810 t/s
+    2048         1550 t/s      1949 t/s             2219 t/s
+    8192         1578 t/s      1917 t/s             2138 t/s
+
+The calibrated plan copies about 14 of the 53 cold experts of a layer. The
+best fixed count was 15. With 2 GB of hot experts it copies about 37 of 108.
+Then pp8192 goes from 1164 to 1784 t/s (the best fixed count, 40, gave 1762).
+
+With six other busy processes on the CPU, it copies about 17. On the chat
+text in groups of 512, the KL to float32 stays at 0.0022 to 0.0024. The CPU
+part uses the CPU during a prompt, so other load on the CPU slows it.
+
+The table gives the effect of the int8 activations on the 26B. The text is a
+chat prompt and the answer of the model (1488 tokens):
+
+    form                             ppl     KL       top token   prompt
+    float32 (CPU)                    1.714   -        -           46 t/s
+    CPU, int16 (INT4_Q8=16)          1.713   0.0000   99.9%       67 t/s
+    CPU, int8 (default)              1.726   0.0026   98.0%       186 t/s
+    GPU, float32 experts             1.713   0.0003   99.7%       518 t/s
+    GPU, int8 experts (KQ_Q4X)       1.716   0.0012   99.5%       771 t/s
+    GPU, int8 experts and dense      1.724   0.0020   98.9%       1214 t/s
+    GPU, and float16 attention       1.723   0.0024   98.5%       1404 t/s
+
+KL is the mean KL(float32 || form) over the 64 most probable tokens. On the
+text of this README (a prompt with no chat turns), the model is not sure of
+many tokens: 41% of the top tokens have a probability less than 0.3. There
+the int8 forms agree for only 83% of the top tokens, but the perplexity does
+not change (261.5 and 261.8; llama-perplexity gives 261.2). Where the top
+token has a probability more than 0.7, int8 agrees for all tokens. No one
+product causes the difference: int8 in the input of any one product type
+gives about 88%.
+
+Thus measure agreement on text of the kind that the model reads in use.
+
+The 26B on the CPU (llama-bench method, 18 threads; llama.cpp
+in the same session):
+
+    runtime                         pp512       tg128
+    numpy-gemma before KQ_Q4X       71 t/s      16.5 t/s
+    numpy-gemma                     166 t/s     19.2 t/s
+    numpy-gemma, NP_GEMMA_FLASH=1   231 t/s     19.1 t/s
+    llama.cpp                       105 t/s     19.6 t/s
+
+The attention of the prompt was then the largest part. The flash kernel
+(NP_GEMMA_FLASH=1) is now the default. It takes 0.8 s of a prompt of 512
+tokens, and the batched matmul 1.5 s. A prompt of 16384 tokens: 105 t/s
+with the flash kernel, 51 t/s with the batched matmul, 74 t/s for
+llama.cpp.
 
 #### Two ideas that the measurement does not support
 
@@ -1797,7 +2100,7 @@ one GGUF file of this runtime (132 GB). The experts stay NVFP4 in groups of 16
 rows, one layout for the CPU and the GPU. QWEN38_PLAN.md has the plan and the
 history. HANDOFF_QWEN38.md has the state, the profiles, and the next steps.
 
-The speed (2026-09-28). The method is that of llama-bench: random tokens,
+The speed. The method is that of llama-bench: random tokens,
 one warm-up, 3 reps (`scripts/bench_qwen4.py`). The machine has a Xeon
 W-2295 (18 cores, 66 GB/s) and 188 GB of RAM. Its RTX 5060 Ti has about 8 GB
 free, on PCIe Gen3 x8. Other programs ran on the machine.
@@ -1859,6 +2162,1053 @@ It gives the <think> part as the reasoning. It gives the tool calls of the
 model as the tool_calls of the API:
 
     python scripts/serve_qwen4.py --ctx 98304 --port 8081     # http://127.0.0.1:8081/v1
+
+A request sets the think part with "reasoning_effort" (none, low, medium,
+high) or "thinking"; --thinking gives the default (medium). The usage of a
+response gives the prompt tokens that the cache held
+(prompt_tokens_details.cached_tokens).
+
+The security of the servers (serve.py and serve_qwen4.py):
+
+- Each request needs the API key: "Authorization: Bearer KEY" or the
+  header x-api-key. The key comes from --api-key, else NP_GEMMA_API_KEY,
+  else "change-me" (set your own). --api-key "" turns the check off. /health needs no
+  key.
+- The server sends CORS headers only for --cors-origin. Without it, a web
+  page cannot call the server from a browser.
+- A body above --max-body-mb (64 MB) gets 413, and a negative
+  Content-Length gets 400. The server does not read such a body.
+- The raw answers (last-answer.txt, empty-*.txt) go to files only with
+  --debug DIR, in DIR, readable by the owner only.
+- max_tokens below 1 gets 400. serve_qwen4.py raises a request of 8192
+  tokens or more (--max-tokens-floor-min) to --max-tokens-floor (32768).
+  A smaller request (a title, a summary) keeps its limit. The headers
+  X-Max-Tokens-Applied and X-Max-Tokens-Requested give a change.
+- A stream parses a long answer again only every 1 + n / 2000 tokens. A
+  parse of 30000 tokens takes 33 ms, and it holds the GIL that the model
+  thread needs.
+- In serve_qwen4.py, a CUDA error that leaves the GPU unusable ends the
+  process with exit 70. Then scripts/serve_forever.sh starts the server
+  again (after any exit that is not 0).
+
+The option --mtp N gives N drafts of the MTP layer for each
+round of Qwen3.8 on the GPU. The prompt also fills the cache of the MTP
+layer. A draft stays only when the sample of its row picks it, so the text
+has the distribution of the settings. With the hot experts fixed, a greedy
+answer of 106 tokens is the same with and without --mtp 3:
+
+    setting                       plain        --mtp 3
+    greedy, thinking off          21.9 tok/s   27.8 tok/s (68% of drafts)
+    temperature 0.7               -            19.5 tok/s (40% of drafts)
+
+### The methods of the 26B on the Qwen models
+
+The changes to the 26B on the GPU in this round, and the Qwen models:
+
+    method                         26B    Qwen3.6          Qwen3.8
+    the step as one graph (flags)  yes    yes (new)        yes (new)
+    skip when no expert is cold    yes    yes (new)        yes (new)
+    mixed groups of a prompt       yes    yes (new)        yes (before)
+    groups of 2048 rows            yes    yes (new)        yes (new)
+    the plan tuned                 yes    new default      as before
+    one-pass decode attention      new    as before (fd)   QSA
+    prompt attention, tensor cores new    as before        QSA
+    int8 dense products (prompt)   new    as before        as before
+    fused norms of a step          new    GP_ADD_RMS       GP_ADD_RMS
+    hot experts, a block a group   new    (rows)           no (see below)
+
+- The flag form is in QwenGPU._moe_split, so the steps and the small
+  groups (the MTP verify group) of both models use it. The verify of an
+  MTP round of Qwen3.8 went from 103 to 84 ms. A verify group still gives
+  the bits of steps.
+- The mixed groups moved from Qwen4GPU to QwenGPU. Qwen3.6 went from 547 to
+  960 tok/s at pp2048 (groups of 1024 rows copied all the cold experts).
+  Groups of 2048 rows: Qwen3.8 pp8192 from 402 to 491 tok/s, Qwen3.6 from
+  754 to 932.
+- The costs of the plan (GP_MOE_PLAN) now come from desc when the host
+  sets them. A fit of the measured costs gave a worse plan: the copies come
+  from pageable memory, so they use the CPU too. A search on the sum of the
+  waits found the best cost of a copy for Qwen3.6 (about twice the default).
+  It made Qwen3.8 slower.
+- The default of the K quants now has that ratio: Qwen3.6 pp8192 1019 to
+  1032 tok/s, pp2048 1010 to 1073. NP_GEMMA_GPU_MIX_CAL=1 turns the search
+  on.
+- The hot experts of Qwen3.8 (KQ_NVX) keep one warp for each group. A block
+  for each group (as for the 26B) did not change the decode. At 1 GB of hot
+  experts, the cold experts on the CPU limit it. The block also changed the
+  order of the sums. Then an expert on the GPU did not give the bits of the
+  CPU, and the tokens changed with the set of hot experts.
+- The runner records all the graphs of a program before it launches one
+  (gg_exec). The first use of a kernel can make the driver wait for the
+  GPU. A graph on the GPU can wait for a task of the CPU, and the host runs
+  the tasks after the launches. Thus a record after a launch can wait for
+  a task that waits for the record.
+
+### Images on Qwen3.6 and Qwen3.8
+
+Qwen3.6-35B-A3B and Qwen3.8-Flash-Next have the same image encoder, the
+Qwen3-VL ViT. It has 27 layers of 1152, 16 heads of 72, patches of 16, a
+merge of 2 x 2, and no deepstack layers. Only the output width is different
+(2048 and 2560). The file np_gemma/vision_qwen.py reads the mmproj GGUF of
+Qwen3.6. For Qwen3.8 it reads the tensors model.visual.* of the checkpoint
+(BF16 in the NVFP4 files too). The graph follows transformers
+(qwen3_5_moe and qwen4_exp; the two vision graphs are the same):
+
+- The image: bicubic to sides that are multiples of 32 (smart_resize), and
+  values 2 (x / 255) - 1. The patches go in the order of the 2 x 2 blocks.
+- The patch linear: the Conv3d of two equal frames is the sum of its two
+  kernels. Then the 48 x 48 position table, bilinear with align corners.
+- Each layer: LayerNorm, q k v with bias, the 2D RoPE (theta 1e4),
+  attention with scale 1 / sqrt(72), LayerNorm, and the FFN with gelu tanh.
+- The merger: LayerNorm, the 4 rows of a block as one row of 4608, and two
+  linears with gelu (erf) between them.
+
+The encoder is a program with two new records: ENC_LNORM (LayerNorm with
+bias) and ENC_GELU (the tanh or the erf form). ENC_ROPE2D of gemma4v serves
+the RoPE. For it, the rows of q and k of each head get the order of that
+record (quarters 0, 2, 1, 3). The scores do not change, because q and k
+get the same order.
+
+The text side:
+
+- The template writes <|vision_start|><|image_pad|><|vision_end|>. Then
+  media.expand_qwen makes one <|image_pad|> for each row of the image.
+  The rows take the place of the embeddings. The tokens of an image are
+  causal.
+- M-RoPE (media.mrope_positions): a token of an image has the positions
+  (p, p + row, p + column). The text after the image continues at p +
+  max(rows, columns), not at the index of the row. QwenCache.set_rope keeps
+  the positions of each row of the cache, and the rows after the prompt
+  continue from the largest one + 1. Qwen.rope takes positions (3, t), with
+  sections [11, 11, 10]. A frequency pair j takes the row if j % 3 == 1,
+  the column if j % 3 == 2, else the time. A prompt of text only keeps the
+  old path: the same bits as before.
+- Qwen3.8, QSA: the indexer gives each block of 4 keys the RoPE of its
+  first row. After an image, that row has an M-RoPE position. Thus the
+  record QSA_SELECT takes the positions of the rows (operand 22). They are
+  (rows, 3) int32, or 0 for text only, on the CPU and on the GPU.
+
+The checks:
+
+    scripts/check_mm_qwen.py (against transformers)
+      Qwen3.6 weights (334 tensors)        equal to the GGUF
+      Qwen3.6 image rows, CPU program      mean 1e-5, max 1e-4
+      Qwen3.6 image rows, GPU program      mean 2.3e-3 (x in float16 on the tensor cores)
+      Qwen3.8 image rows, CPU / GPU        mean 1e-5 / 3.1e-3
+      M-RoPE positions (get_rope_index)    equal; cos and sin 4.4e-7
+    scripts/check_qwen_mm_prompt.py (CPU program against GPU, test-1.jpeg)
+      Qwen3.6                              KL 0.009, same top token
+      Qwen3.8                              KL 0.0006, same top token
+    QSA block keys after an image (2624 tokens)
+      CPU and GPU against the keys of transformers    3e-7
+      the same without the positions                   549 of 549 blocks wrong
+
+Both models read the front page (the headline, the date) and give the year
+to a second question after the answer. Q8_0 weights in this encoder give
+rows with 4% to 9% error (mean), so the Qwen encoder keeps BF16.
+
+                                  CPU program   GPU program
+    encoder, 936 patches          1.6 s         0.16 s
+    Qwen3.6 prompt, 259 tokens    3.1 s         1.1 s
+    Qwen3.8 prompt, 259 tokens    58 s          4.9 s
+
+The server scripts/serve_qwen4.py loads Qwen3.6 or Qwen3.8, as the
+architecture of the GGUF says. The option --mmproj gives the encoder: the
+mmproj GGUF of Qwen3.6, or models/Qwen3.8-Flash-Next-NVFP4. The options
+--image-budget (1024 tokens) and --media-dir are as in serve.py. The encoder runs on the thread of the
+model. The cache compares the keys of the tokens, so another image of the
+same size is not a hit. On Qwen3.6 an image and a question take 2.2 s,
+then the answer comes at about 31 tok/s.
+
+The cache of a chat. The DeltaNet state cannot go back, so
+the server reuses the cache only from its end or from a snapshot. Before,
+it kept one snapshot, at the end of the last prompt. But the template of
+the next turn writes the earlier answer in another form than the model
+wrote it:
+
+- Qwen3.6 drops the think part of the earlier answers. It keeps them only
+  with preserve_thinking, or after the last user message (a tool loop).
+- Qwen3.8 keeps them by default (preserve_thinking undefined is true), but
+  only with the reasoning_content that the client sends back.
+
+Thus each follow-up read the whole chat again. Now the server keeps the
+last 4 snapshots. One of them is after the last <|im_start|>assistant\n of
+each prompt. A prompt uses the longest one that fits. The option
+chat_template_kwargs.preserve_thinking goes to the template. A chat with an
+image and three follow-ups (the new tokens against the prompt):
+
+                                 Qwen3.6                  Qwen3.8
+    thinking off                 cached 325/349, 345/373  370/391, 401/419
+    thinking on                  cached 325/376, 374/409  351/421, 419/458
+    thinking on, reasoning back  cached 325/376, 374/409  462/481, 550/566
+
+A follow-up with thinking off now takes 0.4 to 1.1 s on Qwen3.6.
+
+Video on Qwen3.6 and Qwen3.8. The processor of transformers
+(Qwen3VLVideoProcessor, Qwen3VLProcessor) does this:
+
+- Frames: 2 for each second, at least 4 and at most 768 (np.linspace over
+  the frames, rounded). An odd count gets the last frame again.
+- Size: smart_resize over all the frames. With cap_pixels_per_frame (the
+  reference of qwen-vl-utils; the default of transformers from v5.22), a
+  frame has at most max_video_tokens tokens.
+- Pairs: two frames make one temporal patch. The Conv3d then sees two
+  different frames, so the patch linear of video has the two kernels
+  (1536 values), not their sum. The patches of a pair see only each other.
+- Text: the <|video_pad|> of the template becomes <T seconds><|vision_start|>
+  pads <|vision_end|> for each pair. T is the mean time of its two frames.
+  M-RoPE treats each pair as an image.
+
+np_gemma/vision_qwen.py follows it. video_frames decodes only the sampled
+frames (PyAV), and encode_video runs the program of a pair for each pair.
+The server takes video and video_url parts. The option --video-budget
+gives the most tokens of a pair (128), and --video-frames the most frames
+(32). The script check_mm_qwen.py --video compares with transformers. The
+clip has 9 s: 18 frames, 9 pairs of 9 x 13 tokens.
+
+                                  Qwen3.6               Qwen3.8
+    frame indices, grid, pixels   equal                 equal
+    rows, CPU / GPU program       mean 1e-5 / 1.8e-3    mean 1e-5
+    prompt ids, M-RoPE positions  equal                 equal
+    encoder, GPU / CPU            0.6 to 0.9 s / 7 s    - / 6.7 s
+
+The answers place each slide at its time (1 s, 4 s, 7 s). The last slide
+starts at 6 s, and the answers say so.
+
+Qwen3.8 fills the GPU: 5.3 GB of weights and 3 hot experts in each layer,
+3.7 GB of cache at 98K, and about 4 GB of programs and copies. The desktop
+takes 3.3 GB of it too. Thus the tests of video found three faults of
+the GPU memory of the Qwen servers, and a client found a fourth. They were there for text too; prompts of
+many sizes and media only made them come sooner:
+
+1. The buffer of the copies of the mixed groups (mix_ring) takes all the
+   free memory but MIX_KEEP. A program of a new size then had only that.
+   Now a new program frees the buffer first (QwenGPU.free_ring), and the
+   next mixed group makes it again with what is left.
+2. Each size of group kept its program for good. When a program does not
+   fit, the programs used least recently now go (_evict, with the device
+   copies that only they use). Before a buffer of the copies with less
+   than MIX_RING_MIN experts, programs go as well.
+3. A cudaMalloc that failed and that the code handled left its error in
+   the runtime. The next run then reported "cudaGetLastError(): out of
+   memory" with 1.7 GB free. gg_clear_error now clears it. Also, a new
+   program records and uploads its CUDA graphs when it is made
+   (gg_prepare), not at its first run.
+
+4. The scratch of QSA_SELECT (Qwen3.8) had nbmax keys for each query, with
+   nbmax from the size of the context. At 98K a mixed group of 2048 rows
+   took 403 MB, in each program, when bind() ran. A turn of 8500 tokens of
+   a client with 27 tools then failed. Now nbmax follows the rows of the
+   run ((pos + t) / 4 + 1), and one buffer serves all the programs
+   (QwenGPU._alloc makes room for it).
+
+The GPU classes of the Gemma models (ModelGPU of the 12B and the 26B,
+E4BGPU) had fault 2 too. A 12B server with MTP failed at a prompt of 21674
+tokens of an agent harness ("cudaMalloc of 16777216 bytes failed"). It
+held a program for each size of group and then had 11.8 GB of the GPU.
+Now they use gpu.ProgramLRU. When a new program, a larger cache, or the
+program of the drafter does not fit, the group programs used least
+recently go. A new program also records its graphs when it is made.
+
+In a test, a dummy buffer left 4 GB of the GPU free. Six prompts of 173 to
+4123 tokens with MTP then evicted programs and made them again. Their
+tokens were the same as those of a run with all the memory.
+
+After the fixes, 3 rounds of the tests (long text, video, video and image,
+chats; 60 requests) pass at 98K on both models. Before, a prompt of 1800
+tokens failed on Qwen3.8 at 98K with no media at all. By default
+(--mmproj-gpu auto) the encoder of Qwen3.8 stays on the CPU. Its 1.3 GB on
+the GPU have no room next to the programs of the model. The encoder of
+Qwen3.6 stays on the GPU. The server encodes a small image at the start,
+so its weights are there before the buffers of the model.
+
+--mmproj-gpu reserve puts the encoder of Qwen3.8 on the GPU in
+memory reserved before the model sizes its hot experts
+(QwenEmbedder.reserve_gpu): the weights and the program of an image of
+max(--image-budget, 1120) tokens, 1.58 GB. A smaller image has a smaller
+program, and a buffer then holds the rest of the room between media
+requests, so the programs and the buffer of the copies of the model cannot
+take it. A request gets at most that many tokens. On the 3090 at 98K: 60 hot
+experts in each layer in place of 72, the 8K prompt 688 tok/s (675 without),
+an image on the GPU in 0.2 to 0.3 s (2.2 s at 1120 tokens; the CPU 2.2 s at
+any size), with the buffer of the copies and the MTP layer left in place.
+Also: a GPU encoder program of a new size used to keep the buffers of the
+old sizes (in the mirror of all sizes) until release; _Runner now frees
+them, and frees the old program before the new one takes its memory.
+
+### Images, video, and audio on the E4B and the 26B
+
+The E2B, the E4B, and the 26B have real encoders (gemma4v; gemma4a on the
+E2B and the E4B). The file np_gemma/gemma4_encoders.py reads them from the
+mmproj GGUF and follows transformers:
+
+- Vision: patches of 16 x 16, and a 2D RoPE of theta 100 in each layer.
+  The E4B has 16 layers of 768 and the 26B 27 of 1152. The attention of
+  all patches runs on the C flash kernel. Then the average of each 3 x 3
+  block, and the std_bias and std_scale of the 26B.
+- Audio: the mel, two convs of stride 2, and 12 Conformer layers (local
+  attention of 12 keys with relative positions, the conv module).
+- The linears of the E4B clamp their input and output (use_clipped_linears).
+
+The 26B has no audio encoder (audio_config is None); it takes images and
+video. The E4B text side gives a soft token the per-layer row of the pad
+token (id 0), as transformers does. The E4B is causal; on the 26B the
+tokens of an image see each other.
+
+The checks against transformers (scripts/check_mm_gemma4.py, the
+unquantized QAT safetensors):
+
+    E4B weights (931 tensors)          equal to the GGUF (the converter changes undone)
+    E4B image rows                     1.8e-4 and 4.6e-6 (relative)
+    E4B mel, audio rows                exact, 4.4e-6
+    26B weights (356), image rows      equal; 7.3e-5 and 3.6e-5
+    E4B end to end, int4 on the GPU    image KL 0.007 (38/40), audio 0.0020
+                                       (48/48), text alone 0.020
+
+The 26B vision tensors come from the shard of 50 GB by range requests
+(1.15 GB). A full reference of the 26B is too large, so llama.cpp
+(llama-mtmd-cli, the same GGUF files) is the reference there. The thought of
+both on the test image gives the same headline and date and the same first
+draft sentence.
+
+Three faults of the tools came out:
+
+1. The mmproj of unsloth for the 26B comes from the model before QAT: its
+   vision weights differ by up to 45%. Use the mmproj of
+   google/gemma-4-26B-A4B-it-qat-q4_0-gguf with the QAT GGUF.
+2. With eager attention, transformers hides the keys that an audio query
+   sees. The mask is additive there, and the audio attention masks where
+   attention_mask.logical_not() is True. The references use sdpa.
+3. The C flash kernel (cops.attn_prefill) gives nonsense for a head of 72
+   values (the 26B vision). The encoder pads the head to 80 with zeros.
+
+The encoders are programs (np_gemma/program.py), as the steps of the text
+models are. The records ENC_* run in C on the CPU, in one OpenMP region
+where the rows split over the threads. When the model is on the GPU, they
+run as one CUDA graph there.
+
+NP_GEMMA_MEDIA_GPU=0 keeps them on the CPU, and
+NP_GEMMA_ENC_PY=1 runs the NumPy layers (the reference). A program has the
+size of its input: the patches of an image, or the rows of a clip. The last
+four sizes stay compiled, and the GPU programs share one copy of the
+weights. The records:
+
+- ENC_LINEAR: x times a bfloat16 or float32 W, for any sizes (the 26B FFN
+  has 4304). It applies the clamps of a clippable linear and a bias. The
+  float32 matrices of the mmproj are upcasts of bfloat16, so they become
+  bfloat16 with no loss.
+- ENC_RMS, ENC_ADD (with a scale), ENC_GELU_MUL, ENC_SILU, ENC_MUL_VEC,
+  ENC_GLU: rows and values.
+- ENC_ROPE2D: the axial 2D RoPE of gemma4v, in place.
+- ENC_ATTN: the attention of all patches. On the CPU it calls the flash
+  kernel of the prompt in the region of the program
+  (gemma_attn_prefill_region). The tasks of the AVX-512 and AVX2 versions
+  are now functions of their own. On the GPU a warp takes a query and a
+  head, with tiles of 32 keys.
+- ENC_DWCONV and ENC_LOCAL_ATTN: the causal depthwise conv and the local
+  attention of gemma4a (12 keys, the relative position term, the soft cap).
+
+The mel and the subsample convs of the audio stay on the host (the front
+end, about 70 ms).
+
+The script check_mm_gemma4.py compares with transformers, with and without
+--gpu. The E4B image rows agree to 1.7e-4 and 7.1e-6 (GPU 2.9e-4 and
+4.9e-6), and the audio rows to 2.9e-6 (GPU 2.8e-6). The 26B image rows
+agree to 3.4e-5 and 3.7e-5 (GPU 4.0e-5 and 3.9e-5). The script check_mm_prompt of
+the E4B gives image KL 0.007 and audio 0.0020, as before. The checks
+check_flash_c and check_program pass after the change of the flash kernel.
+
+On the CPU the linears read W in groups of 16 rows (KQ_BF16X16 and
+kq_x16f_body, now with an AVX2 core too). Each column is one fma for each
+of 16 tokens (6 on AVX2). The products of an image take half the time or
+less: E4B 1736 to 836 ms, 26B 5294 to 1961 ms (AVX-512, 18 threads), and
+5684 to 2935 ms (AVX2, 6 threads). NP_GEMMA_ENC_X16=0 keeps the rows.
+
+On the GPU the linears with bfloat16 W run on the tensor cores. The kernel
+k_enc_gemm_tc is k_gemm_bh for any cols of 8k values; x becomes float16
+with the input clamps. The rows then differ from transformers by a few
+percent at most (mean 1.7e-3 on the E4B, 5.2e-3 on the 26B). The logits of
+the E4B do not change: image KL 0.0064 (39/40), against 0.0070 (38/40) with
+the float32 kernel. NP_GEMMA_GPU_ENC_TC=0 keeps the float32 kernel.
+
+                               NumPy      CPU program   GPU program
+    E4B image (280 tokens)     3.9 s      2.7 s         0.35 s
+    E4B clip of 17 s           2.6 s      0.74 s        0.14 s
+    26B image (280 tokens)     11.7 s     6 to 8 s      0.92 s
+
+The 26B on the server: an image and a question take 4.3 s. The 9 s video
+takes 12.1 s (192 s with the CPU encoder), and a new question on it 0.7 s.
+
+### 8-bit weights in the encoders
+
+Gemma4Embedder(q8=True) gives each linear of the encoders with cols of 32k
+values Q8_0 weights (cops.kq_to_q8_0). The only exception is the 26B FFN
+down matrix (4304 cols), which keeps bfloat16. On the CPU the weights are
+in groups of 16 rows (KQ_Q8X16). An encoder linear then takes the int8
+records of the GGUF products: ENC_CLAMP (the input clamps), KQ_QUANT and
+KQ_LINEAR, and ENC_BIAS_CLAMP (the bias and the output clamps). The server
+takes --mmproj-q8 (auto: on for the E2B and E4B).
+
+KQ_Q8X16 now also has an AVX2 kernel (the i5). It multiplies |x| by w with
+the sign of x (vpmaddubsw, then vpmaddwd), so no int16 sum saturates.
+Before it, the AVX2 path of Q8_0 took 98.7 s for an image.
+
+Two faults came out:
+
+1. The kernels k_enc_* did not start with PDL_START. In a CUDA graph a
+   kernel can start before the kernel before it ends, and must wait with
+   griddepcontrol.wait. Thus ENC_BIAS_CLAMP read the rows of KQ_LINEAR
+   before they were all written.
+2. The widened guard of KQ_Q8X16 also took kq_tiles, which exists only
+   with VNNI. The AVX2 library then did not load.
+
+The E4B with Q8_0 encoders (check_mm_prompt, int4 on the GPU):
+
+                                 bfloat16          Q8_0
+    image KL (top token)         0.0064 (39/40)    0.0063 (38/40), CPU encoder 0.0073
+    audio KL                     0.0020 (48/48)    0.0020 (48/48), CPU encoder 0.0020
+    the weights of the linears   912 MB            485 MB
+    image, CPU (AVX-512, 18)     1.58 s            1.33 s
+    image, CPU (AVX2, 6)         6.27 s            5.76 s
+    image, GPU                   0.37 s            0.43 s
+    audio, CPU (AVX-512, 18)     0.50 s            0.32 s
+
+The rows of Q8_0 differ from transformers by 1% to 4% (mean), the CPU more
+than the GPU. The answers do not change.
+
+### Video on the Gemma 4 12B
+
+The 12B has no video encoder. A video is a series of frames. Each frame is
+an image with a budget of 70 soft tokens, as in the video processor of
+transformers:
+
+- 32 frames: the indices 0, N/32, 2N/32, and so on of the N frames,
+  truncated to integers (np_gemma/unified.py frame_indices).
+- Before each frame, its time as mm:ss and a space. Then <|image>, a
+  <|video|> (id 258884) for each soft token, and <image|>. A space joins
+  two frames (media.video_text). The time is the frame index over the
+  frames per second.
+- The tokens of one frame see each other. The time text between two frames
+  ends the block, so a frame does not see a later frame.
+- The video has no audio track in the model. Send the sound as an audio
+  part.
+
+PyAV (the package av 19.0, with its own FFmpeg) decodes the video. It is in
+the venv now. The library transformers decodes a video path only with
+torchcodec. Thus the reference (scripts/hf_mm_reference.py --video) decodes
+it with the PyAV reader of transformers and gives the frames to the
+processor.
+
+The test clip is 9 s (216 frames at 24 frames per second): three images of
+llama.cpp, 3 s each. The command is in scripts/check_mm_prompt.py. On it:
+
+    the prompt ids of the server (the chat template, the times, the frames)
+        the same as transformers: 2325 ids, 32 frames of 63 tokens
+    float32 (the same weights), the soft rows of the reference   KL 0.00000, 44/44
+    int4 on the GPU, our soft rows                                KL 0.0178, 41/44
+    the prompt pass on the GPU                                    1.82 s
+    the server: the video and a question, 94 tokens out           7.0 s
+    the same video, a new question                                0.3 s
+
+The server takes video_url (or video): a data URI, or a path under
+--media-dir. The options --video-frames and --video-budget change the 32
+frames and the 70 tokens of a frame.
+
+A cut of the cache after a turn often found the rows of a window gone. The
+MTP drafter reads two layers on the host, and those layers drop rows at
+each step. Then the Session read the whole history again: 5 s for each
+question on the same video.
+
+Now a layer with a window keeps KV_KEEP more
+rows when it drops rows (NP_GEMMA_KV_KEEP, 1024 by default). A cut back of
+up to KV_KEEP tokens is then always possible. The script check_gpu_session
+(the 26B) now reuses the cache for the cut of 1300 too, with the same bits.
+The script check_mtp gives the ids of the plain decode.
+
+### Images and audio on the Gemma 4 12B
+
+The 12B (the "unified" model) has no image encoder and no audio encoder,
+as MULTIMODAL_PLAN.md tells. The file np_gemma/unified.py reads the mmproj
+GGUF of google:
+
+- An image becomes patches of 48 x 48 pixels (70 to 1120 of them, 280 by
+  default). Each patch goes through LayerNorm, a linear, LayerNorm, the
+  rows of two position tables, LayerNorm, an RMS norm, and a projection.
+- Audio at 16 kHz becomes frames of 640 samples (40 ms). Each frame goes
+  through an RMS norm and a projection.
+
+The GGUF keeps the 6912 values of a patch in the order channel, row,
+column. transformers uses row, column, channel.
+
+np_gemma/media.py puts the soft tokens of each placeholder into the prompt
+ids (<|image> + n x <|image|> + <image|>). Model.prefill(media=spans) puts
+the soft rows in place of the token rows. The tokens of one image see each
+other in every layer. The text of the mask function of transformers says
+that the global layers stay causal. But generate() and forward() of transformers
+both give the logits of the mask in every layer, as llama.cpp does.
+NP_GEMMA_BIDIR_ALL=0 keeps the global layers causal.
+
+The checks (scripts/check_mm_unified.py, scripts/check_mm_prompt.py, and
+the references of scripts/hf_mm_reference.py):
+
+    soft rows of the same pixels           7.7e-5 (relative)
+    image, float32 (the same weights)      KL 0.00000, 40/40 top tokens
+    audio, float32                         KL 0.00000, 48/48
+    image, int4 GGUF, our soft rows        KL 0.013, 40/40 (int4 on text: 0.014)
+    the same, the Unsloth 12B file         KL 0.00055, 40/40
+    audio, int4 GGUF, our soft rows        KL 0.0014, 47/48
+    image with no mask                     KL 0.77, 29/41
+
+The server takes --mmproj, --image-budget, and --media-dir. A request sends
+image_url (a data URI, or a path under --media-dir; detail low gives 70
+tokens, high 1120) and input_audio (base64). The server fetches nothing
+from the network. A session matches the soft tokens only of the same media
+(Session.common). Thus a chat that sends the same image in each turn
+reuses the cache. The 12B on the GPU (the dense weights), with MTP:
+
+    an image (280 tokens), 60 tokens out      8.8 s (a new chat, the prompt on the CPU)
+    the same image, a new question            0.9 s (272 tokens reused)
+    a clip of 17 s (436 tokens), 91 out       11.5 s (the prompt on the CPU)
+
+The prompt pass of a prompt with media runs on the GPU when the model does.
+ModelGPU.group puts the soft rows in x. The attention records of a large
+group (GP_ATTN_QC_MT) take the array lim (operand 16): the last key of each
+query less pos. Four kernels read that record: k_attn_qc_mt,
+k_flash_qc_mt, k_flash_tc, and k_flash_qc_tc. They use lim for the causal
+limit and for the last key of a tile.
+
+Without media lim is the identity, so text gives the same bits. A chunk of
+a prompt does not split an image. On the CPU the
+prompt with media runs as a program (np_gemma/prompt.py), with int8 or
+int16 activations as a prompt without media: the soft rows go into x, and
+the int16 flash kernel (gemma_attn_prefill_qc) takes the last key of each
+query (limit). The Python path takes the same kernel, so the two have the
+same bits (NP_GEMMA_MEDIA_GPU=0 runs the prompt on the CPU on a GPU too).
+
+    the 12B, int4, an image of 266 tokens     prompt 0.37 s (the CPU: about 6 s)
+    KL to transformers                         0.0145, 40/40 (no mask: 0.757)
+    a clip of 436 tokens                       prompt 0.39 s, KL 0.0014
+    the server: an image and a question       1.9 s (before: 8.8 s)
+    the server: a clip, 91 tokens out         3.0 s (before: 11.5 s)
+
+check_gpu_prompt and check_gpu_split of the 26B pass.
+
+### A cut of a chat cache on the GPU
+
+A chat client sends the whole history in each turn. The Gemma 4 template
+drops the thought part of an earlier answer, so the history can differ from
+the cache before its end. The Session then cuts the cache back to the common
+prefix (KVCache.truncate). On the GPU of the server this gave an illegal
+memory access, and then each later request failed. The faults:
+
+1. The GPU copy (GPUKV) learned of a cut only from sync(). While the GPU
+   holds the cache, the host rows lag, so sync() did not see the cut.
+2. A layer with a window keeps only the rows from base. A cut before base
+   made the next prompt pass write before the buffer (the access fault).
+3. A token at n sees back to n - window + 1. A cut that kept n but not
+   those rows passed the test (n >= base), and the logits then had errors
+   of up to 14.
+
+Now Model.truncate_cache cuts the GPU copy (GPUKV.truncate) and the host
+cache. Each one first checks that every layer with a window holds the row
+n - window + 1. If a layer does not, the Session starts again from an empty
+cache.
+
+The script scripts/check_gpu_session.py runs a prompt of 8717 tokens
+and 48 steps. It then cuts the history back by 1700, 1300, 300, 40, and 0
+tokens, and adds a question. A reference Session makes the same rows with no
+cut. The logits of 24 tokens have the same bits for all five cuts. Before
+the fix, the cut of 1700 gave the access fault and the cut of 1300 gave the
+errors.
+
+The script fixes the hot experts (NP_GEMMA_GPU_HOT_DYN=0). It also turns off
+the mixed groups (NP_GEMMA_GPU_MIX=0). Otherwise the place of an expert
+follows the text, and the logits of two runs differ by about 2.
+
+A cut that starts again costs a prompt pass of the history. The GPU keeps
+between one and two windows of rows (1024 to 2048). Thus the model reads a
+history again when it changes more than about 1000 tokens before its end.
+
+The server now writes the trace of a failed generation to its log.
+
+### A long prompt of the 26B on the GPU
+
+After a prompt pass of about 8000 tokens or more on the GPU, the decode of
+the 26B on the GPU gave nonsense. The same prompt on the CPU, a GPU prompt
+with a CPU decode, and a CPU prompt with a GPU decode gave the right text.
+The fault was in GPUKV:
+
+1. A layer with a window that dropped its oldest rows (prepare) set
+   host_end to the first row that it kept.
+2. The host cache had no rows of the prompt. Thus sync() before the next
+   step read the host end as a truncate, and it cut end to that value.
+3. The next drop then moved base with no rows. The rows of the window no
+   longer matched their positions.
+
+prepare no longer changes host_end (detach starts at base). The same fault
+also came in a long decode on the GPU, at the second drop. The script
+scripts/check_gpu_prompt.py runs a prompt of 11778 tokens on the GPU. It
+then compares 32 GPU steps with the CPU program on the same rows: 31 of 32
+top tokens agree (20 before the fix).
+
+The server (scripts/serve.py) has --max-context. A request with a longer
+prompt gets an error 400, and max_tokens gets the room that is left. The
+option --mtp now turns MTP on with --gpu too (NP_GEMMA_MTP=0 turns it off). The
+26B with --gpu hot --gpu-experts-gb 1.5 --max-context 81920 answered a
+prompt of 81495 tokens in 93 s.
+
+### The Gemma 4 26B on an AVX2 CPU
+
+The target is a CPU with AVX2 and no AVX-512: a Core i5-8500 (Coffee Lake,
+6 cores, 32 GB, no GPU). The test here runs the code of that CPU on the
+Xeon: NP_GEMMA_ARCH=avx2 selects the AVX2 library, and the kernels that
+check the CPU at run time take their AVX2 form too. 6 threads, the method
+of llama-bench (scripts/bench_llama_method.py), the Xeon at 50% of its
+clock:
+
+    runtime                              pp512   tg64
+    numpy-gemma before                   19.6    6.5
+    numpy-gemma now                      51.3    14.7
+    llama.cpp (build-avx2, -t 6)         26.2    12.4
+
+The changes:
+
+- The AVX2 library did not build (no -mf16c), so such a CPU ran the NumPy
+  fallback. It builds again.
+- llama.cpp repacks the Q4_0 matrices in groups of 8 rows (q4_0_8x8). The
+  KQ_Q4X copies of this runtime are the same idea (groups of 16 rows), and
+  only a CPU with VNNI made them. An AVX2 CPU now makes them too. Their
+  AVX2 kernel (kq_q4x_rows) takes int8 x, and a 32-bit lane is a row.
+  One vpmaddubsw of the codes and 4 values of x gives the products of 8
+  rows.
+- The decode of the 26B on AVX2 takes int8 x (i4q_begin: one thread
+  quantizes the x rows of a record). The Q6_K head takes int8 x too. The
+  decode on AVX-512 keeps float32 x.
+- The prompt uses the KQ_Q4X copies on AVX2 (they needed AVX-512 before),
+  and kq_quant_part has an AVX2 form with the same bits.
+
+A step of one token and a verify group still give the same bits
+(check_mt.py). The int8 x changes the values. Against the float32 x of
+the decode on AVX-512, over 255 steps of the chat text: KL (top 64)
+4.9e-3, and 97.6% of the top tokens agree.
+
+The experts alone give 2.0e-3. The dense matrices give the rest. About
+half comes from the query and gate side, and half from the output and
+down side. llama.cpp has the same int8 form. NP_GEMMA_Q4X=0 gives the
+float32 decode (about half the speed).
+
+The memory: the copies take 13 GB more (RssAnon 16.5 GB). The pages of
+the GGUF file that the copies replace are clean. Thus the kernel can drop
+them. llama.cpp keeps a repack of 13.1 GB in the same way. The load
+takes 24.5 s, most of it for the copies.
+
+### MTP on the GPU and the hot experts
+
+In some runs of check_qwen4_gpu.py, MTP with the MTP layer on the GPU did
+not give the tokens of the plain decode. Only the first 2 of 48 were the
+same. The test looked for a fault of the synchronization. It found none:
+
+- Each hot slot held the bytes of its expert. The slot table on the GPU
+  was that of the host. The test looked before each verify group and each
+  run of the MTP layer.
+- With a synchronization of the GPU before each copy of an expert, the
+  difference stayed. Thus no copy overlapped a kernel.
+- The hot experts stayed fixed with NP_GEMMA_GPU_HOT_INS=0 or HOT_DYN=0.
+  Then 6 runs of MTP on the GPU, a run on the CPU, and 2 plain runs gave
+  the same 48 tokens.
+- The tokens differed only at the two nearest ties of the plain decode:
+  token 2 (margin 0.142) and token 18 (margin 0.076).
+
+HotCache moves experts between the GPU and the CPU, and a hot expert gives
+values a little different from a cold one. A run of MTP moves other
+experts than the plain decode, so a near tie can go the other way. The
+check now keeps the hot experts fixed for the MTP part, and it fails when
+a token differs.
+
+### The UD files of the E2B and the E4B
+
+The files unsloth/gemma-4-E2B-it-GGUF and gemma-4-E4B-it-GGUF (UD-Q4_K_XL)
+mix Q4_K, Q5_K, Q6_K, Q8_0, and IQ4_XS. The E4B class knew only Q4_0 (the
+QAT files). The changes:
+
+- gguf.py reads IQ4_XS (ggml type 23). On 64 blocks of 3 tensors, the
+  values are those of dequantize_row_iq4_xs of ggml, bit for bit.
+- The E2B file gives a feed-forward size for each layer (6144, then 12288).
+  text_config gives a list then.
+- E4B.kq gives a K quant or Q8_0 matrix to the GGUF products (GP_KQ_LINEAR
+  on the CPU and on the GPU). An IQ4_XS matrix becomes Q8_0: the table
+  values of the codes, and a float16 scale d (ls - 32) for each 32 values.
+- The forms of the E4B take these matrices (linear, int4_multi4), and a
+  small matrix gets a bfloat16 copy.
+- The tiles of csrc/kquants.c now take rows of up to 1024 parts (KQ_S). The
+  down matrices in Q6_K (10240 values) went from 4.4 to 81 GB/s.
+- The GPU head of a K quant token table (Q5_K) is one GP_KQ_LINEAR.
+
+Against the f32 mode (each weight dequantized), on 512 tokens of a chat
+text:
+
+    model   ppl f32   ppl int4   KL       top token
+    E2B     11.744    11.932     0.0021   98.2%
+    E4B     5.387     5.374      0.0006   98.0%
+
+The decode against llama.cpp (llama-bench, 18 threads; tok/s):
+
+    model   CPU    llama.cpp CPU   GPU    llama.cpp GPU
+    E2B     13.9   24.4            99.7   178
+    E4B     9.0    13.9            62.2   98
+
+A GPU step of the E4B takes 15.9 ms. The products take 10.8 ms: 2.52 GB at
+233 GB/s, half of the rate of the memory. About 660 small records take
+about 5 ms. The kernel of the products of one token has a warp for each
+row and few loads in flight. The hot experts of the 26B had the same
+problem.
+
+Three changes to the products of one token on the GPU:
+
+- gpu.py _fuse_kq joins the GP_KQ_LINEAR records on the same x. One
+  GP_KQ_MULTI does up to 5 matrices (q, k, v; gate, up).
+- A row of 8192 values or more (the down matrices) gets 4 warps
+  (k_kq_linear_split). A shorter row keeps one warp.
+- kq_row_i8 takes int8 x (dp4a) for Q4_K, Q5_K, Q6_K, and Q8_0, as it did
+  for Q8_R. The CPU products of these types use int8 x too. Thus the GPU
+  now gives the values of the CPU to 5e-7 (5e-3 with float x).
+  NP_GEMMA_GPU_I8X=0 gives the float x again.
+
+The decode (tok/s, the same 64 tokens in each case):
+
+    model   before   joined, split   int8 x
+    E2B     99.7     102.6           107.9
+    E4B     62.2     64.6            68.5
+
+With int8 x, the Q6_K down matrices go from 337 to 470 GB/s. The kernel
+reads 1 byte of x in place of 4. A small Q4_K matrix alone is
+slower, because of the extra launch that quantizes x. A group shares that
+launch.
+
+Two changes to the small kernels of the step:
+
+- k_add_norm_v keeps the values of a row in registers (float4), so it
+  reads o, x, and w once. Alone in a graph, a record with two norms went
+  from 5.5 to 2.6 us. The order of the sum of squares changed. Against the
+  CPU, on 255 decode steps of the chat text, the KL (top 64) is 9.6e-4 and
+  the top token agrees at 98.4%. With the old kernel, it was 1.08e-3 and
+  97.6%.
+- k_add_norm_v and k_gelu_mul_rows_v also write the int8 x when the next
+  record is a product with int8 x. That record then does not quantize x.
+  The launches that quantize x went from 135 to 35 for each step. These
+  values are the same bits as those of k_kq_quant_x.
+
+NP_GEMMA_GPU_AN_V=0 and NP_GEMMA_GPU_QX_FUSE=0 give the old kernels. The
+decode (tok/s):
+
+    model      old kernels   new kernels
+    E2B        103.8         114.3
+    E4B        70.6          72.1
+    Qwen3.6    48.7          58.4 (check_qwen_gpu, 73.2 with a warm HotCache)
+
+The Qwen3.6 step uses ADD_NORM too. It gives the same 128 tokens as the CPU.
+
+#### The int8 x of the CPU products
+
+On the CPU, a K quant product of the E4B step ran at 34 GB/s, but alone it
+ran at 55 to 75 GB/s. The first product after GP_KQ_QUANT was slow. The gate
+matrix took 350 to 920 us, and the up matrix after it took 270 us. The
+threads of the team wrote the parts of the int8 x (omp for, 80 parts of 32
+values). Then each thread of the product read lines that many cores wrote,
+and each product lost about 200 us. The time of GP_KQ_QUANT did not show
+it.
+
+Now one thread quantizes an x of 512 parts or less (kq_quant_body,
+kq_quant_rows_body, ma_quant_body). The quantization uses AVX-512 and gives
+the same bits (cvtps rounds as lrintf). NP_GEMMA_QUANT_SINGLE sets the
+limit, and 0 gives the old form. The CPU decode (tok/s):
+
+    model                 old    new    llama.cpp
+    E2B UD-Q4_K_XL        14.0   22.6   24.4
+    E4B UD-Q4_K_XL        8.8    13.2   13.9
+    Qwen3.6 UD-Q4_K_M     17.0   17.9   -
+
+The E4B step went from 94 to 61 ms. The products now run at 52 GB/s. The
+text of the decode is the same. The int4 path of the QAT files (Q4_0)
+reads x as float, so it did not have the problem.
+
+#### The GPU products against llama.cpp
+
+MTP_PLAN.md has the details. In short:
+
+- A lane of the one-token products reads 16 bytes (32 values) of each
+  superblock, not 4 bytes. A warp then has 4 times the bytes in flight.
+- The gate, the up matrix, and the GELU are one kernel (k_kq_glu_i8).
+- The GPU applies the soft cap and finds the greedy token (GP_SOFTCAP,
+  GP_ARGMAX).
+- The token rows of the Q4_K and Q5_K tables come from C (gemma_kq45_rows),
+  with the bits of NumPy.
+- The rope tables of all the positions stay on the GPU.
+
+The decode (tok/s, e4bgen, 32 tokens; llama.cpp from the table above):
+
+    model   GPU    llama.cpp GPU   CPU    llama.cpp CPU
+    E2B     131.1  178             24.5   24.4
+    E4B     87.4   98              14.4   13.9
+
+check_mtp.py (four prompts) gave 88.1 plain for the E4B, and llama.cpp
+89.9 with the same prompts. The E2B on the GPU is still behind. Its
+matrices are smaller, so the host part of a step (about 1 ms) is a larger
+part of it.
+
+### The Unsloth Q4_0 file of the 26B
+
+Unsloth gives a file of the 26B with the name "UD-Q4_K_XL"
+(unsloth/gemma-4-26B-A4B-it-qat-GGUF). All its tensors are Q4_0, the token
+table (token_embd) too. The file of Google keeps the token table in Q6_K.
+
+The weights of the Unsloth file agree with the unquantized QAT release of
+Google (google/gemma-4-26B-A4B-it-qat-q4_0-unquantized). The difference is
+0.16 to 0.18 per cent of the norm in each tensor that we compared. That is
+the error of the float16 scales.
+
+The Q4_0 file of Google has a difference
+of 5 to 8 per cent from that release. Its Q6_K token table has 1.4 per cent.
+The scales of its feed-forward matrices are 3/4 of the scales of the Unsloth
+file. The file of Google thus does not have the grid of the release.
+
+The test used three chat prompts with no media. For each prompt,
+scripts/hf_mm_reference.py ran the release in float32 and made a greedy
+answer of up to 128 tokens (models2/mm-refs/26b-chat1.npz to 26b-chat3.npz).
+Then scripts/check_mm_prompt.py --model 26b --gguf FILE gave these results
+over 360 positions:
+
+    file              runtime   mean KL (top 64)   top token
+    Google Q4_0       CPU       0.027              349/360
+    Unsloth Q4_0      CPU       0.0010             359/360
+    Unsloth Q4_0      GPU       0.0001             359/360
+
+The runtime gave a Q4_0 token table to the bfloat16 head before. That head
+reads 1.48 GB for each token, and the decode on the CPU fell from 17.4 to
+14.4 tok/s. Now a Q4_0 token table is the int4 head (Model._embed_q from
+gguf.int4_packed, the blocks of the file in place). It reads 0.42 GB, and
+the Q6_K head of the file of Google reads 0.61 GB. The values do not change.
+The products of two or more rows on the CPU take int8 x, as the layers do.
+
+On the GPU, gg_q4_head (k_q4_head) is the head for a Q4_0 table. Lane l of a
+warp reads two bytes of a block, four blocks at a time, and x in float2
+pairs. One to four rows have their own kernels. The time of the head of the
+26B on an RTX 5060 Ti:
+
+    rows of x    1        2        3        4        16
+    Q4_0         1.00 ms  1.33 ms  1.71 ms  2.06 ms  9.65 ms
+    Q6_K         1.61 ms  2.59 ms  3.09 ms  3.98 ms  11.90 ms
+
+We also tried a lane for each value of a block (the order of k_q6k_head).
+That order reads x in one run, but it took 1.48 ms for one row.
+
+The speed (tok/s; 18 threads, pp512 and tg128; the GPU with the hot experts,
+scripts/bench_decode.py --gpu hot):
+
+    file           llama.cpp CPU    numpy-gemma CPU   numpy-gemma GPU
+    Google Q4_0    110 / 18.7       271 / 19.4        99.8
+    Unsloth Q4_0   103 / 20.1       269 / 20.1        98.5
+
+We also ran llama.cpp on the GPU, with the experts of 4 layers on the CPU.
+It gave 1392 / 90.9 for the file of Google and 1411 / 96.9 for the Unsloth
+file. The
+GPU runs of numpy-gemma change by 94 to 103 tok/s from run to run.
+
+Other differences of the Unsloth file: add_bos_token is 0, eot_token_id is
+106, and the chat template is different. The prompt ids of our server are
+the same for the two files.
+
+Do the Google files have other weights? No. The GGUF of Google changed two
+times after the release of 2026-06-05. The upload of 2026-07-15 changed the
+chat template. The upload of 2026-07-17 has the note "validated QAT GGUF
+checkpoint (280 sequence length, corrected vocabulary)".
+
+We read 8 tensors of
+the file of 2026-06-05 with HTTP range requests. They have the same bits as
+the file of 2026-07-17, which is the file in models/gemma-4-26B-qat-q4_0
+(sha256 3eca3b8f). Only the metadata changed. Thus no GGUF of Google has the
+grid of the unquantized release.
+
+The token lists, the merges, the token types, and the scores of the Unsloth
+file are the same as those of the file of Google.
+
+The chat template of
+Unsloth is the canonical template of Google (2026-07-09) with two changes. It
+has no header comment. It also accepts the arguments of a tool call as a
+JSON string. The template of Google stops with an error for such a string.
+But llama-server and np_gemma/chat.py change the string to a JSON object
+before they use the template. The file np_gemma/chat_template.jinja has the
+same bytes as the template of Google.
+
+Unsloth changed the template of all its uploads to this template on
+2026-07-17 (the commit "Added Gemma official chat template update"). Our
+Unsloth files are those uploads: their sha256 values are the values of the
+repositories now. An Unsloth file from before that date has an older
+template. For such a file, use --chat-template-file in llama.cpp, or the
+fixed file.
+
+The add_bos_token 0 of the Unsloth 26B file has no effect in
+llama.cpp. The vocabulary code sets it to true for Gemma 4
+(src/llama-vocab.cpp), and llama-tokenize gives the BOS token for both files.
+Thus the fixed file and the Unsloth file differ in llama.cpp only for a tool
+call with the arguments as a string.
+
+Use the Unsloth file directly. It is the 26B default of the scripts. Our
+server makes the prompt with np_gemma/chat_template.jinja and adds the BOS
+token itself. Thus the metadata of the file has no effect on our prompts.
+
+A fixed file is optional. It has the tensors of Unsloth and all the metadata
+of the file of Google (the template, add_bos_token 1, the tokenizer). Only
+general.name changes. Make it for a program that needs the exact metadata of
+Google:
+
+    PYTHONPATH=../llama.cpp/gguf-py python scripts/gguf_swap_metadata.py \
+        --meta models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf \
+        --tensors models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
+        --out models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-Q4_0-fixed.gguf
+
+The 658 tensors have the same bytes as those of the Unsloth file. llama-server
+(--jinja) adds the BOS token and uses the template of Google. The check of
+26b-chat1.npz gave KL 0.0016 on the CPU and 0.00006 on the GPU, and the GPU
+decode gave 98.1 tok/s.
+
+### The Unsloth Q4_0 file of the 12B
+
+The 12B has the same facts as the 26B. The file of Google
+(google/gemma-4-12B-it-qat-q4_0-gguf, sha256 93567e57, the upload of
+2026-07-17) is in models/gemma-4-12B-qat-q4_0. We read 8 tensors of the
+file of 2026-06-05 with HTTP range requests. They have the same bits as the
+file of 2026-07-17.
+
+The difference from the unquantized release
+(google/gemma-4-12B-it-qat-q4_0-unquantized), as a per cent of the norm:
+
+    tensors                      Google    Unsloth
+    attention, feed-forward      4.9-5.1   0.18
+    token table                  1.34      0.18
+
+Only 15 to 18 per cent of the codes of the two files are the same. The
+Unsloth file (unsloth/gemma-4-12B-it-qat-GGUF, gemma-4-12B-it-qat-UD-Q4_K_XL,
+sha256 90fd44e2) is Q4_0 in all its tensors, the token table too. Its
+metadata has the same differences as the 26B file: the template of Unsloth
+and eot_token_id 106. Its add_bos_token is 1, as in the file of Google.
+
+The test used the three chat prompts of the 26B test. The reference is the
+12B release in float32 (models2/mm-refs/12b-chat1.npz to 12b-chat3.npz).
+The results over 376 positions:
+
+    file              runtime   mean KL (top 64)   top token
+    Google Q4_0       CPU       0.026              359/376
+    Google Q4_0       GPU       0.025              362/376
+    Unsloth Q4_0      CPU       0.0007             376/376
+    Unsloth Q4_0      GPU       0.0001             376/376
+
+With an image (12b-image.npz, our soft rows), the Unsloth tensors gave KL
+0.00055,
+and the file of Google gave 0.013. That value of 0.013 is the int4 value in
+the table of "Images and audio on the Gemma 4 12B". It came from the grid of
+the file of Google, not from the runtime.
+
+Use the Unsloth file of the 12B directly too. It is the 12B default of
+scripts/check_mm_prompt.py. An optional fixed file of the 12B, with the
+metadata of Google:
+
+    PYTHONPATH=../llama.cpp/gguf-py python scripts/gguf_swap_metadata.py \
+        --meta models/gemma-4-12B-qat-q4_0/gemma-4-12b-it-qat-q4_0.gguf \
+        --tensors models2/gemma-4-12B-unsloth-UD-Q4_K_XL/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf \
+        --out models2/gemma-4-12B-unsloth-UD-Q4_K_XL/gemma-4-12B-it-qat-Q4_0-fixed.gguf
+
+The 667 tensors of the fixed file have the same bytes as those of the
+Unsloth file. Give --model-id gemma-4-12b-it-qat-q4_0 to scripts/serve.py to
+keep the model id.
+The speed (tok/s, pp512 / tg128 on the CPU; scripts/bench_decode.py --gpu
+dense):
+
+    file                  CPU            GPU
+    Google Q4_0           89.0 / 7.80    45.4
+    Unsloth (fixed) Q4_0  88.6 / 7.83    47.4
+
+The head of the Unsloth file on the GPU is 0.57 GB, and the Q6_K head of the
+file of Google is 0.83 GB.
+
+### The Unsloth Q4_0 files of the E4B and the E2B
+
+The E4B and the E2B have the same facts as the 26B and the 12B. The files of
+Google (google/gemma-4-E4B-it-qat-q4_0-gguf, sha256 676c3507, and
+gemma-4-E2B-it-qat-q4_0-gguf, sha256 fa401b55) are the uploads of
+2026-07-17. We read 8 tensors of the files of 2026-06-05 with HTTP range
+requests. They have the same bits as the files of 2026-07-17.
+
+The QAT files of Unsloth (unsloth/gemma-4-E4B-it-qat-GGUF and
+gemma-4-E2B-it-qat-GGUF, UD-Q4_K_XL, sha256 df0fd4ee and e5310072) are Q4_0
+in all their tensors. The file of Google keeps the token table and the
+per-layer table in Q6_K and the per-layer projection in F16. Thus the files
+of Unsloth are smaller: 4.22 GB and 2.62 GB, not 5.15 GB and 3.35 GB. These
+files are not the UD files of the section "The UD files of the E2B and the
+E4B". Those files are not QAT files.
+
+The unquantized releases are in models2/gemma-4-E4B-qat and
+models2/gemma-4-E2B-qat (google/gemma-4-E4B-it-qat-q4_0-unquantized and the
+E2B). The difference from them, as a per cent of the norm:
+
+    tensors                          Google E4B   Google E2B   Unsloth
+    the matrices of the layers       4.9-5.2      4.9-5.2      0.18
+    the token table                  1.33         1.38         0.18
+    the per-layer table              1.38         1.36         0.18
+    the per-layer projection         0.00 (F16)   0.00 (F16)   0.18
+
+The release keeps the per-layer projection on a Q4_0 grid too.
+
+The test used the three chat prompts of the 26B test. Each release in
+float32 is the reference (models2/mm-refs/e4b-chat1.npz to e4b-chat3.npz,
+and e2b-chat1.npz to e2b-chat3.npz). The results over 364 positions:
+
+    model   file      runtime   mean KL (top 64)   top token
+    E4B     Google    CPU       0.020              343/364
+    E4B     Google    GPU       0.019              346/364
+    E4B     Unsloth   CPU       0.0004             363/364
+    E4B     Unsloth   GPU       0.00002            363/364
+    E2B     Google    CPU       0.025              346/364
+    E2B     Google    GPU       0.024              346/364
+    E2B     Unsloth   CPU       0.0007             358/364
+    E2B     Unsloth   GPU       0.00003            363/364
+
+The references of the E4B with media (our soft rows) gave these results:
+
+    reference         Google            Unsloth
+    e4b-image.npz     KL 0.0076, 38/40  KL 0.00030, 40/40
+    e4b-audio.npz     KL 0.0018, 48/48  KL 0.00006, 48/48
+    e4b-text.npz      KL 0.022, 40/40   KL 0.00024, 39/40
+
+The template of the E2B and the E4B is the canonical template of Google
+without the empty thought block. The runtime gives empty_thought_block False
+for these models too. The template of Unsloth has the same two changes as
+for the 26B. The add_bos_token is 1 in all four files.
+
+Two changes let the runtime use these files:
+
+- The E4B class on the GPU took a Q6_K head (gg_q6k_head) or a K quant head
+  (GP_KQ_LINEAR). A Q4_0 token table stopped the GPU path with an error.
+  Now E4B._gpu_head gives the Q4_0 blocks to gg_q4_head. Against the CPU,
+  scripts/check_gpu.py gave logits max |d| 0.0001 and 32/32 top tokens.
+- The per-layer rows of a prompt (embed_rows, gguf.take_rows) of a Q4_0 table
+  went through NumPy: 39.7 ms for 512 tokens of the E4B. The C function
+  gemma_q4_0_rows takes 2.5 ms and gives the same bits. The prompt pass of
+  512 tokens on the GPU went from 2494 to 2990 tok/s (E4B) and from 4158 to
+  5203 tok/s (E2B).
+
+The speed is in tok/s. The CPU gives pp512 / tg128 with 18 threads. The GPU
+values come from scripts/bench_e4b_gpu.py, with the tensor cores in the
+prompt pass:
+
+    model   file      CPU             GPU pp512   GPU tg128
+    E4B     Google    96.6 / 15.0     2989        100.6
+    E4B     Unsloth   111.2 / 15.9    2990        108.7
+    E2B     Google    180.7 / 26.5    5192        167.2
+    E2B     Unsloth   225.2 / 28.2    5203        179.9
+
+Use the Unsloth files directly. The E4B scripts use the Unsloth E4B file as
+their default. The mmproj file of Google stays the mmproj file of the E4B.
 
 ## Test results
 
@@ -1939,10 +3289,12 @@ These facts are necessary. A generic transformer will give wrong output.
   Layer 47 has 0.0496. Multiply the layer output by this scalar.
 * The embedding table and the output head are tied. Apply the final logit
   softcap: tanh(logits / 30) * 30.
-* A GGUF QAT file keeps the tied embedding table in the Q6_K type. The code
-  reads the 210-byte blocks in place. The output head then reads 6.05 bits for
-  each weight in place of 16 bits. The load step does no dequantize of the
-  table. For the 26B model this step was 6.6 s.
+* A GGUF QAT file of Google keeps the tied token table in the Q6_K type.
+  The code reads the 210-byte blocks in place. The output head then reads 6.05
+  bits for each weight in place of 16 bits. The load step does no dequantize
+  of the table. For the 26B model this step was 6.6 s.
+* A file with a Q4_0 table (Unsloth) gives the int4 head: 4.5 bits for each
+  weight.
 * The attention mask is causal. A sliding layer also masks keys that are older
   than 1024 positions.
 * The tokenizer replaces each space with the character U+2581. It uses BPE with
@@ -2000,8 +3352,12 @@ give about 35 GB/s for a plain read. Thus some bandwidth remains.
 
 The server gives the OpenAI paths. It uses only the Python standard library.
 
-    PYTHONPATH=. python scripts/serve.py --gguf models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf \
-        --dtype int4 --port 8080 --temperature 0.0
+    PYTHONPATH=. python scripts/serve.py \
+        --gguf models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
+        --model-id gemma-4-26B_q4_0-it --dtype int4 --port 8080 --temperature 0.0
+
+Use the Unsloth file of the 26B (see "The Unsloth Q4_0 file of the 26B"). The
+--model-id option keeps the model id of the harness settings below.
 
 The paths are:
 
@@ -2022,7 +3378,28 @@ The model is not thread safe and shares one key and value cache. Thus the
 server answers one request at a time. The other requests wait.
 
 A client points at http://127.0.0.1:8080/v1 . The model id is the file name of
-the GGUF. Use --thinking to open the thought channel.
+the GGUF.
+
+The thought channel is open by default (--thinking auto). It is closed when
+--max-context is less than 32768, because the thought part takes room. Use
+--thinking on or --thinking off to set it. The Gemma 4 template has one level
+of thought.
+
+A request sets the thought channel with the field thinking (true, false,
+or {"type": "enabled"}), reasoning_effort, reasoning.effort, or
+chat_template_kwargs.enable_thinking. The values none, off, and disabled
+close it.
+
+After a tool result, the Gemma 4 template ends the prompt in an open
+thought channel (<|channel>thought and a newline). The model then writes
+its thought with no opener, and closes it with <channel|>. The server
+parses such an answer with the opener in front (Backend.open_channel).
+Before this, the thought went out as the answer. A harness then sent it
+back as the words of the model, and the model repeated its steps.
+
+Use --debug DIR to write each turn to a file in DIR. The file has the request,
+the prompt text, the thought setting, the raw answer, and the tool calls.
+DIR/turns.log gets a line for each turn.
 
 The server gives tool calls. Send the OpenAI tools field. The model then answers
 with the field tool_calls and the finish reason tool_calls. Send the result back
@@ -2110,7 +3487,7 @@ GGUF data. With --gpu dense or hot, the whole E4B model runs on the GPU.
 With --mtp and --gpu, the drafter runs on the GPU too, and MTP is on by
 default for the E4B:
 
-    python scripts/serve.py --gguf gemma-4-E4B_q4_0-it.gguf --gpu dense --mtp ASSISTANT_DIR
+    python scripts/serve.py --gguf gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf --gpu dense --mtp ASSISTANT_DIR
 
 A chat turn of 197 tokens took 2.2 s, with the prompt pass and MTP. The
 server keeps the cache of a chat for the next turn, as for the 26B.
@@ -2132,6 +3509,50 @@ np_gemma/sampling.py gives the Sampler class. A temperature of zero selects the
 most probable token. The other settings are top_k, top_p, min_p, and the three
 penalties. The seed makes a sampled run repeatable. The class keeps the count of
 each token in the history for the penalties.
+
+With MTP and sampling, a draft stays only when the sample picks it. That is
+the default (mtp_accept "exact"), and the text then follows the distribution
+of the settings. The option mtp_accept "in_set" also keeps a draft when the
+settings allow it (Sampler.draft_ok). It needs top_k, top_p, min_p, or
+mtp_floor. Without them it acts as "exact".
+
+The Sampler keeps a draft only
+when its probability is at least mtp_floor times the best probability. Give
+the options to scripts/serve.py (--mtp-accept in_set --mtp-floor 0.1), or in
+a request ("mtp_accept", "mtp_floor").
+
+MTP_PLAN.md has the test. With a floor of 0.1, three drafts on the E4B gave
+144.7 tok/s, and "exact" gave 127.9. The test found no drift above its noise.
+The values below come after the changes of the next paragraphs.
+
+A pick on the host now sorts only the candidates. For top_k they come from
+_top_idx. For top_p and min_p they are the tokens near the best score. A pick
+took 0.31 ms, not 1.56 ms,
+with top_k 64. With top_p alone it took 1.0 ms, not 21 ms. The tokens are
+the same with the same seed.
+
+On the GPU, the head also gives the candidates of each row (gg_topk, a radix
+select). They are the k best logits, the row max, and the sum for the
+temperature. The host then copies k values, not 262144.
+
+ Sampler.sample_sparse uses them
+when they settle the result (top_k, or top_p and min_p within the
+candidates). Else it takes the whole row (assistant.RowPicker). A greedy
+Sampler takes the best tokens of the GPU. NP_GEMMA_SPARSE=0 turns the
+candidates off. The E4B on the GPU with the settings of Gemma (tok/s):
+
+    mode               plain    1 draft   2 drafts   3 drafts
+    greedy             107.7    153.4     165.3      175.8
+    sampling, before    90.8    116.6     119.4      127.4
+    sampling, now      107.0    152.3     158.2      174.2
+    in_set 0.1, now             169.9     185.0      214.6
+
+The tokens are the same as with the whole rows, for each setting of the
+test, on the E4B, the 12B, and the 26B.
+
+A floor of 0.1 did not change the accuracy on GSM8K. But it makes open text
+less varied, as a temperature of about 0.8 in place of 1.0 does (see
+MTP_PLAN.md). Use it for tasks with one right answer.
 
 ## Limits
 

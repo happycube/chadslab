@@ -18,13 +18,12 @@ from np_gemma.chat import render_chat
 from np_gemma.config import Config
 from np_gemma.gguf import GGUF
 
-P = "models/gemma-4-26B-qat-q4_0/gemma-4-26B_q4_0-it.gguf"
+P = "models2/gemma-4-26B-unsloth-UD-Q4_K_XL/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 
 
 def cache_bytes(cache, i):
     n = 0
-    for a in (cache.k[i], cache.v[i], cache.kq[i], cache.ks[i],
-              cache.vq[i], cache.vs[i]):
+    for a in (cache.kq[i], cache.ks[i], cache.vq[i], cache.vs[i]):
         if a is not None:
             n += a.nbytes
     return n
@@ -48,7 +47,7 @@ def main():
         dt = time.perf_counter() - t0
         slide, glob, total = [], [], 0
         for i in range(cfg.num_hidden_layers):
-            if s.cache.k[i] is None:
+            if s.cache.kq[i] is None:
                 continue
             rows = s.cache.end[i] - s.cache.base[i]
             (slide if cfg.plan[i].is_sliding else glob).append(rows)

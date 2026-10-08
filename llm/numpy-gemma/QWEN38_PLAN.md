@@ -493,6 +493,445 @@ type; --experts nv4 of the converter keeps type 51.
   tokens on the tensor cores take 6.2 ms in place of 8.9 ms. The step
   kernel is 2.3 to 3 times faster.
 
+## MTP and an optimization pass on the 2-socket Xeon and the 3090
+
+The GGUF of this runtime, made again on this machine with
+scripts/convert_nvfp4_gguf.py (--dense bf16: the dense matrices as they
+are; 23 minutes from the checkpoint on NFS), runs with NP_GEMMA_DENSE=bf16
+(no Q8_0 requantization at the load) and the hot experts of the free
+memory (88 in each layer). Greedy decode of 256 tokens of a chat answer,
+2.0 GHz:
+
+    start                     plain 20.2 tok/s   MTP (3 drafts, layer on the GPU) 20.7
+    bf16 small groups         MTP 26.2 (verify of 4: 95 -> 68 ms)
+    head, scores, argmax      MTP 28.2
+    CPU task team, rows       plain 27.7         MTP 29.3 (1 draft: 30.4)
+    bench_qwen4 tg128         17.4 -> 27.5 tok/s; pp2048 342 -> 347
+
+The changes:
+
+- The bfloat16 products of a verify group (k_kq_linear for each row looped
+  over the tokens: 4 tokens took 1.8 times one) read each chunk of 8
+  weights once for all the tokens (kq_row_bf16_nt; KQ_LINEAR, the split of
+  long rows, KQ_MULTI with the float32 alpha and beta of a DeltaNet layer).
+  Each token keeps the operations of one token: a verify group still has
+  the bits of the steps (check_qwen4_gpu: max rel 0).
+- The logits of the head go to pinned memory (1 MB a row: 2.0 -> 1.6 ms for
+  a row, 4.4 -> 3.3 for 4), and greedy MTP takes the best token of each
+  row from the GPU (Qwen4GPU.argmax, GP_ARGMAX): no copy of the logits.
+- HotCache.score_group scores the tokens of a group at once, on the rows
+  of its layers only (the same scores as one call for each token; one pass
+  of copies). The scores took about 13 ms of Python in a round, now 6.7.
+- The CPU programs of a GPU program run in a team of half the cores bound
+  spread (gemma_run_task, NP_GEMMA_GPU_CPU_THREADS): 48 threads bound close
+  gave 21.3 tok/s, 24 spread 26.0. kq_rows and kq_gather run a few rows on
+  the calling thread: their teams (64 threads for the n-gram rows) spun on
+  the cores of the cold experts (MTP drafts 30 -> 20 ms a round).
+- serve_qwen4.py runs MTP by default (--mtp 1 with the layer; 0 turns it
+  off): the server (3 hot experts in each layer, --hot-gb 0.5) decoded
+  23.6-25.2 tok/s without MTP and 28.8 with it (88% of the drafts).
+
+What was tried and left: the cold experts of each node on its own CPUs
+(the pages of expert e on node e % 2, the threads of each node on its
+experts, in one team or in nested teams): no gain once the threads are
+spread (0.232 against 0.234 ms for 5 experts; nested teams took 1 to 3.5
+ms for each call). One node reads about 55 GB/s of these experts and both
+about 100, but the kernel of a step is not bound by that. 109 hot experts
+in each layer in place of 88 gave 28.4 in place of 27.7 tok/s, and the
+programs of MTP then ran out of GPU memory.
+
+What is left: a verify of 4 tokens (77 ms) still costs about two steps (36
+ms): the CPU part (the cold experts of 4 tokens, about 34 ms) is half of it,
+so 1 draft is the best (30.4 tok/s; 2 drafts 29.6, 3 drafts 29.0).
+
+## The experts: the copies of HotCache, the CPU threads, and zero copy
+
+A trace of a decode step (nsys, Q8_0 dense, 119 hot experts in each layer):
+the GPU waited for the CPU part 15.7 ms of 34.8 (k_await), the dense
+products took 8 ms, the hot experts 4.8 ms (k_kqh_gu 72 us for 12 MB: a warp
+for each group of 16 rows, 166 GB/s), and about 1300 small kernels 4.5 ms.
+
+- k_kqh_nvx: a block of 8 warps (4 for down) for each group of 16 rows,
+  the warps over the blocks of columns: the hot experts 4.8 -> 1.7 ms a
+  step. The CPU part is the longer one in each layer, so the step gained
+  only 3% (30.9 -> 31.8 tok/s).
+- The copies of HotCache came from the pageable map of the file
+  (cudaMemcpyAsync: the driver stages them with a memcpy and holds itself).
+  With the dynamic slots off, the decode went from 32 to 36 tok/s and MTP
+  to 46. The copies now go through two pinned buffers of each worker
+  (gg_h2d_staged), and the workers stay on the last CPU of the node of the
+  GPU (gg_worker_bind), which the CPU team (bound spread) leaves free.
+- Zero copy (NP_GEMMA_GPU_ZC): the GPU computes some cold experts from a
+  pinned copy of all the experts in host memory (68 GB, interleaved over
+  the nodes, 95 s to make), while the CPU computes the others. A kernel reads
+  host memory at 11-12 GB/s (PCIe 3.0 x16), so an expert takes 0.25 ms.
+  Before the fix of the copies it gave 31.8 -> 33.9 tok/s; after it, 44.6 ->
+  33.7: the CPU share is now shorter than one expert over PCIe. With the
+  verify groups too (ZC_MT 1): MTP 58.7 -> 47.8. It stays as an option.
+
+The GPU is on node 0 (CPUs 0-23, PCIe 3.0 x16). Decode of 256 tokens of a
+chat answer (greedy) and bench_qwen4, 2.0 GHz:
+
+    dense   hot     plain    MTP 1 draft   MTP 3 drafts   pp512   pp2048   tg128
+    q8      119     44.6     58.7          60.6           411     618      42.1
+    bf16     88     36.8     49.8          50.4           306     426      35.9
+
+    before (q8): plain 30.6, MTP 33.2; pp512 267, pp2048 472, tg128 30.1
+    the 5060 Ti (q8, 0.5 GB hot): pp512 327, pp2048 496, tg128 22.8
+
+## 2.4 GHz, kernel fusion, and the CPUs
+
+The clocks at 2.4 GHz (core and uncore), Q8_0 dense: plain 44.6 -> 47.0
+tok/s, MTP (3 drafts) 60.6 -> 67.0, pp512 411 -> 440, pp2048 618 -> 655,
+tg128 42.1 -> 44.4. bf16: plain 36.8 -> 38.8, MTP 50.4 -> 51.6, pp512 306 ->
+332, pp2048 426 -> 446, tg128 35.9 -> 38.5.
+
+Kernel fusion (NP_GEMMA_GPU_HC_FUSE, NP_GEMMA_GPU_TOPK_SPLIT): the add of
+the hyper connections and the norm that follows (96 a step), the int8 x of
+the products written by HC_NORM, HC_ACT, and HC_MIX (the GP_KQ_QUANT records
+between no longer clear it), and the hot split in the kernel of the router.
+The values are those of the separate kernels (check_qwen4_gpu: a verify
+group equals the steps). Plain decode q8 45.4 -> 46.7, bf16 38.3 -> 39.6;
+MTP 65.6 -> 66.8 and 51.7 -> 52.7. The kernels of the hot experts run while
+the GPU waits for the CPU, so they are not on the path of a step.
+
+The CPUs: the uncore counters over 4 s of decode (q8) give about 10 GB/s of
+DRAM reads on each socket and 5 GB/s on each UPI direction, with 12, 24, or
+44 threads (41.5, 46.0, 38.5 tok/s). The CPU part of a layer is about a
+third of a step, so it reads about 30 GB/s of each socket while it runs:
+not the limit (one socket gives 55-60). A copy of the experts on each node
+(NP_GEMMA_GPU_NUMA_COPY) gave 46.3 against 47.0: the barriers and the start
+of each team call bound the CPU part, not the memory.
+
+## The sync of the CPU part
+
+The phases of KQ_MOE for one layer alone (7 cold experts, thread 0): sort
+5.1 us, the copy of the rows of the pairs 3.4, gate and up 125.5, act 8.7,
+down 70.1, sum 4.2, and KQ_QUANT before it 14: about 35 us of barriers and
+single work in 240. kq_moe_small_body (t <= 4, act bit 3) does the int8 x,
+the sort, and the copy in one single, the act in the thread that ends the
+last task of an expert, and the down tasks wait for their expert, not for
+a barrier: 7 barriers become 3, with the same bits. In the decode it gave
+about 1% (plain 46.8 -> 47.0, MTP 66.2 -> 67.0, within the noise), and a
+longer spin of the OpenMP threads (GOMP_SPINCOUNT) nothing.
+
+In the decode a layer's CPU program takes 208 us for 4.5 cold experts (12.5
+MB): 10 ms of a step of 24.7 ms (gg_task_stats). The gate and up tasks of 7
+experts alone ran at about 100 GB/s of both sockets, so the rest is the
+start of many short streams (a task is 23 KB) and the fixed cost of a
+region, not barriers. Fewer cold bytes (the hot experts on the GPU) or
+work for the CPUs while the GPU runs (about 12 ms of a step) are what is
+left.
+
+## Optane, a copy of the experts on each node, and 256K tokens
+
+The two Optane modules (126 GiB each, on socket 1) are one App Direct region
+of 252 GiB, interleaved, with ext4 at /mnt/pmem (dax=always). Node 0 has 6
+channels of DRAM (192 GB) and node 1 129 GB.
+
+- A thread of socket 1 reads the module at 10-13 GB/s, a thread of socket 0
+  at 0.4 GB/s (a remote read updates the directory in the module). The
+  GGUF reader stages a file of a DAX mount on the node of the module with
+  threads of that node (gguf._stage_dax, 81 GB in 8.5 s in huge pages),
+  keeping the 51 GB n-gram table on the module, and QwenGPU copies the
+  experts from it to node 0 (70.7 GB in 3.3-4.5 s). The load: 36 s (the
+  plain map of the file on Optane: 127 s).
+- The decode (q8 dense, 48 threads, 2.4 GHz): a copy on each node 52.7
+  tok/s plain and 72.4 with MTP (3 drafts); the staged copy on node 1 alone
+  32.2; the file on NVMe through the page cache 33.3 (36.9 MTP).
+- The share of each node in a step (kq_calib_nodes) moved between 0.5 and
+  0.62 from run to run with no measurable gain (52.7 against 52.5).
+- Note: a shell pinned to the CPUs of node 0 (taskset) gives the runtime 24
+  threads and a CPU team on node 0 only.
+
+The cache: 20.6 KB a token (int8 keys and values of the full attention
+layers, the keys of the indexer) and 118 MB of state. QwenGPU(ctx=) leaves
+room for it before the hot experts. bf16 dense with 262144 tokens (the
+largest position of the model): 42 hot experts in each layer; a prompt of
+259999 tokens in 892 s (291 tok/s; 313 at the start, 273 at 220K), then 13.1
+tok/s of decode at that depth.
+
+## The prompt in bf16
+
+256K tokens: bf16 dense 291 tok/s (42 hot experts), q8 347 tok/s (73), and
+13.1 and 13.7 tok/s of decode at that depth.
+
+A trace of a prompt of 8192 tokens (bf16): 20 s, the GPU busy 60%. The
+products of the bf16 matrices ran in k_kq_gemm (float32, 4.6 s), the
+experts of the GPU in k_qmoe_gu and k_qmoe_dn (3.1 s: the tensor-core
+kernels take a shared expert of Q8_R only), and the sort of the pairs on
+one thread 1.0 s; the DeltaNet (1.3 s) and the attention (1.2 s) are those
+of q8. k_gemm_bf16_tc (x rounded to bfloat16, 52-58 TFLOPS against 13) and
+k_qmoe_sort_par: 406 -> 503 tok/s. The accuracy on 8192 tokens of source
+(the prompt path, every token): NLL 0.9208 with float32 products, 0.9212
+with the tensor cores, 0.9205 with q8 dense; top-1 against float32 97.1%
+(q8 96.2%), KL 0.013 (q8 0.019).
+
+One bfloat16 plane keeps 8 bits of x. Two planes (hi = bf16(x), lo =
+bf16(x - hi), two products into the same float32 sums) keep about 16: the
+error of a product 1e-5 in place of 1.6e-3, at half the rate (25 against 53
+TFLOPS; the 3090 gives about 71 TFLOPS of bf16 with float32 sums, so two
+planes cannot pass about 35). The default is two planes: 469 tok/s for
+8192 tokens (one plane 504). On the text, KL to float32 0.0104 (one plane
+0.0128); two runs of float32 products differ by 0.0066 (the split of the
+experts between the CPU and the GPU, and their int8 x), so the products
+are now a small part of the difference.
+
+## bf16: the shared expert, the copies of a prompt, tq6
+
+- The shared expert of a group MoE in bf16: the routed experts stay on the
+  int8 tensor cores (k_qmoe_gu_tc, k_qmoe_dn_tc skip the tiles of the
+  shared expert), and gg_gemm_bf16 computes the shared expert on the rows
+  start[E] .. start[E] + t of act, act2, de (start[E] read on the device).
+  8K prompt 469 -> 595 tok/s; KL to float32 unchanged (0.0129 with tq6).
+- The copies of a mixed group (GP_FETCH) waited about 0.9 s of each group
+  of 2048 tokens: the experts staged from Optane were copied by the worker
+  through its pinned buffers. QwenGPU page-locks the node-0 copy of the
+  experts (70.7 GB in 1.9 s), and the fetch worker copies registered memory
+  by DMA: 564 -> 649 tok/s. HotCache stays staged (full-rate DMA in the
+  decode took MTP from 66.7 to 58.8 tok/s).
+- tq6 is the cache of NP_GEMMA_DENSE=bf16 (18.7 KB a token, 21.8 for
+  int8): KL 0.0130 against 0.0104 for int8, the prompt about 10% slower
+  (more CPU time between the kernels, the kernels the same).
+
+    bf16 (tq6)    8K prompt 649 tok/s, decode 42.3, MTP 57.6
+    q8 (int8)     8K prompt 715 tok/s, decode 51.2, MTP 70.5
+
+The GPU still waits about 5.7 s of a bf16 prompt of 8192 tokens, in two
+places of each layer of each group: from the router to the sort (about 15
+ms: the plan on the CPU, the copies, and their wait) and from the sum of
+the experts to the add (about 12 ms: the experts of the CPU). The cost of a
+copy in the plan (MIX_GPU 0.7 ms) was too low on this machine: a sweep gave
+618 (0.7 ms), 667 (1.2 ms), 639 (1.8), 584 (4.0) tok/s, and the calibration
+of the cost (NP_GEMMA_GPU_MIX_CAL, now on by default) 680. With it: bf16
+676 tok/s, q8 768 tok/s.
+
+## bf16: the work during the copies, the output of the CPU
+
+- A mixed group now computes the hot experts and the shared expert during
+  the copies of the cold experts that it moves to the GPU
+  (NP_GEMMA_GPU_MIX_SPLIT, on by default). The plan (GP_MOE_PLAN) gives two
+  lists of pairs: gidx for the hot experts, gidx2 for the copied ones. The
+  first KQ_GROUP_MOE runs before GP_FETCH_WAIT; the second has no shared
+  expert (the sort gives it no rows, k_qmoe_sum adds only the routed
+  pairs) and runs after it; an add joins the two parts. Alone it gave
+  little: bf16 681 -> 668, q8 766 -> 783.
+- A trace then showed the real wait: the sum of the CPU experts went to the
+  GPU from pageable memory, at 1.8 GB/s (2048 x 4096 x 4 bytes, about 18
+  ms in each layer of each group). host_out of the mixed groups is now
+  pinned: bf16 741 to 757 tok/s for 8192 tokens, 761 for 16384; q8 855.
+- The copy cost of the plan: the calibration still wins (757) against
+  fixed costs of 1.2 ms (734), 2 ms (693), 3 ms (655), 5 ms (610).
+- KL to float32 0.0156 (NLL 0.9169 against 0.9208 for float32); two runs
+  of tq6 differ by 0.012, so the change is within the noise of the split
+  of the experts. check_qwen4_gpu.py passes in bf16.
+
+    bf16 (tq6)    8K prompt 757 tok/s, decode 42.3, MTP 57.6
+    q8 (int8)     8K prompt 855 tok/s, decode 51.2, MTP 70.5
+
+The trace of the bf16 prompt of 8192 tokens (GPU busy 68%):
+
+    k_gemm_bf16_tc     2.38 s   the dense products and the shared expert
+    k_attn_qsa_mt      1.29 s   the attention of the full layers
+    k_gdn_heads        1.25 s   the DeltaNet heads
+    k_qmoe_gu_tc       0.55 s
+    k_kq_gemm          0.44 s   float32 products of the small matrices
+    k_qmoe_dn_tc       0.34 s
+    k_gdn_conv         0.18 s
+    k_to_bf16          0.15 s
+
+    the wait for the copied experts after the hot ones    9.0 ms, 1.74 s
+    from the router to the plan                           3.1 ms, 0.6 s
+
+## The DeltaNet of a prompt group in parallel
+
+k_gdn_heads ran one block for each value head (48 blocks of 128 threads)
+with three block sums for each token: 8.8 ms for a group of 2048 tokens,
+1.25 s of the bf16 prompt of 8192 tokens, and k_gdn_conv (one thread for
+each channel, the tokens in a loop) 0.18 s. Only the state needs the order
+of the tokens, and each column of it is on its own. A group of 64 tokens or
+more with no log (NP_GEMMA_GPU_GDN_PAR=4) now runs:
+
+    k_gdn_conv_par   each (token, channel)                 0.52 ms
+    k_gdn_prep       norms of q, k; decay, beta; conv state
+    k_gdn_scan       4 threads for each column, 192 blocks  1.55 ms
+    k_gdn_out        the norm of the output and the gate    0.24 ms
+
+The 8K prompt: 757 -> 837 to 855 tok/s; KL to float32 0.0150 (0.0156
+before). The verify groups keep k_gdn_heads (their log and commit need the
+bits of the steps). check_qwen_gpu_groups.py (Qwen3.6) passes.
+
+## The attention of the QSA layers on the tensor cores
+
+k_attn_qsa_mt ran the dot of each query head with each key in float32: a
+block for each query and half of its heads (R = 6), so each key was decoded
+twice for each query, 26 ms for a group of 2048 tokens, 1.26 s of the bf16
+prompt of 8192 tokens. k_attn_qsa_tc (NP_GEMMA_GPU_QSA_TC, on by default)
+puts the 12 query heads of a key head in the 16 rows of an mma.m16n8k16
+tile. Block (query, key head), 4 warps, each with its own keys (16 at a
+time, the rows of sel), decoded to float16 times their scale in its own
+shared memory; S = Q K^T with q as two float16 planes (hi + lo, about 22
+bits; 2 keeps one plane), a softmax that runs, O += P V (P float16, V by
+ldmatrix.trans), and the warps join at the end. Forms int8 (q8) and TQ6
+(bf16); the float32 first layer and the int16 forms keep k_attn_qsa_mt.
+
+- 8K bf16 prompt 860 -> 910 tok/s (one plane 889); the kernel 26 -> 17
+  ms a group.
+- KL to float32 0.0120 (0.0150 before, two float32 runs differ by 0.0066);
+  NLL 0.9193 (float32 0.9208).
+- Alone (the scratchpad bench qsa_bench.py: 2048 queries at position 6144,
+  2048 random keys each): TQ6 31.9 -> 21.1 ms, int8 28.7 -> 19.4 ms; the
+  outputs agree to 1e-3. So the decode of TQ6 is not the limit.
+- Still about 1.5 times, not the 4 to 5 that the count of instructions
+  gives. Not found yet: the counters of the GPU need root
+  (ERR_NVGPUCTRPERM; NVreg_RestrictProfilingToAdminUsers=0 or ncu with
+  sudo). The codebook of TQ6 in shared memory changed little (18.3 -> 17.0
+  ms). The kernel has 230 registers (two blocks of 4 warps on an SM) and
+  each warp runs its keys in series: decode (gathered rows), S, softmax,
+  decode V, P V. Likely the latency of the gathers with 8 warps on an SM.
+  Next: a profile (stall reasons, occupancy); then the keys of a step
+  decoded by all the warps into one tile (cp.async of the raw rows of the
+  next step during the products), the output split over the warps (fewer
+  registers, more blocks on an SM).
+
+## Decode at the reduced clocks: the CPU part, warm slots
+
+The setup of the server: RQ8_0 experts, 256K context, the image encoder on
+the GPU, MTP 1 draft; the CPUs at 2.0 GHz (turbo off; uncore 2.0, then 2.4),
+the GPU at a 200 W limit. 10 hot experts in each layer.
+
+- A step: 48 layers of (the GPU before the MoE, 322 us: attention or
+  DeltaNet, the dense products, the router) then (the cold experts on the
+  CPU, 428 us). About 332 of the 490 selections of a step are cold, about
+  36 MB of RQ8_0 in each layer, read at about 100 GB/s.
+- Inside the CPU part (NP_GEMMA_MOE_PROF, kq_moe_prof): the threads arrive
+  within 2 us, the single region 11 us, gate and up end at 208 us (mean;
+  max 241), down at 373 (max 392), all 414. The team is busy and even: the
+  low use of the CPUs (about 20%) is the duty cycle (24 of 48 cores, busy
+  57% of a step), not idle threads in the part.
+- The team: 24 threads 25.7 tok/s, 32 25.0, 40 or 44 17 (they share cores
+  with the threads that spin: the runner, the copy worker, Python), 48 and
+  more of node 0 worse. Uncore 2.4 GHz in place of 2.0: no change in the
+  noise (24.4 to 25.8).
+- Warm slots (HotCache.enable_warm): more slots for the decode in a buffer
+  that the GPU holds for something else. A slot value KQH_WARM + i is
+  expert i there (gg_warm_base, read at run time by the hot kernels;
+  desc[16..18] for the plan of a mixed group). serve_qwen4 --mmproj-gpu
+  lend: the encoder measures its room (1.57 GB), gives it to the model
+  between images (QwenGPU.lend_warm), and takes it back for each image.
+  The rows are laid out by their own expert sizes (the MTP layer of the
+  NVFP4 file has larger experts). NP_GEMMA_GPU_WARM=ring also uses the
+  buffer of the copies of the mixed groups (cleared by each mixed group and
+  by each new program).
+- With the lent room: 6 warm slots a layer (284 filled), cold 332 -> 301 a
+  step, the CPU part 428 -> 390 us; plain 25.8 -> 27.0 tok/s, MTP (1
+  draft) 27.0 -> 27.8; the 8K prompt 590 -> 595 tok/s; the warm experts
+  stay through the prompt. check_qwen4_gpu.py PASS with lent slots (the
+  verify group exact); with ring the verify group differs (6.8e-3: a new
+  program frees the ring and the warm experts go to the CPU).
+
+## The CPU part of a prompt on real text
+
+- numad, before it was turned off, had moved the process of the agent (and
+  so the shell of each benchmark it started) to node 1: an affinity of
+  CPUs 24-47 that stayed. The earlier runs without taskset ran on
+  24 cores (more threads did not help; 32 threads were slower than 24).
+  taskset -c 0-47 (or taskset -a -p on the parent) fixes it. The decode
+  numbers of those runs need a run again.
+- A prompt of random tokens spreads few tokens on many experts less than
+  real text does. On an 8K prompt of real text (the notes and sources of
+  this project) the CPU part was the wait of each mixed group: about 290
+  experts a layer on the CPU, 4100 to 4800 pairs, median 8 tokens an expert
+  (36 experts of 1 token). 216-270 tok/s pinned to node 1; 347 (first
+  prompt) to 504 on both nodes.
+- The microbenchmark: the CPU inputs of the last layer of 4 groups
+  (cap_mix in the scratchpad), kq_moe on the weights of that layer.
+  Gate and up 38 ms, act 3 ms, down 21 ms, sum 2.5 ms of a 64 ms layer
+  (NP_GEMMA_MOE_GPROF). perf: kq_prep 13%, kq_row_scales 7%, a stack
+  probe of the 66 KB S of kq_tile4, the sign steps of Q8_0.
+- kq_rows4_t2 (NP_GEMMA_KQ_TILE2): the scales of a step of 64 values in
+  the lanes of the products, made one time for the 4 rows (dE) and in the
+  loop for the token (2 broadcasts), multiplied in the loop: S = ds * xs as
+  kq_prep, so the same bits. Q8_0 takes x + 128 (xor 0x80) from -128 sum(w)
+  of each lane (nE): the integer sums of kq_dot_q8_0 with no sign steps.
+  Short tiles have their own code; the next 4 rows are prefetched. The
+  same bits as kq_tile4 (the whole layer, Q8_0 and the mix).
+- One thread, weights in cache: about 17 MAC a cycle at 64 tokens; ports 0
+  and 5 are 68% busy. The exact form needs 4 vector uops for each 64 MACs
+  (dpbusd, cvt, mul, fma), so little is left there. Scales made in the
+  loop in place of the arrays of the rows (less L1) were slower.
+- A layer, both nodes: 24 threads 59.4 -> 45.3 ms; 40 threads 43.6 ->
+  38.7; with the copy on node 1 (330 experts) 31.8 (mix: 60.5 -> 35.1).
+  The CPU part of a mixed group now has its own team
+  (NP_GEMMA_GPU_MIX_THREADS, 40) and reads the copy on node 1
+  (NP_GEMMA_GPU_MIX_NUMA).
+- 8K real-text prompt, RQ8_0: 347 -> 455 tok/s for the first prompt, 504 ->
+  561-570 after the calibration settles. 4K with the calibration off: 408
+  -> 571, the same logits bit for bit. The copies are now the larger wait
+  (1.8-2.3 s of 3.5 s a group). check_qwen4_gpu.py: PASS.
+- The runs again on 40 CPUs (taskset 0-19,24-43, OMP_NUM_THREADS=40; so
+  the team of a mixed group is 32), lent image room, ctx 256K, tok/s:
+
+  |                         | RQ8_0  | RQ6 mix |
+  |-------------------------|--------|---------|
+  | hot experts a layer     | 22     | 30      |
+  | plain, team 24 / 32 / 40| 30.3 / 30.3 / 31.8 | 32.2 / 31.6 / 32.9 |
+  | MTP 1, team 24 / 32 / 40| 34.4 / 35.9 / 37.4 | 38.5 / 39.0 / 41.4 |
+  | CPU task a layer, 40    | 291 us | 274 us  |
+  | 8K real text, 3 runs    | 519, 596, 605 | 521, 575, 581 |
+
+  The team of 40 is the best for the step too (the default of
+  NP_GEMMA_GPU_CPU_THREADS is OMP_NUM_THREADS / 2: set it). Pinned to node
+  1 the same day: RQ8_0 27.8 / 29.6, mix 29.3 / 35.2 (plain / MTP).
+
+## The calibration with prefetch
+
+8K real text, RQ8_0, 256K ctx, 40 CPUs, tok/s of the 2nd and 3rd runs with
+the calibration off (NP_GEMMA_GPU_MIX_CAL=0) at a fixed copy cost (gpu_c)
+and a cost of a prefetched copy for the size of the prediction
+(NP_GEMMA_GPU_PREFETCH_COST, a share of gpu_c):
+
+| gpu_c   | cost 1.0 | 0.6  | 0.35 | 1.5  |
+|---------|----------|------|------|------|
+| 0.45 ms | 534-539  | 506  | 460  |      |
+| 0.65 ms | 596-600  | 562  | 511  |      |
+| 0.9 ms  | 597-599  | 587-597 | 566 |     |
+| 1.2 ms  | 581-589  |      |      | 583  |
+| 1.6 ms  | 558-561  |      |      | 536  |
+
+With the calibration on (it settles near 0.9 ms): 601-618 (two runs of the
+same settings; the runs differ by about 2%), cost 1.5 582-600, 2.0 594-598.
+A larger prediction is slower: it takes copies and GPU work from experts the
+CPU does as well. The calibration (the least waits) is as good as the best
+fixed cost, so it stays. The first prompt of a process (about 480 tok/s) is
+the compile of the program of the mixed groups and a first group with no
+prediction, not the start of the calibration (starting at 0.9 ms changed
+nothing).
+
+## The memory of the cache
+
+The cache of 131072 positions (NP_GEMMA_QWEN_KV=tq6, the first full layer
+float32; QWEN_PLAN.md has the forms):
+
+    part                                         before    now
+    keys and values, 11 tq6 layers               1.20 GiB  1.20 GiB
+    the raw keys of the indexer (12 layers)      0.75 GiB  0.38 GiB
+    the first full layer (float32)               0.50 GiB  0.50 GiB
+    the keys of the blocks of the indexer        0.19 GiB  0.09 GiB
+    the MTP layer (tq6)                          0.11 GiB  0.11 GiB
+    the state of the DeltaNet layers (fixed)     0.10 GiB  0.10 GiB
+
+- The keys of the indexer are now float16 (idxk and blk of QSA_SELECT, on
+  the CPU, the GPU, and in Qwen4.qsa_mask). The sums use float32. The
+  scores only rank the blocks.
+- check_qwen4_indexer.py ran on 4000 random rows. The 1949 queries that
+  drop blocks keep 997888 blocks, and 105 of them change (one block for
+  each of 105 queries). Each
+  has a score within 0.17% of the score of the last kept block. The float32
+  keys give no change. The check now passes such a block (NEAR).
+- The raw keys must stay. A snapshot of the server can start in a block,
+  and the key of that block then needs the raw keys before the snapshot.
+
 ## Risks
 
 - The page cache: if the working set does not fit, the rate falls by a

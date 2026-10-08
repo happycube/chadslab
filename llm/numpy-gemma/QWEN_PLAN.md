@@ -538,8 +538,75 @@ Status of phase 4 (the int16 cache, done):
 - GP_ATTN_QC_MT of the CPU now uses one row of scores for each thread, not
   one for each (token, head). Before, a long cache needed gigabytes of
   scores.
+
+The int8 forms of the cache:
+
+- NP_GEMMA_QWEN_KV=int8 keeps int8 keys and values, with a scale of
+  max |x| / 127 for each 32 values. The form k16v8 keeps int16 keys and
+  int8 values. The
+  cache keeps only these rows, as the int16 form does.
+- The first full attention layer keeps a different form
+  (qwen.layer_kv_form). NP_GEMMA_QWEN_KV_FIRST sets it: f32 (the default),
+  int16, int8, or "same" (the form of the other layers).
+- Qwen3.6 uses the records of the int8 cache of the Gemma models: KV_WRITE8
+  and ATTN_Q8 (or ATTN_Q8_MT), and the forms with V8 for k16v8. Qwen3.8
+  gives ATTN_QSA a form operand: 0 int16, 1 int8, 2 k16v8. The CPU
+  (csrc/qsa.c) and the GPU (k_attn_qsa_mt, k_attn_part) read it.
+- Tests: check_qwen_gpu_groups.py (Qwen3.6) and check_qwen4_gpu.py
+  (Qwen3.8, with MTP) pass with int8. On Qwen3.6, 160 decode steps against
+  the float cache give a KL of 7.6e-3 (int16), 5.9e-3 (int8), and 7.6e-3
+  (k16v8). The experts make this test noisy, so the forms do not differ
+  clearly here.
 - The checks pass (the logits of 4 layers of NumPy against transformers:
   6.6e-6). The GPU and the CPU now give the same 128 tokens of an answer.
+
+The default cache and the TQ6 form:
+
+- The default is now NP_GEMMA_QWEN_KV=int8, and the first full attention
+  layer keeps float32 rows (NP_GEMMA_QWEN_KV_FIRST=f32). The quantization
+  of that one layer gives most of the error of the cache.
+- NP_GEMMA_QWEN_KV=tq6 is the form for very long contexts. It is
+  TurboQuant (the MSE form, with no QJL stage). Each group of 32 values
+  gets a fixed rotation: random signs, then the Walsh-Hadamard transform.
+  The cache keeps a float32 norm and 6 bits for each value of the group.
+  The 6 bits are the index of the nearest Lloyd-Max value. These values
+  are for one coordinate of a random unit vector.
+  np_gemma/tq6.py has the description, the tables, and the NumPy form.
+- The attention works in the rotated form. GP_TQ_ROT rotates the queries
+  before the attention and the output after it. The scores do not change,
+  because the rotation is orthonormal. The records KV_WRITETQ, ATTN_TQ,
+  and ATTN_TQ_MT have the operands of the int8 records. ATTN_QSA of
+  Qwen3.8 has the form 4.
+- On the GPU, k_attn_part reads TQ6 (attn_kv8), and k_flash_qc_h has a TQ
+  form for the prompt pass. The GPU and the CPU quantize with the same
+  order of the operations.
+
+The quality of the forms on Qwen3.6, with the CPU programs. The table
+gives the KL of the top 64 tokens against a float32 cache. The text is a
+chat of 25766 positions.
+
+    form                          KL        top-1 same   GiB at 262144
+    int8, first layer float32     3.21e-3   97.19%       3.53
+    int16 (the old default)       3.78e-3   97.01%       5.31
+    int8, first layer int16       3.81e-3   96.93%       3.06
+    tq6, first layer float32      3.98e-3   96.90%       2.97
+    tq6 in every layer            4.46e-3   96.68%       2.19
+
+The sizes are those of the 10 full layers of Qwen3.6. The float32 layer
+takes 1.0 GiB of the 2.97 GiB of tq6.
+
+The speed of tq6:
+
+- GPU (scripts/bench_qwen_ctx.py, 0.5 GB of hot experts): at position
+  190000, tq6 gives 27.1 tok/s and int8 22.9 tok/s. At position 131000, tq6
+  gives 30.2 tok/s and int8 26.5 tok/s. The codebook is in shared memory.
+- CPU, the attention of one step over 131000 positions: VNNI (18 threads)
+  30 ms for both forms. AVX2 (3 threads) 51 ms for tq6, 25 ms for int8. The
+  AVX2 form finds the values with permutes of the symmetric codebook (not
+  gathers), but it is limited by the arithmetic.
+- Tests: check_qwen_gguf.py, check_qwen4_cpu.py, check_qwen_gpu.py,
+  check_qwen_gpu_groups.py, and check_qwen4_gpu.py (with MTP) pass with
+  tq6.
 
 The decode at far positions (scripts/bench_qwen_ctx.py; hot experts fixed,
 0.5 GB; 0 GB for the last two rows):

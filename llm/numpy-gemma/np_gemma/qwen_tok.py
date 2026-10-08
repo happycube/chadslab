@@ -13,22 +13,33 @@ The pipeline of tokenizer.json has these steps:
 The decoder changes the characters back to bytes, and the bytes to text.
 
 The pattern of step 3 uses the Unicode classes \\p{L}, \\p{M}, and \\p{N}.
-The re module of Python does not have them, and the regex module is not
-always installed. Thus split_words follows the pattern with unicodedata:
+The re module of Python does not have them (written out as ranges, re
+takes 3x the time of the Python code), and the regex module is not always
+installed. Thus split_words follows the pattern with unicodedata:
 
     (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}
     | ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+
+
+and encode takes fast_split: re with the ASCII classes for a text of ASCII
+alone, else the pattern in the regex module when it is there, else
+split_words. encode also keeps the ids of each piece (the pieces repeat),
+and changes the bytes of a new piece to the characters of BPE with
+str.translate.
 
 scripts/check_qwen_tok.py compares the ids with the tokenizers library.
 """
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
 _CONTRACTIONS = ("s", "t", "re", "ve", "m", "ll", "d")
+# The mark of escape(): a character of the private use area in place of the
+# "<" of a special token in the text of a message.
+ESCAPE = "\ue000"
 
 
 @lru_cache(maxsize=65536)
@@ -112,6 +123,37 @@ def _match(text, pos, n):
     return e
 
 
+# The pattern itself, for the regex module (when installed): the pieces of
+# split_words, at about 1.6x its speed (the characters of a Unicode version
+# after that of unicodedata aside).
+PATTERN = (r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"""
+           r"""| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+""")
+# The pattern of a text of ASCII characters alone, for re (3x the speed of
+# split_words): there \p{L} is [A-Za-z], \p{N} [0-9], no \p{M}, and \s the
+# White_Space characters (not the \x1c-\x1f of the \s of re). The "(?i)" of
+# the contractions without the case folds of re beyond ASCII.
+_S = r"\t\n\x0b\x0c\r "
+_ASCII_RE = re.compile(
+    r"'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])|[^\r\nA-Za-z0-9]?[A-Za-z]+|[0-9]"
+    r"| ?[^{S}A-Za-z0-9]+[\r\n]*|[{S}]*[\r\n]+|[{S}]+(?![^{S}])|[{S}]+".format(S=_S))
+
+
+@lru_cache(maxsize=1)
+def _unicode_split():
+    """The split of a text with other characters than ASCII: findall of the
+    regex module, else split_words."""
+    try:
+        import regex
+    except ImportError:
+        return split_words
+    return regex.compile(PATTERN).findall
+
+
+def fast_split(text):
+    """split_words, faster: re for ASCII text, else the regex module."""
+    return _ASCII_RE.findall(text) if text.isascii() else _unicode_split()(text)
+
+
 def bytes_to_unicode():
     """Return the byte table of GPT-2: byte value -> a printable character."""
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("\xa1"), ord("\xac") + 1)) + \
@@ -151,7 +193,22 @@ class QwenTokenizer:
         self.char_byte = {c: b for b, c in self.byte_char.items()}
         # The longest special tokens first, so a longer one wins.
         self._specials = sorted(self.special, key=len, reverse=True)
+        # escape() keeps all of them as text in a message: the chat structure
+        # (<|im_end|>), the media (<|image_pad|>), and <think>, <tool_call>.
+        self._structural = list(self._specials)
+        # ESCAPE stands for "<" only in front of the rest of a special token:
+        # a U+E000 of the text itself stays.
+        self._unescape = re.compile(re.escape(ESCAPE) + "(?=" + "|".join(
+            re.escape(t[1:]) for t in self._specials) + ")")
         self._cache = {}
+        # the bytes of a piece (as latin-1 characters) to the characters of BPE
+        self._bytes_tr = dict(self.byte_char)
+        # the ids of each piece of text (before its bytes)
+        self._words = {}
+        # the special tokens in the order of _specials: the first match of
+        # the alternation at a position is the longest
+        self._special_re = re.compile("(" + "|".join(re.escape(s) for s in self._specials) + ")") \
+            if self._specials else None
         self.stop_ids = [self.special[s] for s in ("<|im_end|>", "<|endoftext|>")
                          if s in self.special]
 
@@ -188,31 +245,53 @@ class QwenTokenizer:
 
     def _split_special(self, text):
         """Yield (is_special, part) for the text, at the special tokens."""
-        pos = 0
-        n = len(text)
-        while pos < n:
-            nxt, which = n, None
-            for s in self._specials:
-                j = text.find(s, pos)
-                if j != -1 and j < nxt:
-                    nxt, which = j, s
-            if nxt > pos:
-                yield False, text[pos:nxt]
-            if which is None:
-                break
-            yield True, which
-            pos = nxt + len(which)
+        if self._special_re is None:
+            if text:
+                yield False, text
+            return
+        for i, part in enumerate(self._special_re.split(text)):
+            if i % 2:
+                yield True, part
+            elif part:
+                yield False, part
+
+    def escape(self, text):
+        """text with each special token (<|im_end|>, <|image_pad|>, <think>,
+        <tool_call>, ...) marked as plain text: encode gives the ids of its
+        characters, not the special token. For the text of a message (a file
+        in a tool result can hold "<|im_end|>"; as the token it ends the turn
+        of the prompt, and the model copies the token and stops)."""
+        if "<" not in text:
+            return text
+        for t in self._structural:
+            if t in text:
+                text = text.replace(t, ESCAPE + t[1:])
+        return text
+
+    def unescape(self, text):
+        """text with the "<" of the special tokens that escape() marked."""
+        return self._unescape.sub("<", text) if ESCAPE in text else text
 
     def encode(self, text):
-        """Return the token ids of text."""
+        """Return the token ids of text. A special token marked by escape()
+        is plain text."""
         out = []
-        bc = self.byte_char
+        words, tr = self._words, self._bytes_tr
         for special, part in self._split_special(text):
             if special:
                 out.append(self.special[part])
                 continue
-            for w in split_words(unicodedata.normalize("NFC", part)):
-                out += self._bpe("".join(bc[b] for b in w.encode("utf-8")))
+            if ESCAPE in part:
+                part = self.unescape(part)
+            if not part.isascii():
+                part = unicodedata.normalize("NFC", part)
+            for w in fast_split(part):
+                ids = words.get(w)
+                if ids is None:
+                    ids = self._bpe(w.encode("utf-8").decode("latin-1").translate(tr))
+                    if len(words) < 500000:
+                        words[w] = ids
+                out += ids
         return out
 
     def decode(self, ids, skip_special=False):

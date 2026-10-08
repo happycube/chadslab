@@ -16,8 +16,10 @@ Q4_0, and Q6_K. A different type raises an error.
 from __future__ import annotations
 
 import mmap
+import os
 import re
 import struct
+import types
 
 import numpy as np
 
@@ -28,6 +30,7 @@ F32, F16, Q4_0, Q4_1 = 0, 1, 2, 3
 Q5_0, Q5_1, Q8_0, Q8_1 = 6, 7, 8, 9
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K = 10, 11, 12, 13, 14, 15
 IQ4_NL = 20
+IQ4_XS = 23
 BF16 = 30
 # The types of this runtime (not of ggml), in files of
 # scripts/convert_nvfp4_gguf.py: NVFP4 in the rows of KQ_NV4 (csrc/kquants.c:
@@ -38,9 +41,26 @@ BF16 = 30
 NV4 = 51
 E4M3_ROWS = 52
 NVX = 53
+# RQ8_0 (scripts/convert_q8_gguf.py --experts rq8, RQ8_EXPERTS_PLAN.md): the
+# blocks of Q8_0, of the values of a row after the TQ6 rotation of each 32
+# (np_gemma/tq6.py rotate: the signs TQ6_SIGNS, WHT32 with the butterflies of
+# stride 1 first, / sqrt(32)). w.x = (R w).(R x): the Q8_0 kernels run on the
+# rotated x. The file holds the rotation (ROTATION_META); the reader checks it.
+RQ8_0 = 55
+# RQ6_K (RQ6_MIX_PLAN.md): the blocks of Q6_K (256 values, 210 bytes) of the
+# rotated rows, the rotation of RQ8_0.
+RQ6_K = 56
+# BF12 (plan-scripts/BF12_PLAN.md): the bfloat16 values of a row in 12.25
+# bits, exact but for the values more than 15 binades under the largest of
+# their group of 32 (they decode to 0): in each group of 32 the sign and the
+# mantissa of each value (a byte), the gap of its exponent to the largest of
+# the group (4 bits), and that largest exponent (a byte); the row padded to
+# 16 bytes. Sign 1, gap 15, mantissa 0 is the zero code. cops.kq_bf16_to_bf12.
+BF12 = 57
 _ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
               E4M3_ROWS: lambda cols: cols,
-              NVX: lambda cols: cols // 32 * 18 + 1}
+              NVX: lambda cols: cols // 32 * 18 + 1,
+              BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16}
 
 
 def _e4m3_values():
@@ -61,12 +81,13 @@ _BLOCK = {
     F32: (1, 4), F16: (1, 2), BF16: (1, 2),
     Q4_0: (32, 18), Q4_1: (32, 20), Q5_0: (32, 22), Q5_1: (32, 24),
     Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210), Q4_K: (256, 144), Q5_K: (256, 176),
-    IQ4_NL: (32, 18),
+    IQ4_NL: (32, 18), IQ4_XS: (256, 136), RQ8_0: (32, 34), RQ6_K: (256, 210),
 }
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
-    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
+    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", IQ4_XS: "IQ4_XS", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
+    RQ8_0: "RQ8_0", RQ6_K: "RQ6_K", BF12: "BF12",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -78,8 +99,14 @@ _BLOCK_DT = {
     Q6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
                     ("sc", "i1", (16,)), ("d", "<f2")]),
     Q8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
+    RQ8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
+    RQ6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
+                     ("sc", "i1", (16,)), ("d", "<f2")]),
     Q5_1: np.dtype([("d", "<f2"), ("m", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
     IQ4_NL: np.dtype([("d", "<f2"), ("qs", "u1", (16,))]),
+    # ggml block_iq4_xs: d, the high 2 bits of the 8 scales, their low 4 bits
+    # (2 in a byte), and the codes of 256 values.
+    IQ4_XS: np.dtype([("d", "<f2"), ("sh", "<u2"), ("sl", "u1", (4,)), ("qs", "u1", (128,))]),
     Q4_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qs", "u1", (128,))]),
     Q5_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qh", "u1", (32,)),
                     ("qs", "u1", (128,))]),
@@ -222,8 +249,26 @@ def _dequant(raw, t, count):
         q = raw["qs"]
         v = np.concatenate([_IQ4_NL_VALUES[q & 0x0F], _IQ4_NL_VALUES[q >> 4]], axis=1)
         return (v * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
+    if t == IQ4_XS:
+        # 256 values in 8 parts of 32. Part j has the 6-bit scale ls (4 bits of
+        # sl, 2 bits of sh) and the codes of 16 bytes as IQ4_NL: the low 4
+        # bits of byte i are value i, the high 4 bits value i + 16. The value
+        # is d (ls - 32) times the table value.
+        nb = raw.shape[0]
+        j = np.arange(8)
+        sl = raw["sl"].astype(np.int32)[:, j // 2] >> (4 * (j % 2)) & 0xF
+        sh = raw["sh"].astype(np.int32)[:, None] >> (2 * j) & 3
+        ls = (sl | (sh << 4)) - 32                                  # (nb, 8)
+        q = raw["qs"].reshape(nb, 8, 16)
+        v = np.concatenate([_IQ4_NL_VALUES[q & 0x0F], _IQ4_NL_VALUES[q >> 4]], axis=2)
+        out = v * (raw["d"].astype(np.float32)[:, None] * ls)[:, :, None]
+        return out.astype(np.float32).reshape(-1)[:count]
     if t == Q8_0:
         return (raw["qs"].astype(np.float32) * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
+    if t == RQ8_0:
+        from .tq6 import unrotate
+        v = raw["qs"].astype(np.float32) * raw["d"].astype(np.float32)[:, None]
+        return unrotate(v).reshape(-1)[:count]
     if t in (Q4_K, Q5_K):
         # 256 values in 4 parts of 64: the low 4 bits of 32 bytes are the
         # first 32 values of a part, the high 4 bits the next 32. Q5_K adds
@@ -244,7 +289,7 @@ def _dequant(raw, t, count):
         dmin = raw["dmin"].astype(np.float32)[:, None, None]
         out = d * sc[:, :, None] * q - dmin * mn[:, :, None]
         return out.astype(np.float32).reshape(-1)[:count]
-    if t == Q6_K:
+    if t in (Q6_K, RQ6_K):
         # 256 values in one block. ql holds the low 4 bits, qh the top 2 bits,
         # sc one 8-bit scale for each group of 16, and d the block scale.
         # Use int16 for the work. The scale of a group of 16 is a repeat, not a
@@ -264,9 +309,38 @@ def _dequant(raw, t, count):
         y4 = q4 * np.repeat(sc[:, :, 6:8], 16, axis=2)
         out = np.concatenate([y1, y2, y3, y4], axis=2)
         out = out.reshape(nb, 256).astype(np.float32) * d[:, None]
-        return out.reshape(-1)[:count]
+        out = out.reshape(-1)[:count]
+        if t == RQ6_K:
+            from .tq6 import unrotate
+            out = unrotate(out).reshape(-1)
+        return out
     raise ValueError("dequant for type %s is not implemented" % _TYPE_NAME.get(t, t))
 
+
+
+def _dax_node(path):
+    """The NUMA node of the persistent memory under path when it is on a mount
+    with the dax option (/proc/mounts, /sys/block/<dev>/device/numa_node),
+    else None."""
+    import os
+    try:
+        real = os.path.realpath(path)
+        best = None
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 4 and (real == p[1] or real.startswith(p[1].rstrip("/") + "/")):
+                    if best is None or len(p[1]) > len(best[1]):
+                        best = p
+        if best is None or not any(o == "dax" or (o.startswith("dax=") and o != "dax=never")
+                                   for o in best[3].split(",")):
+            return None
+        dev = os.path.basename(best[0])
+        with open("/sys/block/%s/device/numa_node" % dev) as f:
+            n = int(f.read())
+        return n if n >= 0 else 0
+    except (OSError, ValueError):
+        return None
 
 class GGUF:
     """Read a GGUF file from a read-only memory map.
@@ -283,7 +357,10 @@ class GGUF:
     # at that precision. A 4-bit output head changes the first token.
     keep_embedding_bf16 = True
 
-    def __init__(self, path):
+    def __init__(self, path, stage=True, skip=()):
+        """stage False: no copy of a file on a DAX mount (_stage_dax), for a
+        reader of the metadata only. skip: tensors that the copy leaves out
+        (another file has them: GGUFOverlay)."""
         self.path = path
         self._fh = open(path, "rb")
         magic = self._fh.read(4)
@@ -307,6 +384,12 @@ class GGUF:
             off = struct.unpack("<Q", self._fh.read(8))[0]
             self.tensors[name] = (dims, t, off)
             self._order.append(name)
+        if any(t in (RQ8_0, RQ6_K) for _d, t, _o in self.tensors.values()):
+            want = rotation_meta()
+            got = {k: self.meta.get(k) for k in want}
+            if got != want:
+                raise ValueError("%s: RQ8_0 tensors of another rotation (%s; this build: %s)"
+                                 % (path, got, want))
         align = int(self.meta.get("general.alignment", 32))
         self._base = (self._fh.tell() + align - 1) // align * align
         self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
@@ -314,6 +397,13 @@ class GGUF:
             self._mm.madvise(mmap.MADV_HUGEPAGE)
         except (AttributeError, OSError):
             pass
+        self._stage = []
+        self.staged = False
+        self.stage_node = None
+        self.expert_node = None
+        self._skip = set(skip)
+        if stage:
+            self._stage_dax()
         # Map the runtime names to the GGUF names. A model that this module
         # does not map (Qwen3.5) reads its tensors by GGUF name (raw).
         self._to_gguf = {}
@@ -342,19 +432,157 @@ class GGUF:
             return _PREFIX + "layers.%s.%s" % (idx, target)
         raise KeyError("unknown tensor %s" % gname)
 
+    def _stage_dax(self):
+        """A file on a DAX mount (persistent memory, Optane in App Direct
+        mode): the map reads the module itself, and only the threads of its
+        NUMA node read it fast (about 10-13 GB/s on the 2-socket Xeon; a
+        thread of the other socket 0.4 GB/s, as each remote read updates the
+        directory in the module). So the tensors go into memory of the
+        process on the node of the module (NP_GEMMA_DAX_PLACE=interleave: over
+        all the nodes), copied by threads of that node; QwenGPU then copies
+        the experts to the other node (NP_GEMMA_GPU_NUMA_COPY); the tensors of NP_GEMMA_DAX_KEEP (by default
+        the n-gram table, per_layer_token_embd.weight: 51 GB of rows that a
+        step reads a few of) stay on the module. NP_GEMMA_DAX_STAGE=0: no
+        copy. The routed experts (the tensors *_exps.*) go to the node of
+        NP_GEMMA_DAX_EXPERTS: "auto" (the default) the node of the module if
+        all the staged tensors take at most 85% of its memory, else the
+        other node (the Q8_0 experts of Qwen3.8 are 131 GB, node 1 of the
+        Xeon 129 GB: the threads of node 1 read the module and write the
+        pages on node 0); or a node. self.expert_node is that node."""
+        import ctypes
+        import os
+        import sys
+        import time
+        if os.environ.get("NP_GEMMA_DAX_STAGE", "1") == "0":
+            return
+        node = _dax_node(self.path)
+        if node is None:
+            return
+        from . import numa
+        keep = set(os.environ.get("NP_GEMMA_DAX_KEEP", "per_layer_token_embd.weight").split(","))
+        keep |= getattr(self, "_skip", set())
+        place = os.environ.get("NP_GEMMA_DAX_PLACE", "node")
+        self.stage_node = None if place == "interleave" else node
+        staged_bytes = sum(tensor_bytes(d, t) for n, (d, t, _o) in self.tensors.items()
+                           if n not in keep)
+        xopt = os.environ.get("NP_GEMMA_DAX_EXPERTS", "auto")
+        xnode = node
+        if xopt != "auto":
+            xnode = int(xopt)
+        elif place != "interleave" and staged_bytes > 0.85 * numa.node_bytes(node):
+            others = sorted(set(numa.node_of_cpu().values()) - {node})
+            if others:
+                xnode = others[0]
+        self.expert_node = None if place == "interleave" else xnode
+        # the byte ranges of the staged tensors, in runs of adjacent tensors
+        # of the same node
+        spans = []
+        for name in self._order:
+            dims, t, off = self.tensors[name]
+            lo = self._base + off
+            hi = lo + tensor_bytes(dims, t)
+            if name in keep:
+                continue
+            nd = xnode if "_exps." in name else node
+            if spans and lo - spans[-1][1] < (1 << 20) and spans[-1][2] == nd:
+                spans[-1][1] = max(spans[-1][1], hi)
+            else:
+                spans.append([lo, hi, nd])
+        if not spans:
+            return
+        cpus = sorted(numa.node_cpus(node)) or None
+        t0 = time.time()
+        total = 0
+        from concurrent.futures import ThreadPoolExecutor
+
+        def pin():
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+        src0 = np.frombuffer(self._mm, dtype=np.uint8).ctypes.data
+        chunk = 32 << 20
+        # The tensors for the other node: the threads of the module's node
+        # copy a block into a buffer of their node, the threads of the other
+        # node copy it on (their pages, faulted and written locally): the
+        # threads of node 1 writing the pages of node 0 went at 1.8 GB/s.
+        xcpus = sorted(numa.node_cpus(xnode)) if xnode != node and place != "interleave" else []
+
+        def pin_x():
+            os.sched_setaffinity(0, xcpus)
+        block = 512 << 20
+        with ThreadPoolExecutor(min(16, len(cpus or [0]) or 1), initializer=pin) as ex, \
+                ThreadPoolExecutor(min(16, len(xcpus) or 1), initializer=pin_x if xcpus else None) as ex2:
+            bounce = [numa.empty_on(block, np.uint8, node) for _ in range(2)] if xcpus else None
+            for lo, hi, nd in spans:
+                a = numa.empty_interleaved(hi - lo) if place == "interleave" else \
+                    numa.empty_on(hi - lo, np.uint8, nd)
+                dst0 = a.ctypes.data
+                if not xcpus or nd == node:
+                    list(ex.map(lambda o: ctypes.memmove(dst0 + o, src0 + lo + o, min(chunk, hi - lo - o)),
+                                range(0, hi - lo, chunk)))
+                else:
+                    pend = [[], []]
+                    for k, o in enumerate(range(0, hi - lo, block)):
+                        n = min(block, hi - lo - o)
+                        for f in pend[k % 2]:
+                            f.result()              # the copy on that last read this buffer
+                        b0 = bounce[k % 2].ctypes.data
+                        list(ex.map(lambda p, b0=b0, o=o, n=n: ctypes.memmove(
+                            b0 + p, src0 + lo + o + p, min(chunk, n - p)), range(0, n, chunk)))
+                        pend[k % 2] = [ex2.submit(ctypes.memmove, dst0 + o + p, b0 + p, min(chunk, n - p))
+                                       for p in range(0, n, chunk)]
+                    for f in pend[0] + pend[1]:
+                        f.result()
+                self._stage.append((lo, hi, a))
+                total += hi - lo
+        self.staged = True
+        if os.environ.get("NP_GEMMA_QUIET") != "1":
+            dt = time.time() - t0
+            print("%s on a DAX mount (node %d): %.1f GB into memory in %.1f s (%.1f GB/s)%s; "
+                  "kept on the module: %s" % (os.path.basename(self.path), node, total / 1e9, dt,
+                                               total / 1e9 / max(dt, 1e-9),
+                                               "" if xnode == node else ", the experts on node %d" % xnode,
+                                               ", ".join(sorted(keep - self._skip)) +
+                                               (" and %d tensors of another file" % len(self._skip)
+                                                if self._skip else "")),
+                  file=sys.stderr)
+
+    def _buf_at(self, pos, n):
+        """The buffer and offset of n bytes at pos of the file: a staged copy
+        (_stage_dax), or the map."""
+        for lo, hi, a in self._stage:
+            if lo <= pos and pos + n <= hi:
+                return a, pos - lo
+        return self._mm, pos
+
     def raw(self, gname):
         """The blocks of a tensor by its GGUF name, as a structured array
-        (a view of the map), with its dims (ggml order) and type."""
+        (a view of the map, or of the staged copy of a file on a DAX mount),
+        with its dims (ggml order) and type."""
         dims, t, off = self.tensors[gname]
         if t in _ROW_BYTES:
             n = _ROW_BYTES[t](int(dims[0])) * int(np.prod(dims[1:]))
-            return np.frombuffer(self._mm, dtype=np.uint8, count=n, offset=self._base + off), dims, t
+            buf, o = self._buf_at(self._base + off, n)
+            return np.frombuffer(buf, dtype=np.uint8, count=n, offset=o), dims, t
         dt = _BLOCK_DT.get(t)
         if dt is None:
             raise ValueError("type %s is not implemented" % _TYPE_NAME.get(t, t))
         bv, _bb = _BLOCK[t]
         n = int(np.prod(dims)) // bv
-        return np.frombuffer(self._mm, dtype=dt, count=n, offset=self._base + off), dims, t
+        buf, o = self._buf_at(self._base + off, n * np.dtype(dt).itemsize)
+        return np.frombuffer(buf, dtype=dt, count=n, offset=o), dims, t
+
+    def drop_cache(self):
+        """Drop the pages of the file from the page cache and from the map
+        (its tensors were copied: GGUFOverlay experts). The map stays valid;
+        a later read faults the pages in again."""
+        try:
+            self._mm.madvise(mmap.MADV_DONTNEED)
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            os.posix_fadvise(self._fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
 
     def advise_random(self, gname):
         """No read-ahead and no huge pages on the bytes of a tensor (random
@@ -562,10 +790,14 @@ class GGUF:
         bv, _bb = _BLOCK[t]
         nblk_row = cols // bv
         table = self._blocks(hf_name, 0, int(dims[1]) * nblk_row)
-        if t == Q6_K and dtype == np.float32:
+        if t in (Q6_K, Q4_K, Q5_K, Q4_0) and dtype == np.float32:
             from . import cops
             if cops.available():
-                return cops.q6k_rows(table.view(np.uint8), rows, cols)
+                if t == Q6_K:
+                    return cops.q6k_rows(table.view(np.uint8), rows, cols)
+                if t == Q4_0:
+                    return cops.q4_0_rows(table.view(np.uint8), rows, cols)
+                return cops.kq45_rows(table.view(np.uint8), rows, cols, t == Q5_K)
         raw = table.reshape(-1, nblk_row)[rows].reshape(-1)
         arr = _dequant(raw, t, rows.size * cols).reshape(rows.size, cols)
         if dtype is not None and arr.dtype != np.dtype(dtype):
@@ -633,9 +865,13 @@ class GGUF:
         # The 12B and the 26B reuse the key as the value in a global layer, so
         # those layers have no value projection. The E4B has one there.
         has_v = any(("blk.%d.attn_v.weight" % i) in self.tensors for i in full)
+        # The E2B file gives a size for each layer (the shared layers have a
+        # wider feed-forward part); the others give one value.
+        ffn = np.asarray(m["gemma4.feed_forward_length"]).reshape(-1)
+        ffn = int(ffn[0]) if len(set(ffn.tolist())) == 1 else [int(v) for v in ffn]
         cfg = {
             "hidden_size": int(m["gemma4.embedding_length"]),
-            "intermediate_size": int(m["gemma4.feed_forward_length"]),
+            "intermediate_size": ffn,
             "num_hidden_layers": int(m["gemma4.block_count"]),
             "num_attention_heads": int(m["gemma4.attention.head_count"]),
             "num_key_value_heads": int(head_kv[sliding[0]]) if sliding else int(head_kv[0]),
@@ -778,6 +1014,66 @@ class GGUFSplit(GGUF):
             p.close()
 
 
+class GGUFOverlay(GGUF):
+    """A model file with the tensors of other files over its own: the
+    experts in another form (scripts/convert_q8_gguf.py --experts-only) take
+    the place of those of the model. The model file stages from a DAX mount
+    only the tensors that stay (the experts it no longer gives are left on
+    the module), so the experts of the overlay come from their own map:
+    QwenGPU copies them to the memory of the nodes (_numa_copy_experts).
+
+        g = GGUFOverlay("model.gguf", ["experts.gguf"])
+    """
+
+    def __init__(self, path, overs):
+        self.path = path
+        self.over = [GGUF(p, stage=False) for p in overs]
+        names = set()
+        for o in self.over:
+            names |= set(o.tensors)
+        self.base = open_gguf(path) if not names else (
+            GGUFSplit(path) if re.search(r"-\d{5}-of-\d{5}\.gguf$", path) else GGUF(path, skip=names))
+        self.parts = [self.base] + self.over
+        self.meta = self.base.meta
+        self.version = self.base.version
+        self.tensors = dict(self.base.tensors)
+        self._where = {n: self.base for n in self.base.tensors}
+        self._order = list(self.base._order)
+        for o in self.over:
+            for name in o._order:
+                if name not in self.tensors:
+                    raise ValueError("%s: %s is not a tensor of the model" % (o.path, name))
+                old, new = self.tensors[name], o.tensors[name]
+                if tuple(old[0]) != tuple(new[0]):
+                    raise ValueError("%s: %s has dims %s, the model %s" % (o.path, name, new[0], old[0]))
+                self.tensors[name] = new
+                self._where[name] = o
+        rot = [t for _d, t, _o in self.tensors.values() if t in (RQ8_0, RQ6_K)]
+        if rot:
+            want = rotation_meta()
+            for p in self.parts:
+                if any(t in (RQ8_0, RQ6_K) for _d, t, _o in p.tensors.values()):
+                    got = {k: p.meta.get(k) for k in want}
+                    if got != want:
+                        raise ValueError("%s: another rotation (%s)" % (p.path, got))
+        self.staged = getattr(self.base, "staged", False)
+        self.stage_node = getattr(self.base, "stage_node", None)
+        self.expert_node = None
+        self.experts_mapped = any("_exps." in n for o in self.over for n in o.tensors)
+        self._stage = getattr(self.base, "_stage", [])
+        self._to_gguf = {}
+
+    def raw(self, gname):
+        return self._where[gname].raw(gname)
+
+    def advise_random(self, gname):
+        return self._where[gname].advise_random(gname)
+
+    def close(self):
+        for p in self.parts:
+            p.close()
+
+
 def open_gguf(path):
     """A GGUF file, or the first file of a split model (GGUFSplit)."""
     if re.search(r"-\d{5}-of-\d{5}\.gguf$", path):
@@ -824,6 +1120,14 @@ def _w_value(f, v):
         raise TypeError("metadata value %r" % (v,))
 
 
+def rotation_meta():
+    """The metadata of the rotation of the RQ8_0 tensors of a file: the
+    tables of this build (csrc/tq6_tables.h)."""
+    from .tq6 import SIGN_BITS
+    return {"np_gemma.rotation.group": 32, "np_gemma.rotation.signs": int(SIGN_BITS),
+            "np_gemma.rotation.order": "wht32-stride1-first"}
+
+
 def tensor_bytes(dims, t):
     """The bytes of a tensor of dims (ggml order) and type t."""
     if t in _ROW_BYTES:
@@ -835,7 +1139,8 @@ def tensor_bytes(dims, t):
 def write_gguf(path, meta, tensors, align=32, progress=None):
     """Write a GGUF file (version 3). meta is a list of (key, value).
     tensors is a list of (name, dims (ggml order), type, make): make() gives
-    the data (a NumPy array, or a list of arrays written in turn) when the
+    the data (a NumPy array, or a list or a generator of arrays written in
+    turn) when the
     writer comes to the tensor, so one tensor at a time is in memory."""
     meta = list(meta) + [("general.alignment", align)]
     infos, off = [], 0
@@ -862,7 +1167,7 @@ def write_gguf(path, meta, tensors, align=32, progress=None):
         for (name, dims, t, make), (_n, _d, _t, o) in zip(tensors, infos):
             assert f.tell() == base + o, name
             data = make()
-            parts = data if isinstance(data, list) else [data]
+            parts = data if isinstance(data, (list, types.GeneratorType)) else [data]
             n = 0
             for a in parts:
                 b = memoryview(np.ascontiguousarray(a)).cast("B")

@@ -45,12 +45,15 @@ _INT4_MULTI4 = os.environ.get("NP_GEMMA_INT4_MULTI4", "1") == "1"
 # "Accuracy against the reference"):
 #   "1"   int8 for every product. This is the method of llama.cpp. It
 #         changes the most probable token at about 16 per cent of the
-#         positions, against the float products. A dense model uses it by
-#         default.
-#   "16"  float32 for the attention and the dense matrices, and int16 for the
-#         experts. It changes about 0.3 per cent of the positions, and the
-#         prompt pass takes about 1.5 times the time of "1". A model with a
-#         mixture of experts (the 26B) uses it by default.
+#         positions, against the float products. It is the default for a
+#         dense model (the 12B).
+#   "16"  int16 for every product in the prompt program (np_gemma/prompt.py,
+#         kq_q4x_gemm16 with VNNI); in the Python path, float32 for the
+#         attention and the dense matrices and int16 for the experts. It
+#         gives the NLL of float32. The default for a model with experts
+#         (the 26B, whose 30 layers make the noise of int8 grow) when the
+#         library has the int16 kernels: its prompt takes about 1.1 times
+#         the time of "1" (the 12B: about 2 times).
 #   "0"   float32 for every product. The prompt pass takes about 1.9 times the
 #         time of "1".
 # Set NP_GEMMA_INT4_Q8 to select one form for every model. See prompt_act.
@@ -66,13 +69,14 @@ def prompt_act(moe):
     """Return the form of the prompt activations of a model: "1", "16", or "0".
 
     NP_GEMMA_INT4_Q8 selects one form for every model. Without it, a model
-    with a mixture of experts uses "16" and a dense model uses "1". The
-    experts make the int16 form cheap for the 26B. For a dense model, "16"
-    is the same as "0", which takes about 1.9 times the time of "1".
+    with experts uses "16" when the library has the int16 kernels of the
+    prompt program (cops.kq_q16_ok), and every other model "1".
     """
     if _PROMPT_ACT_ENV is not None:
         return _PROMPT_ACT_ENV
-    return "16" if moe else "1"
+    if moe and _COPS_READY and hasattr(_cops, "kq_q16_ok") and _cops.kq_q16_ok():
+        return "16"
+    return "1"
 _INT4_Q8_GEMV_OK = (_INT4_Q8_GEMV and _COPS_READY
                     and bool(getattr(_cops, "VNNI", False)))
 _QKV_OK = _FUSED_QKV and _COPS_READY
@@ -267,8 +271,10 @@ def linear_q6k(x, w_bytes, cols):
 
 
 # The key and value cache keeps an int16 copy only when it holds at least this
-# many rows. Below it the float32 path is faster.
-ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "128"))
+# many rows. The step program (program.ready) needs the copy, so below the
+# limit a step runs the Python loop: with 128, the first 128 tokens of the
+# 26B decoded at 13.5 tok/s, not 20.9 (llama-bench tg128 on the CPU).
+ATTN_MIN = int(os.environ.get("NP_GEMMA_ATTN_MIN", "1"))
 
 
 def qkv_ready():
@@ -547,6 +553,15 @@ def quantize_i16(x):
     return q.reshape(x.shape), s.reshape(x.shape[:-1])
 
 
+def quantize_i8(x):
+    """quantize_i16 for the int8 cache (NP_GEMMA_KV_INT8): int8 values and
+    the scale max |x| / 127 for each group of 32."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    assert x.shape[-1] == 32, "the last axis must be one group of 32 values"
+    q, s = _cops.quantize_i8_groups(x.reshape(-1))
+    return q.reshape(x.shape), s.reshape(x.shape[:-1])
+
+
 def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
     """Run the fused attention for one query token over the int16 cache.
 
@@ -555,6 +570,9 @@ def attn_decode(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n):
     group of 32. The query stays float32. Return (q_heads, head_dim).
     """
     q = np.ascontiguousarray(q, dtype=np.float32).reshape(q_heads, head_dim)
+    if vq.dtype == np.int8:
+        return _cops.attn_decode_q8(q[None], kq, ks, vq, vs, q_heads, kv_heads, head_dim,
+                                    None, [n])[0]
     return _cops.attn_decode_i16(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, n)
 
 
@@ -577,6 +595,8 @@ def attn_decode_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n):
     """
     t = q.shape[0]
     q = np.ascontiguousarray(q, dtype=np.float32).reshape(t, q_heads, head_dim)
+    if vq.dtype == np.int8:
+        return _cops.attn_decode_q8(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n)
     return _cops.attn_decode_i16_mt(q, kq, ks, vq, vs, q_heads, kv_heads, head_dim, lo, n)
 
 
@@ -584,14 +604,20 @@ def attn_decode_f32(q, k, v, pos, base=0, window=0):
     """Run the fused float32 attention for one query token.
 
     q is (1, q_heads, head_dim) after RoPE, or (q_heads, head_dim). k and v
-    are (kv_heads, keys, head_dim), the layout of the cache. They may be a
-    part of a larger buffer: the kernel uses the stride between two heads, so
-    it copies nothing. pos is the position of the query and base is the
+    are (kv_heads, keys, head_dim) views of a float cache: position-major
+    (keys, kv_heads, head_dim) transposed (a head stride of head_dim), or
+    head-major. The kernel reads them by their strides, so it copies
+    nothing. pos is the position of the query and base is the
     position of key zero. A window of zero turns the sliding window off.
     Return the output, with the shape of q.
     """
     k = np.asarray(k, dtype=np.float32)
     v = np.asarray(v, dtype=np.float32)
+    for a in (k, v):
+        # the strides the kernel derives (gp_kv_rs): a row of kv_heads *
+        # head_dim (position-major) or of head_dim (head-major)
+        hs, rs = a.strides[0] // 4, a.strides[1] // 4
+        assert a.strides[2] == 4 and rs == (a.shape[0] * a.shape[2] if hs == a.shape[2] else a.shape[2])
     q2 = np.ascontiguousarray(q, dtype=np.float32).reshape(-1)
     head_dim = k.shape[2]
     q_heads = q2.size // head_dim
@@ -654,18 +680,46 @@ def quantize_int4(w, group=INT4_GROUP):
     This value matches the quantization-aware training of the model. A smaller
     group gives a smaller error and a slower multiply. Use group=None for one
     scale for each row.
+
+    Each block takes the scale with the least squared error of three: the
+    largest |w| / 8 (the rule of llama.cpp, without its sign), and the two
+    scales of the QAT grid. A QAT block holds k s with k from -8 to 7, and its
+    values reach one end of that range. Thus s = max(-min / 8, max / 7), or
+    the same with the sign of w changed (a negative scale). The weights of the
+    QAT releases of Gemma 4 then come back to 0.18 per cent (the float16 scale);
+    the first rule gave 5 to 8 per cent. The codes use the float16 scale of the
+    block, the scale that the kernels read.
     """
     w = np.asarray(w, dtype=np.float32)
     rows, cols = w.shape
     group = cols if group is None else group
     groups = cols // group
-    wg = w.reshape(rows, groups, group)
+    scale = np.empty((rows, groups), dtype=np.float32)
+    q = np.empty((rows, groups, group), dtype=np.int8)
+    step = max(1, (1 << 22) // cols)       # rows of a part: about 16 MB of w
+    for r0 in range(0, rows, step):
+        wg = w[r0:r0 + step].reshape(-1, groups, group)
+        hi, lo = wg.max(axis=2), wg.min(axis=2)
+        cands = (np.maximum(hi, -lo) / 8.0, np.maximum(-lo / 8.0, hi / 7.0),
+                 -np.maximum(hi / 8.0, -lo / 7.0))
+        best = None
+        for c in cands:
+            c = c.astype(np.float16).astype(np.float32)
+            safe = np.where(c == 0.0, 1.0, c)
+            k = np.rint(wg / safe[:, :, None]).clip(-8.0, 7.0)
+            err = np.square(k * c[:, :, None] - wg).sum(axis=2)
+            if best is None:
+                best, bs, bk = err, c, k
+            else:
+                pick = err < best
+                best = np.where(pick, err, best)
+                bs = np.where(pick, c, bs)
+                bk = np.where(pick[:, :, None], k, bk)
+        scale[r0:r0 + step] = np.where(bs == 0.0, 1e-12, bs)
+        q[r0:r0 + step] = bk.astype(np.int8)
     # Use the offset-8 nibble and the block layout of Q4_0. Thus a Q4_0 file
     # needs no change of the nibbles.
-    scale = np.max(np.abs(wg), axis=2) / 8.0
-    scale = np.where(scale == 0.0, 1e-12, scale).astype(np.float32)
-    q = np.rint(wg / scale[:, :, None]).clip(-8.0, 7.0).astype(np.int16)
-    qb = (q + 8).astype(np.uint8).reshape(rows, groups, 2, group // 2)
+    qb = (q.astype(np.int16) + 8).astype(np.uint8).reshape(rows, groups, 2, group // 2)
     qs = (qb[:, :, 0, :] | (qb[:, :, 1, :] << 4)).astype(np.uint8)
     return pack_int4_blocks(scale, qs), scale
 
@@ -802,7 +856,7 @@ def int4_q8_moe_ready():
 def moe_prompt_ready(act):
     """Return True when a fused expert kernel serves the prompt form act."""
     if act == "1":
-        return _INT4_Q8_HW
+        return _INT4_Q8_HW or bool(_Q4X_MOE)
     return _COPS_READY
 
 
@@ -813,8 +867,16 @@ def moe_prompt(h, gu, dn, val, idx, inner, act):
     experts of the layer in one region. See prompt_act.
     """
     if act == "1":
+        e = _Q4X_MOE.get(gu[0].ctypes.data)
+        if e is not None:
+            return _q4x_moe(h, e, val, idx)
+        if not _INT4_Q8_HW:
+            return moe_int4_f32(h, gu, dn, val, idx, inner)
         return moe_int4_q8(h, gu, dn, val, idx, inner)
     if act == "16":
+        e = _Q4X_MOE.get(gu[0].ctypes.data) if _Q4X_X16_PY else None
+        if e is not None:
+            return _q4x_moe(h, e, val, idx, x16=True)
         return moe_int4_q16(h, gu, dn, val, idx, inner)
     return moe_int4_f32(h, gu, dn, val, idx, inner)
 
@@ -939,14 +1001,164 @@ def moe_int4_q8(h, gu, dn, val, idx, inner):
 _INT4_GEMM_TOKENS = int(os.environ.get("NP_GEMMA_INT4_GEMM_TOKENS", "64"))
 
 
-def linear_int4(x, packed, scales, q8=None):
+# ---- KQ_Q4X: the int4 matrices in groups of 16 rows (csrc/kquants.c) ----
+# q4x_pack_model makes a copy of each int4 matrix of a model (Model.load_all)
+# in groups of 16 rows, for the products of a prompt with int8 activations: a
+# lane of vpdpbusd is a row, as KQ_NVX of Qwen3.8. The prompt of the 26B:
+# the experts of a layer with 512 tokens take 18 ms, not 67. The copy is in
+# memory (the int4 bytes again). NP_GEMMA_Q4X=0 turns it off.
+_Q4X = {}          # the address of an int4 matrix -> its KQ_Q4X bytes
+_Q4X_MOE = {}      # the address of the gate and up stack -> (gate and up, down, inner)
+_Q4X_SCRATCH = {}  # the scratch of kq_moe for a count of tokens
+_Q4X_HEAD = {}     # the address of a Q4_0 token table (the tied head) -> its KQ_Q4X bytes
+# On an AVX2 CPU (no AVX-512) the copies take int8 x with vpmaddubsw, as the
+# repack of llama.cpp (q4_0_8x8) does; an AVX-512 CPU without VNNI keeps the
+# int4 matrices.
+_Q4X_ON = (os.environ.get("NP_GEMMA_Q4X", "1") != "0" and _COPS_READY
+           and (bool(getattr(_cops, "VNNI", False)) or not getattr(_cops, "AVX512", True)))
+# The decode of the 26B on the CPU with the copies: float32 x on AVX-512 (the
+# products of MOE to 4e-6), int8 x on AVX2 (the float kernel there has no
+# 16-lane form; int8 is the form of llama.cpp).
+# NP_GEMMA_Q4X_INT8_DECODE=1 or 0 sets it (VNNI: vpdpbusd).
+_Q4X_INT8_ENV = os.environ.get("NP_GEMMA_Q4X_INT8_DECODE")
+Q4X_INT8_DECODE = _Q4X_ON and (not getattr(_cops, "AVX512", True) if _Q4X_INT8_ENV is None
+                               else _Q4X_INT8_ENV == "1")
+# The int16 x of a decode step on AVX2 (the build with the int8 decode): in
+# place of int8 for the KQ_Q4X products of a step (the C side reads it too),
+# the experts (KQ_MOE act bit 2) and the head. The default;
+# NP_GEMMA_DECODE_X16=0 keeps int8 x.
+DECODE_X16 = (Q4X_INT8_DECODE and os.environ.get("NP_GEMMA_DECODE_X16", "1") != "0"
+              and _COPS_READY and _cops.kq_q16_ok())
+
+
+def _q4x_ok(packed, scales):
+    return (isinstance(packed, np.ndarray) and packed.dtype == np.uint8 and packed.ndim >= 3
+            and packed.shape[-1] == 18 and packed.size // (packed.shape[-2] * 18) % 16 == 0)
+
+
+def q4x_pack_model(model):
+    """The KQ_Q4X copies of the int4 matrices of the layers of model: the
+    dense matrices, and the experts (the gate and up stack as two stacks).
+    Return the count of the bytes."""
+    if not _Q4X_ON:
+        return 0
+    n = 0
+    for w in model._layers.values():
+        if not isinstance(w, dict):
+            continue
+        for key, v in w.items():
+            if not (isinstance(v, tuple) and len(v) == 2 and _q4x_ok(*v)):
+                continue
+            q, s = v
+            if key == "experts.gate_up_proj":
+                d = w.get("experts.down_proj")
+                if d is None or not _q4x_ok(*d):
+                    continue
+                # the gate and up rows as they are (2 inner rows for each
+                # expert): one copy for the CPU (kq_moe with no up matrix)
+                # and the GPU (the bytes of an expert are those of the int4
+                # expert, so its tables and copies do not change)
+                e = (_cops.kq_q4x_pack(q, s), _cops.kq_q4x_pack(*d), q.shape[1] // 2)
+                _Q4X_MOE[q.ctypes.data] = e
+                n += e[0].nbytes + e[1].nbytes
+            elif key != "experts.down_proj" and q.ndim == 3:
+                _Q4X[q.ctypes.data] = _cops.kq_q4x_pack(q, s)
+                n += _Q4X[q.ctypes.data].nbytes
+    # The head of a Q4_0 token table (the Unsloth files): the copy for every
+    # token count, with int8 x. The 26B, AVX2 and 6 threads: 16.6 -> 7.7 ms
+    # for a token, 65.9 -> 13.4 ms for 4 (the int4 head there took int8 x
+    # too). VNNI and 18 threads: 8.2 -> 6.1 ms, 19.0 -> 6.2 ms. One kernel
+    # for each count also gives a verify group of MTP the logits of the
+    # steps; the int4 head took float x for a token and int8 x for a group.
+    # The token rows (Model.embed) keep the int4 table.
+    head = getattr(model, "_embed_q", None)
+    if (getattr(model, "_dtype", None) == "int4" and head is not None
+            and _q4x_ok(head, model._embed_s)):
+        _Q4X_HEAD[head.ctypes.data] = _cops.kq_q4x_pack(head, model._embed_s)
+        n += _Q4X_HEAD[head.ctypes.data].nbytes
+    return n
+
+
+def q4x_moe_mats(e):
+    """The descriptor of kq_moe for the KQ_Q4X experts e (gate and up, down,
+    inner): no up matrix, so the gate matrix holds both."""
+    return _cops.kq_moe_mats((e[0], _cops.KQ_Q4X), None, (e[1], _cops.KQ_Q4X), None)
+
+
+def _q4x_linear(x, qx):
+    """x (tokens, cols) times the KQ_Q4X matrix qx, int8 activations."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    t, cols = x.shape
+    rows = qx.nbytes // (cols // 32 * 18)
+    xq = np.empty((t, cols), np.int8)
+    xs = np.empty((t, cols // 32), np.float32)
+    xm = np.empty((t, cols // 16), np.float32)
+    _cops.kq_quant_x(x, xq, xs, xm)
+    out = np.empty((t, rows), np.float32)
+    _cops.kq_linear(qx, _cops.KQ_Q4X, rows, cols, xq, xs, xm, x, t, out)
+    return out
+
+
+def _q4x_moe(h, e, val, idx, x16=False):
+    """The experts of a prompt with KQ_Q4X (e: gate and up, down, inner), int8
+    activations (x16: int16, from the float rows h), the tanh GELU."""
+    GU, D, inner = e
+    h = np.ascontiguousarray(h, dtype=np.float32)
+    t, hidden = h.shape
+    top_k = idx.shape[1]
+    experts = GU.nbytes // (2 * inner * hidden // 32 * 18)
+    xq = np.empty((t, hidden), np.int8)
+    xs = np.empty((t, hidden // 32), np.float32)
+    xm = np.empty((t, hidden // 16), np.float32)
+    if not x16:
+        _cops.kq_quant_x(h, xq, xs, xm)
+    key = (t, top_k, experts, hidden, inner)
+    sc = _Q4X_SCRATCH.get(key)
+    if sc is None:
+        _Q4X_SCRATCH.clear()        # one size at a time: its pages stay mapped
+        sc = _Q4X_SCRATCH[key] = _cops.kq_moe_scratch(t, top_k, experts, hidden, inner)
+    mats = q4x_moe_mats(e)
+    out = np.empty((t, hidden), np.float32)
+    _cops.kq_moe_act(xq, xs, xm, np.ascontiguousarray(idx, dtype=np.int32),
+                     np.ascontiguousarray(val, dtype=np.float32), experts, mats, None, hidden,
+                     inner, sc, out, gelu=True, hf=h if x16 else None, x16=x16)
+    return out
+
+
+# The int16 x of a prompt on AVX2 (prompt_act "16", the Python path: a
+# KVCache form the prompt program does not take): the KQ_Q4X copies with
+# kq_linear16 and the int16 experts (KQ_MOE act bit 2), as the prompt
+# program. The float32 products of the VNNI build took 2 tok/s there.
+_Q4X_X16_PY = (_COPS_READY and _Q4X_ON and not getattr(_cops, "AVX512", True)
+               and _cops.kq_q16_ok())
+
+
+def linear_int4(x, packed, scales, q8=None, x16=False):
     """Multiply x by W. W is packed 4-bit data.
 
     Use the C kernel when the C path is available. Otherwise, dequantize W and
     use NumPy. q8 selects the int8 activations for two or more tokens. None
-    uses the default of the process (NP_GEMMA_INT4_Q8).
+    uses the default of the process (NP_GEMMA_INT4_Q8). A matrix with a
+    KQ_Q4X copy (q4x_pack_model) uses it for int8 activations.
     """
     q8_ok = _INT4_Q8_OK if q8 is None else (q8 and _INT4_Q8_HW)
+    if _Q4X_HEAD:
+        qx = _Q4X_HEAD.get(packed.ctypes.data)
+        if qx is not None:
+            if DECODE_X16:
+                cols = x.shape[1]
+                return _cops.kq_linear16(qx, qx.nbytes // (cols // 32 * 18), cols, x)
+            return _q4x_linear(x, qx)
+    if x16 and _Q4X_X16_PY and x.shape[0] >= 2:
+        qx = _Q4X.get(packed.ctypes.data)
+        if qx is not None:
+            cols = x.shape[1]
+            return _cops.kq_linear16(qx, qx.nbytes // (cols // 32 * 18), cols, x)
+    # The KQ_Q4X copies take int8 x with VNNI or with AVX2 (q4x_pack_model).
+    if (_INT4_Q8 if q8 is None else q8) and x.shape[0] >= 2 and _Q4X:
+        qx = _Q4X.get(packed.ctypes.data)
+        if qx is not None:
+            return _q4x_linear(x, qx)
     if _KERNEL_MODE != "numpy" and _COPS_READY:
         group = INT4_GROUP
         tokens = x.shape[0]
@@ -1069,6 +1281,19 @@ def softmax_mask(scores, positions, n_rep, base, window):
     return softmax(scores, axis=-1)
 
 
+def softmax_mask_limit(scores, positions, limit, base, window):
+    """softmax_mask with a last key for each query (limit) in place of its
+    position: the tokens of one image see each other. The window still
+    hides the keys before position - window + 1."""
+    kpos = base + np.arange(scores.shape[-1])
+    positions = np.asarray(positions)
+    mask = kpos[None, :] <= np.asarray(limit)[:, None]
+    if window:
+        mask &= (positions[:, None] - kpos[None, :]) < window
+    scores = np.where(mask[None, :, None, :], scores, np.float32(-1e30))
+    return softmax(scores, axis=-1)
+
+
 def flash_ready():
     """Return True when the C flash attention kernel is ready."""
     return _cops is not None and _cops.available()
@@ -1077,6 +1302,14 @@ def flash_ready():
 def flash_prefill(q, k, v, positions, base, window):
     """Run the C flash attention kernel for a prompt."""
     return _cops.attn_prefill(q, k, v, positions, base, window)
+
+
+def flash_prefill_qc(q, kq, ks, vq, vs, positions, base, window, limit=None):
+    """flash_prefill on the int16 cache (KVCache.read_qc), with no float copy
+    of it: the same values. limit: the last key of each query (the tokens of
+    an image, softmax_mask_limit). None when the kernel does not take the
+    shape."""
+    return _cops.attn_prefill_qc(q, kq, ks, vq, vs, positions, base, window, limit)
 
 
 def _select_flash_impl():
