@@ -1,3 +1,31 @@
+
+# reclank : by clankers, for running clankers
+
+This is still a research project in running LLM's in vibe-coded code, 
+definitely not a product yet!  (There are plenty of other projects 
+kinda like this one, but this one is mine.)
+
+The main things about it:
+
+- BF12 format for crunching bf16 weights by 28% with <.01% near-zero
+  weights zeroed out.  Great for saving VRAM in MoE models when you
+  want unquantized dense weights!
+- very few outside dependencies.
+- Should work from low (gemma 4 e4b, 26b, qwen 3.6 35a3b) up to Flash
+  (Qwen 3.8 F-N NVFP4, Deepseek 4.1-Flash with virtually-original weights)
+- Has full NUMA support for dual Xeons/EPYC/etc.
+
+What it doesn't have yet:
+
+- No AMD*/Intel support, not tested < NVidia Ampere.
+
+(* - I want to bypass ROCm and run on Polaris, maybe even Hawaii, by 
+going to /dev/amdgpu and /dev/amdkfd, but that's another project!)
+
+Maybe I'll deslop it enough to be useful to other people.  Maybe ;)
+
+[AI slop follows]
+
 # reclank — an LLM runtime in NumPy, C, and CUDA
 
 This project runs the model google/gemma-4-12B-it-qat-q4_0-unquantized.
@@ -13,6 +41,8 @@ appears only in the check scripts, where it builds the reference.
 It also runs Qwen3.8-Flash-Next (125B, 512 experts) from the NVFP4 checkpoint
 of NVIDIA, on the CPU or on a small GPU. See the section
 "Qwen3.8-Flash-Next".
+
+happycube:  it also also runs Deepseek 4.1 flash, if you have enough RAM.
 
 A C kernel reads the packed 4-bit and 2-bit weights in place. Thus the file
 layout is the runtime layout, and the model builds no float32 copy of a
