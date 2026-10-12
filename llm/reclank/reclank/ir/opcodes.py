@@ -1,0 +1,281 @@
+"""The operation codes of the programs: the one table for Python, the CPU
+runner (backends/cpu/csrc/common/interp.c, gp_step), and the GPU runner (backends/cuda/csrc,
+gg_launch).
+
+Each row is (name, code, runners, text). runners says where a record of the
+code runs: "cpu", "gpu", or both. The C name of a code is GP_<name>.
+
+    python -m reclank.ir.opcodes          # writes reclank/backends/include/opcodes.h
+    python -m reclank.ir.opcodes --check  # exit 1 when the header differs
+
+The header has the codes, the record (gp_rec), and gp_op_known(). A runner
+gives an error for a code that the table does not have. A known code that a
+runner does not run (a GPU record on the CPU) does nothing there, as before
+the table; tests/unit/test_opcodes.py checks that each code has a case in
+the runners that the table names. PROGRAMS.md describes the records.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+# The size of a record and the first word of a program.
+NARG = 24
+MAGIC = 0x4750524F47303031          # "GPROG001"
+
+# The tag of an operand: an integer (also an address), the bits of a float32,
+# or the index of a slot of the environment.
+T_NONE, T_INT, T_F32, T_SLOT = 0, 1, 2, 3
+
+B, C, G = ("cpu", "gpu"), ("cpu",), ("gpu",)
+
+TABLE = [
+    # 1 to 15: scalar operations on the slots of the environment
+    ("S_MOV", 1, B, "a slot gets a value"),
+    ("S_ADD", 2, B, "the sum of two values"),
+    ("S_SUB", 3, B, "the difference of two values"),
+    ("S_MUL", 4, B, "the product of two values"),
+    ("S_MAX", 5, B, "the larger of two values"),
+    ("S_MIN", 6, B, "the smaller of two values"),
+    # element operations
+    ("RMS_NORM", 16, B, "the RMS norm of rows"),
+    ("ADD", 17, B, "a + b"),
+    ("MUL_S", 18, B, "x times a scalar"),
+    ("COPY", 19, B, "a copy of rows"),
+    ("GELU", 20, B, "the tanh GELU"),
+    ("MUL", 21, B, "a * b"),
+    # int4 matrices (the Gemma 4 QAT files) and bfloat16
+    ("INT4_LINEAR", 32, B, "an int4 matrix on one token"),
+    ("INT4_MULTI4", 33, B, "up to 4 int4 matrices on the same x"),
+    ("RMS_NORM_MULTI4", 34, B, "the norm of x, then up to 4 int4 matrices"),
+    ("GELU_MUL_INT4", 35, B, "gelu(gate) * up, then an int4 matrix"),
+    ("INT4_LINEAR_MT", 36, B, "an int4 matrix on a small group"),
+    ("INT4_MULTI4_MT", 37, B, "up to 4 int4 matrices on a small group"),
+    ("GELU_MUL_ROWS", 38, B, "gelu(gate) * up of rows"),
+    ("BF16_LINEAR", 39, B, "a bfloat16 matrix"),
+    # attention and the cache
+    ("QKV_NORM_ROPE", 48, B, "the norms of q, k, v and the rope"),
+    ("KV_WRITE", 49, B, "the int16 rows of k and v in the cache"),
+    ("ATTN_QC", 50, B, "the attention of one query over the int16 cache"),
+    ("ATTN_F32", 51, B, "the attention over the float cache"),
+    ("ATTN_QC_MT", 52, B, "ATTN_QC for a small group"),
+    ("ATTN_F32_MT", 53, C, "ATTN_F32 for a small group"),
+    ("QKV_NORM", 54, B, "the norms of q, k, v"),
+    ("ROPE", 55, B, "the rope of q and k"),
+    ("KV_WRITE_HEADS", 56, B, "the float rows of k and v (the E4B)"),
+    ("ATTN_F32H", 57, B, "the float attention of the E4B"),
+    # the int8 cache (KVCache kv="int8"): KV_WRITE, ATTN_QC, ATTN_QC_MT with int8 values
+    ("KV_WRITE8", 58, B, "KV_WRITE with int8 values"),
+    ("ATTN_Q8", 59, B, "ATTN_QC over int8 values"),
+    ("ATTN_Q8_MT", 60, B, "ATTN_QC_MT over int8 values"),
+    # int16 keys and int8 values (KVCache kv="k16v8")
+    ("KV_WRITEV8", 61, B, "int16 keys, int8 values"),
+    ("ATTN_V8", 62, B, "the attention over int16 keys and int8 values"),
+    ("ATTN_V8_MT", 63, B, "ATTN_V8 for a small group"),
+    # the experts of the 26B
+    ("ROUTER", 64, B, "the router of one token"),
+    ("MOE", 65, C, "the experts of one token"),
+    ("ROUTER_MT", 66, B, "the router of a small group"),
+    ("MOE_MT", 67, C, "the experts of a small group"),
+    ("MOE_N", 68, C, "the experts of a large group"),
+    # the TQ6 cache (reclank/formats/tq6.py)
+    ("KV_WRITETQ", 69, B, "KV_WRITE8 with the TQ6 rotation"),
+    ("ATTN_TQ", 70, B, "ATTN_Q8 over the TQ6 cache"),
+    ("ATTN_TQ_MT", 71, B, "ATTN_Q8_MT over the TQ6 cache"),
+    ("TQ_ROT", 72, B, "the rotation of the queries (and its inverse for the output)"),
+    # a program in parts (reclank/models/gemma4/parts.py)
+    ("XBAR", 80, C, "the barrier between the parts"),
+    ("MOE_PART", 81, C, "the experts of one part"),
+    ("ATTN_QC_H", 82, C, "ATTN_QC for the heads of one part"),
+    ("ATTN_F32_H", 83, C, "ATTN_F32 for the heads of one part"),
+    # work between the GPU and the CPU (reclank/models/gemma4/gpu.py)
+    ("TO_HOST", 84, G, "rows to pinned host memory"),
+    ("CPU_JOIN", 85, G, "wait for the CPU program"),
+    ("TO_DEV", 86, G, "rows from pinned host memory"),
+    ("HOT_SPLIT", 87, G, "the experts of a token: hot on the GPU, cold on the CPU"),
+    ("HOT_MOE", 88, G, "the hot experts of one token"),
+    ("MOE_GPU", 89, G, "experts on the GPU"),
+    ("FETCH", 90, G, "start the copy of experts to the GPU"),
+    ("FETCH_WAIT", 91, G, "wait for a copy of experts"),
+    ("FETCH_DONE", 92, G, "the end of the copies of a step"),
+    ("HOT_SPLIT_MT", 93, G, "HOT_SPLIT for a small group"),
+    ("F32_LINEAR", 94, G, "a float32 matrix"),
+    ("DRAFT_HEAD", 95, G, "the head of the MTP drafter"),
+    ("ARGMAX", 96, G, "the best token of rows of logits"),
+    ("ADD_NORM", 97, G, "x + o, then the norm"),
+    ("COUNT", 98, G, "count the uses of experts"),
+    # 100 to 102 were the MLX affine records (removed)
+    # the Gated DeltaNet and Qwen3.5 (QWEN_PLAN.md)
+    ("ROUTER_TOPK", 103, B, "the top k experts of the Qwen router"),
+    ("GDN", 104, B, "the Gated DeltaNet"),
+    ("ATTN_PREP", 105, B, "the norms and the rope of the Qwen attention"),
+    ("SIGMUL", 106, B, "sigmoid(gate) * x"),
+    ("KQ_QUANT", 107, B, "int8 rows of x for the GGUF products"),
+    ("KQ_LINEAR", 108, B, "a GGUF matrix (K quants, Q8_0, NVFP4, BF12)"),
+    ("KQ_MOE", 109, C, "GGUF experts"),
+    # the GPU only (reclank/models/qwen/gpu35.py)
+    ("KQ_HOT_MOE", 110, G, "the hot GGUF experts"),
+    ("KQ_MULTI", 111, G, "up to 5 GGUF matrices on the same x"),
+    ("ADD_RMS", 112, G, "x + o, then the RMS norm"),
+    ("KQ_GROUP_MOE", 113, G, "GGUF experts of a large group"),
+    # qwen4exp: the gated residual and the n-gram layer (backends/cpu/csrc/common/hyperconn.c)
+    ("HC_NORM", 114, B, "the norm of the streams"),
+    ("HC_ACT", 115, B, "the gates of the streams"),
+    ("HC_MIX", 116, B, "the mix of the streams"),
+    ("HC_ADD", 117, B, "the output back into the streams"),
+    ("PLE_GATE", 118, B, "the gate of the n-gram layer"),
+    ("PLE_CONV", 119, B, "the convolution of the n-gram layer"),
+    # qwen4exp: QSA (backends/cpu/csrc/common/qsa.c)
+    ("QSA_SELECT", 120, B, "the blocks of keys of each query"),
+    ("ATTN_QSA", 121, B, "the attention over the selected blocks"),
+    ("HC_CAT", 122, B, "the streams side by side"),
+    ("MOE_PLAN", 123, C, "the plan of the experts of a group (CPU part)"),
+    ("CPU_START", 124, G, "start a CPU program"),
+    ("CPU_WAIT", 125, G, "wait for a CPU program"),
+    # the handoff to the CPU inside a graph: flags in pinned memory (backends/cuda/csrc)
+    ("SIGNAL", 126, G, "set a flag for the CPU"),
+    ("AWAIT", 127, G, "wait for a flag of the CPU"),
+    ("D2H", 128, G, "a copy to the host"),
+    ("H2D", 129, G, "a copy to the device"),
+    ("CPU_TASK", 130, G, "a CPU program inside the graph"),
+    ("FFN_OUT", 131, G, "the end of a layer of the 26B in one kernel"),
+    ("SOFTCAP", 132, G, "x = tanh(x / cap) cap, the soft cap of the logits"),
+    # the media encoders (reclank/encoders/runtime.py)
+    ("ENC_LINEAR", 133, B, "a matrix of an encoder"),
+    ("ENC_RMS", 134, B, "the RMS norm"),
+    ("ENC_GELU_MUL", 135, B, "gelu(gate) * up"),
+    ("ENC_ADD", 136, B, "x + s y"),
+    ("ENC_ROPE2D", 137, B, "the 2D rope of the vision encoders"),
+    ("ENC_ATTN", 138, B, "the attention of an encoder"),
+    ("ENC_SILU", 139, B, "the SiLU"),
+    ("ENC_MUL_VEC", 140, B, "x times a vector"),
+    ("ENC_GLU", 141, B, "the GLU"),
+    ("ENC_DWCONV", 142, B, "the depthwise convolution of the audio encoder"),
+    ("ENC_LOCAL_ATTN", 143, B, "the local attention of the audio encoder"),
+    ("ENC_CLAMP", 144, B, "clamp the values"),
+    ("ENC_BIAS_CLAMP", 145, B, "a bias, then clamp"),
+    ("ENC_LNORM", 146, B, "the layer norm"),
+    ("ENC_GELU", 147, B, "the GELU (tanh or erf)"),
+    ("Q6K_LINEAR", 148, C, "the rows of a Q6_K matrix (the head of the parts)"),
+    ("PART_PREFILL", 149, C, "the attention of a prompt block for the KV heads of a part"),
+    ("ATTN_PREFILL_QC", 150, C, "the attention of a prompt block over the int16 cache"),
+    ("KQ_QUANT16", 151, C, "the int16 x of a prompt block"),
+    ("KQ_LINEAR16", 152, C, "its KQ_Q4X product"),
+    # the GPU+parts mode of QwenGPU: the cold experts in a part for each node
+    ("KQ_MOE_PART", 153, C, "the cold experts, each part its rows"),
+    ("RUN_PARTS", 154, C, "the program runs in the pinned team of the parts"),
+    ("HC_PRE", 155, G, "the input of a block from the normed streams (down, act, up, mix, inject)"),
+    ("MOE_COMBINE", 156, G, "the routed experts of the GPU and the rows of the CPU, in the order of the router"),
+    # DeepSeek V4.1 Flash (DEEPSEEK_V41_PLAN.md, kernels/dsv41)
+    ("DS_MXX_LINEAR", 157, G, "x times a KQ_MXX matrix on int16 x (the operations of the CPU)"),
+    ("DS_FP8_LINEAR", 158, G, "x times an FP8 matrix with E8M0 scales of 32 x 32 blocks"),
+    ("DS_HC_MIX", 159, G, "the raw mixes of the streams of a sublayer"),
+    ("DS_HC_PRE", 160, G, "the input of a sublayer: the pre mix of the streams, then the norm"),
+    ("DS_HC_POST", 161, G, "the output of a sublayer back into the streams (post, comb)"),
+    ("DS_ROPE", 162, G, "the rope of the last values of each head (adjacent pairs)"),
+    ("DS_FP4", 163, G, "the FP4 rounding of the reference (E4M3 scales of 16 or E8M0 of 32)"),
+    ("DS_WIN_WRITE", 164, G, "the rope and the E4M3 rounding of the window rows of a group"),
+    ("DS_COMPRESS", 165, G, "the compressor: the pooled, normed latent of a group of tokens"),
+    ("DS_CMP_WRITE", 166, G, "the compressed row and the index key of a group into their caches"),
+    ("DS_IDX_SCORE", 167, G, "the scores of the indexer over the compressed entries"),
+    ("DS_CAND", 168, G, "the max of each block of scores (the candidates)"),
+    ("DS_TOPK", 169, G, "the k best scores, in the order of their indices"),
+    ("DS_ATTN", 170, G, "the attention of a query over the window and the selected entries, with sinks"),
+    ("DS_ROUTER", 171, G, "the router: sqrt-softplus, the bias for the choice, the scaled weights"),
+    ("DS_SWIGLU", 172, G, "silu(min(g, limit)) clamp(u, -limit, limit)"),
+    ("DS_ENGRAM", 173, G, "the gates of engram into the streams"),
+    ("DS_HOT_MOE", 174, G, "the routed experts the GPU holds (KQ_MXX), the de row of each pair"),
+    ("DS_COMBINE", 175, G, "the de rows of the GPU and of the CPU, in the order of the router"),
+    ("DS_RING_PUT", 176, G, "the window rows of a group into the ring, after the attention"),
+    ("DS_RING_RESTORE", 177, G, "the ring rows of the refused drafts back (DSpark)"),
+    ("DS_STREAM_MEAN", 178, G, "the mean of the streams (the input of DSpark)"),
+    ("DS_COMPRESS_FIX", 179, G, "the compressor's open group as after the accepted tokens (DSpark)"),
+    ("DS_GATHER", 180, G, "the row of a token chosen on the GPU (the Markov embedding)"),
+    ("DS_MARKOV", 181, G, "a draft position: the Markov bias into its logits, then their argmax"),
+    ("DS_CONF", 182, G, "the confidence of each draft position"),
+    ("DS_EMBED", 183, G, "the BF12 embedding rows of the tokens (pinned host memory) into the streams"),
+    ("DS_ENGRAM_ROWS", 184, G, "the values of gathered engram rows (E4M3 codes, E8M0 scales)"),
+    ("DS_ROWS_AT", 185, G, "the rows of a group at their positions into a buffer of rows from a slot (bounded replay)"),
+    ("DS_TOPK_MERGE", 186, G, "the k best so far and the scores of a chunk: the k best (DS_TOPK in chunks)"),
+]
+
+OPS = {name: code for name, code, _, _ in TABLE}
+OP_NAMES = {code: name for name, code in OPS.items()}
+RUNNERS = {name: runners for name, _, runners, _ in TABLE}
+globals().update(OPS)
+__all__ = ["NARG", "MAGIC", "T_NONE", "T_INT", "T_F32", "T_SLOT", "OP_NAMES"] + list(OPS)
+
+HEADER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backends",
+                      "include", "opcodes.h")
+
+
+def header():
+    """The text of backends/include/opcodes.h."""
+    w = max(len(n) for n in OPS)
+    rows = []
+    for name, code, runners, text in TABLE:
+        rows.append("    GP_%-*s = %3d,   /* %-7s %s */" % (w, name, code, "+".join(runners), text))
+    cases = []
+    line = "    "
+    for name in OPS:
+        item = "case GP_%s: " % name
+        if len(line) + len(item) > 92:
+            cases.append(line.rstrip())
+            line = "    "
+        line += item
+    cases.append(line.rstrip())
+    return """/* The operation codes of the programs. Generated by reclank/ir/opcodes.py
+ * (python -m reclank.ir.opcodes): do not edit. */
+#ifndef RECLANK_OPCODES_H
+#define RECLANK_OPCODES_H
+
+#include <stdint.h>
+
+#define GP_NARG %d
+#define GP_MAGIC 0x%XLL   /* "GPROG001" */
+
+typedef struct {
+    int32_t op;
+    int32_t flags;
+    uint8_t tag[GP_NARG];
+    int64_t v[GP_NARG];
+} gp_rec;
+
+enum { GP_T_NONE = %d, GP_T_INT = %d, GP_T_F32 = %d, GP_T_SLOT = %d };
+
+enum {
+%s
+};
+
+/* 1 for a code of the table, else 0: a runner fails on an unknown code. */
+static inline int gp_op_known(int op)
+{
+    switch (op) {
+%s
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+#endif
+""" % (NARG, MAGIC, T_NONE, T_INT, T_F32, T_SLOT, "\n".join(rows), "\n".join(cases))
+
+
+def main(argv):
+    text = header()
+    old = open(HEADER).read() if os.path.exists(HEADER) else None
+    if "--check" in argv:
+        if old != text:
+            print("%s differs from reclank/ir/opcodes.py: run python -m reclank.ir.opcodes" % HEADER)
+            return 1
+        return 0
+    if old != text:
+        with open(HEADER, "w") as f:
+            f.write(text)
+        print("wrote", HEADER)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

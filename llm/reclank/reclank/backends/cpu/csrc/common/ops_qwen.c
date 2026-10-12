@@ -1,0 +1,367 @@
+/* ---------- small operations of other models (Qwen3.5) ---------- */
+
+/* The router of a MoE layer as softmax, then the top k, then the k weights
+ * divided by their sum (Qwen3.5, Mixtral). At an equal value the lower index
+ * wins. One token for each thread. */
+static void gp_router_topk_body(const float *logits, int t, int experts, int k, float *val,
+                                int32_t *idx, const int32_t *map, float bias, float swap,
+                                int32_t *sel)
+{
+    /* map (or NULL): the choice takes the logit + bias of each expert with
+     * map[x] >= 0 (on the GPU), the weights the plain softmax (k_router_topk) */
+    const float wb = map != NULL ? expf(bias) : 1.f;
+    #pragma omp for schedule(static)
+    for (int j = 0; j < t; ++j) {
+        const float *l = logits + (size_t)j * experts;
+        float m = -INFINITY;
+        for (int x = 0; x < experts; ++x) {
+            m = l[x] > m ? l[x] : m;
+        }
+        float p[1024];
+        float sum = 0.f;
+        for (int x = 0; x < experts; ++x) {
+            p[x] = expf(l[x] - m);
+            sum += p[x];
+            if (map != NULL && map[x] >= 0) {
+                p[x] *= wb;
+            }
+        }
+        float vs = 0.f;
+        for (int s2 = 0; s2 < k; ++s2) {
+            int b = -1;
+            for (int x = 0; x < experts; ++x) {
+                if (p[x] >= 0.f && (b < 0 || p[x] > p[b])) {
+                    b = x;
+                }
+            }
+            const float pb = map != NULL ? expf(l[b] - m) : p[b];
+            idx[(size_t)j * k + s2] = b;
+            val[(size_t)j * k + s2] = pb / sum;
+            vs += pb / sum;
+            p[b] = -1.f;
+        }
+        if (map != NULL && swap > 0.f) {
+            /* RECLANK_GPU_HOT_SWAP (k_router_topk): sel gets the choice; from
+             * the lightest, a chosen expert with map < 0 gives its place to
+             * the best unchosen one with map >= 0 of at least swap times its
+             * weight; the first with none ends it */
+            int32_t *ij = idx + (size_t)j * k;
+            float *vj = val + (size_t)j * k;
+            if (sel != NULL) {
+                memcpy(sel + (size_t)j * k, ij, (size_t)k * sizeof(*ij));
+            }
+            for (int s2 = k - 1; s2 >= 0; --s2) {
+                if (map[ij[s2]] >= 0) {
+                    continue;
+                }
+                int b = -1;
+                for (int x = 0; x < experts; ++x) {
+                    if (p[x] >= 0.f && map[x] >= 0 && (b < 0 || p[x] > p[b])) {
+                        b = x;
+                    }
+                }
+                if (b < 0) {
+                    break;
+                }
+                const float cp = expf(l[b] - m) / sum;
+                if (cp < swap * vj[s2]) {
+                    break;
+                }
+                vs += cp - vj[s2];
+                ij[s2] = b;
+                vj[s2] = cp;
+                p[b] = -1.f;
+            }
+        }
+        for (int s2 = 0; s2 < k; ++s2) {
+            val[(size_t)j * k + s2] /= vs;
+        }
+    }
+}
+
+/* out = x * sigmoid(g), for n values. */
+static void gp_sigmul_body(const float *x, const float *g, float *out, int64_t n)
+{
+    #pragma omp for schedule(static)
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = x[i] / (1.f + expf(-g[i]));
+    }
+}
+
+/* The steps before the attention of a gated attention with partial RoPE
+ * (Qwen3.5), for t tokens from pos:
+ *
+ * - qg (t x nq x 2 hd): the query and the gate of each head;
+ * - the query: rms_norm with qn, RoPE on the first rot values, times scale,
+ *   into qout (t x nq x hd); the gate into gate (t x nq x hd);
+ * - kk, vv (t x nk x hd): the key gets rms_norm with kn and RoPE; the key and
+ *   the value go to the cache K, V (nk heads, hs values between heads) at
+ *   the positions pos to pos + t - 1. With a null K (the int16 cache), the
+ *   key goes to kout (t x nk x hd) instead.
+ *
+ * cos and sin have rot values for each token (the two halves the same). */
+static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
+                              const float *qn, const float *kn, const float *cos,
+                              const float *sin, float *K, float *V, int64_t hs, int64_t pos,
+                              int t, int nq, int nk, int hd, int rot, float eps, float scale,
+                              float *qout, float *gate, float *kout)
+{
+    int half = rot / 2;
+    #pragma omp for schedule(static)
+    for (int x = 0; x < t * (nq + nk); ++x) {
+        int j = x / (nq + nk), h = x % (nq + nk);
+        const float *src;
+        const float *w;
+        float *dst;
+        float sc;
+        if (h < nq) {
+            src = qg + ((size_t)j * nq + h) * 2 * hd;
+            memcpy(gate + ((size_t)j * nq + h) * hd, src + hd, (size_t)hd * 4);
+            dst = qout + ((size_t)j * nq + h) * hd;
+            w = qn;
+            sc = scale;
+        } else {
+            int kh = h - nq;
+            src = kk + ((size_t)j * nk + kh) * hd;
+            if (K == NULL) {
+                /* The int16 cache: the key goes to kout, and GP_KV_WRITE
+                 * stores the key and the value. */
+                dst = kout + ((size_t)j * nk + kh) * hd;
+            } else {
+                size_t rs = gp_kv_rs((size_t)hs, nk, hd);
+                dst = K + (size_t)kh * hs + (size_t)(pos + j) * rs;
+                memcpy(V + (size_t)kh * hs + (size_t)(pos + j) * rs,
+                       vv + ((size_t)j * nk + kh) * hd, (size_t)hd * 4);
+            }
+            w = kn;
+            sc = 1.f;
+        }
+        float ss = 0.f;
+        for (int d = 0; d < hd; ++d) {
+            ss += src[d] * src[d];
+        }
+        float inv = 1.f / sqrtf(ss / (float)hd + eps);
+        float y[1024];
+        for (int d = 0; d < hd; ++d) {
+            y[d] = src[d] * inv * w[d];
+        }
+        const float *c = cos + (size_t)j * rot, *sn = sin + (size_t)j * rot;
+        for (int d = 0; d < half; ++d) {
+            float a = y[d], b = y[d + half];
+            dst[d] = (a * c[d] - b * sn[d]) * sc;
+            dst[d + half] = (b * c[d + half] + a * sn[d + half]) * sc;
+        }
+        for (int d = rot; d < hd; ++d) {
+            dst[d] = y[d] * sc;
+        }
+    }
+}
+
+/* GP_NARG, GP_MAGIC, gp_rec, and the codes GP_*: the table of
+ * reclank/ir/opcodes.py. */
+#include "opcodes.h"
+
+/* Set by a record that cannot run its shape (the int8 cache has one
+ * kernel); rc_run then returns -3. */
+static volatile int gp_fail;
+
+
+int rc_gp_record_size(void)
+{
+    return (int)sizeof(gp_rec);
+}
+
+static inline int64_t gp_i(const gp_rec *r, const int64_t *e, int k)
+{
+    return r->tag[k] == GP_T_SLOT ? e[r->v[k]] : r->v[k];
+}
+
+static inline float gp_f(const gp_rec *r, const int64_t *e, int k)
+{
+    uint32_t u = (uint32_t)gp_i(r, e, k);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+#define GP_P(T, k) ((T *)(intptr_t)gp_i(r, e, (k)))
+#define GP_I(k) ((int)gp_i(r, e, (k)))
+
+/* out += d * v, one multiply and one add for each value, as NumPy does. A fused
+ * multiply and add rounds one time and gives other bits. */
+__attribute__((optimize("fp-contract=off")))
+static void gp_add_scaled(float *out, const float *d, float v, int n)
+{
+    for (int c = 0; c < n; ++c) {
+        float p = d[c] * v;
+        out[c] = out[c] + p;
+    }
+}
+
+/* The experts of one token, as Model._moe_one_token does it. The kernels run
+ * the selected experts in the order of their index. Then the code adds their
+ * outputs with the router weights, in the same order.
+ *
+ * GP_MOE gives the count of experts as operand 3. GP_MOE_N gives the address
+ * of an int32 that holds the count. The GPU writes that count with the list
+ * of the experts that it does not hold (reclank/backends/cuda/runtime.py). A count of 0 gives
+ * an output of zeros. */
+static void gp_moe_one(const gp_rec *r, const int64_t *e)
+{
+    const float *h = GP_P(const float, 0);
+    const float *val = GP_P(const float, 1);
+    const int32_t *idx = GP_P(const int32_t, 2);
+    int top_k = r->op == GP_MOE_N ? *GP_P(const int32_t, 3) : GP_I(3);
+    const uint8_t *gu_w = GP_P(const uint8_t, 4);
+    const float *gu_s = GP_P(const float, 5);
+    const uint8_t *dn_w = GP_P(const uint8_t, 6);
+    const float *dn_s = GP_P(const float, 7);
+    int gu_rows = GP_I(8);
+    int cols = GP_I(9);
+    int dn_rows = GP_I(10);
+    int inner = GP_I(11);
+    int32_t *ids = GP_P(int32_t, 12);
+    float *act = GP_P(float, 13);
+    float *act2 = GP_P(float, 14);
+    float *de = GP_P(float, 15);
+    float *out = GP_P(float, 16);
+    #pragma omp single
+    {
+        /* np.unique: the router gives distinct experts, so a sort is enough. */
+        for (int j = 0; j < top_k; ++j) {
+            ids[j] = idx[j];
+        }
+        for (int j = 1; j < top_k; ++j) {
+            int32_t x = ids[j];
+            int k = j - 1;
+            while (k >= 0 && ids[k] > x) {
+                ids[k + 1] = ids[k];
+                --k;
+            }
+            ids[k + 1] = x;
+        }
+    }
+    gemma_moe_gemv_gelu_body(gu_w, gu_s, h, ids, top_k, act, act2, gu_rows, cols, 0, inner);
+    gemma_int4_moe_gemv_body(dn_w, dn_s, act2, ids, top_k, de, dn_rows, inner, inner);
+    #pragma omp single
+    {
+        for (int c = 0; c < dn_rows; ++c) {
+            out[c] = 0.0f;
+        }
+        for (int j = 0; j < top_k; ++j) {
+            int s = 0;
+            while (idx[s] != ids[j]) {
+                ++s;
+            }
+            gp_add_scaled(out, de + (size_t)j * (size_t)dn_rows, val[s], dn_rows);
+        }
+    }
+}
+
+/* The key rows of query row j of a group: the first row lo and the count n.
+ * The first query has the position pos, and row 0 of the buffer has the
+ * position base. A sliding layer (window > 0) reads only the window. This is
+ * the rule of Model._attention for a group. */
+static inline void gp_rows(int64_t pos, int64_t base, int window, int j,
+                           int *lo, int *n)
+{
+    int64_t p = pos + j;
+    int64_t l = window > 0 ? p - window + 1 - base : 0;
+    if (l < 0) {
+        l = 0;
+    }
+    *lo = (int)l;
+    *n = (int)(p + 1 - base - l);
+}
+
+/* The experts of a group of tokens, as Model._moe_mt does it.
+ *
+ * A pair is one (expert, token). The code sorts the pairs by expert with a
+ * stable sort, so the pairs of one expert keep the order of their tokens.
+ * The kernels then read each expert one time for all of its pairs. Last, each
+ * token adds the outputs of its pairs in the order of the expert index, with
+ * the router weights. */
+static void gp_moe_group(const gp_rec *r, const int64_t *e)
+{
+    const float *h = GP_P(const float, 0);
+    const float *val = GP_P(const float, 1);
+    const int32_t *idx = GP_P(const int32_t, 2);
+    int tokens = GP_I(3);
+    int top_k = GP_I(4);
+    const uint8_t *gu_w = GP_P(const uint8_t, 5);
+    const float *gu_s = GP_P(const float, 6);
+    const uint8_t *dn_w = GP_P(const uint8_t, 7);
+    const float *dn_s = GP_P(const float, 8);
+    int gu_rows = GP_I(9);
+    int cols = GP_I(10);
+    int dn_rows = GP_I(11);
+    int inner = GP_I(12);
+    int32_t *order = GP_P(int32_t, 13);    /* the flat index of each pair */
+    int32_t *ids = GP_P(int32_t, 14);      /* the expert of each job */
+    int32_t *poff = GP_P(int32_t, 15);     /* the first pair of each job */
+    int32_t *xi = GP_P(int32_t, 16);       /* the token of each pair */
+    int32_t *xi2 = GP_P(int32_t, 17);      /* the pair itself */
+    int32_t *jobs_out = GP_P(int32_t, 18);
+    float *act = GP_P(float, 19);
+    float *act2 = GP_P(float, 20);
+    float *de = GP_P(float, 21);
+    float *out = GP_P(float, 22);
+    const int pairs = tokens * top_k;
+    #pragma omp single
+    {
+        /* A stable insertion sort of the flat indices by expert. */
+        for (int f = 0; f < pairs; ++f) {
+            int32_t x = f;
+            int k = f - 1;
+            while (k >= 0 && idx[order[k]] > idx[x]) {
+                order[k + 1] = order[k];
+                --k;
+            }
+            order[k + 1] = x;
+        }
+        /* A pair with a negative expert index is not for the CPU: the GPU
+         * computes it (reclank/backends/cuda/runtime.py). The sort puts such pairs first. */
+        int s0 = 0;
+        while (s0 < pairs && idx[order[s0]] < 0) {
+            ++s0;
+        }
+        int jobs = 0;
+        for (int p = s0; p < pairs; ++p) {
+            int32_t ex = idx[order[p]];
+            if (jobs == 0 || ids[jobs - 1] != ex) {
+                ids[jobs] = ex;
+                poff[jobs] = p;
+                ++jobs;
+            }
+            xi[p] = order[p] / top_k;
+            xi2[p] = p;
+        }
+        poff[jobs] = pairs;
+        jobs_out[0] = jobs;
+    }
+    const int jobs = jobs_out[0];
+    gemma_moe_gemv_gelu_mt_body(gu_w, gu_s, h, ids, poff, xi, jobs, act, act2,
+                                gu_rows, cols, cols, inner);
+    gemma_int4_moe_gemv_mt_body(dn_w, dn_s, act2, ids, poff, xi2, jobs, de,
+                                dn_rows, inner, inner);
+    #pragma omp single
+    {
+        for (int t = 0; t < tokens; ++t) {
+            float *o = out + (size_t)t * (size_t)dn_rows;
+            for (int c = 0; c < dn_rows; ++c) {
+                o[c] = 0.0f;
+            }
+        }
+        /* The pairs are in the order of the expert index. The pairs of one
+         * token therefore come in that order too. */
+        for (int p = 0; p < pairs; ++p) {
+            int f = order[p];
+            if (idx[f] < 0) {
+                continue;
+            }
+            int t = f / top_k;
+            gp_add_scaled(out + (size_t)t * (size_t)dn_rows,
+                          de + (size_t)p * (size_t)dn_rows, val[f], dn_rows);
+        }
+    }
+}
