@@ -7,7 +7,7 @@ kinda like this one, but this one is mine.)
 
 The main things about it:
 
-- BF12 format for crunching bf16 weights by 28% with <.01% near-zero
+- BF12 format for crunching bf16 weights by 23% with <.01% near-zero
   weights zeroed out.  Great for saving VRAM in MoE models when you
   want unquantized dense weights!
 - very few outside dependencies.
