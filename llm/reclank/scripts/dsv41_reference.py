@@ -7,7 +7,7 @@ of its tilelang kernels. The weights come from the shards layer by layer
 (each layer's dense weights loaded before it runs and dropped after; the
 routed experts a token picks loaded for its MoE, then dropped; the engram
 rows read from the shards), so the process holds a few GB beside the
-zygote. The weights take the forms of the reference's convert.py: wo_a
+weightkeeper. The weights take the forms of the reference's convert.py: wo_a
 dequantized to bfloat16, the experts as float4_e2m1fn_x2, the rest as
 model.py declares them (the head and the compressors of ratio 2 in float32).
 
@@ -15,8 +15,9 @@ For each prompt (a chat turn through encoding.py, at position 0 in one
 chunk) it writes an .npz: the ids, the logits of every prompt position, the
 output of every layer (float32, hc x dim) at every prompt position, then the
 greedy tokens of --steps decode steps with their logits and the output of
-every layer of the first --layer-steps steps. Text only for now (no vision,
-no DSpark).
+every layer of the first --layer-steps steps. --image adds a prompt with an
+image (image_processor.prepare_vl_inputs, the ViT and the aligner of
+vision.py, bias_vl, the engram mask: model.py forward). No DSpark.
 
 Run in its own environment (torch on the CPU, transformers, tokenizers,
 safetensors, sympy):
@@ -96,6 +97,10 @@ def main():
     ap.add_argument("--dump-layers", help="a check: for the first prompt's prefill, the inputs (h, pre_mix) "
                     "and the intermediates of these layers (comma separated) to --dump-out, then stop")
     ap.add_argument("--dump-out")
+    ap.add_argument("--image", action="append", help="a prompt of this image and --image-text")
+    ap.add_argument("--image-text", default="What is in this image? Answer in one sentence.")
+    ap.add_argument("--image-rows", help="a check of the model after the ViT: the aligner rows of the image "
+                    "from this .npz (array y) in place of the reference's ViT and aligner")
     ap.add_argument("--keep-last", type=int, default=32,
                     help="the layer outputs of only the last N prompt positions of a prompt over 64 tokens")
     a = ap.parse_args()
@@ -114,8 +119,9 @@ def main():
     torch.manual_seed(0)
     sh = Shards(a.ckpt)
     cfg = json.load(open(os.path.join(inf, "config.json")))
-    cfg.update(max_batch_size=1, max_seq_len=a.max_seq_len, vision_n_layers=0, dspark_block_size=0,
-               temperature=0.0)
+    cfg.update(max_batch_size=1, max_seq_len=a.max_seq_len, dspark_block_size=0, temperature=0.0)
+    if not a.image:
+        cfg.update(vision_n_layers=0)
     args = M.ModelArgs(**{k: v for k, v in cfg.items() if k in M.ModelArgs.__dataclass_fields__})
 
     # ---- the patches: no tensors for the routed experts nor the engram tables
@@ -162,7 +168,7 @@ def main():
     def moe_forward(self, x, image_mask=None):
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, None)
+        weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         self.last_indices = indices.clone()
@@ -211,22 +217,39 @@ def main():
     load("embed.", model.embed)
     load("norm.", model.norm)
     load("head.", model.head)
+    if a.image_rows:
+        rows_in = torch.from_numpy(np.load(a.image_rows)["y"])
+        model.encode_image = lambda patches, n_vit_h, n_vit_w: rows_in.to(torch.bfloat16)
+    if model.vision is not None:
+        load("vision.", model.vision)
+        load("aligner.", model.aligner)
+        for n in ("image_start", "image_end", "image_newline"):
+            p = getattr(model, n)
+            p.data = to_param(n, p)
     for i, layer in enumerate(model.layers):
         unload("layers.%d." % i, layer)
     log("embed, norm, head loaded")
 
     @torch.inference_mode()
-    def forward(ids, start_pos, keep_layers):
+    def forward(ids, start_pos, keep_layers, types=None, images=None):
+        """types, images: the token types and the image inputs of
+        prepare_vl_inputs (model.py forward: the image mask for bias_vl and
+        engram, the image rows in place of the embedding)."""
         x = torch.tensor([ids], dtype=torch.long)
-        hashes = model.engram_hash(x, start_pos, None)
-        h = model.embed(x).unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
+        image_mask = None if types is None else torch.tensor([types]) >= 0
+        engram_mask = None if image_mask is None else ~image_mask
+        hashes = model.engram_hash(x, start_pos, engram_mask)
+        h = model.embed(x)
+        if images:
+            model.merge_image_embeddings([images], h)
+        h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
         pre_mix = M.make_identity_pre_mix(h, args.hc_mult)
         outs, routes = [], []
         for i, layer in enumerate(model.layers):
             load("layers.%d." % i, layer)
             if layer.engram is not None:
-                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :], None)
-            h, pre_mix = layer(h, start_pos, pre_mix, None)
+                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :], engram_mask)
+            h, pre_mix = layer(h, start_pos, pre_mix, image_mask)
             unload("layers.%d." % i, layer)
             routes.append(layer.ffn.last_indices.numpy().astype(np.int16))
             if keep_layers:
@@ -306,13 +329,23 @@ def main():
         body = "\n\n".join(open(f).read() for f in a.long_file)
         body = tok.decode(tok.encode(body, add_special_tokens=False)[:a.long_tokens])
         texts.append(body + "\n\nSummarize the text above in two sentences.")
-    for pi, text in enumerate(texts):
-        prompt = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
-        ids = tok.encode(prompt, add_special_tokens=False)
+    cases = [(t, None) for t in texts] + [(a.image_text, f) for f in a.image or ()]
+    for pi, (text, image) in enumerate(cases):
+        types = images = None
+        if image is None:
+            prompt = encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
+            ids = tok.encode(prompt, add_special_tokens=False)
+        else:
+            from image_processor import prepare_vl_inputs
+            content = [{"type": "image_url", "image_url": {"url": image}}, {"type": "text", "text": text}]
+            prompt, media = encode_messages([{"role": "user", "content": content}], thinking_mode="chat",
+                                            return_multi_modal_data=True)
+            ids, types, images = prepare_vl_inputs(prompt, media["images"], tok, args)
+            images = images or None
         log("prompt %d: %d tokens: %r" % (pi, len(ids), prompt[:120]))
         # a fresh state for each prompt: the caches are written from position 0 on
         t1 = time.time()
-        logits, layers_out, routes = forward(ids, 0, True)
+        logits, layers_out, routes = forward(ids, 0, True, types, images)
         first = 0 if len(ids) <= 64 else len(ids) - a.keep_last
         layers_out = layers_out[first:]
         log("prefill %.1f s; the top token %d %r" % (time.time() - t1, int(logits[-1].argmax()),
@@ -335,6 +368,7 @@ def main():
                 break
         out = os.path.join(a.out, "prompt%d.npz" % pi)
         np.savez(out, ids=np.array(ids), prompt=prompt, logits=logits.astype(np.float32),
+                 types=np.array(types if types is not None else []), image=image or "",
                  layers=layers_out.astype(np.float32), layers_first=first, routes=routes, gen=np.array(gen + [nxt]),
                  step_logits=np.array(step_logits, np.float32),
                  step_layers=np.array(step_layers, np.float32), step_routes=np.array(step_routes),

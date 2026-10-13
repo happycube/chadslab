@@ -1,6 +1,7 @@
 """The server of reclank: python -m server --model PATH [options] (see
 server/options.py). The family of the model comes from the file (the GGUF
-general.architecture): Gemma 4, Qwen3.6, or Qwen3.8."""
+general.architecture): Gemma 4, Qwen3.6, or Qwen3.8; or of a checkpoint directory
+(its config.json): DeepSeek V4.1 Flash."""
 from __future__ import annotations
 
 import os
@@ -14,28 +15,35 @@ from server.backend import Backend  # noqa: E402
 from server.options import parser  # noqa: E402
 from server.worker import ModelWorker  # noqa: E402
 
-FAMILIES = ("gemma4", "qwen")
+FAMILIES = ("gemma4", "qwen", "deepseek41")
 
 
 def family_module(name):
     if name == "gemma4":
         from reclank.models.gemma4 import engine
+    elif name == "deepseek41":
+        from reclank.models.deepseek41 import engine
     else:
         from reclank.models.qwen import engine
     return engine
 
 
 def detect(opts):
-    """The family of the model file (or --family) and its metadata."""
-    from reclank.formats.gguf import GGUF
-    meta = GGUF(opts.model, stage=False).meta      # the metadata only: no copy of a file on Optane
+    """The family of the model file (or --family) and its metadata: the GGUF
+    metadata, or the config.json of a checkpoint directory."""
+    if os.path.isdir(opts.model):
+        from reclank.models.deepseek41.engine import load_meta
+        meta = load_meta(opts.model)
+    else:
+        from reclank.formats.gguf import GGUF
+        meta = GGUF(opts.model, stage=False).meta      # the metadata only: no copy of a file on Optane
     if opts.family != "auto":
         return opts.family, meta
     for name in FAMILIES:
         if family_module(name).detect(meta):
             return name, meta
-    raise SystemExit("%s: no family takes the architecture %r" % (opts.model,
-                                                                  meta.get("general.architecture")))
+    raise SystemExit("%s: no family takes the architecture %r" % (
+        opts.model, meta.get("general.architecture", meta.get("model_type"))))
 
 
 def build(opts):

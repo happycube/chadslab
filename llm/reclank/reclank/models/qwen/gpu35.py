@@ -205,6 +205,9 @@ PRE_F = 128             # the fetch events of the prefetch (gpu.cu GG_FETCH_MAX 
 # 32K, a buffer of 0 to 3 experts gave 267 tok/s, one of 189 367 tok/s.
 MIX_KEEP_MIN = float(os.environ.get("RECLANK_GPU_MIX_KEEP_MIN", "0.3e9"))
 MIX_RING_MIN = int(os.environ.get("RECLANK_GPU_MIX_RING_MIN", "64"))
+# The experts of the ring of the mixed groups that the size of the hot experts
+# leaves free (QwenGPU.__init__ with no hot_gb).
+MIX_RING = int(os.environ.get("RECLANK_GPU_MIX_RING", "192"))
 
 
 class _Emit:
@@ -436,8 +439,9 @@ class QwenGPU(WarmPool, ProgramLRU):
         self.E, self.L = E, L
         # The bytes of one expert of each matrix (gate, up, down), the most
         # over the layers.
-        self.per = [max(model.M("layers.%d.mlp.switch_mlp.%s" % (i, n)).data.nbytes // E
-                        for i in range(L)) for n in ("gate_proj", "up_proj", "down_proj")]
+        self.per = [max(getattr(m, "nb", None) or m.data.nbytes // E
+                        for m in (model.M("layers.%d.mlp.switch_mlp.%s" % (i, n)) for i in range(L)))
+                    for n in ("gate_proj", "up_proj", "down_proj")]
         per = sum(self.per)
         if hot_gb is None and os.environ.get("RECLANK_GPU_HOT_GB"):
             hot_gb = float(os.environ["RECLANK_GPU_HOT_GB"])
@@ -454,9 +458,17 @@ class QwenGPU(WarmPool, ProgramLRU):
             # room of the image encoder, bench_prompt_real --lend-gb): a
             # server with no encoder failed at its first long prompt.
             prog_gb = float(os.environ.get("RECLANK_GPU_PROGRAM_GB", 4.5 if self.mix_size >= 4096 else 2.0))
-            room = mem_info()[0] - self._dense_bytes() - head - prog_gb * 1e9 - 2 * E * per - \
-                self._kv_bytes(self.ctx)
-            n = int(max(1, room // ((L - 2) * per)))
+            room = mem_info()[0] - self._dense_bytes() - head - prog_gb * 1e9 - self._kv_bytes(self.ctx)
+            if self.mix_size > 0:
+                # The prompts run as mixed groups, whose copies go to a ring of
+                # the pool (_pool_room): never the large groups of the two
+                # buffers (prefill: the rest under MIX_MIN runs in split groups).
+                # The ring keeps MIX_RING experts (a ring of 189 gave 367 tok/s at
+                # 32K, of 0 to 3 267); with the BF12 experts of the weightkeeper
+                # (7.5 MB) the two buffers (7.7 GB) left 1 slot a layer.
+                n = int(max(1, (room - MIX_RING * per) // (L * per)))
+            else:
+                n = int(max(1, (room - 2 * E * per) // ((L - 2) * per)))
         else:
             n = int(max(1, hot_gb * 1e9 // (L * per)))
         self.n_slots = n = min(E, n)
@@ -465,10 +477,15 @@ class QwenGPU(WarmPool, ProgramLRU):
         # program for each NUMA node (their rows), in place of the copy of
         # all the experts on each node
         self.parts = None
-        if not moe_parts.wanted():
+        # the experts of the weightkeeper (keep.KeptGGUF): split between the
+        # nodes by expert already, the split of _numa_split (no copy, no parts)
+        kept = getattr(model.g, "kept", False)
+        if kept:
+            self._kept_split()
+        elif not moe_parts.wanted():
             self._numa_copy_experts()
         self._dram_experts()
-        if moe_parts.wanted() and not getattr(self, "zc_dev", None):
+        if moe_parts.wanted() and not getattr(self, "zc_dev", None) and not kept:
             layers = [i for i in range(self.L + 1)
                       if "blk.%d.ffn_gate_exps.weight" % i in model.g.tensors]
             mats = {i: tuple(model.M("layers.%d.mlp.switch_mlp.%s" % (i, n))
@@ -878,7 +895,44 @@ class QwenGPU(WarmPool, ProgramLRU):
         """The bytes of an expert of the expert matrix m: m.data has the E
         experts, or after a split only those of node 0 (_numa_split)."""
         nb = getattr(self, "numa_nb", {}).get(id(m))
-        return nb if nb is not None else m.data.nbytes // self.cfg.num_experts
+        return nb if nb is not None else getattr(m, "nb", None) or m.data.nbytes // self.cfg.num_experts
+
+    def _kept_split(self):
+        """The split of _numa_split from the weightkeeper's stacks (m.kept: the
+        experts of each node, whole, in the order of their index): m.data the
+        experts of the GPU's node, numa_mats1 those of the other, slot0 and
+        slot1 the slot of each expert there (-1: not there)."""
+        gnode = self._gpu_node()
+        E = self.E
+        self.numa_mats1, self.numa_slot0, self.numa_slot1, self.numa_nb = {}, {}, {}, {}
+        layers = [i for i in range(self.L + 1) if "blk.%d.ffn_gate_exps.weight" % i in self.model.g.tensors]
+        total = 0
+        for i in layers:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                m = self.model.M("layers.%d.mlp.switch_mlp.%s" % (i, name))
+                here = [x for x in m.kept if x[0] == gnode]
+                there = [x for x in m.kept if x[0] != gnode]
+                if len(here) != 1 or len(there) > 1:
+                    raise ValueError("the weightkeeper's experts are on the nodes %s; the GPU is on node %d"
+                                     % ([x[0] for x in m.kept], gnode))
+                _n0, a0, ids0 = here[0]
+                m.data = a0.reshape(-1)
+                self.numa_nb[id(m)] = m.nb
+                s0 = np.full(E, -1, np.int32)
+                s0[ids0] = np.arange(len(ids0), dtype=np.int32)
+                self.numa_slot0[i] = s0
+                s1 = np.full(E, -1, np.int32)
+                if there:
+                    _n1, a1, ids1 = there[0]
+                    self.numa_mats1.setdefault(i, {})[name] = a1.reshape(-1)
+                    s1[ids1] = np.arange(len(ids1), dtype=np.int32)
+                self.numa_slot1[i] = s1
+                total += sum(x[1].nbytes for x in m.kept)
+        self.numa_split = True
+        if os.environ.get("RECLANK_QUIET") != "1":
+            print("the experts of the weightkeeper: %.1f GB, each on one node (the GPU's node %d holds %d "
+                  "of each layer)" % (total / 1e9, gnode, int((self.numa_slot0[layers[0]] >= 0).sum())),
+                  file=sys.stderr)
 
     def _expert_srcs(self, i, name, m, nb):
         """The host address of the bytes of each expert of a matrix of layer i

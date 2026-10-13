@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from reclank.backends.cpu import cops  # noqa: E402
 from reclank.formats.nvfp4_st import E4M3  # noqa: E402
-from reclank.runtime.zygote import Shards  # noqa: E402
+from reclank.runtime.weightkeeper import Shards  # noqa: E402
 
 
 def read(sh, name):

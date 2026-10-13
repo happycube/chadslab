@@ -1,4 +1,4 @@
-"""The zygote (reclank/runtime/zygote.py) on a small checkpoint of the shape of
+"""The weightkeeper (reclank/runtime/weightkeeper.py) on a small checkpoint of the shape of
 DeepSeek V4.1 Flash: the rows of each part, the dense tensors, the seals."""
 import fcntl
 import json
@@ -11,7 +11,7 @@ import time
 import numpy as np
 import pytest
 
-from reclank.runtime import zygote as Z
+from reclank.runtime import weightkeeper as Z
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 L, E, HIDDEN, INNER = 2, 3, 128, 64
@@ -76,7 +76,7 @@ def test_layout(ckpt):
 def test_serve_attach(ckpt, tmp_path, layout):
     sock = str(tmp_path / "z.sock")
     env = dict(os.environ, PYTHONPATH=ROOT)
-    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "dsv41_zygote.py"), ckpt,
+    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "weightkeeper.py"), ckpt,
                           "--pages", "4k", "--dense", "--threads", "4", "--socket", sock, "--layout", layout],
                          env=env, stderr=subprocess.PIPE, text=True)
     try:

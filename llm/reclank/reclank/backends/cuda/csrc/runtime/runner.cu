@@ -33,12 +33,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     /* ---- the media encoders: the operands of bf16_linear.c gp_step ---- */
     case GP_ENC_LINEAR: {
         int n = (int)hlit(r, 5, &bad), m = (int)hlit(r, 6, &bad), k = (int)hlit(r, 7, &bad);
-        static int enc_tc = -1;
-        if (enc_tc < 0) {
-            const char *v = getenv("RECLANK_GPU_ENC_TC");
-            enc_tc = v == NULL || strcmp(v, "0") != 0;
-        }
-        if (enc_tc && gg_tc && g->tc && hlit(r, 2, &bad) && k % 8 == 0 && n > MT_MAX &&
+        if (enc_tc_on() && gg_tc && g->tc && hlit(r, 2, &bad) && k % 8 == 0 && n > MT_MAX &&
             (size_t)n * k <= g->xh_n) {
             /* bfloat16 W on the tensor cores: x to float16 (with the input
              * clamps), then k_enc_gemm_tc (the bias and the output clamps) */
@@ -85,6 +80,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_ENC_GELU_MUL: {
         int64_t n = hlit(r, 3, &bad);
         k_enc_gelu_mul<<<(unsigned)cdiv(n, T), T, 0, s>>>(
+            (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+            (float *)(intptr_t)hi(r, g->henv, 2), n);
+        break;
+    }
+    case GP_ENC_SILU_MUL: {
+        int64_t n = hlit(r, 3, &bad);
+        k_enc_silu_mul<<<(unsigned)cdiv(n, T), T, 0, s>>>(
             (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
             (float *)(intptr_t)hi(r, g->henv, 2), n);
         break;
@@ -164,6 +166,33 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         int n = (int)hlit(r, 4, &bad), heads = (int)hlit(r, 5, &bad), hd = (int)hlit(r, 6, &bad);
         if (hd > 128) {
             bad = 1;
+            break;
+        }
+        size_t nq = (size_t)n * heads * hd;
+        if (enc_tc_on() && gg_tc && g->tc && hd % 8 == 0 && 3 * nq <= g->xh_n) {
+            /* on the tensor cores: q, k, v to float16 in xh, then k_enc_attn_tc */
+            const float *src[3] = {(const float *)(intptr_t)hi(r, g->henv, 0),
+                                   (const float *)(intptr_t)hi(r, g->henv, 1),
+                                   (const float *)(intptr_t)hi(r, g->henv, 2)};
+            for (int i = 0; i < 3; ++i) {
+                k_enc_to_half<<<(unsigned)cdiv((int64_t)nq, T), T, 0, s>>>(
+                    src[i], g->xh + i * nq, nq, -65504.f, 65504.f);
+            }
+            dim3 grid((unsigned)cdiv(n, EA_Q), (unsigned)heads);
+            const __half *qh = g->xh, *kh = g->xh + nq, *vh = g->xh + 2 * nq;
+            float *out = (float *)(intptr_t)hi(r, g->henv, 3);
+            int hp = (hd + 15) / 16 * 16;
+            if (hp <= 32) {
+                k_enc_attn_tc<32><<<grid, 128, 0, s>>>(qh, kh, vh, out, n, heads, hd);
+            } else if (hp <= 64) {
+                k_enc_attn_tc<64><<<grid, 128, 0, s>>>(qh, kh, vh, out, n, heads, hd);
+            } else if (hp <= 80) {
+                k_enc_attn_tc<80><<<grid, 128, 0, s>>>(qh, kh, vh, out, n, heads, hd);
+            } else if (hp <= 96) {
+                k_enc_attn_tc<96><<<grid, 128, 0, s>>>(qh, kh, vh, out, n, heads, hd);
+            } else {
+                k_enc_attn_tc<128><<<grid, 128, 0, s>>>(qh, kh, vh, out, n, heads, hd);
+            }
             break;
         }
         size_t smem = (size_t)(2 * 32 * (hd + 1) + 4 * hd) * sizeof(float);
@@ -1472,6 +1501,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     case GP_DS_EMBED:
         k_ds_embed<<<(unsigned)hlit(r, 3, &bad), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_DS_EMBED_ROWS:
+        k_ds_embed_rows<<<(unsigned)hlit(r, 3, &bad), 256, 0, s>>>(dr, denv);
         break;
     case GP_DS_ENGRAM_ROWS:
         k_ds_engram_rows<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad), 256), 256, 0, s>>>(dr, denv);

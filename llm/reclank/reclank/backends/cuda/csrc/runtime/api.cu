@@ -294,6 +294,8 @@ void *rc_gpu_load(const int64_t *prog, int use_graph)
             n = (size_t)r->v[5] * (size_t)r->v[4];
         } else if (r->op == GP_ENC_LINEAR && r->v[2] && r->v[5] > MT_MAX) {
             n = (size_t)r->v[5] * (size_t)r->v[7];      /* the rows x cols of x */
+        } else if (r->op == GP_ENC_ATTN && r->v[6] % 8 == 0) {
+            n = 3 * (size_t)r->v[4] * (size_t)r->v[5] * (size_t)r->v[6];   /* q, k, v (k_enc_attn_tc) */
         } else if (r->op == GP_KQ_GROUP_MOE && (r->v[16] == KQ_BF16 || r->v[16] == KQ_BF12)) {
             /* the two bfloat16 planes of h (or act2) for the shared expert */
             n = 2 * (size_t)r->v[3] * (size_t)(r->v[6] > r->v[7] ? r->v[6] : r->v[7]);

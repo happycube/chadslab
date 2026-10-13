@@ -47,14 +47,14 @@ def main():
     ap.add_argument("ref", nargs="+")
     ap.add_argument("--exact", action="store_true")
     ap.add_argument("--steps", type=int, default=8)
-    ap.add_argument("--no-zygote", action="store_true")
+    ap.add_argument("--no-weightkeeper", action="store_true")
     ap.add_argument("--force-routes", action="store_true",
                     help="take the reference's experts (the near-ties of the router aside)")
     a = ap.parse_args()
     t0 = time.time()
-    m = DSV41CPU(a.ckpt, exact=a.exact, zygote=not a.no_zygote)
+    m = DSV41CPU(a.ckpt, exact=a.exact, weightkeeper=not a.no_weightkeeper)
     print("loaded (%s, experts from %s) in %.1f s" % ("exact" if a.exact else "near",
-                                                     "the zygote" if m.w.z is not None else "the shards",
+                                                     "the weightkeeper" if m.w.z is not None else "the shards",
                                                      time.time() - t0))
     for path in a.ref:
         r = np.load(path)

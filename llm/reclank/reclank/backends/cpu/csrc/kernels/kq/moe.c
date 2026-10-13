@@ -43,9 +43,115 @@ static void kq_rows_f_any(const uint8_t *w, int type, int nr, int cols, const fl
  * out[j * ost + i]. The experts in BF12 (an overlay of the MTP layer from the
  * bfloat16 of the original: the values of bfloat16, but the zeroed ones)
  * read the float32 rows, not int8 or int16 ones. */
+#if defined(__AVX512F__)
+/* A BF12 row as the float32 values that kq_dot_bf12 multiplies (its decode,
+ * stored). */
+static void kq_bf12_row_f(const uint8_t *w, int cols, float *out)
+{
+    const uint8_t *lo = w, *hi = w + cols, *E = w + cols + cols / 2;
+    const __m512i m7f = _mm512_set1_epi16(0x7f), m80 = _mm512_set1_epi16(0x80);
+    const __m512i g15 = _mm512_set1_epi16(15), m15 = _mm512_set1_epi16(15);
+    for (int g = 0; g < cols / 32; ++g) {
+        __m512i l = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i *)(lo + 32 * g)));
+        __m256i h16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(hi + 16 * g)));
+        __m512i gp = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_and_si256(h16, _mm512_castsi512_si256(m15))),
+                                        _mm256_srli_epi16(h16, 4), 1);
+        __m512i e = _mm512_sub_epi16(_mm512_set1_epi16(E[g]), gp);
+        __m512i b = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi16(_mm512_and_si512(l, m80), 8),
+                                                    _mm512_slli_epi16(e, 7)), _mm512_and_si512(l, m7f));
+        b = _mm512_maskz_mov_epi16(~(_mm512_cmpeq_epi16_mask(gp, g15) & _mm512_cmpeq_epi16_mask(l, m80)), b);
+        _mm512_storeu_ps(out + 32 * g, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                             _mm512_castsi512_si256(b)), 16)));
+        _mm512_storeu_ps(out + 32 * g + 16, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                             _mm512_extracti64x4_epi64(b, 1)), 16)));
+    }
+}
+
+/* The dot of a decoded BF12 row (kq_bf12_row_f) and x in the order of
+ * kq_dot_bf12: the same bits. */
+static float kq_dot_bf12_f(const float *wf, int cols, const float *x)
+{
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    for (int g = 0; g < cols / 32; ++g) {
+        a0 = _mm512_fmadd_ps(_mm512_loadu_ps(wf + 32 * g), _mm512_loadu_ps(x + 32 * g), a0);
+        a1 = _mm512_fmadd_ps(_mm512_loadu_ps(wf + 32 * g + 16), _mm512_loadu_ps(x + 32 * g + 16), a1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+}
+#endif
+
+#if defined(__AVX512F__)
+/* The bfloat16 bits of group g of a BF12 row (kq_dot_bf12's decode). */
+static inline __m512i kq_bf12_group(const uint8_t *w, int cols, int g)
+{
+    const uint8_t *lo = w, *hi = w + cols, *E = w + cols + cols / 2;
+    const __m512i m7f = _mm512_set1_epi16(0x7f), m80 = _mm512_set1_epi16(0x80);
+    const __m512i g15 = _mm512_set1_epi16(15), m15 = _mm512_set1_epi16(15);
+    __m512i l = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i *)(lo + 32 * g)));
+    __m256i h16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(hi + 16 * g)));
+    __m512i gp = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_and_si256(h16, _mm512_castsi512_si256(m15))),
+                                    _mm256_srli_epi16(h16, 4), 1);
+    __m512i e = _mm512_sub_epi16(_mm512_set1_epi16(E[g]), gp);
+    __m512i b = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi16(_mm512_and_si512(l, m80), 8),
+                                                _mm512_slli_epi16(e, 7)), _mm512_and_si512(l, m7f));
+    return _mm512_maskz_mov_epi16(~(_mm512_cmpeq_epi16_mask(gp, g15) & _mm512_cmpeq_epi16_mask(l, m80)), b);
+}
+
+/* Four BF12 rows (rb bytes apart) on one float row x: out[i * ost], each the
+ * sums of kq_dot_bf12 in its order (the same bits); x read once for the four,
+ * four chains at a time. */
+static void kq_dot4_bf12(const uint8_t *w, size_t rb, int cols, const float *x, float *out, size_t ost)
+{
+    __m512 a[8];
+    for (int i = 0; i < 8; ++i) {
+        a[i] = _mm512_setzero_ps();
+    }
+    for (int g = 0; g < cols / 32; ++g) {
+        __m512 x0 = _mm512_loadu_ps(x + 32 * g), x1 = _mm512_loadu_ps(x + 32 * g + 16);
+        #pragma GCC unroll 4
+        for (int i = 0; i < 4; ++i) {
+            __m512i b = kq_bf12_group(w + (size_t)i * rb, cols, g);
+            a[2 * i] = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                                           _mm512_castsi512_si256(b)), 16)), x0, a[2 * i]);
+            a[2 * i + 1] = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                                               _mm512_extracti64x4_epi64(b, 1)), 16)), x1, a[2 * i + 1]);
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        out[(size_t)i * ost] = _mm512_reduce_add_ps(_mm512_add_ps(a[2 * i], a[2 * i + 1]));
+    }
+}
+#endif
+
 static void kq_rows_bf12_f(const uint8_t *w, size_t rb, int nr, int cols, const float *x, size_t xst,
                            int n, float *out, size_t ost)
 {
+#if defined(__AVX512F__)
+    static int dot4 = -1;       /* RECLANK_BF12_DOT4=0: one row at a time (a check of the bits) */
+    if (dot4 < 0) {
+        const char *v = getenv("RECLANK_BF12_DOT4");
+        dot4 = v ? atoi(v) != 0 : 1;
+    }
+    if (dot4 && n == 1 && nr % 4 == 0) {
+        /* one token (a decode step): four rows at a time */
+        for (int i = 0; i < nr; i += 4) {
+            kq_dot4_bf12(w + (size_t)i * rb, rb, cols, x, out + i, 1);
+        }
+        return;
+    }
+    if (n > 1 && cols <= 8192) {
+        /* each row decoded once for the n rows of x (the BF12 routed experts of
+         * a group: one decode a row, not one for each token) */
+        float wf[8192] __attribute__((aligned(64)));
+        for (int i = 0; i < nr; ++i) {
+            kq_bf12_row_f(w + (size_t)i * rb, cols, wf);
+            for (int j = 0; j < n; ++j) {
+                out[(size_t)j * ost + i] = kq_dot_bf12_f(wf, cols, x + (size_t)j * xst);
+            }
+        }
+        return;
+    }
+#endif
     for (int j = 0; j < n; ++j) {
         const float *xr = x + (size_t)j * xst;
         for (int i = 0; i < nr; ++i) {

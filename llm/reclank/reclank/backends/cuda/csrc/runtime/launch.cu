@@ -836,6 +836,7 @@ __global__ void k_enc_lnorm(const float *x, const float *w, const float *b, floa
 __global__ void k_enc_gelu(const float *x, float *y, int64_t n, int use_erf);
 __global__ void k_enc_add(float *x, const float *y, int64_t n, float sc);
 __global__ void k_enc_silu(const float *x, float *y, int64_t n);
+__global__ void k_enc_silu_mul(const float *g, const float *u, float *y, int64_t n);
 __global__ void k_enc_clamp(const float *x, float *y, int64_t n, float lo, float hi);
 __global__ void k_enc_bias_clamp(float *y, const float *b, int rows, int cols, float lo, float hi);
 __global__ void k_enc_mul_vec(const float *x, const float *vec, float *y, int rows, int cols);
@@ -847,6 +848,22 @@ __global__ void k_enc_local_attn(const float *q, const float *k, const float *v,
 __global__ void k_enc_rope2d(float *x, const int *pos, const float *inv, int n, int heads, int hd);
 __global__ void k_enc_attn(const float *q, const float *k, const float *v, float *o,
                            int n, int heads, int hd);
+#define EA_Q 64
+template <int HP>
+__global__ void k_enc_attn_tc(const __half *q, const __half *k, const __half *v, float *o, int n,
+                              int heads, int hd);
+
+/* The encoders on the tensor cores (ENC_LINEAR, ENC_ATTN) unless
+ * RECLANK_GPU_ENC_TC=0. */
+static int enc_tc_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_ENC_TC");
+        on = v == NULL || strcmp(v, "0") != 0;
+    }
+    return on;
+}
 
 /* The float32 of a literal operand. */
 static float hlitf(const gp_rec *r, int k, int *bad)

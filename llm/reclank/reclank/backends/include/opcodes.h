@@ -166,6 +166,8 @@ enum {
     GP_DS_ENGRAM_ROWS  = 184,   /* gpu     the values of gathered engram rows (E4M3 codes, E8M0 scales) */
     GP_DS_ROWS_AT      = 185,   /* gpu     the rows of a group at their positions into a buffer of rows from a slot (bounded replay) */
     GP_DS_TOPK_MERGE   = 186,   /* gpu     the k best so far and the scores of a chunk: the k best (DS_TOPK in chunks) */
+    GP_ENC_SILU_MUL    = 187,   /* cpu+gpu silu(gate) * up */
+    GP_DS_EMBED_ROWS   = 188,   /* gpu     the rows of an image span in place of the embedding, into the streams */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -207,7 +209,7 @@ static inline int gp_op_known(int op)
     case GP_DS_HOT_MOE: case GP_DS_COMBINE: case GP_DS_RING_PUT: case GP_DS_RING_RESTORE:
     case GP_DS_STREAM_MEAN: case GP_DS_COMPRESS_FIX: case GP_DS_GATHER: case GP_DS_MARKOV:
     case GP_DS_CONF: case GP_DS_EMBED: case GP_DS_ENGRAM_ROWS: case GP_DS_ROWS_AT:
-    case GP_DS_TOPK_MERGE:
+    case GP_DS_TOPK_MERGE: case GP_ENC_SILU_MUL: case GP_DS_EMBED_ROWS:
         return 1;
     default:
         return 0;

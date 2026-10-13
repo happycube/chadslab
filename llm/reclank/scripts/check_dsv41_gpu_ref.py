@@ -3,7 +3,9 @@
 groups, then steps) against the reference (scripts/dsv41_reference.py,
 DEEPSEEK_V41_PLAN.md Phase 3): the KL and the top token of the prompt's last
 logits, then of each step on the reference's tokens (teacher forced). With
---cpu, the CPU model in near mode the same way, for a side by side.
+--cpu, the CPU model in near mode the same way, for a side by side. A
+reference of an image (dsv41_reference.py --image) gets the rows of its span
+from models/deepseek41/vision.py (the image encoded before the model loads).
 
     RECLANK_GPU_PART_THREADS=18 taskset -c 0-19,24-43 python scripts/check_dsv41_gpu_ref.py \\
         /home/cpage/models/DeepSeek-V4.1-Flash /home/cpage/npg-run/dsv41-ref/v1/prompt1.npz [--cpu]
@@ -36,6 +38,28 @@ def kl(ref, mine):
     return float((np.exp(p) * (p - logsm(mine))).sum(-1).mean())
 
 
+def image_spans(m, ckpt, r):
+    """The image spans (start, rows) of a reference of an image, or None: the
+    rows of vision.py, each span where the reference's token types have it."""
+    img = str(r["image"]) if "image" in r.files else ""
+    if not img:
+        return None
+    from reclank.models.deepseek41.engine import load_meta
+    from reclank.models.deepseek41.vision import IMAGE_START, DSVision
+    vis = DSVision(m.w.src, load_meta(ckpt))
+    types = r["types"]
+    starts = [i for i in range(len(types)) if types[i] == IMAGE_START]
+    assert len(starts) == 1, "one image a prompt"
+    t0 = time.time()
+    rows, grid = vis.image(open(img, "rb").read())
+    vis.release()
+    n = int((types >= 0).sum())
+    assert rows.shape[0] == n, (rows.shape, n)
+    print("the image %s: %d x %d tokens, a span of %d at %d (%.1f s)" % (
+        os.path.basename(img), grid[0], grid[1], n, starts[0], time.time() - t0))
+    return [(starts[0], rows)]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("ckpt")
@@ -53,6 +77,7 @@ def main():
     ap.add_argument("--steps", type=int, default=0, help="more steps on the GPU's own tokens after the reference's")
     a = ap.parse_args()
     m = DSV41CPU(a.ckpt, exact=False, max_len=a.max_len)
+    media = {path: image_spans(m, a.ckpt, np.load(path)) for path in a.ref}
     g = DSV41GPU(m, keep_layers=False, hot_gb=a.hot_gb, cache=a.cache, group=a.group, rq8=a.rq8, x8_prefill=a.x8_prefill,
                  replay=not a.full_prefill)
     saved = {}
@@ -69,8 +94,9 @@ def main():
             g.reset()
             t0 = time.time()
             if name == "gpu":
-                lg = g.prefill(ids, 0, group=a.group)
+                lg = g.prefill(ids, 0, group=a.group, media=media[path])
             else:
+                assert media[path] is None, "the CPU model takes no image"
                 lg = m.forward(ids, 0)[0][-1]
             tp = time.time() - t0
             kls, tops = [kl(r["logits"][-1:], lg[None])], [int(lg.argmax()) == int(r["logits"][-1].argmax())]

@@ -44,7 +44,7 @@ ARCHS = ("qwen35moe", "qwen4exp")
 
 
 def detect(meta):
-    return meta.get("general.architecture") in ARCHS
+    return meta.get("general.architecture") in ARCHS or meta.get("model_type") == "qwen4_exp"
 
 
 class QwenEngine(Engine):
@@ -552,14 +552,19 @@ def load(opts, meta, worker=None):
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     path = opts.model if os.path.isabs(opts.model) else os.path.join(root, opts.model)
     arch = meta.get("general.architecture")
-    template = opts.template or os.path.join(os.path.dirname(path), "chat_template.jinja")
+    # a checkpoint directory (the original Qwen3.8 in the weightkeeper): its
+    # template and tokenizer inside it
+    here = path if os.path.isdir(path) else os.path.dirname(path)
+    if os.path.isdir(path) and meta.get("model_type") == "qwen4_exp":
+        arch = "qwen4exp"
+    template = opts.template or os.path.join(here, "chat_template.jinja")
     text = None
     if not os.path.exists(template):
         if arch == "qwen35moe":
             text = meta["tokenizer.chat_template"]          # the template of the GGUF
         else:
             template = os.path.join(root, "models/Qwen3.8-Flash-Next-NVFP4/chat_template.jinja")
-    tok = QwenTok(opts.tokenizer or os.path.join(os.path.dirname(path), "tokenizer.json"), template, text)
+    tok = QwenTok(opts.tokenizer or os.path.join(here, "tokenizer.json"), template, text)
     if opts.mmproj and arch not in ("qwen35moe", "qwen4exp"):
         raise ValueError("--mmproj: %s has no image input" % arch)
     gpu = opts.backend != "cpu"

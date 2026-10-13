@@ -38,6 +38,7 @@ static size_t kq_moe_part_scratch_bytes(int t, int k, int experts, int hidden, i
     KQ_PT(P * inner); KQ_PT(P * inner);                            /* aq, aq2 */
     KQ_PT(P * npi * 4); KQ_PT(P * npi * 8); KQ_PT(P * (inner / 16) * 8);    /* as, am, an (2 planes) */
     KQ_PT(P * nd * 4);                                             /* de */
+    KQ_PT(P * hidden * 4);                                         /* xf (KQ_BF12: the float rows) */
 #undef KQ_PT
     return a + 64;
 }
@@ -255,6 +256,11 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
     float *am = (float *)ma_take(&p, (size_t)P * npi * 8);
     int32_t *an = (int32_t *)ma_take(&p, (size_t)P * (inner / 16) * 8);
     float *de = (float *)ma_take(&p, (size_t)P * nd * 4);
+    /* KQ_BF12 (the routed experts of the bfloat16 checkpoint in the
+     * weightkeeper, reclank/models/qwen/keep.py) reads the float32 rows: x of
+     * the pairs (xf) and the act (arow), kq_rows_bf12_f as kq_moe_body */
+    float *xf = (float *)ma_take(&p, (size_t)P * hidden * 4);
+    const int gbf = Gt == KQ_BF12, ubf = Ut == KQ_BF12, dbf = Dt == KQ_BF12;
     /* (units of 32 rows for KQ_MXX, kq_mxx_rows32 feeding two groups from each
      * broadcast of x, were slower on a prompt: 16 here) */
     const int ngu = Gt == KQ_NVX || Gt == KQ_Q4X || Gt == KQ_MXX ? 16 : 4;
@@ -335,6 +341,9 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         memcpy(xq + (size_t)q * hidden, tq + (size_t)j * hidden, (size_t)hidden);
         memcpy(xs + (size_t)q * nph, ts + (size_t)j * nph, (size_t)nph * 4);
         memcpy(xm + (size_t)q * 2 * nph, tm + (size_t)j * 2 * nph, (size_t)nph * 8);
+        if (gbf || ubf) {
+            memcpy(xf + (size_t)q * hidden, hf + (size_t)j * hidden, (size_t)hidden * 4);
+        }
         if (x2 && !one) {
             memcpy(xq2 + (size_t)q * hidden, tq2 + (size_t)j * hidden, (size_t)hidden);
         }
@@ -359,6 +368,11 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         int rr = (int)(qq) * ngu, isup = rr >= ni, r = rr % ni;                                    \
         const uint8_t *w = isup ? Uw + (size_t)e * Us + (size_t)(Ur + r) * rbu                     \
                                 : Gw + (size_t)e * Gs + (size_t)(Gr + r) * rbg;                    \
+        if (isup ? ubf : gbf) {                                                                    \
+            kq_rows_bf12_f(w, isup ? rbu : rbg, ngu, hidden, xf + (size_t)s0 * hidden, (size_t)hidden, \
+                           n, act + (size_t)s0 * 2 * ni + rr, (size_t)2 * ni);                     \
+            break;                                                                                 \
+        }                                                                                          \
         kq_rows_n2(w, isup ? rbu : rbg, isup ? Ut : Gt, ngu, hidden, xq + (size_t)s0 * hidden,     \
                    xs + (size_t)s0 * nph, xm + (size_t)s0 * 2 * nph, xn + (size_t)s0 * xns,        \
                    x2 && !one ? xq2 + (size_t)s0 * hidden : NULL, n, act + (size_t)s0 * 2 * ni + rr, \
@@ -444,6 +458,11 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         int e = used[ui], s0 = start[e], n = start[e + 1] - s0;                                    \
         int r = (int)(qq) * ndn;                                                                   \
         const uint8_t *w = Dw + (size_t)e * Ds + (size_t)(Dr + r) * rbd;                           \
+        if (dbf) {                                                                                 \
+            kq_rows_bf12_f(w, rbd, ndn, inner, arow + (size_t)s0 * inner, (size_t)inner, n,        \
+                           de + (size_t)s0 * nd + r, (size_t)nd);                                  \
+            break;                                                                                 \
+        }                                                                                          \
         kq_rows_n2(w, rbd, Dt, ndn, inner, aq + (size_t)s0 * inner, as + (size_t)s0 * npi,         \
                    am + (size_t)s0 * 2 * npi, an + (size_t)s0 * ans,                               \
                    x2 && !one ? aq2 + (size_t)s0 * inner : NULL, n, de + (size_t)s0 * nd + r, (size_t)nd); \

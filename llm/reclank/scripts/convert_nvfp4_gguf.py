@@ -38,59 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reclank.backends.cpu import cops  # noqa: E402
 from reclank.formats.gguf import BF16, E4M3_ROWS, F32, Q8_0, tensor_bytes, write_gguf  # noqa: E402
 from reclank.formats.nvfp4_st import NVFP4Source  # noqa: E402
-
-
-def reorder(a, dim, hk, rep, hd):
-    """The heads of axis dim from grouped by key head to the tiled order of
-    llama.cpp (_reorder_v_heads of its converter)."""
-    a = np.moveaxis(a, dim, 0)
-    sh = a.shape
-    a = a.reshape(hk, rep, hd, *sh[1:]).swapaxes(0, 1).reshape(sh)
-    return np.ascontiguousarray(np.moveaxis(a, 0, dim))
-
-
-def metadata(cfg, src):
-    a = "qwen4exp."
-    m = [("general.architecture", "qwen4exp"),
-         ("general.name", "Qwen3.8-Flash-Next NVFP4 (reclank)"),
-         ("general.source", "nvidia/Qwen3.8-Flash-Next-NVFP4"),
-         (a + "block_count", cfg.num_hidden_layers),
-         (a + "nextn_predict_layers", 1 if "blk.%d.nextn.eh_proj.weight" % cfg.num_hidden_layers
-          in src.tensors else 0),
-         (a + "full_attention_interval", int(src.hf.get("full_attention_interval", 4))),
-         (a + "embedding_length", cfg.hidden_size),
-         (a + "attention.layer_norm_rms_epsilon", float(cfg.rms_norm_eps)),
-         (a + "attention.head_count", cfg.num_heads),
-         (a + "attention.head_count_kv", cfg.num_kv_heads),
-         (a + "attention.key_length", cfg.head_dim),
-         (a + "attention.value_length", cfg.head_dim),
-         (a + "rope.freq_base", float(cfg.rope_theta)),
-         (a + "rope.dimension_count", cfg.rotary_dim),
-         (a + "ssm.group_count", cfg.lin_k_heads),
-         (a + "ssm.time_step_rank", cfg.lin_v_heads),
-         (a + "ssm.state_size", cfg.lin_k_dim),
-         (a + "ssm.inner_size", cfg.lin_v_heads * cfg.lin_v_dim),
-         (a + "ssm.conv_kernel", cfg.conv_kernel),
-         (a + "expert_count", cfg.num_experts),
-         (a + "expert_used_count", cfg.top_k),
-         (a + "expert_feed_forward_length", cfg.moe_inter),
-         (a + "expert_shared_feed_forward_length", cfg.shared_inter),
-         (a + "hyper_connection.count", cfg.hc_count),
-         (a + "hyper_connection.low_rank", cfg.hc_lowrank),
-         (a + "ple.layers", list(cfg.ple_layers)),
-         (a + "ple.ngram_size", cfg.ple_ngram),
-         (a + "ple.heads_per_ngram", cfg.ple_heads_per_ngram),
-         (a + "ple.conv_kernel", cfg.ple_conv_kernel),
-         (a + "ple.eos_token_id", cfg.ple_eos),
-         (a + "embedding_length_per_layer_input", cfg.ple_row),
-         (a + "ple.layer_multipliers", list(cfg.ple_multipliers)),
-         (a + "ple.head_offsets", list(cfg.ple_offsets)),
-         (a + "ple.head_vocab_sizes", list(cfg.ple_sizes)),
-         (a + "attention.indexer.head_count", cfg.indexer_heads),
-         (a + "attention.indexer.key_length", cfg.indexer_dim),
-         (a + "attention.indexer.top_k", cfg.indexer_top_k),
-         (a + "attention.compress_ratios", list(cfg.compress_ratios))]
-    return m
+from reclank.formats.qwen38_orig import metadata, reorder  # noqa: E402
 
 
 def main():

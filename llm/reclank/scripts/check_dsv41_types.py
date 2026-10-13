@@ -9,13 +9,13 @@ Phase 1, step 4): csrc/kernels/kq/mxx.c against NumPy forms written here.
   rounded); the exact product against float64 sums of the same rounded
   values; the act rounding (E4M3, power-of-two scales) against a NumPy form
   that picks the nearest of the 256 E4M3 values.
-- the rows of a part from the zygote's segments (if one runs) against the
+- the rows of a part from the weightkeeper's segments (if one runs) against the
   rows from the shards.
 - KQ_FP8B32: the dequantized values; the near and exact products against
   float64.
 - the error of near and exact against float64 products of the unrounded x.
 
-    python scripts/check_dsv41_types.py /home/cpage/models/DeepSeek-V4.1-Flash [--layer 3] [--zygote]
+    python scripts/check_dsv41_types.py CKPT [--layer 3] [--weightkeeper]
 """
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def main():
     ap.add_argument("--layer", type=int, default=3)
     ap.add_argument("--experts", default="0,17,383")
     ap.add_argument("--tokens", type=int, default=5)
-    ap.add_argument("--zygote", action="store_true", help="compare the rows of a running zygote too")
+    ap.add_argument("--weightkeeper", action="store_true", help="compare the rows of a running weightkeeper too")
     a = ap.parse_args()
     src = D.DSV41Source(a.ckpt)
     rng = np.random.default_rng(0)
@@ -134,8 +134,8 @@ def main():
         ye64 = xq.astype(np.float64) @ ref.astype(np.float64).T
         print("FP8 %s (%d x %d): near vs float64 %.1f dB; exact vs float64 of its values %.1f dB, vs unrounded x %.1f dB"
               % (name, rows, cols, db(yn - y64, y64), db(ye - ye64, ye64), db(ye - y64, y64)))
-    if a.zygote:
-        from reclank.runtime import zygote as Z
+    if a.weightkeeper:
+        from reclank.runtime import weightkeeper as Z
         wz = Z.attach()
         ix = wz.index
         for part in range(len(ix["segments"])):
@@ -147,8 +147,8 @@ def main():
                     ref = ex[w][0 if kind == "weight" else 1][r0:r0 + nr]
                     if not np.array_equal(pl[name][e], ref.reshape(nr, -1)):
                         bad += 1
-                        print("zygote part %d expert %d %s DIFFERS" % (part, e, name))
-        print("the zygote's rows of layer %d: %s" % (a.layer, "checked" if not bad else "see above"))
+                        print("weightkeeper part %d expert %d %s DIFFERS" % (part, e, name))
+        print("the weightkeeper's rows of layer %d: %s" % (a.layer, "checked" if not bad else "see above"))
     print("all equal" if not bad else "%d checks failed" % bad)
     return 1 if bad else 0
 

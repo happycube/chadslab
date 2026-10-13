@@ -1,5 +1,5 @@
-"""The zygote: the expert rows of DeepSeek V4.1 Flash loaded once for many
-rounds (DEEPSEEK_V41_PLAN.md 4.2; the command: scripts/dsv41_zygote.py).
+"""The weightkeeper: the expert rows of DeepSeek V4.1 Flash loaded once for many
+rounds (DEEPSEEK_V41_PLAN.md 4.2; the command: scripts/weightkeeper.py).
 
 A process that reads the routed experts of the checkpoint once (289 GB,
 about 100 s from the NVMe) into a segment for each NUMA node, and hands the
@@ -25,7 +25,7 @@ socket, so a round starts in seconds:
   part's rows as the shard has them (index["planes"]); a round reads both.
 - **The handoff.** A round connects (attach()), checks the uid of the peer,
   gets the index (JSON) and the memfds (SCM_RIGHTS), and maps them read-only
-  at one address in the same order; no copy, the pages stay where the zygote
+  at one address in the same order; no copy, the pages stay where the weightkeeper
   put them. Each memfd is sealed (no write, no resize) once it is filled.
 - **The checkpoint** of the segments: the size and a sha256 of the header of
   each shard in the index (Weights.check against the files of a round).
@@ -37,15 +37,15 @@ socket, so a round starts in seconds:
   segment on the GPU's node too (index["dense"]["tensors"]: name -> offset,
   dtype, shape), for a smaller test or a machine with room.
 
-As root (the root parent, run()): the zygote fills the pools of hugetlb pages
+As root (the root parent, run()): the weightkeeper fills the pools of hugetlb pages
 it needs (drop the page cache, compact the node, ask for the pages), and a
-parent that stays root gives them back when the zygote exits. lock=True
+parent that stays root gives them back when the weightkeeper exits. lock=True
 (--lock) also locks the memory of each node in full: mlock of every segment,
 vm.compact_unevictable_allowed 0, the MPOL_BIND policy (no NUMA balancing), a
-check of /proc/self/numa_maps, all or nothing. Then the zygote drops to the
+check of /proc/self/numa_maps, all or nothing. Then the weightkeeper drops to the
 invoking user (SUDO_UID) before it serves.
 
-    run(Options(ckpt="/path/DeepSeek-V4.1-Flash", lock=True))   # the zygote
+    run(Options(ckpt="/path/DeepSeek-V4.1-Flash", lock=True))   # the weightkeeper
     w = attach()                                                # a round
     planes = w.planes(layer=3, part=0)   # dict: name -> uint8 (E, rows, bytes)
 """
@@ -72,6 +72,7 @@ from reclank.runtime import numa
 
 LAYOUT = "dsv41-expert-mxx-v2"
 LAYOUT_V1 = "dsv41-expert-planes-v1"
+LAYOUT_TENSORS = "tensors-v1"       # the GGUF tensors of a model (reclank/models/qwen/keep.py)
 MATS = ("w1", "w3", "w2")
 VERSION = 1
 PLANES = ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
@@ -128,7 +129,7 @@ def _up(n, a):
 
 
 def log(msg):
-    print("zygote: " + msg, file=sys.stderr, flush=True)
+    print("weightkeeper: " + msg, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- the checkpoint
@@ -162,7 +163,10 @@ class Shards:
 
 def identity(path):
     """The size and the sha256 of the header of each shard of the checkpoint at
-    path (the check of a round: Weights.check)."""
+    path (the check of a round: Weights.check), or of a GGUF file."""
+    if path.endswith(".gguf"):
+        from reclank.models.qwen.keep import gguf_ident
+        return gguf_ident(path)
     where = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
     out = {}
     for f in sorted(set(where.values())):
@@ -610,7 +614,7 @@ def fill(sh, index, segs, dense_seg, threads):
         total / 1e9, dt, total / 1e9 / max(dt, 1e-9), "yes" if all(rd.direct.values()) else "no"))
 
 
-# ---------------------------------------------------------------- the zygote
+# ---------------------------------------------------------------- the weightkeeper
 
 @dataclass
 class Options:
@@ -624,6 +628,13 @@ class Options:
     dense_node: int = 0
     maxpage: int = G1
     layout: str = "mxx"         # "mxx" (v2) or "planes" (v1)
+    # Qwen3.8-Flash-Next (reclank/models/qwen/keep.py): the types of ORIG's
+    # bfloat16 tensors, the least they keep: bf12 (the default), bf16, q8 (rq8
+    # for the experts)
+    dense_type: str = "bf12"
+    experts_type: str = "bf12"
+    ngram_type: str = "bf12"
+    counts: str = None          # the counts of the router (layers x experts, .npy): the experts' nodes
     sock: str = None
     user: int = None            # the uid to drop to as root (default SUDO_UID)
     group: int = None
@@ -632,18 +643,47 @@ class Options:
 
 def default_socket(uid=None):
     uid = os.getuid() if uid is None else uid
-    return "/tmp/reclank-zygote-%d.sock" % uid
+    return "/tmp/reclank-weightkeeper-%d.sock" % uid
 
 
-class Zygote:
+def plugin(ckpt):
+    """The module of a model that the weightkeeper takes in the tensors layout
+    (layout(), fill()), or None: DeepSeek V4.1 (this module's layouts)."""
+    from reclank.models.qwen import keep as qwen_keep
+    if qwen_keep.detect_gguf(ckpt):
+        return qwen_keep.GGUF_PLUGIN        # a GGUF file of Qwen3.8 (its tensors as they are)
+    cfg = json.load(open(os.path.join(ckpt, "config.json")))
+    if qwen_keep.detect(cfg):
+        return qwen_keep
+    return None
+
+
+class Weightkeeper:
     def __init__(self, o: Options):
         self.o = o
         self.root = os.geteuid() == 0
         self.numa_on = numa.enabled()
         t0 = time.time()
-        self.sh = Shards(o.ckpt)
+        self.plugin = plugin(o.ckpt)
+        if hasattr(self.plugin, "ident"):
+            # a file of its own (a GGUF): its identity, no shards
+            self.sh = Shards.__new__(Shards)
+            self.sh.path, self.sh.ident = os.path.abspath(o.ckpt), self.plugin.ident(o.ckpt)
+        else:
+            self.sh = Shards(o.ckpt)
         all_nodes = sorted(set(numa.node_of_cpu().values())) if self.numa_on else [0]
         nodes = list(o.nodes) if o.nodes else all_nodes
+        if self.plugin is not None:
+            share = [o.share] + [(1.0 - o.share) / (len(nodes) - 1)] * (len(nodes) - 1) \
+                if len(nodes) > 1 else [1.0]
+            ix = self.index = self.plugin.layout(o.ckpt, nodes, share, o)
+            ix.update(version=VERSION, checkpoint=self.sh.path, shards=self.sh.ident, dense=None)
+            log("%s: %d files, %s (dense %s, experts %s, n-gram %s), the experts of each layer split "
+                "between nodes %s: %s GB a node (%.1f s)" % (
+                    o.ckpt, len(self.sh.ident), ix["model"], ix["types"]["dense"], ix["types"]["experts"],
+                    ix["types"]["ngram"], nodes, ["%.1f" % (b / 1e9) for b in ix["part_bytes"]],
+                    time.time() - t0))
+            return
         L = int(self.sh.hf["num_hidden_layers"])
         layers = list(o.layers) if o.layers is not None else list(range(L))
         share = [o.share] + [(1.0 - o.share) / (len(nodes) - 1)] * (len(nodes) - 1) \
@@ -670,9 +710,10 @@ class Zygote:
         o, ix = self.o, self.index
         t0 = time.time()
         self.segs = []
+        name = "%s-n%%d" % ("dsv41-experts" if self.plugin is None else ix["model"])
         for part, nd in enumerate(ix["nodes"]):
             ch = pages(ix["part_bytes"][part], nd, self.root, o.maxpage)
-            self.segs.append(Segment("dsv41-experts-n%d" % nd, nd, ch, self.numa_on))
+            self.segs.append(Segment(name % nd, nd, ch, self.numa_on))
         self.dense = None
         if ix["dense"]:
             ch = pages(ix["dense"]["bytes"], o.dense_node, self.root, o.maxpage)
@@ -696,7 +737,10 @@ class Zygote:
         if errs:
             raise errs[0]
         log("populated in %.1f s" % (time.time() - t0))
-        fill(self.sh, ix, self.segs, self.dense, o.threads)
+        if self.plugin is not None:
+            self.plugin.fill(self.sh, ix, self.segs, o.threads, log)
+        else:
+            fill(self.sh, ix, self.segs, self.dense, o.threads)
         for s in every:
             weak = s.seal()
             seals = {fcntl.fcntl(fd, F_GET_SEALS) for fd in s.fds}
@@ -717,7 +761,7 @@ class Zygote:
                 if r is not True:
                     bad.append("%s: mlock: %s" % (s.name, os.strerror(r)))
             if bad:
-                raise SystemExit("zygote: --lock: " + "; ".join(bad))
+                raise SystemExit("weightkeeper: --lock: " + "; ".join(bad))
             log("locked: %.1f GB" % (sum(s.size for s in every) / 1e9))
         elif bad:
             log("warning: " + "; ".join(bad))
@@ -740,7 +784,7 @@ class Zygote:
                 c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 c.connect(path)
                 c.close()
-                raise SystemExit("zygote: a zygote answers on %s" % path)
+                raise SystemExit("weightkeeper: a weightkeeper answers on %s" % path)
             except (ConnectionRefusedError, FileNotFoundError):
                 os.unlink(path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -785,7 +829,9 @@ class Zygote:
 
     def status(self):
         ix = self.index
-        return dict(pid=os.getpid(), locked=ix["locked"], layers=len(ix["layers"]), nodes=ix["nodes"],
+        return dict(pid=os.getpid(), model=ix.get("model", "deepseek_v41"), layout=ix["layout"],
+                    types=ix.get("types"), locked=ix["locked"], layers=len(ix.get("layers", [])) or ix.get("L"),
+                    nodes=ix["nodes"],
                     segments=[dict(node=s.node, gb=round(s.size / 1e9, 2),
                                    chunks=[[_pname(pg), round(n / 1e9, 2)] for pg, n, _o in s.chunks])
                               for s in self.segs + ([self.dense] if self.dense else [])],
@@ -801,7 +847,7 @@ def _recv_exact(c, n):
     while len(out) < n:
         b = c.recv(n - len(out))
         if not b:
-            raise ConnectionError("the zygote closed the socket")
+            raise ConnectionError("the weightkeeper closed the socket")
         out += b
     return bytes(out)
 
@@ -820,7 +866,7 @@ def _drop(uid, gid):
     except PermissionError:
         pass
     else:
-        raise SystemExit("zygote: could not drop root")
+        raise SystemExit("weightkeeper: could not drop root")
     _pdeathsig()
 
 
@@ -832,19 +878,19 @@ def _pdeathsig():
 
 
 def run(o: Options):
-    """The zygote, as the module text says: as root a parent that stays root
-    and gives back the pools and the settings when the zygote exits."""
+    """The weightkeeper, as the module text says: as root a parent that stays root
+    and gives back the pools and the settings when the weightkeeper exits."""
     root = os.geteuid() == 0
     if o.lock and not root:
-        raise SystemExit("zygote: --lock needs root (sudo): no partial lock")
+        raise SystemExit("weightkeeper: --lock needs root (sudo): no partial lock")
     if not root:
-        z = Zygote(o)
+        z = Weightkeeper(o)
         z.load()
         return z.serve(o.sock or default_socket())
     uid = o.user if o.user is not None else int(os.environ.get("SUDO_UID", "0"))
     gid = o.group if o.group is not None else int(os.environ.get("SUDO_GID", "0"))
     if uid == 0:
-        raise SystemExit("zygote: as root it serves as the invoking user: run it with sudo, or give --user")
+        raise SystemExit("weightkeeper: as root it serves as the invoking user: run it with sudo, or give --user")
     path = o.sock or default_socket(uid)
     nodes = sorted(set(numa.node_of_cpu().values())) or [0]
     st = system_state(nodes)
@@ -863,7 +909,7 @@ def run(o: Options):
         try:
             _pdeathsig()
             resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            z = Zygote(o)
+            z = Weightkeeper(o)
             z.load()
             _drop(uid, gid)
             log("dropped to uid %d" % uid)
@@ -908,9 +954,11 @@ def request(op, path=None):
 
 
 class Weights:
-    """The segments of a zygote, mapped read-only in this process."""
+    """The segments of a weightkeeper, mapped read-only in this process."""
 
-    def __init__(self, path=None, populate=True):
+    def __init__(self, path=None, populate=True, ckpt=None):
+        """ckpt: the checkpoint the round wants; another one raises ValueError
+        before anything is mapped."""
         c = request("get", path)
         with c:
             self.index = json.loads(_recv_msg(c))
@@ -918,7 +966,15 @@ class Weights:
             if self.index.get("dense"):
                 nfd += len(self.index["dense"]["chunks"])
             _msg, fds, _flags, _addr = socket.recv_fds(c, 16, nfd)
-        assert self.index["version"] == VERSION and self.index["layout"] in (LAYOUT, LAYOUT_V1), self.index["layout"]
+        if self.index["version"] != VERSION or self.index["layout"] not in (LAYOUT, LAYOUT_V1, LAYOUT_TENSORS):
+            for fd in fds:
+                os.close(fd)
+            raise ValueError("the weightkeeper has the layout %r (version %s)" % (
+                self.index["layout"], self.index["version"]))
+        if ckpt is not None and identity(ckpt) != self.index["shards"]:
+            for fd in fds:
+                os.close(fd)
+            raise ValueError("the weightkeeper holds another checkpoint (%s)" % self.index["checkpoint"])
         self.fds = list(fds)
         self.base, self.size, k = [], [], 0
         for s in self.index["segments"]:
@@ -937,7 +993,7 @@ class Weights:
         """Raise when the checkpoint at ckpt is not the one of the segments."""
         mine = identity(ckpt)
         if mine != self.index["shards"]:
-            raise ValueError("the zygote holds another checkpoint (%s)" % self.index["checkpoint"])
+            raise ValueError("the weightkeeper holds another checkpoint (%s)" % self.index["checkpoint"])
 
     def _arr(self, addr, n):
         a = np.frombuffer((ctypes.c_uint8 * n).from_address(addr), np.uint8)
@@ -966,6 +1022,18 @@ class Weights:
         seg = self._arr(base, E * st).reshape(E, st)
         return {w: seg[:, off:off + n] for w, off, _r0, _nr, _cols, n in ix["mats"][part]}
 
+    def tensor(self, name):
+        """The tensors layout: a tensor whole on one node (uint8, its bytes), or
+        for one split by rows, [(part, uint8 (E, nr x rb), first row, rows)]."""
+        d = self.index["tensors"][name]
+        if d["place"] == "node":
+            return self._arr(self.base[d["seg"]] + d["off"], d["bytes"])
+        if d["place"] == "experts":
+            return [(p, self._arr(self.base[p] + off, len(ids) * d["nb"]).reshape(len(ids), d["nb"]), ids)
+                    for p, off, ids in d["parts"]]
+        return [(p, self._arr(self.base[p] + off, d["E"] * nr * d["rb"]).reshape(d["E"], nr * d["rb"]), r0, nr)
+                for p, off, r0, nr in d["parts"]]
+
     def dense(self, name):
         off, dt, shape = self.index["dense"]["tensors"][name]
         from reclank.formats.safetensors import _NP
@@ -974,6 +1042,7 @@ class Weights:
         return self._arr(self.dense_base + off, n).view(dtype).reshape(shape)
 
 
-def attach(path=None, populate=True):
-    """The segments of the zygote of this user (or at path), mapped read-only."""
-    return Weights(path, populate)
+def attach(path=None, populate=True, ckpt=None):
+    """The segments of the weightkeeper of this user (or at path), mapped
+    read-only; ckpt: ValueError when it holds another checkpoint."""
+    return Weights(path, populate, ckpt)

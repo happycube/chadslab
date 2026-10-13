@@ -1013,6 +1013,18 @@ static void gp_step(const gp_rec *r, int64_t *e)
         }
         break;
     }
+    case GP_ENC_SILU_MUL: {
+        /* g, u, y, n: y = silu(g) u */
+        const float *g = GP_P(const float, 0);
+        const float *u = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        int64_t n = gp_i(r, e, 3);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            y[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+        }
+        break;
+    }
     case GP_ENC_MUL_VEC: {
         /* x, vec, y, rows, cols: y = x vec (vec of cols values for each row) */
         const float *x = GP_P(const float, 0);

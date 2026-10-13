@@ -932,6 +932,77 @@ float32; QWEN_PLAN.md has the forms):
 - The raw keys must stay. A snapshot of the server can start in a block,
   and the key of that block then needs the raw keys before the snapshot.
 
+## Full quality: the original bfloat16 checkpoint in the weightkeeper
+
+The weightkeeper (reclank/runtime/weightkeeper.py, the zygote of DeepSeek V4.1
+renamed) takes Qwen3.8-Flash-Next too: the original bfloat16 checkpoint
+(Qwen/Qwen3.8-Flash-Next, "ORIG", 336 GB on the HDD) converted once into the
+GGUF tensors of the runtime in memory (reclank/models/qwen/keep.py), handed
+to the rounds over its socket; scripts/weightkeeper.py CKPT. The types are
+minimums for each kind (--dense-type, --experts-type, --ngram-type: bf12, the
+default, bf16, q8, rq8 for the experts); the first test BF12 for every
+bfloat16 tensor: the dense matrices, the shared experts, the routed experts
+of the 48 layers and of the MTP layer, the n-gram table. Kept as they are:
+the embeddings (bfloat16), the indexer and the small tensors (float32).
+
+- **The places.** The routed experts of each layer split between the nodes by
+  expert, each expert whole on one node, the experts of a node one after
+  another (256 a node; with --counts, the router's profile, in snake order:
+  644 / 636 picks of layer 0). That is the split of QwenGPU._numa_split:
+  the CPU part runs each expert on the threads of its node (only the
+  activations cross the sockets), the copies to the GPU read each expert
+  where it is (QwenGPU._kept_split takes the weightkeeper's stacks as that
+  split, no copy, no parts). A split by rows (the DeepSeek layout) would need
+  copies of two ranges for each expert in every copy path of HotCache, the
+  fetch tables and GP_MOE_PLAN. The n-gram table split by rows so the nodes
+  hold the same bytes; the rest on the GPU's node. 140.9 GB on each node:
+  experts 189.6 GB, the n-gram table 81.9 GB (256 bytes a row of 160), dense
+  6.6 GB, the rest 1.7 GB.
+- **The fill.** The small tensors through the map of OrigSource (moved to
+  reclank/formats/qwen38_orig.py, shared with convert_q8_gguf.py): 8.3 GB in
+  60 s. The bulk (an item an expert, 64 MB of n-gram rows) read in the order
+  of the files by one thread, O_DIRECT, converted by 24: 349 GB in 1591 s
+  (219 MB/s, the HDD). Ready in 31 minutes as the user (4 KB shmem pages, 2
+  MB where THP allows; no lock: --lock needs sudo).
+- **BF12.** None over the runtime's rule: dense 511 matrices, 234686 zeroed,
+  the largest 1.65e-3 of its RMS (blk.47.attn_q); experts 75264 matrices,
+  5.17 M zeroed (0.0043%), the largest 1.14e-3 of its RMS; the n-gram table
+  2.17 M zeroed, the largest 1.27e-4. --check: 134 experts, n-gram rows and
+  dense tensors equal to a new conversion of the checkpoint.
+- **The model.** Qwen4 on a checkpoint directory of ORIG takes keep.KeptGGUF
+  (the GGUF interface over the segments); the n-gram rows by their addresses
+  (kq_gather), dense_mode keeps the types. BF12 routed experts run on the
+  generic kernels of the GPU (k_kqh_gu, k_qmoe_gu: kq_row and kq_dequant8 take
+  BF12) and on the float rows of the CPU (kq_rows_bf12_f, now one decode of a
+  row for all the tokens of an expert, the same bits); GP_KQ_MOE_PART takes
+  BF12 too (the float rows of the pairs, xf, and of the act).
+- **The server** (start_server.sh M=qfn): ready in 268 s; "What is the
+  capital of Australia..." answers right; 12.8 tok/s decode with MTP (68% of
+  the drafts) with 1 hot expert a layer: an expert of BF12 is 7.5 MB, and the
+  sizing left the two copy buffers of a prompt (2 x 512 experts, 7.7 GB) and
+  262K of context first (below).
+- **The hot experts and the CPU part.** The size of the hot experts kept room
+  for the two buffers of the large groups of a prompt (2 x 512 experts, 7.7 GB
+  in BF12), which Qwen3.8 never runs (its prompts are mixed groups; the rest
+  under MIX_MIN runs in split groups): with mixed groups it now keeps
+  MIX_RING (192) experts for their ring instead: 17 slots a layer at 262K
+  in place of 1. The rate did not move: nsys of plain steps (real text)
+  gave k_await, the GPU waiting for the CPU's cold experts, 65% of the GPU's
+  time (1.17 ms a layer; the hot experts' kernels 2.3 ms a step). The CPU
+  part (RECLANK_MOE_PROF): kq_rows_bf12_f took a row at a time; kq_dot4_bf12
+  decodes four rows on one x (four chains, the sums of kq_dot_bf12 in its
+  order: the logits of 16 steps and 72 tokens the same bits), BF12 tasks of
+  16 rows (RECLANK_BF12_UNIT16), and 36 CPU threads (24 66.9 ms a step, 28
+  62.1, 32 59.1, 36 57.3, 40 62.8): plain steps 66.9 -> 52.1 ms (19.1 tok/s);
+  the CPU part of a layer 826 -> 666 us (gate and up 254 us mean, 371 the
+  slowest thread: each expert on one node leaves a node idle when the cold
+  experts of a token fall unevenly). The server with MTP: 20.9 -> 26.2 tok/s
+  decode, the prompt 185 tok/s (the mixed groups: to do).
+- **The GGUF.** scripts/weightkeeper.py --gguf OUT CKPT writes the tensors held
+  as one GGUF file (279.8 GB, BF12, the same bytes as the weightkeeper's: 40 tensors,
+  60 experts, 2000 n-gram rows compared); the weightkeeper loads such a file too (the
+  tensors as they are, read in the order of the file: scripts/weightkeeper.py FILE.gguf).
+
 ## Risks
 
 - The page cache: if the working set does not fit, the rate falls by a

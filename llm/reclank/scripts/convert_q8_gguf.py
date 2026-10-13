@@ -56,141 +56,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
-from convert_nvfp4_gguf import metadata, reorder  # noqa: E402
 from reclank.backends.cpu import cops  # noqa: E402
-from reclank.formats.gguf import BF12, GGUF, Q8_0, RQ6_K, RQ8_0, rotation_meta, tensor_bytes, write_gguf
-from reclank.formats.nvfp4_st import NVFP4Source  # noqa: E402
-
-
-def to_q8(w, rot):
-    """Q8_0 blocks of bfloat16 rows (uint16), or RQ8_0 (rot: the rows rotated
-    in each 32 values first)."""
-    if not rot:
-        return cops.kq_to_q8_0(w, w.shape[-1])
-    return cops.kq_to_q8_0(cops.tq6_rotate(bf16f(w)), w.shape[-1])
-
-
-def to_type(w, t):
-    """The blocks of bfloat16 rows in type t: Q8_0, RQ8_0, or RQ6_K (Q6_K of
-    the rotated rows, as llama.cpp quantizes Q6_K)."""
-    if t == RQ6_K:
-        return cops.kq_to_q6_k(cops.tq6_rotate(bf16f(w)), w.shape[-1])
-    return to_q8(w, t == RQ8_0)
-
-
-def back_type(q, cols, t):
-    """The values of blocks of rows of cols values in type t."""
-    kt = {RQ6_K: 14}.get(t, Q8_0)
-    rb = cols // 256 * 210 if kt == 14 else cols // 32 * 34
-    v = cops.kq_rows(q, kt, cols, np.arange(q.size // rb))
-    return cops.tq6_rotate(v, inverse=True) if t in (RQ8_0, RQ6_K) else v
-
-
-def ud_map(path, L):
-    """The types of the routed experts of RQ6_MIX_PLAN.md from the choices of
-    a GGUF of Unsloth (UD-Q4_K_XL): {(layer, "gate"|"up"|"down"): type}.
-    Where it paid for Q8_0, RQ8_0; else RQ6_K if the rows are whole blocks
-    of 256 (gate and up: 2560 inputs), else RQ8_0 (down: 640 inputs, M1)."""
-    from reclank.formats.gguf import open_gguf
-    g = open_gguf(path)
-    out = {}
-    for i in range(L):
-        for x in ("gate", "up", "down"):
-            dims, t, _o = g.tensors["blk.%d.ffn_%s_exps.weight" % (i, x)]
-            out[(i, x)] = RQ8_0 if t == Q8_0 or int(dims[0]) % 256 else RQ6_K
-    g.close()
-    return out
-
-
-class OrigSource(NVFP4Source):
-    """The GGUF view of ORIG: the map of NVFP4Source, with the fused bfloat16
-    experts and the bfloat16 n-gram table in Q8_0. rot: the experts (and the
-    shared experts) in RQ8_0."""
-
-    def __init__(self, path, headers=None, rot=False, xtypes=None):
-        """xtypes: {(layer, "gate"|"up"|"down"): type} of the routed experts
-        (ud_map; the others RQ8_0 with rot, else Q8_0)."""
-        self.rot = rot
-        self.xtypes = xtypes or {}
-        super().__init__(path, headers=headers)
-
-    def _experts(self, b, m, mtp):
-        gu, dn = m + "experts.gate_up_proj", m + "experts.down_proj"
-        E, rows2, cols = self._shape(gu)
-        inter = rows2 // 2
-        assert E == self.E and tuple(self._shape(dn)) == (E, cols, inter), (gu, self._shape(dn))
-        i = int(b.split(".")[1])
-        t0 = RQ8_0 if self.rot else Q8_0
-        tg, tu, td = (self.xtypes.get((i, x), t0) for x in ("gate", "up", "down"))
-        self._add(b + "ffn_gate_exps.weight", "q8exps", (gu, 0, inter, tg), (cols, inter, E), tg)
-        self._add(b + "ffn_up_exps.weight", "q8exps", (gu, inter, rows2, tu), (cols, inter, E), tu)
-        self._add(b + "ffn_down_exps.weight", "q8exps", (dn, 0, cols, td), (inter, cols, E), td)
-
-    def _build(self):
-        super()._build()
-        g = "per_layer_token_embd.weight"
-        dims, _t, _ = self.tensors[g]
-        self._add(g, "q8ple", None, dims, Q8_0)
-        if self.rot:
-            # the shared experts too: the MoE then rotates its x for all its
-            # experts
-            for n, (kind, hf) in list(self._map.items()):
-                if kind == "dense" and n.endswith(("ffn_gate_shexp.weight", "ffn_up_shexp.weight",
-                                                   "ffn_down_shexp.weight")):
-                    self._add(n, "rq8dense", hf, self.tensors[n][0], RQ8_0)
-
-    def _make(self, gname):
-        kind, src = self._map[gname]
-        if kind == "q8exps":
-            hf, lo, hi, t = src
-            return self._q8_experts(hf, lo, hi, t)
-        if kind == "q8ple":
-            return self._q8_ple()
-        if kind == "rq8dense":
-            return to_q8(np.asarray(self._bf16(src)), True)
-        return super()._make(gname)
-
-    def _q8_experts(self, hf, lo, hi, t):
-        """Rows lo to hi of each expert of a fused stack, one expert at a
-        time, in type t."""
-        w = self._bf16(hf)
-        for e in range(self.E):
-            yield to_type(w[e, lo:hi], t)
-
-    def _q8_ple(self):
-        for n in self._ple_shards:
-            w = self._bf16(n)
-            yield cops.kq_to_q8_0(w, w.shape[1])
-
-    def sources(self, gname):
-        """The safetensors names that gname reads."""
-        kind, src = self._map[gname]
-        if kind == "f32":
-            return [src[0]]
-        if kind in ("bf16", "dense", "rq8dense"):
-            return [src]
-        if kind == "ehproj":
-            return ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"]
-        if kind == "q8exps":
-            return [src[0]]  # (hf, lo, hi, type)
-        if kind == "q8ple":
-            return list(self._ple_shards)
-        raise KeyError(gname)
-
-    def span(self, hf):
-        """(path, start, end) of the bytes of a safetensors tensor."""
-        st = self._file(hf)
-        a, b = st.header[hf]["data_offsets"]
-        return os.path.join(self.path, self.where[hf]), st._base + a, st._base + b
+from reclank.formats.gguf import BF12, GGUF, Q8_0, RQ6_K, RQ8_0, rotation_meta, tensor_bytes, write_gguf  # noqa: E402
+from reclank.formats.qwen38_orig import (OrigSource, back_type, bf16f, metadata, reorder,  # noqa: E402,F401
+                                          to_q8, to_type, ud_map)
 
 
 def db(w, q):
     w = np.asarray(w, np.float64)
     return 10 * np.log10(((np.asarray(q, np.float64) - w) ** 2).mean() / (w ** 2).mean())
-
-
-def bf16f(a):
-    return (np.asarray(a, np.uint16).astype(np.uint32) << 16).view(np.float32)
 
 
 def back(q, cols, rot):

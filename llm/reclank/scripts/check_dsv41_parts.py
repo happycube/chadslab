@@ -4,7 +4,7 @@ GP_KQ_MOE_PART with KQ_MXX and flag 128, DEEPSEEK_V41_PLAN.md Phase 3) against
 the products of each expert (cops.kq_mxx_linear, int16 x), on real experts.
 
 The experts of a layer are packed from the shards, each part's rows in the
-memory of its node, as the zygote's layout v2 holds them; the tokens take 6
+memory of its node, as the weightkeeper's layout v2 holds them; the tokens take 6
 of 16 experts. Flag 128: the act silu(min(g, 10)) clamp(u, -10, 10) times
 the weight of the pair before the down rows (the reference's Expert).
 

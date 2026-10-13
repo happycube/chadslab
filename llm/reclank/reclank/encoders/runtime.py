@@ -113,6 +113,9 @@ class _EncCompiler(P.Compiler):
         self.q8 = q8
         self.p = P.Program()
         self.env = self.p.names
+        self.frames = []            # the scopes of P.Compiler (an encoder has none)
+        self.frame_kinds = []
+        self.n_gensym = 0
         if q8 and pack:
             self.env.update(_xq=np.zeros(rows * kmax, np.int8),
                             _xs=np.zeros(rows * kmax // 32, np.float32),
@@ -135,6 +138,26 @@ def quantize_q8(lin):
     # KQ_Q8X16 has a kernel for VNNI and for AVX2 (backends/cpu/csrc/kernels/kq)
     if rows % 16 == 0 and _platform.machine().lower() in ("x86_64", "amd64"):
         lin.q8x16 = _KQ(cops.kq_pack_q8x16(data, rows, cols), cops.KQ_Q8X16, rows, cols)
+    return True
+
+
+def to_bf12(lin):
+    """Give a linear of bfloat16 W the BF12 rows of W (lin.kq, for a GPU
+    program; the bfloat16 values in 12.25 bits) and drop W, under the rule of
+    the runtime (convert_q8_gguf.py --dense bf12): cols a multiple of 32, more
+    than one row, no Inf or NaN, the largest zeroed value at most 2^-8 of the
+    RMS of the matrix. Return False (W kept) when W does not pass."""
+    from reclank.backends.cpu import cops
+    from reclank.formats.gguf import BF12
+    from reclank.models.gemma4.e4b import _KQ
+    rows, cols = lin.w.shape
+    if lin.w.dtype != np.uint16 or cols % 32 or rows < 2:
+        return False
+    data, rep = cops.kq_bf16_to_bf12(lin.w, cols)
+    if rep["nonfinite"] or rep["largest"] > rep["rms"] / 256:
+        return False
+    lin.kq = _KQ(data, BF12, rows, cols)
+    lin.w = None
     return True
 
 

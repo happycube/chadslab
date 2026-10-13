@@ -552,6 +552,10 @@ def _py_step(op, a, e):
         n = V(2)
         x = _arr(V(0), n)
         _arr(V(1), n)[:] = x / (1.0 + np.exp(-x))
+    elif op == ENC_SILU_MUL:
+        n = V(3)
+        g = _arr(V(0), n)
+        _arr(V(2), n)[:] = g / (1.0 + np.exp(-g)) * _arr(V(1), n)
     elif op == ENC_MUL_VEC:
         rows, cols = V(3), V(4)
         _arr(V(2), rows * cols).reshape(rows, cols)[:] = (
@@ -1652,17 +1656,21 @@ def k_enc_linear(c, lin, x, out=None):
     input."""
     n = x.shape[0]
     k = x.size // n
-    m = lin.w.shape[0]
+    # lin.kq: W in a type of the GGUF records (encoders.runtime.to_bf12: BF12),
+    # in a GPU program; lin.q8 with the compiler's q8
+    kq = getattr(lin, "kq", None) if not getattr(c, "pack", False) else None
+    if kq is None and getattr(c, "q8", False):
+        kq = getattr(lin, "q8", None)
+    m = lin.w.shape[0] if kq is None else kq.rows
     out = c.buffer((n, m)) if out is None else out
+    if kq is not None:
+        return _k_enc_linear_kq(c, lin, kq, x, n, m, k, out)
     wbf = 1 if lin.w.dtype == np.uint16 else 0
     inf = float("inf")
     scratch = None
     if lin.imin is not None:
         scratch = c.env["_scratch"]
         assert scratch.size >= n * k, "the scratch of enc_linear is too small"
-    q8 = getattr(lin, "q8", None) if getattr(c, "q8", False) else None
-    if q8 is not None:
-        return _k_enc_linear_q8(c, lin, q8, x, n, m, k, out)
     x16 = None
     if getattr(c, "pack", False) and os.environ.get("RECLANK_ENC_X16", "1") != "0":
         # A CPU program: W in groups of 16 rows (kq_x16f_body), made once.
@@ -1677,12 +1685,13 @@ def k_enc_linear(c, lin, x, out=None):
     return out
 
 
-def _k_enc_linear_q8(c, lin, q8, x, n, m, k, out):
-    """enc_linear with Q8_0 weights (lin.q8, and lin.q8x16 for a CPU with
-    VNNI): the input clamps (ENC_CLAMP), then the int8 product of the GGUF
-    records (KQ_QUANT and KQ_LINEAR; the GPU quantizes x itself), then the
-    bias and the output clamps (ENC_BIAS_CLAMP). The int8 rows of x share
-    the buffers "_xq", "_xs", and "_xm" of the compiler."""
+def _k_enc_linear_kq(c, lin, q8, x, n, m, k, out):
+    """enc_linear with the weights of a GGUF type: Q8_0 (lin.q8, and
+    lin.q8x16 for a CPU with VNNI) or BF12 (lin.kq, on the GPU): the input
+    clamps (ENC_CLAMP), then the product of the GGUF records (KQ_QUANT and
+    KQ_LINEAR; the GPU quantizes x itself), then the bias and the output
+    clamps (ENC_BIAS_CLAMP). The int8 rows of x share the buffers "_xq",
+    "_xs", and "_xm" of the compiler."""
     inf = float("inf")
     xin = x
     if lin.imin is not None:
@@ -1750,6 +1759,13 @@ def k_enc_silu(c, x, out=None):
     return out
 
 
+def k_enc_silu_mul(c, g, u, out=None):
+    """(enc_silu_mul g u): silu(g) u."""
+    out = c.buffer(g.shape) if out is None else out
+    c.p.emit(ENC_SILU_MUL, g, u, out, g.size)
+    return out
+
+
 def k_enc_mul_vec(c, x, vec, out=None):
     """(enc_mul_vec x vec): each row of x times vec."""
     out = c.buffer(x.shape) if out is None else out
@@ -1807,6 +1823,7 @@ KERNELS = {
     "enc_rope2d": k_enc_rope2d,
     "enc_attn": k_enc_attn,
     "enc_silu": k_enc_silu,
+    "enc_silu_mul": k_enc_silu_mul,
     "enc_mul_vec": k_enc_mul_vec,
     "enc_glu": k_enc_glu,
     "enc_dwconv": k_enc_dwconv,

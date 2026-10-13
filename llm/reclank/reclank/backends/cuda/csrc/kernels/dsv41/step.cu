@@ -1506,9 +1506,10 @@ __global__ void __launch_bounds__(512) k_ds_attn_join(const gp_rec *r, const int
 }
 
 /* GP_DS_ROUTER: logits [t, E], bias [E], ids [t, k] (int32), val [t, k], t,
- * E, k, scale. s = sqrt(softplus(logit)); the k best of s + bias (ties to
- * the lower expert); the weights s / sum s times scale (model.py moe). A
- * block of 256 threads for each token. */
+ * E, k, scale, bias_vl [E] or NULL, vis [t] (int32) or NULL. s =
+ * sqrt(softplus(logit)); the k best of s + bias (bias_vl for a token of an
+ * image span: vis[j] != 0; ties to the lower expert); the weights s / sum s
+ * times scale (model.py Gate). A block of 256 threads for each token. */
 __global__ void __launch_bounds__(256) k_ds_router(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -1517,6 +1518,9 @@ __global__ void __launch_bounds__(256) k_ds_router(const gp_rec *r, const int64_
     __shared__ float bv[8];
     __shared__ int bi[8], pick[16];
     const float *lg = DP(const float, 0) + (size_t)j * E, *bias = DP(const float, 1);
+    if (DP(const void, 9) && DP(const int, 9)[j]) {
+        bias = DP(const float, 8);
+    }
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
         float l = lg[i];
         s[i] = sqrtf(fmaxf(l, 0.f) + log1pf(expf(-fabsf(l))));
@@ -1977,6 +1981,27 @@ __global__ void __launch_bounds__(256) k_ds_embed(const gp_rec *r, const int64_t
             for (int s2 = 0; s2 < hc; ++s2) {
                 h[(size_t)s2 * dim + c + u] = v;
             }
+        }
+    }
+}
+
+/* GP_DS_EMBED_ROWS: rows [t, dim], vis [t] (int32), h [t, hc, dim], t, dim,
+ * hc: the row of each token of an image span (vis[j] != 0: the aligner's
+ * row, or a learned delimiter) in place of its embedding, into every stream
+ * (model.py merge_image_embeddings). A block for each token. */
+__global__ void __launch_bounds__(256) k_ds_embed_rows(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int j = blockIdx.x, dim = DI(4), hc = DI(5);
+    if (!DP(const int, 1)[j]) {
+        return;
+    }
+    const float *row = DP(const float, 0) + (size_t)j * dim;
+    float *h = DP(float, 2) + (size_t)j * hc * dim;
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+        float v = row[c];
+        for (int s2 = 0; s2 < hc; ++s2) {
+            h[(size_t)s2 * dim + c] = v;
         }
     }
 }

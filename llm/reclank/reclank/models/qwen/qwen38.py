@@ -51,6 +51,8 @@ def dense_mode(g, dense=None):
     of a file of convert_q8_gguf.py --dense bf12 stay BF12 unless
     RECLANK_DENSE is q8, rq8 or bf16 (Qwen4CPU.K; rq8: rotated Q8_0, the
     other bfloat16 matrices as q8)."""
+    if getattr(g, "kept", False):
+        return "bf16"       # the weightkeeper chose the types (its least ones): as they are
     dense = dense or os.environ.get("RECLANK_DENSE", "q8")
     if dense != "auto":
         return dense
@@ -218,7 +220,20 @@ class Qwen4(QwenGGUF):
             # several files (a,b): the later ones over the earlier (GGUFOverlay),
             # e.g. the NVFP4 experts, then the BF12 experts of the MTP layer
             experts = [e for e in experts.split(",") if e]
-        if experts and not is_checkpoint(path):
+        from reclank.models.qwen import keep
+        if path.endswith(".gguf") and keep.holds(path):
+            # a GGUF file that the weightkeeper holds: its tensors from there
+            self.g = keep.KeptGGUF(path)
+            self.cfg = cfg or config_from_gguf(self.g)
+        elif is_checkpoint(path) and keep.is_orig(path):
+            # The original bfloat16 checkpoint: its tensors from the weightkeeper
+            # (reclank/models/qwen/keep.py; scripts/weightkeeper.py CKPT)
+            if not keep.holds(path):
+                raise SystemExit("%s: the original bfloat16 checkpoint runs from the weightkeeper: "
+                                 "start it first (scripts/weightkeeper.py %s)" % (path, path))
+            self.g = keep.KeptGGUF(path)
+            self.cfg = cfg or config_from_gguf(self.g)
+        elif experts and not is_checkpoint(path):
             from reclank.formats.gguf import GGUFOverlay
             self.g = GGUFOverlay(path, experts)
             if mtp is not None:
@@ -771,6 +786,19 @@ class Qwen4CPU(Qwen4):
     def K(self, gname):
         from reclank.models.qwen.qwen35 import KMat
         m = self._k.get(gname)
+        if m is None and getattr(self.g, "kept", False) and \
+                self.g.index["tensors"][gname]["place"] == "experts":
+            # a stack of experts split between the nodes by the weightkeeper:
+            # data holds those of the first node; kept, all the nodes (the GPU
+            # takes them as its split, gpu35.QwenGPU._kept_split)
+            d = self.g.index["tensors"][gname]
+            m = KMat.__new__(KMat)
+            m.kept = self.g.experts(gname)
+            m.data = m.kept[0][1].reshape(-1)
+            m.type, m.cols, m.rows, m.rot = int(d["type"]), int(d["dims"][0]), int(d["dims"][1]), False
+            m.nb = int(d["nb"])
+            self._k[gname] = m
+            return m
         if m is None:
             m = KMat(self.g, gname)
             if m.rot:
@@ -952,6 +980,15 @@ class Qwen4CPU(Qwen4):
         """The 16 rows of the n-gram table of each token (t x hid)."""
         from reclank.backends.cpu import cops
         rows = self.ple_ids(ids, cache)
+        if getattr(self.g, "kept", False):
+            # the weightkeeper (keep.KeptGGUF): the rows split between the nodes,
+            # read by their addresses (many threads), then decoded
+            g, name = self.g, "per_layer_token_embd.weight"
+            d = g.index["tensors"][name]
+            r = rows.reshape(-1).astype(np.int64)
+            raw = cops.kq_gather(g.row_addrs(name, r), d["rb"])
+            return cops.kq_rows(raw.reshape(-1), d["type"], int(d["dims"][0]),
+                                np.arange(len(r))).reshape(len(ids), -1)
         if hasattr(self.g, "ple_rows"):
             return self.g.ple_rows(rows.reshape(-1)).reshape(len(ids), -1)
         m = self.K("per_layer_token_embd.weight")

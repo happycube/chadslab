@@ -13,12 +13,13 @@ THINKING = ("auto", "on", "off", "low", "medium", "high", "xhigh")
 
 def parser():
     ap = argparse.ArgumentParser(prog="python -m server", description=(
-        "An OpenAI compatible server for the models of reclank (Gemma 4, Qwen3.6, Qwen3.8). "
+        "An OpenAI compatible server for the models of reclank (Gemma 4, Qwen3.6, Qwen3.8, "
+        "DeepSeek V4.1 Flash). "
         "The family comes from the model file; --family forces one."))
     g = ap.add_argument_group("the model")
     g.add_argument("--model", "-m", "--gguf", dest="model", required=True,
-                   help="the GGUF file of the model")
-    g.add_argument("--family", choices=("auto", "gemma4", "qwen"), default="auto")
+                   help="the GGUF file of the model, or a checkpoint directory (DeepSeek V4.1)")
+    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41"), default="auto")
     g.add_argument("--tokenizer", "--tok", dest="tokenizer", default=None,
                    help="tokenizer.json (Gemma: the GGUF data by default; Qwen: next to the model)")
     g.add_argument("--template", default=None,
@@ -82,7 +83,8 @@ def parser():
     g = ap.add_argument_group("media")
     g.add_argument("--mmproj", default=None,
                    help="the media encoder (Gemma: the mmproj GGUF; Qwen3.6: the mmproj GGUF; "
-                        "Qwen3.8: the checkpoint directory)")
+                        "Qwen3.8: the checkpoint directory; DeepSeek V4.1: in the checkpoint, on "
+                        "unless off)")
     g.add_argument("--mmproj-q8", choices=("auto", "on", "off"), default=None)
     g.add_argument("--mmproj-gpu", choices=("auto", "keep", "reserve", "lend", "release", "off"),
                    default=None, help="Qwen: the encoder on the GPU")

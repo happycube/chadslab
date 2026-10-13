@@ -145,6 +145,9 @@ def multipliers(layers, max_ngram, vocab):
     return np.stack(rows)                         # [layers, max_ngram]
 
 
+DEAD = -1          # the cache entry of a token of an image span
+
+
 class Hashes:
     """The hash ids of the engram layers, with the ids of the sequence so far."""
 
@@ -162,16 +165,24 @@ class Hashes:
         self.mult = multipliers(self.layers, self.n, nv)
         self.cache = np.zeros(max_len, np.int64)
 
-    def ids(self, tokens, start):
-        """[len(tokens), layers, (n - 1) heads] for the positions start.. of tokens."""
+    def ids(self, tokens, start, dead=None):
+        """[len(tokens), layers, (n - 1) heads] for the positions start.. of
+        tokens. dead [len(tokens)] (bool): the tokens of an image span, which
+        take no part in an n-gram: the look-back stops at them as at the start
+        (engram.py NgramHashState: DEAD)."""
         tokens = np.asarray(tokens, np.int64)
         L = len(tokens)
-        self.cache[start:start + L] = self.map[tokens]
+        c = self.map[tokens]
+        if dead is not None:
+            c = np.where(dead, DEAD, c)
+        self.cache[start:start + L] = c
         pos = np.arange(start, start + L)
         cols = []
+        blocked = np.zeros(L, bool)
         for shift in range(self.n):
             src = self.cache[np.maximum(pos - shift, 0)]
-            cols.append(np.where(pos < shift, self.pad, src))
+            blocked |= (pos < shift) | (src == DEAD)
+            cols.append(np.where(blocked, self.pad, src))
         toks = np.stack(cols, -1)                                     # [L, n]
         prod = toks[:, None, :] * self.mult[None]                     # [L, layers, n]
         rolling, out = prod[..., 0], []

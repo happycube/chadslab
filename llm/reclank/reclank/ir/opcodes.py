@@ -197,6 +197,9 @@ TABLE = [
     ("DS_ENGRAM_ROWS", 184, G, "the values of gathered engram rows (E4M3 codes, E8M0 scales)"),
     ("DS_ROWS_AT", 185, G, "the rows of a group at their positions into a buffer of rows from a slot (bounded replay)"),
     ("DS_TOPK_MERGE", 186, G, "the k best so far and the scores of a chunk: the k best (DS_TOPK in chunks)"),
+    # the image input of DeepSeek V4.1 (models/deepseek41/vision.py)
+    ("ENC_SILU_MUL", 187, B, "silu(gate) * up"),
+    ("DS_EMBED_ROWS", 188, G, "the rows of an image span in place of the embedding, into the streams"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}

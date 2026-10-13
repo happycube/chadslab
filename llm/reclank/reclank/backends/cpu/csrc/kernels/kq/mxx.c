@@ -137,7 +137,7 @@ int64_t rc_kq_mxx_pack(const uint8_t *codes, const uint8_t *scales, int rows, in
     return odd;
 }
 
-/* rc_kq_mxx_pack on the calling thread alone (the zygote packs from many
+/* rc_kq_mxx_pack on the calling thread alone (the weightkeeper packs from many
  * threads at once). */
 void rc_kq_mxx_pack_serial(const uint8_t *codes, const uint8_t *scales, int rows, int cols, uint8_t *out)
 {

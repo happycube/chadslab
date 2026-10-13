@@ -13,7 +13,7 @@
 - The routed experts: all cold for now (the hot experts on the GPU come
   next): GP_SIGNAL gives the normed input, the choice and the weights to
   pinned memory, GP_CPU_TASK runs GP_KQ_MOE_PART on the rows of each node
-  in the zygote's segments (flag 128: the clamped SwiGLU and the weight of
+  in the weightkeeper's segments (flag 128: the clamped SwiGLU and the weight of
   the pair before the down rows), GP_AWAIT brings their sum back.
 - The state (the window rings, the compressed caches, the index keys, the
   compressor's open group) is in arrays of this object with device copies;
@@ -148,7 +148,7 @@ class DSV41GPU:
         self.replay = bool(replay) and max(m.kv_sources) == self.dec0 == m.cand_src
         self.w = m.w
         if self.w.z is None or self.w.z.index["layout"] == "dsv41-expert-planes-v1":
-            raise ValueError("the GPU step needs a zygote with the KQ_MXX layout (v2)")
+            raise ValueError("the GPU step needs a weightkeeper with the KQ_MXX layout (v2)")
         self.mirror = Mirror()
         self.keep_layers = keep_layers
         self.cap = min(m.max_len, CAP)
@@ -377,13 +377,13 @@ class DSV41GPU:
         for a in self.state_arrays():
             self.mirror.buffer_of(a).download(a)
 
-    # ---- the parts on the zygote's segments
+    # ---- the parts on the weightkeeper's segments
     def _parts(self):
         z = self.w.z
         ix = z.index
         cpus = moe_parts.part_cpus()
         if ix["nodes"] != moe_parts.nodes()[:len(cpus)] or len(ix["segments"]) != len(cpus):
-            raise ValueError("the zygote's nodes %s are not those of the parts %s" % (ix["nodes"], moe_parts.nodes()))
+            raise ValueError("the weightkeeper's nodes %s are not those of the parts %s" % (ix["nodes"], moe_parts.nodes()))
         desc = {}
         for i in ix["layers"]:
             k = ix["layers"].index(i)
@@ -474,7 +474,7 @@ class DSV41GPU:
 
     def expert_ranges(self, i, e, slot):
         """The (host, device, bytes) ranges that copy expert e of layer i from
-        the zygote's segments into slot (the order of expert_bytes)."""
+        the weightkeeper's segments into slot (the order of expert_bytes)."""
         z = self.w.z
         ix = z.index
         k = ix["layers"].index(i)
@@ -494,7 +494,7 @@ class DSV41GPU:
         return float(np.mean([self.maps[i][ids[i]] >= 0 for i in range(self.m.L)]))
 
     # ---- the program
-    def _compile(self, t, stage="full"):
+    def _compile(self, t, stage="full", vis=False):
         """The program of t tokens at the slot pos (a step: t = 1; a group of a
         prompt: t > 1, the logits of its last token). Its inputs and outputs:
         a _Run. stage "full": all the layers; for the bounded replay of a
@@ -502,7 +502,9 @@ class DSV41GPU:
         compressed rows and index keys of dec0: the decoder's global KV) and
         its outputs of the positions from the slot rbase into rep_h, rep_raw;
         "dec" (t = the window, at pos = rbase): the decoder from rep_h, its
-        window from pos on, the logits."""
+        window from pos on, the logits. vis: the tokens may be of an image span
+        (the inputs vmask, and vrows: the image's rows in place of their
+        embedding; the router's bias_vl for them)."""
         m, prog = self.m, P.Program()
         L, dim, hc, hd, rd = m.L, m.dim, m.hc, m.head_dim, m.rd
         H, win, k = m.heads, m.win, m.topk
@@ -537,6 +539,9 @@ class DSV41GPU:
         else:
             io.h = h = z(t, hc, dim)
         io.tok = z(t, dtype=np.int32)
+        io.vis = vis
+        io.vrows = z(t, dim) if vis and stage != "dec" else None
+        io.vmask = z(t, dtype=np.int32) if vis else None
         io.eg = {i: z(t, 24 * 256) for i in m.engram_layers}
         io.egc = {i: z(t * 24, 256, dtype=np.uint8) for i in m.engram_layers}
         io.egs = {i: z(t * 24, 8, dtype=np.uint8) for i in m.engram_layers}
@@ -756,7 +761,8 @@ class DSV41GPU:
             ids, vals = S(io.ids[i], k), S(io.vals[i], k)
             lin12(S(xa), f + "gate.weight", S(logits_r))
             prog.emit(P.DS_ROUTER, S(logits_r), self.vec(f + "gate.bias"), ids, vals, n, logits_r.shape[1], k,
-                      float(m.route_scale))
+                      float(m.route_scale), self.vec(f + "gate.bias_vl") if vis else None,
+                      S(io.vmask) if vis else None)
             # the routed experts: the hot ones on the GPU, the cold ones in the
             # parts at the same time (their de rows, flag 64), the shared one
             cold, cold_val = colds[i]
@@ -801,6 +807,8 @@ class DSV41GPU:
 
         if stage != "dec":
             prog.emit(P.DS_EMBED, self.embed_tab, io.tok, h, t, dim, hc)
+            if vis:
+                prog.emit(P.DS_EMBED_ROWS, io.vrows, io.vmask, h, t, dim, hc)
             for i in m.engram_layers:
                 prog.emit(P.DS_ENGRAM_ROWS, io.egc[i], io.egs[i], io.eg[i], t * 24, 256)
         if len(lanes) == 1:
@@ -881,11 +889,13 @@ class DSV41GPU:
             b = store[key] = pinned((size,), dt) if pin else np.zeros(size, dt)
         return b[:n].reshape(shape)
 
-    def run(self, t, part="full"):
-        """The program of t tokens (made the first time)."""
-        r = self.runs.get((t, part))
+    def run(self, t, part="full", vis=False):
+        """The program of t tokens (made the first time); vis: the one that
+        takes the rows of an image span (_compile)."""
+        key = (t, part, "vis") if vis else (t, part)
+        r = self.runs.get(key)
         if r is None:
-            r = self.runs[t, part] = self._compile(t, part)
+            r = self.runs[key] = self._compile(t, part, vis)
         return r
 
     # ---- the inputs, a step, a prompt
@@ -902,20 +912,35 @@ class DSV41GPU:
         vals = D.E4M3[table[flat]].reshape(-1, shape[1] // 32, 32) * D.E8M0[scales[flat]][..., None]
         return vals.reshape(hashes.shape[0], -1).astype(np.float32)
 
-    def _inputs(self, r, tokens, pos, rbase=0):
+    def _inputs(self, r, tokens, pos, rbase=0, media=None):
         """The inputs of a run: the token ids (the GPU reads and decodes their
-        embedding rows) and the bytes of the engram rows of their hashes."""
+        embedding rows) and the bytes of the engram rows of their hashes.
+        media (a program of vis): (rows [t, dim] or None, mask [t]) of the
+        tokens of image spans. Their n-grams stop at them (Hashes: dead) and
+        engram adds nothing to them: their rows are zero, so the value of wkv
+        is zero (model.py Engram: the gate shut)."""
         m = self.m
+        dead = None
+        if r.vis:
+            rows, mask = media
+            r.vmask[:] = mask
+            self.mirror.buffer_of(r.vmask).upload(r.vmask)
+            if r.vrows is not None:
+                r.vrows[:] = rows
+                self.mirror.buffer_of(r.vrows).upload(r.vrows)
+            dead = np.asarray(mask) != 0
         if r.lay.start > 0:
             # the decoder of a bounded replay: its input is the encoder's (rep_h)
             r.g.bind(self._slots(r, pos, rbase))
             return
         tokens = np.asarray(tokens, np.int64)
-        hashes = m.hashes.ids(tokens, pos)
+        hashes = m.hashes.ids(tokens, pos, dead)
         r.tok[:] = tokens
         self.mirror.buffer_of(r.tok).upload(r.tok)
         for j, i in enumerate(m.engram_layers):
             r.egc[i][:], r.egs[i][:] = self.engram_codes(i, hashes[:, j])
+            if dead is not None:
+                r.egc[i].reshape(len(tokens), -1)[dead] = 0
             self.mirror.buffer_of(r.egc[i]).upload(r.egc[i])
             self.mirror.buffer_of(r.egs[i]).upload(r.egs[i])
         r.g.bind(self._slots(r, pos, rbase))
@@ -927,18 +952,19 @@ class DSV41GPU:
             sl["pos%d" % j] = int(pos) + r0
         return sl
 
-    def forward(self, tokens, pos, part="full", rbase=0):
+    def forward(self, tokens, pos, part="full", rbase=0, media=None):
         """len(tokens) tokens at pos (a program of that size); the logits of
         the last one [vocab] (part "enc": None). The hot cache (when the GPU
         holds experts) lands its finished copies before, learns the choice of
-        the run after, and starts its next copies."""
+        the run after, and starts its next copies. media: (rows, mask) of
+        the tokens of image spans (media_rows), or None."""
         self.fit(pos + len(tokens))
-        r = self.run(len(tokens), part)
+        r = self.run(len(tokens), part, media is not None)
         if self.hot is not None:
             # a group of a prompt waits for the copies the group before chose:
             # its run is seconds, a copy of 256 experts about half of one
             self.hot.land(wait=len(tokens) > VERIFY_MAX)
-        self._inputs(r, tokens, pos, rbase)
+        self._inputs(r, tokens, pos, rbase, media)
         r.g.run()
         if part != "enc":
             r.g.download("logits")
@@ -980,14 +1006,33 @@ class DSV41GPU:
         tokens before (the CPU model's Hashes keeps them by position)."""
         return self.forward([token], pos)
 
-    def prefill(self, tokens, pos=0, group=None, each=None):
+    @staticmethod
+    def media_rows(spans, p0, n, dim, rows=True):
+        """The input of a run of n tokens at p0 from the image spans (each
+        (start position, rows [len, dim])): (rows [n, dim] or None, mask [n]
+        int32), or None when no span meets the run."""
+        hit = [(s, a) for s, a in spans or () if s < p0 + n and s + a.shape[0] > p0]
+        if not hit:
+            return None
+        mask = np.zeros(n, np.int32)
+        out = np.zeros((n, dim), np.float32) if rows else None
+        for s, a in hit:
+            lo, hi = max(s, p0), min(s + a.shape[0], p0 + n)
+            mask[lo - p0:hi - p0] = 1
+            if rows:
+                out[lo - p0:hi - p0] = a[lo - s:hi - s]
+        return out, mask
+
+    def prefill(self, tokens, pos=0, group=None, each=None, media=None):
         """A prompt in groups of up to group tokens (default self.group): the
         largest multiple of GROUP_STEP, below it the powers of two; the logits
         of its last token.
         With replay and more tokens than the window: the groups through the
         encoder, then the last window of tokens through the decoder (bounded
         replay). each(run, pos, n): after each run that gave main_h (DSpark).
-        The programs serve the whole prompt from the first group (fit)."""
+        The programs serve the whole prompt from the first group (fit).
+        media: the image spans of the prompt, (start position, rows [len,
+        dim]) each (DSVision.span_rows)."""
         group = group or self.group
         tokens = list(tokens)
         n_all, win = len(tokens), self.m.win
@@ -1001,12 +1046,14 @@ class DSV41GPU:
                 n -= n % GROUP_STEP
             else:
                 n = 1 << (n.bit_length() - 1)
-            out = self.forward(tokens[at:at + n], pos + at, "enc" if rep else "full", base)
+            out = self.forward(tokens[at:at + n], pos + at, "enc" if rep else "full", base,
+                               self.media_rows(media, pos + at, n, self.m.dim))
             if not rep and each is not None:
                 each(self.last, pos + at, n)
             at += n
         if rep:
-            out = self.forward(tokens[n_all - win:], base, "dec", base)
+            out = self.forward(tokens[n_all - win:], base, "dec", base,
+                               self.media_rows(media, base, win, self.m.dim, rows=False))
             if each is not None:
                 each(self.last, base, win)
         return out
@@ -1062,7 +1109,7 @@ class DSHot:
     plus its uses; after a run, at most budget experts a token (at most cap a
     run) come in where the best expert not held beats the worst held by
     margin. A slot leaves first (its map entry -1 before the next run), the
-    copy runs on the copy worker (rc_gpu_cache_copy, from the zygote's
+    copy runs on the copy worker (rc_gpu_cache_copy, from the weightkeeper's
     segments) while the GPU goes on, and the expert is held (its map entry)
     from the first run after its copy is done. On the real routes of the
     prompt of 1414 tokens, 16 slots a layer and 4 copies a token held 44% of
@@ -1075,6 +1122,8 @@ class DSHot:
         # 64); cap_group: of a group of a prompt (RECLANK_DS_HOT_CAP_GROUP, 256:
         # the next group waits for them, about half a second)
         cap = int(cap or os.environ.get("RECLANK_DS_HOT_CAP", "64"))
+        # budget: the copies a token (RECLANK_DS_HOT_BUDGET, a measure)
+        budget = int(os.environ.get("RECLANK_DS_HOT_BUDGET", budget))
         self.cap_group = int(os.environ.get("RECLANK_DS_HOT_CAP_GROUP", "256"))
         self.decay, self.budget, self.cap, self.margin = decay, budget, cap, margin
         self.score = np.zeros((L, E))
@@ -1083,7 +1132,7 @@ class DSHot:
         self.copies = 0
 
     def register(self):
-        """Page-lock the zygote's segments for the copies (DMA, no staging
+        """Page-lock the weightkeeper's segments for the copies (DMA, no staging
         through the CPU, which the parts need); left as they are when CUDA
         refuses."""
         import sys
@@ -1091,7 +1140,7 @@ class DSHot:
         from reclank.backends.cuda.runtime import lib
         z, t0 = self.g.w.z, time.time()
         self.registered = all(lib().rc_gpu_host_register_ro(b, n) == 0 for b, n in zip(z.base, z.size))
-        print("the zygote's segments page-locked for the copies: %s (%.1f s)" % (
+        print("the weightkeeper's segments page-locked for the copies: %s (%.1f s)" % (
             "yes" if self.registered else lib().rc_gpu_last_error().decode(), time.time() - t0), file=sys.stderr)
 
     def observe(self, ids, t, layers=None):

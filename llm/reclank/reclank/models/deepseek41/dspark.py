@@ -221,7 +221,8 @@ class DSpark:
                 prog.emit(P.DS_HC_PRE, h, raw_a, sca, ba, g.vec(p + "ffn_norm.weight"), xa, bs, dim, eps, hc_eps)
                 f = p + "ffn."
                 lin12(xa, f + "gate.weight", lr)
-                prog.emit(P.DS_ROUTER, lr, g.vec(f + "gate.bias"), ids_r, vals_r, bs, self.E, k, float(m.route_scale))
+                prog.emit(P.DS_ROUTER, lr, g.vec(f + "gate.bias"), ids_r, vals_r, bs, self.E, k, float(m.route_scale),
+                          None, None)       # (drafts are text: no bias_vl)
                 sx = f + "shared_experts."
                 if self.where == "cpu1":
                     # the routed experts in the part of node 1 while the GPU does the shared one
@@ -343,96 +344,154 @@ class DSpark:
                 best, bl = rate, L
         return bl
 
-    def prefill(self, prompt, group=None):
-        """The prompt on the main model in groups, each group's rows seeding the
-        rings; the logits of its last token and the input of DSpark of it."""
+    def prefill(self, prompt, group=None, pos=0, media=None):
+        """The prompt at pos on the main model in groups, each group's rows
+        seeding the rings; the logits of its last token and the input of
+        DSpark of it. media: its image spans (DSV41GPU.prefill)."""
         g, last = self.g, {}
 
         def each(r, at, n):
             last["h"] = g.download(r.main_h)
             self.seed(last["h"], at)
 
-        lg = g.prefill(prompt, 0, group, each)
+        lg = g.prefill(prompt, pos, group, each, media)
         return lg, last["h"][-1:].copy()
 
-    def generate(self, prompt, n, spec="auto", fixed=None, on_token=None, probe=8):
-        """n tokens after the prompt (greedy). spec False: plain steps (the
-        check of the bits); True: a draft every round; "auto": a draft only
-        while the rounds of DSpark give more tokens a second than plain steps
-        (both rates measured as it runs; every probe-th step tries the other).
-        fixed: always that many drafts. Returns the tokens and the stats."""
+    def generate(self, prompt, n, spec="auto", fixed=None, on_token=None, probe=8, temperature=0.0, top_p=1.0,
+                 seed=None, stop=None):
+        """n tokens after the prompt (None: until stop), greedy (temperature
+        0) or sampled at temperature with top_p (seed: of the draws), from an
+        empty state (stream: the loop). on_token(t): each token. Returns the
+        tokens and the stats."""
+        from reclank.core.sampling import Sampler
         g = self.g
         g.reset()
         self.reset()
         lg, main_last = self.prefill(prompt)
         self.warm()
-        y, pos = int(np.argmax(lg)), len(prompt)
+        sampler = Sampler(temperature=temperature, top_p=top_p if top_p < 1.0 else None, seed=seed)
+        stats = {}
         out = []
-        stats = dict(rounds=0, plain=0, drafted=0, accepted=0, lengths=[], conf=[])
+        for tok in self.stream(lg, main_last, len(prompt), sampler, max_tokens=n,
+                               eos=() if stop is None else (stop,), spec=spec, fixed=fixed, probe=probe,
+                               stats=stats):
+            out.append(tok)
+            if on_token is not None:
+                on_token(tok)
+        return out, stats
+
+    @staticmethod
+    def _take(sampler, row, d):
+        """A draft d at a row of the main model's logits: (taken, the token of
+        the row). Greedy: taken when it is the choice. Sampled: taken with the
+        probability p(d) of the row under the sampler's settings, else the
+        row's token is drawn from p without d (renormalised); the history of
+        the sampler gets the token. The drafts are the drafter's argmax (one
+        token each), so the tokens are draws of the main model alone."""
+        if sampler.greedy or sampler.temperature <= 0.0:
+            tok = sampler(row)
+            return tok == int(d), tok
+        cand, probs = sampler._dist(row)
+        total = float(probs.sum())
+        hit = np.nonzero(cand == int(d))[0]
+        pd = float(probs[hit[0]]) / total if (hit.size and total > 0) else 0.0
+        if sampler.rng.random() < pd:
+            sampler.accept(d)
+            return True, int(d)
+        probs = probs.copy()
+        if hit.size:
+            probs[hit[0]] = 0.0
+        return False, sampler._sample(cand, probs)
+
+    def stream(self, lg, main_last, pos, sampler, max_tokens=None, eos=(), spec="auto", fixed=None, probe=8,
+               stats=None):
+        """The tokens after a prompt whose state the main model and the rings
+        hold (lg: the logits of its last token, main_last: its input of
+        DSpark, pos: its length), as they come (a generator), up to max_tokens
+        (None: no limit) or a token of eos (yielded). sampler
+        (reclank.core.sampling.Sampler): the choice of each token and the
+        draws of the drafts (_take). spec False: plain steps (the check of
+        the bits); True: a draft every round; "auto": a draft only while the
+        rounds give more tokens a second than plain steps (both rates measured
+        as it runs; every probe-th step tries the other). fixed: always that
+        many drafts. stats (a dict): filled as it runs."""
+        g = self.g
+        if stats is None:
+            stats = {}
+        stats.update(rounds=0, plain=0, drafted=0, accepted=0, lengths=[], conf=[])
+        y = sampler(lg)
         main_rows, mpos = main_last, pos - 1       # the main rows the rings lack
         rate_spec = rate_plain = None              # tokens a ms (moving averages)
         t_start = time.time()
-        it = 0
-        while len(out) < n:
-            it += 1
-            use = bool(spec)
-            if spec == "auto" and rate_spec is not None and rate_plain is not None:
-                use = rate_spec > rate_plain
-                if it % probe == 0:
-                    use = not use
-            elif spec == "auto" and rate_plain is None and rate_spec is not None:
-                use = False
-            t_round = time.time()
-            if not use:
-                if spec is False:
-                    out.append(y)
-                    lg = g.step(y, pos)
-                    y, pos = int(np.argmax(lg)), pos + 1
+        it, count = 0, 0
+        eos = set(eos)
+        try:
+            while True:
+                it += 1
+                use = bool(spec)
+                if spec == "auto" and rate_spec is not None and rate_plain is not None:
+                    use = rate_spec > rate_plain
+                    if it % probe == 0:
+                        use = not use
+                elif spec == "auto" and rate_plain is None and rate_spec is not None:
+                    use = False
+                t_round = time.time()
+                if not use:
+                    count += 1
+                    yield y
+                    if y in eos or (max_tokens is not None and count >= max_tokens):
+                        return
+                    if spec is False:
+                        y, pos = sampler(g.step(y, pos)), pos + 1
+                        continue
+                    # a plain step that keeps the input of DSpark (the rings stay whole)
+                    logits, main_h = g.verify([y], pos)
+                    if main_rows is not None and len(main_rows):
+                        self.seed(main_rows, mpos)
+                    main_rows, mpos = main_h[:1], pos
+                    y, pos = sampler(logits[0]), pos + 1
+                    stats["plain"] += 1
+                    dt = (time.time() - t_round) * 1e3
+                    rate_plain = 1.0 / dt if rate_plain is None else 0.8 * rate_plain + 0.2 / dt
                     continue
-                # a plain step that keeps the input of DSpark (the rings stay whole)
-                logits, main_h = g.verify([y], pos)
-                if main_rows is not None and len(main_rows):
-                    self.seed(main_rows, mpos)
-                main_rows, mpos = main_h[:1], pos
-                out.append(y)
-                if on_token is not None:
-                    on_token(y)
-                y, pos = int(np.argmax(logits[0])), pos + 1
-                stats["plain"] += 1
-                dt = (time.time() - t_round) * 1e3
-                rate_plain = 1.0 / dt if rate_plain is None else 0.8 * rate_plain + 0.2 / dt
-                continue
-            t0 = time.time()
-            drafts, conf = self.draft(y, main_rows, mpos)
-            self.t_draft = 0.9 * self.t_draft + 0.1 * (time.time() - t0) * 1e3
-            L = self.choose(conf) if fixed is None else fixed
-            t0 = time.time()
-            logits, main_h = g.verify([y] + [int(d) for d in drafts[:L]], pos)
-            t = L + 1
-            self.t_verify[t] = 0.8 * self.t_verify[t] + 0.2 * (time.time() - t0) * 1e3
-            choice = np.argmax(logits, -1)
-            a = 0
-            while a < L and int(choice[a]) == int(drafts[a]):
-                a += 1
-            emitted = [y] + [int(d) for d in drafts[:a]]
-            if a < L:
-                g.restore(t, pos, a + 1)
-            out += emitted
-            if on_token is not None:
+                t0 = time.time()
+                drafts, conf = self.draft(y, main_rows, mpos)
+                self.t_draft = 0.9 * self.t_draft + 0.1 * (time.time() - t0) * 1e3
+                L = self.choose(conf) if fixed is None else fixed
+                t0 = time.time()
+                logits, main_h = g.verify([y] + [int(d) for d in drafts[:L]], pos)
+                t = L + 1
+                self.t_verify[t] = 0.8 * self.t_verify[t] + 0.2 * (time.time() - t0) * 1e3
+                a, nxt, ok = 0, None, []
+                while a < L:
+                    taken, tok = self._take(sampler, logits[a], drafts[a])
+                    ok.append(taken)
+                    if not taken:
+                        nxt = tok
+                        break
+                    a += 1
+                if nxt is None:
+                    nxt = sampler(logits[a])
+                emitted = [y] + [int(d) for d in drafts[:a]]
+                if a < L:
+                    g.restore(t, pos, a + 1)
+                stats["rounds"] += 1
+                stats["drafted"] += L
+                stats["accepted"] += a
+                stats["lengths"].append(L)
+                stats["conf"].append((conf.copy(), ok + [False] * (min(L, len(drafts)) - len(ok))))
+                main_rows, mpos = main_h[:a + 1], pos
+                y, pos = nxt, pos + a + 1
+                r = len(emitted) / ((time.time() - t_round) * 1e3)
+                rate_spec = r if rate_spec is None else 0.8 * rate_spec + 0.2 * r
                 for tok in emitted:
-                    on_token(tok)
-            stats["rounds"] += 1
-            stats["drafted"] += L
-            stats["accepted"] += a
-            stats["lengths"].append(L)
-            stats["conf"].append((conf.copy(), [int(choice[i]) == int(drafts[i]) for i in range(min(L, len(drafts)))]))
-            main_rows, mpos = main_h[:a + 1], pos
-            y, pos = int(choice[a]), pos + a + 1
-            r = len(emitted) / ((time.time() - t_round) * 1e3)
-            rate_spec = r if rate_spec is None else 0.8 * rate_spec + 0.2 * r
-        stats["seconds"] = time.time() - t_start
-        stats["rate_spec"], stats["rate_plain"] = rate_spec, rate_plain
-        return out[:n], stats
+                    count += 1
+                    yield tok
+                    if tok in eos or (max_tokens is not None and count >= max_tokens):
+                        return
+        finally:
+            stats["seconds"] = time.time() - t_start
+            stats["rate_spec"], stats["rate_plain"] = rate_spec, rate_plain
 
 
 class _DRun:

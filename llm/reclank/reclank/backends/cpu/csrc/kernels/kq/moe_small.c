@@ -16,6 +16,18 @@
 static void kq_rows_bf12_f(const uint8_t *w, size_t rb, int nr, int cols, const float *x, size_t xst,
                            int n, float *out, size_t ost);
 
+/* RECLANK_BF12_UNIT16 (1): the gate and up tasks of BF12 experts in units of
+ * 16 rows; 0: 4. */
+static int kq_bf12_unit16(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_BF12_UNIT16");
+        on = v ? atoi(v) != 0 : 1;
+    }
+    return on;
+}
+
 static void kq_moe_small_body(const int32_t *ids, const float *val, int t, int k, int experts,
                               const int64_t *mats, const float *shared_logit, int hidden,
                               int inner, uint8_t *scratch, float *out, int gelu, const float *hf,
@@ -83,7 +95,8 @@ static void kq_moe_small_body(const int32_t *ids, const float *val, int t, int k
         xq2 = (int8_t *)ma_take(&p, (size_t)P * hidden);
         aq2 = (int8_t *)ma_take(&p, (size_t)P * inner);
     }
-    int ngu = G.type == KQ_NVX || G.type == KQ_Q4X ? 16 : 4;
+    /* KQ_BF12: units of 16 rows too (a unit of 4 rows was 16 KB of a stream) */
+    int ngu = G.type == KQ_NVX || G.type == KQ_Q4X || (G.type == KQ_BF12 && kq_bf12_unit16()) ? 16 : 4;
     int ndn = D.type == KQ_NVX || D.type == KQ_Q4X ? 16 : kq_ndn_rows();
     /* the sums of xn and an of a pair: one plane, or with x2 (KQ_NVX) both */
     const size_t xns = (size_t)(hidden / 16) * (x2 && ngu == 16 ? 2 : 1);

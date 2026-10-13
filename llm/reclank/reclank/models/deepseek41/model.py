@@ -15,7 +15,7 @@ Two modes (DEEPSEEK_V41_PLAN.md 3):
   input of every FP8 and FP4 product rounded as act_quant rounds it.
 
 The weights: the dense ones from the shards (maps of the files), the routed
-experts from the zygote's segments when one runs (else from the shards),
+experts from the weightkeeper's segments when one runs (else from the shards),
 packed to KQ_MXX for each use. Text only, one sequence: a prompt at position
 0 in one chunk, then steps of one token (as the reference).
 
@@ -135,18 +135,17 @@ def softmax(x, axis=-1):
 
 class Weights:
     """The dense weights (maps of the shards; small float forms cached) and the
-    routed experts (the zygote's segments, or the shards)."""
+    routed experts (the weightkeeper's segments, or the shards)."""
 
-    def __init__(self, path, exact, zygote=True):
+    def __init__(self, path, exact, weightkeeper=True):
         self.src = D.DSV41Source(path)
         self.exact = exact
         self.cache = {}
         self.z = None
-        if zygote:
+        if weightkeeper:
             try:
-                from reclank.runtime import zygote as Z
-                self.z = Z.attach()
-                self.z.check(path)
+                from reclank.runtime import weightkeeper as Z
+                self.z = Z.attach(ckpt=path)
             except (OSError, ValueError):
                 self.z = None
         self.xcache = {}
@@ -189,7 +188,7 @@ class Weights:
 
     def expert(self, layer, e):
         """[(gate+up part, the row range of inner), ...], [(down part, rows of hidden), ...]:
-        the KQ_MXX parts of an expert (a part for each node of the zygote, or
+        the KQ_MXX parts of an expert (a part for each node of the weightkeeper, or
         one for all the rows)."""
         key = (layer, e)
         if key in self.xcache:
@@ -227,12 +226,12 @@ class Weights:
 
 
 class DSV41CPU:
-    def __init__(self, path, exact=False, max_len=None, zygote=True):
+    def __init__(self, path, exact=False, max_len=None, weightkeeper=True):
         """max_len: the most positions of a sequence (default the model's,
         1M: the float32 caches here are reserved, not touched, until used)."""
         self.path = path
         self.exact = exact
-        self.w = Weights(path, exact, zygote)
+        self.w = Weights(path, exact, weightkeeper)
         c = self.w.src.cfg
         self.c = c
         self.L = int(c["num_hidden_layers"])

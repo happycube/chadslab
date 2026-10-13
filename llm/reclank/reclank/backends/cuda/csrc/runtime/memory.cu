@@ -23,7 +23,7 @@ extern "C" int64_t rc_gpu_host_register_rw(void *p, size_t n)
 }
 
 /* Page-lock n bytes of a read-only map at p for the copies to the GPU (the
- * segments of the zygote: a sealed memfd, mapped PROT_READ), so that they
+ * segments of the weightkeeper: a sealed memfd, mapped PROT_READ), so that they
  * are DMA, not a memcpy through a staging buffer. 0, or -1 (the copies then
  * stage). */
 extern "C" int rc_gpu_host_register_ro(void *p, size_t n)

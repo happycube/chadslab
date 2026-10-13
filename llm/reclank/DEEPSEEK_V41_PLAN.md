@@ -260,7 +260,7 @@ the default for that part.
   The load reads each expert's rows once into memory of its node
   (MPOL_BIND) and drops the pages of the shards (posix_fadvise DONTNEED);
   289 GB at about 3 GB/s of the NVMe: about 100 s a load, and a test round
-  needs many loads: the zygote (4.2).
+  needs many loads: the weightkeeper (4.2).
 - **The Optane modules:** two of 128 GB, one on each socket, now two
   regions (not interleaved), each an fsdax namespace with an ext4 of 116 GB
   mounted with dax=always: /mnt/pmem0 on node 0, /mnt/pmem1 on node 1. On
@@ -277,15 +277,15 @@ the default for that part.
   the token ids, so both gathers can start with the token, before layer 1,
   and wait in pinned rows until their layers).
 
-### 4.2 The zygote: the weights loaded once for many rounds
+### 4.2 The weightkeeper: the weights loaded once for many rounds
 
 A process that holds the weights and outlives the test rounds, so a round
 (a new build, a new script) starts in seconds, not the minutes of a load.
-**Done:** reclank/runtime/zygote.py (the zygote, and attach() for a round),
-scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
-`--check`), tests/unit/test_zygote.py.
+**Done:** reclank/runtime/weightkeeper.py (the weightkeeper, and attach() for a round),
+scripts/weightkeeper.py (the command: `--lock`, `--status`, `--stop`,
+`--check`), tests/unit/test_weightkeeper.py.
 
-- **The segments.** The zygote reads the shards once into memfd segments,
+- **The segments.** The weightkeeper reads the shards once into memfd segments,
   one for each node's expert rows, each bound to its node with mbind before
   its pages are touched, in the largest pages it can get (below). The
   layout (dsv41-expert-planes-v1): for each layer, each expert, the planes
@@ -298,7 +298,7 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
 - **The dense weights go straight to the GPU** (18.7 GB in the shards:
   attention, shared and DSpark experts, embed and head, vision). Next to
   144.4 GB of expert rows they do not fit the RAM of either node (4.1), and
-  the GPU is where they run, so the zygote does not hold them: a round
+  the GPU is where they run, so the weightkeeper does not hold them: a round
   streams them from the shards to the GPU, tensor by tensor (O_DIRECT reads,
   no page cache), through two pinned staging buffers of a few hundred MB on
   the GPU's node: the FP8 matrices and their scales as their bytes, the
@@ -308,7 +308,7 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
   BF12 (1.0 GB; a row a token decoded there), which takes 1.3 GB off the
   GPU's node, the tightest memory of the plan (4.1), for 1 GB less of hot
   experts. About 9 s a round at the 2.2 GB/s of the NVMe. `--dense` puts
-  their bytes in a zygote segment on the GPU's node instead (a subset of
+  their bytes in a weightkeeper segment on the GPU's node instead (a subset of
   layers, a machine with room). The engram tables stay files on the Optane
   modules.
 - **The large pages, whenever possible.** In order of preference, per
@@ -318,11 +318,11 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
   2. 2 MB hugetlb pages, for what the 1 GB pool could not give;
   3. shmem transparent huge pages (2 MB, MADV_HUGEPAGE), when
      transparent_hugepage/shmem_enabled allows them (this machine: never,
-     so root sets advise for the zygote's life);
+     so root sets advise for the weightkeeper's life);
   4. 4 KB pages.
 
   Filling a pool needs root, and 1 GB pages need 1 GB of contiguous free
-  memory on the node. So the zygote fills the pools first: it drops the page
+  memory on the node. So the weightkeeper fills the pools first: it drops the page
   cache, compacts each node (nodeN/compact), asks each node for the count it
   needs, and takes the rest in the next size down. The count is a node's
   segment rounded up: 145 pages for its 144.4 GB of expert rows. Without
@@ -333,7 +333,7 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
   each page size per node at the start. The rounds gain too: 1 GB pages
   make cudaHostRegister of 290 GB pin about 300 pages instead of 70
   million, and the TLB covers the rows of a whole layer.
-- **The lock (`--lock`, started as root).** With this parameter the zygote
+- **The lock (`--lock`, started as root).** With this parameter the weightkeeper
   fully locks down the memory of each node: nothing the kernel does moves,
   swaps, reclaims, or changes a page of the weights while it runs.
   1. **Not swapped or reclaimed:** RLIMIT_MEMLOCK raised to unlimited, and
@@ -347,20 +347,20 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
      compaction leaves the locked fallback pages where they are; 1 GB pages
      are never compacted. After the fill, a check of /proc/self/numa_maps
      confirms that every page of a node's segment is on that node.
-  3. **Not changed** (with or without `--lock`): after the fill, the zygote
+  3. **Not changed** (with or without `--lock`): after the fill, the weightkeeper
      drops its writable mapping and seals each memfd (F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
      F_SEAL_SEAL), keeping a locked read-only mapping. A round cannot write
      a weight or resize a segment, even by mistake.
   4. **Not root longer than needed:** before the fill, a small root parent
-     forks the zygote. The zygote drops to the invoking user (SUDO_UID and
+     forks the weightkeeper. The weightkeeper drops to the invoking user (SUDO_UID and
      SUDO_GID, every capability gone) once its pools, locks and seals are in
      place; locked pages stay locked. Its socket is 0600 and owned by that
-     user. The parent does nothing but wait. When the zygote exits, for any
+     user. The parent does nothing but wait. When the weightkeeper exits, for any
      reason, the parent gives the pools back (nr_hugepages as before),
      restores shmem_enabled and compact_unevictable_allowed, and exits.
   5. **All or nothing:** `--lock` without root, or with a node that cannot
      be locked in full, refuses to start and names what failed: no partial
-     lock. Without `--lock`, the zygote takes what it can get and says so.
+     lock. Without `--lock`, the weightkeeper takes what it can get and says so.
 
   The cost: locked memory is out of reach of the kernel's reclaim, so under
   pressure the OOM killer picks other processes. The 5-7 GB left on the GPU's
@@ -369,25 +369,25 @@ scripts/dsv41_zygote.py (the command: `--lock`, `--status`, `--stop`,
   the Optane modules: not RAM, so nothing to lock (MAP_POPULATE maps them
   in 2 MB pieces at the start).
 - **The handoff.** A round is a fresh process (exec: the new code and the
-  new libraries): it connects to the zygote's Unix socket, receives the
+  new libraries): it connects to the weightkeeper's Unix socket, receives the
   segment fds (SCM_RIGHTS) and the index, and maps them read-only (MAP_SHARED);
-  no copy, the pages stay where the zygote bound them. The round page-locks
+  no copy, the pages stay where the weightkeeper bound them. The round page-locks
   what the GPU copies from (cudaHostRegister on its mapping: about 2 s for
   70 GB measured on Qwen3.8, so about 8 s for 290 GB, once a round) and
   uploads the dense part to the GPU. A fork of a loaded process would freeze
   its code and libraries in the child, and a CUDA context does not cross a
-  fork: the zygote never touches CUDA.
+  fork: the weightkeeper never touches CUDA.
 - **The memory.** The segments are the memory of the weights, counted once
   whatever the rounds (one at a time; two rounds at once share them but each
-  needs its own GPU). The zygote holds nothing else (no CUDA, no programs).
-- **The life of the segments.** They go when the zygote exits (memfd); a
+  needs its own GPU). The weightkeeper holds nothing else (no CUDA, no programs).
+- **The life of the segments.** They go when the weightkeeper exits (memfd); a
   `--keep` mode (not done yet) puts them in files (the same mbind; on a hugetlbfs mount of
   each page size when the segments are in hugetlb pages, else /dev/shm) so
-  even the zygote can restart (with `--lock`, the parent keeps the pools
+  even the weightkeeper can restart (with `--lock`, the parent keeps the pools
   until the files are removed); a checksum of each shard's header and size in the index
   so a round never maps weights of another checkpoint.
 - **For the server too:** serve maps the segments in the same way when a
-  zygote runs (a restart of the server in seconds), else loads as before.
+  weightkeeper runs (a restart of the server in seconds), else loads as before.
 - **Measured** (as the user, so 4 KB shmem pages; 4 layers, 28.9 GB):
   populate 14.4 s, the reads 13.1 s at 2.2 GB/s (the NVMe gives 2.0 GB/s to
   dd with O_DIRECT); every page on its node (bind:0 / bind:1 in a round's
@@ -452,21 +452,21 @@ as it is, with scripts/dsv41_ref/kernel.py in place of its tilelang kernels
 (the kernels' roundings: the power-of-two scales of fast_round_scale, E4M3
 and E2M1 to nearest even, the sink of sparse_attn, the probabilities in
 bfloat16 before V), layer by layer from the shards (a few GB beside the
-zygote): 160 s for a prompt of 16 tokens, about 30 s a step. "What is the
+weightkeeper): 160 s for a prompt of 16 tokens, about 30 s a step. "What is the
 capital of France? Answer in one word." gives "Paris". It writes for each
 prompt the ids, the logits, each layer's output, the experts of each token,
 and the greedy steps; `--long-file` adds a prompt of 1400 tokens (the
 compressed KV and the indexers past their top 512); `--dump-layers` the
 inputs and intermediates of chosen layers. Vision and DSpark: later.
 
-### Phase 1: the reader, the zygote, and the types
+### Phase 1: the reader, the weightkeeper, and the types
 
 1. formats/dsv41_st.py: the view of the checkpoint (names, the config, the
    types), the address tables of the experts in the shards, the engram
    tables; nothing written but the byte copies of 4.1, and in near mode the
-   BF12 forms of the bfloat16 matrices, made at the load (in the zygote's
+   BF12 forms of the bfloat16 matrices, made at the load (in the weightkeeper's
    segment, once).
-2. The zygote (4.2, done) and the loader that maps its segments, or loads
+2. The weightkeeper (4.2, done) and the loader that maps its segments, or loads
    alone when none runs; the large pages and `--lock`; the measure of a round's
    start, and of a decode step in 1 GB pages against 4 KB.
 3. KQ_MXFP4 and KQ_FP8B32 on the CPU and the GPU, both modes: near (int16 x
@@ -487,9 +487,9 @@ near product (int16 x, the exact int32 sums, p = a 2^(e - 127), an fma a
 block) equals a NumPy form of the same operations on every output; the
 act rounding of exact mode equals a NumPy form picking among the 256 E4M3
 values. Against products of the unrounded x: near -82 dB, exact (the
-reference's E4M3 x) -31 dB. The zygote's rows equal the shards'. The
-zygote's layout v1 (planes) is packed to KQ_MXX at each use for now; a v2
-layout in KQ_MXX at the next start of the zygote. The GPU forms: Phase 3.
+reference's E4M3 x) -31 dB. The weightkeeper's rows equal the shards'. The
+weightkeeper's layout v1 (planes) is packed to KQ_MXX at each use for now; a v2
+layout in KQ_MXX at the next start of the weightkeeper. The GPU forms: Phase 3.
 
 ### Phase 2: the model on the CPU
 
@@ -502,7 +502,7 @@ layout in KQ_MXX at the next start of the zygote. The GPU forms: Phase 3.
 
 **Done (1 and 2):** models/deepseek41/model.py (DSV41CPU: the reference's
 forward op for op in NumPy with the KQ_MXX and KQ_FP8B32 products, the
-experts from the zygote) and engram.py (the hashes without torch,
+experts from the weightkeeper) and engram.py (the hashes without torch,
 tokenizers or sympy: the token map equals the reference's for all 129280
 ids, 99092 compressed ids; HF's StripAccents drops every combining mark,
 Mn, Mc and Me); scripts/check_dsv41_cpu.py. Each layer fed the reference's
@@ -542,7 +542,7 @@ against float64); scripts/check_dsv41_gpu_types.py. The cold experts in
 parts take KQ_MXX (GP_KQ_MOE_PART flag 128: the act silu(min(g, 10))
 clamp(u, -10, 10) times the weight of the pair before the down rows, as the
 reference's Expert, and the down rows summed as they are): -127 to -143 dB
-against each expert's products (scripts/check_dsv41_parts.py). The zygote's
+against each expert's products (scripts/check_dsv41_parts.py). The weightkeeper's
 layout v2 holds the experts in KQ_MXX (the parts read it in place).
 **The step (done):** kernels/dsv41/step.cu has the records of a decode step
 (GP_DS_HC_MIX, _HC_PRE, _HC_POST, _ROPE, _FP4, _WIN_WRITE, _COMPRESS,
@@ -555,7 +555,7 @@ matrices and the head as BF12 through GP_KQ_LINEAR; the host keeps only
 untouched placeholders), the routed experts split: GP_HOT_SPLIT, the hot ones
 on the GPU (GP_DS_HOT_MOE: whole experts in KQ_MXX in slots, the operations of
 the CPU parts, rc_dexp), the cold ones by GP_CPU_TASK of GP_KQ_MOE_PART on the
-zygote's segments (ExpertParts.from_desc; the rows form, flag 64), and
+weightkeeper's segments (ExpertParts.from_desc; the rows form, flag 64), and
 GP_DS_COMBINE adds the de rows in the order of the router. The engram rows
 and the embedding come from the host for now.
 
@@ -575,7 +575,7 @@ GPUProgram.profile): about 73 ms a step in the graph; the CPU parts 77 ms of
 the profile's 104 (1.9 ms a layer), the FP8 products 11.4 ms (the 7.5 GB at
 the bandwidth), the rest of the GPU about 15 ms. The parts alone: 0.21 ms an
 expert, linear in the experts, the same with 12 threads as 18: bandwidth.
-**The slow DRAM:** a read of each 1 GB page of the zygote (18 threads of its
+**The slow DRAM:** a read of each 1 GB page of the weightkeeper (18 threads of its
 node): the first 25 GB of node 0's segment and the first 16 GB of node 1's
 read at about 18 GB/s, all the other pages at about 71 GB/s; the slow pages
 are local (from the other socket 13-16 GB/s). The likely cause: 5 DRAM
@@ -583,7 +583,7 @@ modules and the Optane module in the 6 slots of each socket, so a 4-way
 interleave set and a 1-way set of about 32 GB (to check: sudo dmidecode -t
 memory). A token reads 6/384 of every byte, so the 25 GB cost node 0 about 22
 ms a token whatever the layout (its parts at least about 48 ms); with all
-pages fast about 32 ms. Moving the zygote out of the slow pages saves at
+pages fast about 32 ms. Moving the weightkeeper out of the slow pages saves at
 most about 8 GB of node 0 (it needs 145 of the 128 fast); the fix is the
 modules (6 DRAM a socket: about 105 GB/s a node), else the experts that the
 slow pages hold kept hot on the GPU first, and DSpark (a verify group reads
@@ -616,7 +616,7 @@ join: it was 16 ms), the rest about 9 ms.
 
 **The hot experts (done):** DSHot: a score for each expert (decay 0.98 a token
 plus its uses), after each run at most 4 copies a token into the slots (the
-copy worker, rc_gpu_cache_copy, from the zygote's segments; the map entry of
+copy worker, rc_gpu_cache_copy, from the weightkeeper's segments; the map entry of
 a slot cleared before, set at the first run after the copy). Exact: the KL is
 the cold one's to the last digit. Held: 30-34% of the pairs on prompt3's
 steps, 14-22% on the short prompts (a simulation on prompt3's real routes:
@@ -765,6 +765,30 @@ scratch shared by the programs (groups of 1024 by default then).
 The engine, the tokenizer, the port of encoding.py, the parser of the
 output (DSML blocks with the V4.1 tags); dsh as the client.
 
+**Done:** models/deepseek41/engine.py, scripts/serve_dsv41.py (python -m server
+--model DIR: a checkpoint directory, its config.json model_type
+deepseek_v41). The tokenizer: DSTokenizer, the BPE of QwenTokenizer with the
+pre-tokenizer of tokenizer.json (a Sequence of Isolated splits in the regex
+module, no normalizer): the ids of the tokenizers library on the real
+prompts (11K tokens) and on CJK, kana, digits, emoji, code, CRLF. The chat:
+the checkpoint's own encoding.py (encode_messages; the tools on the system
+message; the reasoning effort of a request: reasoning_effort, a level or
+1-100, chat_template_kwargs thinking; default high, 75); a plain completion
+after <｜begin▁of▁sentence｜>. The output: the reasoning (</think>), the content,
+the DSML calls by the checkpoint's parse_tool_calls (a block not closed is
+pending). The decode: DSpark.stream with the server's Sampler (greedy, or
+the main model's distribution: a draft taken with its probability). Between
+the turns: snapshots after the last <｜Assistant｜> of a prompt (the window rings
+of every layer, the compressors' open groups, DSpark's rings: about 3 MB);
+the compressed rows and the index keys before a point stay, so a prompt that
+starts with a snapshot runs only its new tokens (as steps run, not the
+bounded replay of a fresh prompt). Checked by HTTP: a short answer, a stream
+with the reasoning apart, a second turn (40 of 74 tokens cached), a tool call
+and its result (330 of 465 cached), /v1/completions, /v1/models. Images:
+Phase 6. The snapshots also keep the engram hashes' ids of their last 8
+positions (a request between two turns, a client's title request, wrote
+others there: the first tokens of the next turn had other hashes).
+
 ### Phase 5: DSpark
 
 The draft of 5 with the 3 blocks (their 128 experts, top 3), the Markov
@@ -866,16 +890,115 @@ plain decoding as the drafts; rc_gpu_profile of each verify length):
   (the join) a layer: 2.0 ms a step, 7.1 ms for a verify group of 6 (24.1).
   Tried: tiles in shared memory, 512 threads, the next tile in registers (no
   gain: occupancy), 32 splits (no gain, other bits).
+- *The hot and the cold experts of a step* (the prompt of 5018 tokens, its
+  plain tokens; RECLANK_PART_PROF, rc_gpu_task_stats): a step 42 ms, the
+  CPU's tasks busy 22.3 ms and idle 16.2 (the GPU's own work: the layers wait
+  on each other). The cold experts (4.7 a layer, 3.55 GB a step) read at
+  about 195 GB/s in their two products (gate and up 11.9 ms, down 5.9), near
+  the DRAM's bound; the rest is about 4.5 ms of barriers and small phases.
+  Splitting the small phases (the act, its int8, the rows of the pairs: about
+  5 cold pairs for 21 threads) by groups balanced them but the step did not
+  change (the products got slower by as much), so it stays as it was; the
+  dynamic split of the products for one token is slower (43.2 ms).
+  The 12 GB of hot experts (15 slots of the 384 a layer) save only 6% (45.1
+  ms with none): 40% of the pairs held over the 423 steps. Offline on those
+  routes: the best possible (Belady) 0.63, the best static set 0.44, LRU 0.42,
+  the scores of DSHot with 16 copies a step 0.43; 30 slots 0.60 (no room). In
+  the program, 1, 2, 4 or 16 copies a step (RECLANK_DS_HOT_BUDGET, a measure)
+  give 38.2-40.3 ms a step: each copy goes through a staging buffer (the
+  weightkeeper's sealed read-only map takes no cudaHostRegister here), its DRAM
+  traffic costs about what its hits save. The hot experts are not a lever on
+  this machine; the cold experts are at the DRAM's rate.
+- *The FP8 products of a step* (k_fp8b32_gemv<1, 1>, a warp a row; ncu of a
+  layer): wq_a 17 us (381 GB/s), wq_b 60 (705), wkv 15 (177), wo_a 53 (636),
+  wo_b 68 (615), the shared expert's three 23-24 each (about 510), the
+  engram wkv 191 (827: the kernel can stream); 10 ms a step, the attention's
+  8.5 on the path (the shared expert runs while the CPU computes the cold
+  experts). The stalls are the loads (long scoreboard 10-19 a issue), then
+  the table of e4m3f in shared memory. Each row's sum keeps its order (the
+  bits of a step and of the verify rows), so a row stays with one warp; the
+  small matrices fill a part of the GPU. The codes now go through a half
+  (their bits at 15, 13..7 of a half are the value times 2^-8, the
+  subnormals too; the half to float and the 256 exact): 193 ms in 20 steps
+  against 202-205 with the table, the same bits. Tried: 8 or 16 steps of the
+  columns loaded ahead (no gain, 16 slower), 8 blocks an SM (2 steps ahead:
+  2.6% faster with the table, none with the half; 4 steps ahead: spills).
 
 The result on the prompt of 5018 tokens (424 tokens, the tokens of plain
 decoding): plain 23.5-23.8 tokens/s (12 GB of hot experts); DSpark (10 GB)
 a draft every round 28.8 tokens/s (0.76 of the drafts accepted, 2.9 tokens
 a round), auto 26.5; it was 22.0 and 21.4.
 
+**Sampling with DSpark** (generate(temperature, top_p, seed, stop)): the
+drafts are the drafter's argmax (one token each), so a draft d is taken with
+the main model's probability p(d) of its row (after the temperature and top_p)
+and, refused, the row's token is drawn from p without d (renormalised); all
+taken, the token after them from the last row: the tokens are draws of the
+main model alone. stop ends it (no cap with n None). The recommended
+settings (README: temperature 1.0, top_p 0.95), thinking mode with reasoning
+effort 50, "Generate an SVG of a pelican riding a bicycle": 10731 tokens at
+28.7 tokens/s, 0.75 of the drafts taken, 3.9 tokens a round (plain greedy:
+24.8). Greedy stays the tokens of plain decoding.
+
 ### Phase 6: vision
 
 The image processor (up to 1024 tokens), the ViT and aligner on the GPU,
 the span in one chunk, bias_vl, no engram in the span.
+
+**Done:** models/deepseek41/vision.py. The pixels as image_processor.py
+(ImageOps.pad, gray 127; the values rounded to bfloat16: the patches equal
+the reference's bit for bit). The ViT as a program of the encoder records
+(the ViT of Qwen: ENC_LINEAR on the tensor cores, ENC_ROPE2D with the rows of
+q and k of each head in its order, ENC_ATTN, and ENC_SILU_MUL, new), the
+matrices BF12 (below); the aligner a second program, the host putting
+the rows of each 3 x 3 block together (the columns of the aligner's w1 in
+that order). Against the reference's ViT in float32: 2.3e-3 (relative, the
+aligner's rows; the reference's own bfloat16 ViT is 3.6e-2 from it). The
+span: image_start, the rows in reading order with image_newline after each
+row, image_end (bfloat16, the reference's h). In the model (DSV41GPU): the
+programs of a run that meets a span (the key vis, made when needed: the
+programs of text keep their bits) take vmask and vrows: GP_DS_EMBED_ROWS
+puts the rows in the streams in place of the embedding, GP_DS_ROUTER takes
+bias_vl for them (two operands more, NULL for text), the decoder of a
+bounded replay the mask; their engram n-grams stop at them (Hashes dead) and
+their engram rows are zero (so wkv gives zero: the gate's term is zero, as
+the reference's shut gate). A span may cross groups. The server: the image
+parts of the messages (and of tool results) into encoding.py's blocks, each
+placeholder expanded to its span, the rows of the last 8 images kept by the
+hash of their bytes, the snapshots keyed by the image of each span; the
+encoder's GPU memory freed after each image (it takes 1.78 GB at 1024
+tokens: the hot experts leave VISION_GB, 1.8 GB, so 10 slots a layer with
+DSpark; the steps 41.8 ms against 41.6 with 13 slots).
+
+**Checked** with the reference (scripts/dsv41_reference.py --image, the
+corn of the checkpoint's examples): its greedy answer "This image shows
+three ears of fresh corn, with one partially husked..." is the server's,
+word for word; the layer-0 experts of the image tokens differ from its
+choice in 2.6% (text 4.2%; without bias_vl 45%); the prompt's KL 0.26, the
+steps' 6.5e-3 with the same aligner rows (--image-rows), as text prompts
+(0.14 and 6e-2 at their prompts). The text logits are those of before, bit
+for bit (prompts 1-3 and 16 steps), DSpark the tokens of plain steps. A
+chart of 3801 x 2640 (990 tokens): its numbers read right; the encoder 8.7
+s (the attention of 8547 patches on the CUDA cores), 2.2 s for 444 tokens.
+
+**The tensor cores and BF12.** ENC_ATTN on the tensor cores
+(k_enc_attn_tc: q, k, v to float16, mma m16n8k16, float32 scores, softmax
+and sums, the weights p float16; hd a multiple of 8 up to 128, padded to 16
+in the kernel, so the hd 72 of Qwen's ViT too; the float kernel with
+RECLANK_GPU_ENC_TC=0, which also turns off the tensor cores of
+ENC_LINEAR). On the real q, k, v of the ViT regrouped as hd 48, 64, 72, 80
+and 128: about 1e-4 from float64 (the float kernel about 4e-6). The ViT's
+and the aligner's matrices BF12 (encoders.runtime.to_bf12 under the
+runtime's rule; enc_linear takes GP_KQ_LINEAR and ENC_BIAS_CLAMP, x in two
+bfloat16 planes; the patch linear stays bfloat16, 588 cols;
+RECLANK_DS_VISION_BF12=0 keeps bfloat16, x float16). Against the
+reference's ViT in float32: 6.0e-4 (corn) and 8.1e-4 (carrots), against
+2.3e-3 and 2.9e-3 before. The encoder of the chart 0.74 s (8547 patches;
+0.50 s with bfloat16 weights and float16 x), from 8.4 s; in the server
+with the pixels and the upload of the weights 1.87 s, the corn 0.59 s. The
+encoder holds 1.70 GB at 1024 tokens (1.79 before). The prompt's KL 0.22
+(0.26 before), top tokens 13 of 13; the corn's answer still the
+reference's word for word; the text logits the same bits.
 
 ### Phase 7: the measures
 

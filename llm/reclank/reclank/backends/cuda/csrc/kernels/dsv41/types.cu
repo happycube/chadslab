@@ -95,17 +95,33 @@ __device__ __forceinline__ float e4m3f(uint32_t b)
 /* One step of 4 columns of k_fp8b32_gemv: the words q of its R rows decoded
  * once, then for each of the tokens (x at the step's columns) and each row
  * p = w0 x0 + w1 x1 + w2 x2 + w3 x3 (in that order), acc = fma(p, s, acc). */
+/* The 4 E4M3 values of a word without the table: each code's bits (sign,
+ * exponent, mantissa) at bits 15, 13..7 of a half are its value times 2^-8,
+ * the subnormals too (half: 2^-14 m / 8 = m 2^-9 2^-8); the half to float
+ * and the 256 are exact: the values of e4m3f to the bit. (The table of
+ * e4m3f in shared memory: 5% more time in the products of a step, its
+ * lookups conflicting.) */
+__device__ __forceinline__ void fp8x4_f16(uint32_t q, float *w)
+{
+    uint32_t a = __byte_perm(q, 0u, 0x5140), b = __byte_perm(q, 0u, 0x5342);
+    uint32_t ha = ((a & 0x00800080u) << 8) | ((a & 0x007f007fu) << 7);
+    uint32_t hb = ((b & 0x00800080u) << 8) | ((b & 0x007f007fu) << 7);
+    float2 fa = __half22float2(*reinterpret_cast<const __half2 *>(&ha));
+    float2 fb = __half22float2(*reinterpret_cast<const __half2 *>(&hb));
+    w[0] = fa.x * 256.f;
+    w[1] = fa.y * 256.f;
+    w[2] = fb.x * 256.f;
+    w[3] = fb.y * 256.f;
+}
+
 template <int R, int NT>
 __device__ __forceinline__ void fp8_step(const uint32_t *q, float s, const float *x, size_t xstride, int tn,
-                                         const float *tab, float (*acc)[NT])
+                                         float (*acc)[NT])
 {
     float wv[R][4];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        wv[r][0] = tab[q[r] & 255];
-        wv[r][1] = tab[(q[r] >> 8) & 255];
-        wv[r][2] = tab[(q[r] >> 16) & 255];
-        wv[r][3] = tab[q[r] >> 24];
+        fp8x4_f16(q[r], wv[r]);
     }
 #pragma unroll
     for (int jj = 0; jj < NT; ++jj) {
@@ -127,9 +143,6 @@ template <int R, int NT>
 __global__ void __launch_bounds__(256) k_fp8b32_gemv(const uint8_t *w, const uint8_t *sc, int rows, int cols,
                                                     const float *x, int t, float *out, int groups)
 {
-    __shared__ float tab[256];
-    tab[threadIdx.x] = e4m3f(threadIdx.x);
-    __syncthreads();
     int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
     if (row0 >= rows) {
         return;
@@ -151,7 +164,7 @@ __global__ void __launch_bounds__(256) k_fp8b32_gemv(const uint8_t *w, const uin
             }
         }
         /* the words of 4 steps of the columns loaded first (16 loads of a lane in
-         * flight with R = 4), then each step in order */
+         * flight with R = 4; 8 or 16 steps: no faster), then each step in order */
         int c = 4 * lane;
         for (; c + 384 < cols; c += 512) {
             uint32_t q[4][R];
@@ -164,7 +177,7 @@ __global__ void __launch_bounds__(256) k_fp8b32_gemv(const uint8_t *w, const uin
             }
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                fp8_step<R, NT>(q[u], e8m0f(sr[(c + 128 * u) / 32]), x0 + c + 128 * u, xstride, tn, tab, acc);
+                fp8_step<R, NT>(q[u], e8m0f(sr[(c + 128 * u) / 32]), x0 + c + 128 * u, xstride, tn, acc);
             }
         }
         for (; c < cols; c += 128) {
@@ -173,7 +186,7 @@ __global__ void __launch_bounds__(256) k_fp8b32_gemv(const uint8_t *w, const uin
             for (int r = 0; r < R; ++r) {
                 q[r] = *(const uint32_t *)(wr + (size_t)r * cols + c);
             }
-            fp8_step<R, NT>(q, e8m0f(sr[c / 32]), x0 + c, xstride, tn, tab, acc);
+            fp8_step<R, NT>(q, e8m0f(sr[c / 32]), x0 + c, xstride, tn, acc);
         }
 #pragma unroll
         for (int r = 0; r < R; ++r) {

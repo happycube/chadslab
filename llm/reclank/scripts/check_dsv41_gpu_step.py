@@ -67,7 +67,7 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     m = DSV41CPU(a.ckpt, exact=False, max_len=a.max_len)
-    assert m.w.z is not None, "a zygote must serve the experts"
+    assert m.w.z is not None, "a weightkeeper must serve the experts"
     ids = np.load(a.ref)["ids"]
     T = len(ids)
     logits, players = m.forward(ids, 0, keep=a.gpu_prefill)

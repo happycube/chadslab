@@ -149,6 +149,17 @@ __global__ void k_enc_gelu_mul(const float *g, const float *u, float *y, int64_t
     }
 }
 
+/* y = silu(g) * u, n values. */
+__global__ void k_enc_silu_mul(const float *g, const float *u, float *y, int64_t n)
+{
+    PDL_START();
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = g[i];
+        y[i] = v / (1.0f + expf(-v)) * u[i];
+    }
+}
+
 /* x += sc y, n values. */
 __global__ void k_enc_add(float *x, const float *y, int64_t n, float sc)
 {
@@ -383,6 +394,166 @@ __global__ void k_enc_attn(const float *q, const float *k, const float *v, float
             int d = lane + 32 * i;
             if (d < hd) {
                 o[((size_t)qi * heads + h) * hd + d] = acc[i] / l;
+            }
+        }
+    }
+}
+
+/* k_enc_attn on the tensor cores (mma.sync m16n8k16): q, k, and v are
+ * float16 (n, heads, hd), from k_enc_to_half; the scores, the softmax, and
+ * the sums are float32, the weights p float16 (as k_flash_tc). hd is a
+ * multiple of 8 of at most HP, HP a multiple of 16 (the values past hd are
+ * zeros). A block of 4 warps takes EA_Q queries of one head; warp w takes the
+ * 16 queries 16 w, with their fragments of q in registers. For each step of
+ * EA_K keys: K and V to shared memory, S = Q K^T, the online softmax on the
+ * fragments of S (the 4 lanes of a row share its maximum and its sum), then
+ * O += P V (the fragments of S are those of P; V by ldmatrix.trans). */
+#define EA_K 64
+
+__device__ __forceinline__ void ldsm_x2_trans(uint32_t *d, const void *p)
+{
+#if RC_SM80
+    unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(d[0]), "=r"(d[1]) : "r"(a));
+#else
+    __trap();
+#endif
+}
+
+template <int HP>
+__global__ void __launch_bounds__(128) k_enc_attn_tc(const __half *q, const __half *k,
+                                                     const __half *v, float *o, int n, int heads,
+                                                     int hd)
+{
+    PDL_START();
+    constexpr int LD = HP + 8;                /* the row stride (halves): 16 bytes apart */
+    __shared__ __align__(16) __half ks[EA_K * LD];
+    __shared__ __align__(16) __half vs[EA_K * LD];
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int g = lane / 4, c = lane % 4;
+    int h = blockIdx.y;
+    size_t rs = (size_t)heads * hd;           /* the row stride of q, k, v */
+    int r0 = blockIdx.x * EA_Q + warp * 16 + g, r1 = r0 + 8;
+    bool live0 = r0 < n, live1 = r1 < n;
+    const __half *q0 = q + (size_t)(live0 ? r0 : 0) * rs + (size_t)h * hd;
+    const __half *q1 = q + (size_t)(live1 ? r1 : 0) * rs + (size_t)h * hd;
+    uint32_t qa[HP / 16][4];
+    #pragma unroll
+    for (int kk = 0; kk < HP / 16; ++kk) {
+        int d0 = kk * 16 + 2 * c, d1 = d0 + 8;
+        qa[kk][0] = d0 < hd ? *(const uint32_t *)&q0[d0] : 0u;
+        qa[kk][1] = d0 < hd ? *(const uint32_t *)&q1[d0] : 0u;
+        qa[kk][2] = d1 < hd ? *(const uint32_t *)&q0[d1] : 0u;
+        qa[kk][3] = d1 < hd ? *(const uint32_t *)&q1[d1] : 0u;
+    }
+    float acc[HP / 8][4];
+    #pragma unroll
+    for (int i = 0; i < HP / 8; ++i) {
+        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
+    }
+    const float L2E = 1.4426950408889634f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += EA_K) {
+        __syncthreads();
+        /* 8 halves (16 bytes) at a time; zeros past n and past hd */
+        for (int x = threadIdx.x; x < EA_K * (HP / 8); x += blockDim.x) {
+            int j = x / (HP / 8), d = (x % (HP / 8)) * 8, kj = k0 + j;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = kv;
+            if (kj < n && d < hd) {
+                size_t src = (size_t)kj * rs + (size_t)h * hd + d;
+                kv = *(const uint4 *)&k[src];
+                vv = *(const uint4 *)&v[src];
+            }
+            *(uint4 *)&ks[j * LD + d] = kv;
+            *(uint4 *)&vs[j * LD + d] = vv;
+        }
+        __syncthreads();
+        float sc[EA_K / 8][4];
+        #pragma unroll
+        for (int nt = 0; nt < EA_K / 8; ++nt) {
+            sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
+        }
+        #pragma unroll
+        for (int kk = 0; kk < HP / 16; ++kk) {
+            #pragma unroll
+            for (int nt = 0; nt < EA_K / 8; ++nt) {
+                uint32_t b[2];
+                b[0] = *(const uint32_t *)&ks[(nt * 8 + g) * LD + kk * 16 + 2 * c];
+                b[1] = *(const uint32_t *)&ks[(nt * 8 + g) * LD + kk * 16 + 2 * c + 8];
+                mma16816(sc[nt], qa[kk], b);
+            }
+        }
+        /* sc[nt][0..1]: row g, keys nt * 8 + 2c and + 1; sc[nt][2..3]: row g + 8.
+         * Each step has a key, so the maxima are finite. */
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < EA_K / 8; ++nt) {
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                bool ok = k0 + nt * 8 + 2 * c + u < n;
+                sc[nt][u] = ok ? sc[nt][u] * L2E : -INFINITY;
+                sc[nt][2 + u] = ok ? sc[nt][2 + u] * L2E : -INFINITY;
+                mx0 = fmaxf(mx0, sc[nt][u]);
+                mx1 = fmaxf(mx1, sc[nt][2 + u]);
+            }
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(RC_FULL_MASK, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(RC_FULL_MASK, mx1, off));
+        }
+        float f0 = exp2f(m0 - mx0), f1 = exp2f(m1 - mx1);   /* 0 at the first step */
+        float ls0 = 0.f, ls1 = 0.f;
+        uint32_t pa[EA_K / 8][2];
+        #pragma unroll
+        for (int nt = 0; nt < EA_K / 8; ++nt) {
+            float e0 = exp2f(sc[nt][0] - mx0), e1 = exp2f(sc[nt][1] - mx0);
+            float e2 = exp2f(sc[nt][2] - mx1), e3 = exp2f(sc[nt][3] - mx1);
+            ls0 += e0 + e1;
+            ls1 += e2 + e3;
+            __half2 h01 = __floats2half2_rn(e0, e1), h23 = __floats2half2_rn(e2, e3);
+            pa[nt][0] = *(uint32_t *)&h01;
+            pa[nt][1] = *(uint32_t *)&h23;
+        }
+        for (int off = 1; off < 4; off <<= 1) {
+            ls0 += __shfl_xor_sync(RC_FULL_MASK, ls0, off);
+            ls1 += __shfl_xor_sync(RC_FULL_MASK, ls1, off);
+        }
+        l0 = l0 * f0 + ls0;
+        l1 = l1 * f1 + ls1;
+        m0 = mx0;
+        m1 = mx1;
+        #pragma unroll
+        for (int nt = 0; nt < HP / 8; ++nt) {
+            acc[nt][0] *= f0;
+            acc[nt][1] *= f0;
+            acc[nt][2] *= f1;
+            acc[nt][3] *= f1;
+        }
+        #pragma unroll
+        for (int kk = 0; kk < EA_K / 16; ++kk) {
+            /* the A fragment of P: keys 16 kk + 2c (tile 2 kk), + 8 (tile 2 kk + 1) */
+            uint32_t a[4] = {pa[2 * kk][0], pa[2 * kk][1], pa[2 * kk + 1][0], pa[2 * kk + 1][1]};
+            const __half *vrow = &vs[(kk * 16 + (lane % 16)) * LD];
+            #pragma unroll
+            for (int nt = 0; nt < HP / 8; ++nt) {
+                uint32_t b[2];
+                ldsm_x2_trans(b, vrow + nt * 8);
+                mma16816(acc[nt], a, b);
+            }
+        }
+    }
+    float inv0 = 1.0f / l0, inv1 = 1.0f / l1;
+    float *o0 = o + (size_t)r0 * rs + (size_t)h * hd, *o1 = o + (size_t)r1 * rs + (size_t)h * hd;
+    #pragma unroll
+    for (int nt = 0; nt < HP / 8; ++nt) {
+        int d = nt * 8 + 2 * c;
+        if (d < hd) {
+            if (live0) {
+                *(float2 *)&o0[d] = make_float2(acc[nt][0] * inv0, acc[nt][1] * inv0);
+            }
+            if (live1) {
+                *(float2 *)&o1[d] = make_float2(acc[nt][2] * inv1, acc[nt][3] * inv1);
             }
         }
     }

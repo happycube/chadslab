@@ -200,6 +200,8 @@ static int gp_run_parts_task(const int64_t *prog, const gp_rec *r, int limit)
         return -1;
     }
     gp_fail = 0;
+    int was = gp_planned;
+    gp_planned = 1;         /* a planned team (rc_team_warn) */
     #pragma omp parallel num_threads(nparts * team)
     {
         int want = cpus[omp_get_thread_num()];
@@ -211,6 +213,7 @@ static int gp_run_parts_task(const int64_t *prog, const gp_rec *r, int limit)
         }
         gp_exec(prog, limit);
     }
+    gp_planned = was;
     return gp_fail == 2 ? -4 : gp_fail ? -3 : 0;
 }
 

@@ -225,7 +225,7 @@ class ExpertParts:
     @classmethod
     def from_desc(cls, desc, gu, dn, E, hidden, inner, cpus, part_nodes=None):
         """ExpertParts on rows already in place on their nodes (the segments of
-        the zygote, reclank/runtime/zygote.py): desc is layer -> [12 int64 for
+        the weightkeeper, reclank/runtime/weightkeeper.py): desc is layer -> [12 int64 for
         each part] (address, type, the bytes of an expert, the first row; gate,
         up, down), gu and dn the rows of each part; part_nodes: the node of
         each part (its scratch; default the first nodes)."""
