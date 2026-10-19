@@ -513,6 +513,16 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
         }
         const uint8_t *w = up + (size_t)ids[pr] * inner * urb;
         float *a = act + (size_t)pr * inner;
+#if defined(__AVX2__)
+        if (x16 && (up_type == KQ_IQ2R || up_type == KQ_IQ2_XXS)) {
+            /* (the rows of the task 4 at a time: kq_rows_x2_iq2, the bits of kq_dot_x2) */
+            kq_rows_x2_iq2(w + (size_t)r0 * urb, urb, up_type, L, r1 - r0, xq[j], xl[j], xs[j], 1, a + r0, 1, 0);
+            for (int r = r0; r < r1; ++r) {
+                float v = a[r] > 0.f ? a[r] : 0.f;
+                a[r] = v * v;
+            }
+        } else
+#endif
         for (int r = r0; r < r1; ++r) {
             float v = x16 ? kq_dot_x2(w + (size_t)r * urb, up_type, L, xq[j], xl[j], xs[j])
                           : kq_dot1(w + (size_t)r * urb, up_type, L, xq[j], xs[j], xm[j], NULL);
@@ -529,6 +539,38 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
         }
     }
     const int dch = (L + NM_DCH - 1) / NM_DCH;
+#if defined(__AVX2__)
+    if (x16 && (down_type == KQ_IQ2R || down_type == KQ_IQ2_XXS) && k <= NM_FEW) {
+        /* the rows of each pair 4 at a time (kq_rows_x2_iq2), then each row's sum over the slots in
+         * their order: the bits of the loop below */
+        #pragma omp for schedule(dynamic, 1)
+        for (int task = 0; task < t * dch; ++task) {
+            int j = task / dch, r0 = (task % dch) * NM_DCH, r1 = r0 + NM_DCH < L ? r0 + NM_DCH : L;
+            float dq[NM_FEW][NM_DCH];
+            for (int q = 0; q < k; ++q) {
+                int pr = j * k + q;
+                if (ids[pr] < 0) {
+                    continue;
+                }
+                kq_rows_x2_iq2(down + ((size_t)ids[pr] * L + r0) * drb, drb, down_type, inner, r1 - r0,
+                               aq + (size_t)pr * inner, al + (size_t)pr * inner, as + (size_t)pr * (inner / 32), 1,
+                               dq[q], 1, 0);
+            }
+            for (int r = r0; r < r1; ++r) {
+                float s = 0.f;
+                for (int q = 0; q < k; ++q) {
+                    int pr = j * k + q;
+                    if (ids[pr] < 0) {
+                        continue;
+                    }
+                    s += val[pr] * dq[q][r - r0];
+                }
+                out[(size_t)j * L + r] = s;
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp for schedule(dynamic, 1)
     for (int task = 0; task < t * dch; ++task) {
         int j = task / dch, r0 = (task % dch) * NM_DCH, r1 = r0 + NM_DCH < L ? r0 + NM_DCH : L;

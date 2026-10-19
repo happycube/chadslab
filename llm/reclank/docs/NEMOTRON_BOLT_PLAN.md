@@ -327,3 +327,20 @@ the reference for P4). P4-P6 are the Pascal + AVX2 machine. P7-P8 after.
   this one (sm_61 has no cp.async and 48 KB a block: a register prefetch with BK 64), and the CPU's
   experts of a step and of a group (at the budget of an 8 GB card the GPU waits 22 of 33 ms of a
   step and 79 of 102 ms of a verify group for them: spec decoding gives nothing there).
+
+**The IQ2 experts on AVX2 (kq_rows_x2_iq2, kernels/kq/nmx2.c):** a CPU step of 6 threads on the AVX2
+tier (at 1.2 GHz) spent 805 ms: NM_LIN2 611 (NVFP4 in_proj and out_proj 399, the IQ2 shared experts
+163, Q8_0 42) and NM_MOE 159 (the routed IQ2 experts). kq_dot_x2 decoded each part of a row for each
+token: the 4 grid entries and the 4 sign masks by _mm256_set_epi64x, the scale in scalars, two sign
+flips (xor and subtraction). Now R rows a pass on T tokens (4 x 1, 2 x 2, 2 x 3): the grid entries
+and the signs of a part once for the tokens, the x of a part once for the rows, the table entries by
+broadcasts and blends, the signs as +1 / -1 bytes for vpsignb, the 8 factors d (2 s + 1) of a block
+in one vector pass, and without VNNI the high plane weighted by 128 in vpmaddwd (not shifted after);
+each row and token the int32 lanes and the float order of kq_dot_x2: the same bits (all the tiers
+alike, scripts/check_iq2.py; the logits of a CPU step and of a group of 3 the same as before on the
+AVX2 and the AVX-512 VNNI tiers). A thread on a 5376 x 4096 shared expert 9.3 -> 7.4 ms (from DRAM
+too), 6 threads 1.65 -> 1.25 ms. Used by NM_LIN2 for 1 to 3 tokens (4 and more take the tiled form)
+and by nm_moe_few's up and down rows (a step and a group of up to 4). The step 825 -> 802 ms (AVX2;
+the IQ2 of NM_LIN2 163 -> 145, NM_MOE 159 -> 150), a group of 3 2234 -> 1980; the AVX-512 VNNI tier
+631 -> 609 and 1780 -> 1489. Not done: the NVFP4 projections (half of a step) have no rows form
+without VNNI; the tiled form at 8 tokens trails the 512-bit tiers by 12%.

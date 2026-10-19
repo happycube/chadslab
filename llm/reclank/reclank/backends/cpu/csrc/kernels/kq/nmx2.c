@@ -106,6 +106,148 @@ static float kq_dot_x2(const uint8_t *w, int type, int cols, const int8_t *xh, c
     return s;
 }
 
+#if defined(__AVX2__)
+/* ---------- IQ2_XXS / KQ_IQ2R rows on int16 x: R rows a pass, on T tokens (kq_rows_x2_iq2) ----------
+ * kq_dot_x2 decodes each part of a row for each token: the four grid entries and the four sign
+ * masks (8 lookups) and the scale of the part (in scalars), then two sign flips, the products and a
+ * float product. Here the grid entries and the signs of a part are read once for the T tokens (a
+ * group of a few rows of NM_LIN2: one row on 2 or 3 tokens), the x of a part once for the R rows,
+ * the table entries by broadcasts and blends (loads, not the inserts of _mm256_set_epi64x), the signs
+ * as +1 / -1 bytes for vpsignb (one flip, not a xor and a subtraction), and the 8 factors d (2 s + 1)
+ * of a block in one vector pass. Each row and token gets the int32 lanes of kq_dot_x2 and its float
+ * operations in its order (d (2 s + 1), times xs, fmadd into the 8 lanes, the sum): the same bits.
+ * The AVX2 tier: one row on one token 9.3 -> 7.4 ms for a 5376 x 4096 matrix (a thread). */
+static uint64_t kq_iq2_pm1[128];       /* IQ2XXS_SIGNS64 as bytes of +1 and -1 */
+__attribute__((constructor)) static void kq_iq2_pm1_init(void)
+{
+    for (int i = 0; i < 128; ++i) {
+        uint64_t s = kq_iq2xxs_signs64[i], v = 0;
+        for (int k = 0; k < 8; ++k) {
+            v |= (uint64_t)(((s >> (8 * k)) & 0xff) ? 0xff : 0x01) << (8 * k);
+        }
+        kq_iq2_pm1[i] = v;
+    }
+}
+
+/* the entries i0 .. i3 of a table of 8-byte rows as one vector (four broadcasts, three blends) */
+static inline __m256i kq_iq2_q4(const uint64_t *t, unsigned i0, unsigned i1, unsigned i2, unsigned i3)
+{
+    __m256i a = _mm256_blend_epi32(_mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)(t + i0))),
+                                   _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)(t + i1))), 0x0c);
+    __m256i b = _mm256_blend_epi32(_mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)(t + i2))),
+                                   _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)(t + i3))), 0xc0);
+    return _mm256_blend_epi32(a, b, 0xf0);
+}
+
+/* the lanes of kq_x2_part: 128 dot(u, hi') + dot(u, lo'), the same integers (the high plane
+ * weighted by 128 in vpmaddwd, not shifted after it, without VNNI) */
+static inline __m256i kq_x2_part2(__m256i u, __m256i h, __m256i l)
+{
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+    return kq_x2_part(u, h, l);
+#else
+    __m256i a = _mm256_madd_epi16(_mm256_maddubs_epi16(u, h), _mm256_set1_epi16(128));
+    __m256i b = _mm256_madd_epi16(_mm256_maddubs_epi16(u, l), _mm256_set1_epi16(1));
+    return _mm256_add_epi32(a, b);
+#endif
+}
+
+/* the 8 factors d (2 s_j + 1) of block b of a row, each as kq_dot_x2 makes it (d * 0.125, then
+ * times the float of 2 s + 1) */
+static inline __m256 kq_iq2_f8(const uint8_t *w, int type, int cols, int b)
+{
+    const uint8_t *p0 = kq_iq2_part(w, type, b, 0);
+    __m256i a = _mm256_srli_epi64(_mm256_loadu_si256((const __m256i *)p0), 60);
+    __m256i c = _mm256_srli_epi64(_mm256_loadu_si256((const __m256i *)(p0 + 32)), 60);
+    const __m256i pk = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    __m256i v = _mm256_permute2x128_si256(_mm256_permutevar8x32_epi32(a, pk), _mm256_permutevar8x32_epi32(c, pk), 0x20);
+    __m256 f = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_add_epi32(v, v), _mm256_set1_epi32(1)));
+    return _mm256_mul_ps(_mm256_set1_ps(kq_iq2_d(w, type, cols, b) * 0.125f), f);
+}
+
+/* R rows (from w, rb apart) on T tokens (xh, xl cols apart, xs cols / 32 apart): out[r ors + j ots] */
+#define KQ_IQ2_RT(R, T)                                                                                            \
+    static void kq_iq2_rt_##R##_##T(const uint8_t *w, size_t rb, int type, int cols, const int8_t *xh,           \
+                                    const int8_t *xl, const float *xs, float *out, size_t ors, size_t ots)       \
+    {                                                                                                              \
+        __m256 acc[R][T];                                                                                          \
+        for (int r = 0; r < R; ++r)                                                                                \
+            for (int j = 0; j < T; ++j)                                                                            \
+                acc[r][j] = _mm256_setzero_ps();                                                                   \
+        const int nxs = cols / 32;                                                                                 \
+        for (int b = 0; b < cols / 256; ++b) {                                                                     \
+            __m256 f8[R];                                                                                          \
+            for (int r = 0; r < R; ++r)                                                                            \
+                f8[r] = kq_iq2_f8(w + r * rb, type, cols, b);                                                      \
+            for (int q = 0; q < 8; ++q) {                                                                          \
+                const int p = 8 * b + q;                                                                           \
+                const __m256i qq = _mm256_set1_epi32(q);                                                           \
+                __m256i h0[T], l0[T];                                                                              \
+                __m256 xsp[T];                                                                                     \
+                for (int j = 0; j < T; ++j) {                                                                      \
+                    h0[j] = _mm256_loadu_si256((const __m256i *)(xh + (size_t)j * cols + 32 * p));               \
+                    l0[j] = _mm256_loadu_si256((const __m256i *)(xl + (size_t)j * cols + 32 * p));               \
+                    xsp[j] = _mm256_set1_ps(xs[(size_t)j * nxs + p]);                                              \
+                }                                                                                                  \
+                for (int r = 0; r < R; ++r) {                                                                      \
+                    uint32_t aux[2];                                                                               \
+                    memcpy(aux, kq_iq2_part(w + r * rb, type, b, q), 8);                                           \
+                    const uint8_t *ix = (const uint8_t *)aux;                                                      \
+                    const __m256i u = kq_iq2_q4(kq_iq2xxs_grid, ix[0], ix[1], ix[2], ix[3]);                      \
+                    const __m256i m = kq_iq2_q4(kq_iq2_pm1, aux[1] & 127, (aux[1] >> 7) & 127,                    \
+                                                (aux[1] >> 14) & 127, (aux[1] >> 21) & 127);                      \
+                    const __m256 fq = _mm256_permutevar8x32_ps(f8[r], qq);                                         \
+                    for (int j = 0; j < T; ++j) {                                                                  \
+                        __m256i h = _mm256_sign_epi8(h0[j], m), l = _mm256_sign_epi8(l0[j], m);                   \
+                        acc[r][j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(kq_x2_part2(u, h, l)),                     \
+                                                    _mm256_mul_ps(fq, xsp[j]), acc[r][j]);                        \
+                    }                                                                                              \
+                }                                                                                                  \
+            }                                                                                                      \
+        }                                                                                                          \
+        for (int r = 0; r < R; ++r)                                                                                \
+            for (int j = 0; j < T; ++j)                                                                            \
+                out[r * ors + j * ots] = kq_x2_hsum(acc[r][j]);                                                    \
+    }
+KQ_IQ2_RT(4, 1)
+KQ_IQ2_RT(1, 1)
+KQ_IQ2_RT(2, 2)
+KQ_IQ2_RT(1, 2)
+KQ_IQ2_RT(2, 3)
+KQ_IQ2_RT(1, 3)
+#undef KQ_IQ2_RT
+
+/* nr rows of IQ2_XXS / KQ_IQ2R on t tokens (1 to 3) of x as int16 planes: out[r ors + j ots], each the
+ * bits of kq_dot_x2 */
+static void kq_rows_x2_iq2(const uint8_t *w, size_t rb, int type, int cols, int nr, const int8_t *xh,
+                           const int8_t *xl, const float *xs, int t, float *out, size_t ors, size_t ots)
+{
+    int r = 0;
+    if (t == 1) {
+        for (; r + 4 <= nr; r += 4) {
+            kq_iq2_rt_4_1(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+        for (; r < nr; ++r) {
+            kq_iq2_rt_1_1(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+    } else if (t == 2) {
+        for (; r + 2 <= nr; r += 2) {
+            kq_iq2_rt_2_2(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+        for (; r < nr; ++r) {
+            kq_iq2_rt_1_2(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+    } else {
+        for (; r + 2 <= nr; r += 2) {
+            kq_iq2_rt_2_3(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+        for (; r < nr; ++r) {
+            kq_iq2_rt_1_3(w + r * rb, rb, type, cols, xh, xl, xs, out + r * ors, ors, ots);
+        }
+    }
+}
+#endif
+
 #if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
 #define NM_X2_VNNI 1
 /* 4 rows of KQ_NV4 or Q8_0 against x as two planes on VNNI: the planes made unsigned once (hu = hi +
@@ -667,6 +809,17 @@ static void nm_lin2_body(const int8_t *xh, const int8_t *xl, const float *xs, co
                     out[(size_t)j * rows + r + q] = o[q];
                 }
             }
+        }
+        return;
+    }
+#endif
+#if defined(__AVX2__)
+    if ((type == KQ_IQ2R || type == KQ_IQ2_XXS) && t <= 3) {
+        /* the rows in tasks of 16, each decoded once for the tokens (kq_rows_x2_iq2) */
+        #pragma omp for schedule(dynamic, 4)
+        for (int r0 = 0; r0 < rows; r0 += 16) {
+            int nr = r0 + 16 < rows ? 16 : rows - r0;
+            kq_rows_x2_iq2(w + (size_t)r0 * rb, rb, type, cols, nr, xh, xl, xs, t, out + r0, 1, (size_t)rows);
         }
         return;
     }
