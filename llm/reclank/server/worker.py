@@ -228,7 +228,16 @@ class ModelWorker:
                     self._note(exc)
                 self._fatal()
                 continue
-            self._job(self.jobs.get())
+            try:
+                job = self.jobs.get_nowait()
+            except queue.Empty:
+                # no job waits: the engine's work of the downtime (NemotronEngine: the expert GPU's
+                # experts by the last prompts' routing), then wait for one
+                idle = getattr(self.engine, "idle", None)
+                if idle is not None:
+                    self._job(idle)
+                job = self.jobs.get()
+            self._job(job)
 
     def _job(self, job):
         try:

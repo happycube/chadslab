@@ -201,12 +201,15 @@ class NmExpertDevice:
         lib.rc_gpu_ex_open.argtypes = [i, ctypes.POINTER(sz)]
         lib.rc_gpu_ex_nm_init.argtypes = [i, i, i, i]
         lib.rc_gpu_ex_nm_store.argtypes = [i, i, vp, vp, sz, sz, i, vp, i]
+        lib.rc_gpu_ex_nm_put.argtypes = [i, i, vp, vp, vp, sz, sz, vp, i]
 
         def check(rc):
             if rc != 0:
                 raise RuntimeError("expert device %s: %s" % (gpu["name"], lib.rc_gpu_last_error().decode()))
 
         Em = max(E for E, _n, _k in cfg.moe.values())
+        self.g, self.check = g, check
+        self.slots = {}             # layer: expert -> its slot here, or -1
         old = os.sched_getaffinity(0)
         if gpu["numa"] >= 0 and numa.enabled():
             os.sched_setaffinity(0, numa.node_cpus(gpu["numa"]))
@@ -245,6 +248,7 @@ class NmExpertDevice:
                 dn = np.concatenate([dnm.data[e * pd:(e + 1) * pd] for e in mine])
                 slots = np.full(E, -1, np.int32)
                 slots[mine] = np.arange(len(mine), dtype=np.int32)
+                self.slots[li] = slots
                 check(lib.rc_gpu_ex_nm_store(li, len(mine), up.ctypes.data, dn.ctypes.data, pu, pd, inner,
                                              slots.ctypes.data, E))
         finally:
@@ -262,6 +266,36 @@ class NmExpertDevice:
         print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB, %d%% of all) after the hot %d%%" % (
             gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(held.sum()), used / 1e9,
             round(100 * self.share), round(100 * g.hot_share)), file=sys.stderr, flush=True)
+
+    def refresh(self, score):
+        """The experts here anew by score (layers x experts: higher first): in each layer, its count of
+        slots of the best experts that g does not hold; those that leave give their slots to those that
+        come (copied from the host stacks; no job may run: between prompts). held changes in place (the
+        CPU's NM_REMOTE_POST reads it). Return (experts copied, bytes)."""
+        g, n, nbytes = self.g, 0, 0
+        for li, slots in self.slots.items():
+            E = slots.size
+            have = slots >= 0
+            sc = np.where(g.hot[li][0] >= 0, -np.inf, np.asarray(score[li][:E], np.float64))
+            # (the experts here first among equals: no copy for a tie)
+            want = np.zeros(E, bool)
+            want[np.lexsort((~have, -sc))[:int(have.sum())]] = True
+            come, go = np.flatnonzero(want & ~have), np.flatnonzero(have & ~want)
+            if not len(come):
+                continue
+            free = slots[go].copy()
+            slots[go] = -1
+            slots[come] = free
+            upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
+            pu, pd = upm.data.nbytes // E, dnm.data.nbytes // E
+            ups = np.array([upm.data.ctypes.data + int(e) * pu for e in come], np.int64)
+            dns = np.array([dnm.data.ctypes.data + int(e) * pd for e in come], np.int64)
+            self.check(self.lib.rc_gpu_ex_nm_put(li, len(come), free.ctypes.data, ups.ctypes.data, dns.ctypes.data,
+                                                 pu, pd, slots.ctypes.data, E))
+            self.held[li, :E] = want
+            n += len(come)
+            nbytes += len(come) * (pu + pd)
+        return n, nbytes
 
 
 class QwenExpertDevice:

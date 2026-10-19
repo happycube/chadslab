@@ -87,6 +87,17 @@ MARGIN_GB = float(os.environ.get("RECLANK_NM_MARGIN_GB", "0.9"))
 # drafter's verify group 305 -> 148 ms (the 1070 idle) -> 82 ms (its experts beside).
 ZC = os.environ.get("RECLANK_NM_ZC", "1") != "0"
 ZC_MIN = int(os.environ["RECLANK_NM_ZC_MIN"]) if os.environ.get("RECLANK_NM_ZC_MIN") else None
+# the runs of at most ZC_ROWS rows of those: the step's kernels (NM_HOT_MOE) on NM_GROUP_MOE's tables,
+# a warp on rows of a pair (NM_GROUP_MOE's grid is every expert by every tile of 32 rows: at one token
+# 7680-35712 blocks for ~6 experts, 0.1-0.4 ms a matrix on the RTX 3060, 15.9 ms of a 39 ms step).
+# RECLANK_NM_ZC_ROWS=0: NM_GROUP_MOE for all.
+ZC_ROWS = int(os.environ.get("RECLANK_NM_ZC_ROWS", "8"))
+# refresh_experts (between prompts: the engine's idle): RECLANK_NM_REFRESH=0 keeps the expert device's
+# first set (the routing profile's); the routing before a call weighs half for each REFRESH_HALF tokens
+# of the new (three two-turn chats, the second turns: a half-life of a turn or more 37.1-37.5 tok/s, none
+# 38.1; a few tokens of a short answer should not undo the turns before them)
+REFRESH = os.environ.get("RECLANK_NM_REFRESH", "1") != "0"
+REFRESH_HALF = float(os.environ.get("RECLANK_NM_REFRESH_HALF", "128"))
 # Super: the time of a run of each size, s (the 3090 and the Xeon, real text, NM_PLAN's groups, 17% hot;
 # 2048 and 4096, staged, from a prompt of 8K tokens against 1024's there, their programs' making included):
 # NemotronGPU.parts picks the runs of a prompt by it (RECLANK_NM_GROUP_COST "size:s,...")
@@ -527,7 +538,8 @@ class NmEmit:
             rec = new[1] if new is not None and new[0] is src and QFUSE and m.cols % 32 == 0 else None
             if rec is not None:
                 args, at = rec[1], _QAT[rec[0]][1]
-                args += [prog._enc(None)] * (at - len(args)) + [prog._enc(a) for a in q]
+                args += [prog._enc(None)] * (at + 3 - len(args))
+                args[at:at + 3] = [prog._enc(a) for a in q]
             else:
                 prog.emit(P.NM_QX, src, t, m.cols, q[0], q[1], q[2])
             if new is not None and new[0] is src:
@@ -571,7 +583,10 @@ class NmEmit:
             a = self._scr[name] = np.zeros(n, dt)
         return a
 
-    def _hot(self, prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im):
+    def _hot(self, prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im, tab=False):
+        """NM_HOT_MOE on the pairs of idx: the experts of slots (>= 0) in the stacks up, down; tab: up
+        and down are NM_GROUP_MOE's tables (each expert's address: a slot or the mapped host memory),
+        every pair of idx >= 0 runs."""
         S = self.scratch
         if self.dev.nv4:
             # (Super's KQ_NV4 experts: float x, docs/NEMOTRON_SUPER_PLAN.md S5; the pool's tables of
@@ -580,13 +595,15 @@ class NmEmit:
             tabs = (pool.pup[self._layer], pool.pdn[self._layer]) if pool is not None else ()
             prog.emit(P.NM_HOT_NV4, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, *tabs)
             return
+        more = [None, None, None, 1] if tab else []
         if I8:
             prog.emit(P.NM_HOT_MOE, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t,
                       S("qx", t * L, np.int8), S("sx", t * L // 32), S("qa", t * k * Im, np.int8),
                       S("sa", t * k * Im // 32), S("qxl", t * L, np.int8) if X16 else None,
-                      S("qal", t * k * Im, np.int8) if X16 else None)
+                      S("qal", t * k * Im, np.int8) if X16 else None, *more)
         else:
-            prog.emit(P.NM_HOT_MOE, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t)
+            prog.emit(P.NM_HOT_MOE, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t,
+                      *([None] * 6 + more if tab else []))
 
     def moe(self, prog, i, lat, idx, val, out, t, side=None):
         """The routed experts of layer i (out: their sums). side (or None): emits the records that do
@@ -595,6 +612,11 @@ class NmEmit:
         self._side, self._layer = side, i
         self._moe(prog, i, lat, idx, val, out, t)
         self.side_now()
+        routes = self.dev.routes
+        if routes is not None and i in self.dev.cfg.moe:
+            # (the choices into refresh_experts' counts: here, not after the router, whose record and the
+            # GP_SIGNAL after it are one kernel, k_nm_route_signal)
+            prog.emit(P.COUNT, idx, routes[i], self.dev.cfg.moe[i][2], prog.slot("nreal"), routes.shape[1])
 
     def _await_add(self, prog, fl, seq, rows, part, gout, out, n, cnt):
         """The wait for the CPU's task and its rows added to the GPU's (gout): out = gout + rows, in the
@@ -649,9 +671,7 @@ class NmEmit:
             elif xd is not None:
                 # an expert device: the pairs of its experts to it (through the CPU's task, as a step's
                 # cold pairs), the others here; the sums added after
-                held = xd.held[i, :E].astype(bool)
-                mine, rest = np.where(held, -1, 0).astype(np.int32), np.where(held, 0, -1).astype(np.int32)
-                d._xkeep += [mine, rest]
+                mine, rest = d.xsplit(i)
                 bufs = d.bufs(t)
                 cnt = S("cnt", 1, np.int32)
                 gidx, gout, part = S("zidx", t * k, np.int32), S("gout", t * L), S("part", t * L)
@@ -672,13 +692,18 @@ class NmEmit:
                 pup, pdn = st["pup"][j], st["pdn"][j]
                 prog.emit(P.FETCH_WAIT, j)
                 prog.stage = True
-            # (KQ_NV4: the up tiles quantize the act themselves, no float act)
-            prog.emit(P.NM_GROUP_MOE, lat, gidx, val, pup, pdn, S("qx", t * L, np.int8), S("sx", t * L // 32),
-                      S("act", 32 if d.nv4 else t * k * Im), S("qa", t * k * Im, np.int8), S("sa", t * k * Im // 32),
-                      S("de", t * k * L), gout, S("work", 2 * Em + 1 + t * k, np.int32), k, L, inner, t, E,
-                      prog.slot("nreal"), S("qxl", t * L, np.int8) if X16 else None,
-                      S("qal", t * k * Im, np.int8) if X16 else None, KQ_NV4 if d.nv4 else None,
-                      (2 if TILES else 1) if st is not None else None)   # (22: the experts in the GPU's memory; 2: NV4T)
+            if t <= ZC_ROWS and not d.nv4:
+                # (a step or a verify group: the step's kernels on the tables, a warp on rows of a pair)
+                self._hot(prog, lat, gidx, val, d.hot[i][0], pup, pdn, S("act", t * k * Im), S("de", t * k * L),
+                          gout, k, L, inner, t, Im, tab=True)
+            else:
+                # (KQ_NV4: the up tiles quantize the act themselves, no float act)
+                prog.emit(P.NM_GROUP_MOE, lat, gidx, val, pup, pdn, S("qx", t * L, np.int8), S("sx", t * L // 32),
+                          S("act", 32 if d.nv4 else t * k * Im), S("qa", t * k * Im, np.int8), S("sa", t * k * Im // 32),
+                          S("de", t * k * L), gout, S("work", 2 * Em + 1 + t * k, np.int32), k, L, inner, t, E,
+                          prog.slot("nreal"), S("qxl", t * L, np.int8) if X16 else None,
+                          S("qal", t * k * Im, np.int8) if X16 else None, KQ_NV4 if d.nv4 else None,
+                          (2 if TILES else 1) if st is not None else None)   # (22: the experts in the GPU's memory; 2: NV4T)
             if st is not None:
                 # (the buffer free; the copies of the layer two on into it)
                 prog.emit(P.FETCH_DONE, j % 2)
@@ -849,6 +874,14 @@ class NemotronGPU:
         # link; a prompt group of more than NV4_HOT_MAX rows every pair on the GPU, NM_GROUP_MOE's
         # k_nm_gtile_nv4 on the tensor cores)
         self.zc_min = ZC_MIN if ZC_MIN is not None else NV4_HOT_MAX + 1 if self.nv4 else 1
+        # every program counts the router's choices of each layer here (GP_COUNT; route_counts() reads
+        # them back): with an expert device (refresh_experts), or RECLANK_NM_ROUTES=1
+        Em = max(E for E, _n, _k in cfg.moe.values())
+        self.routes = (np.zeros((cfg.layers, Em), np.int32) if self.xdev is not None and REFRESH
+                       or os.environ.get("RECLANK_NM_ROUTES") == "1" else None)
+        self._xsplit = {}
+        self._seen = None if self.routes is None else self.routes.copy()
+        self._score = None
         self.progs = {}                 # the programs of a step and of the small groups (this lane's)
         self.gprogs = {}                # those of the prompt groups (both lanes')
         self.zc_tables = None
@@ -1383,3 +1416,56 @@ class NemotronGPU:
 
     def step(self, token):
         return self._run([token], self.cache.n)
+
+    def route_counts(self):
+        """(layers, experts): the router's choices of all runs so far (RECLANK_NM_ROUTES=1)."""
+        mir = self.mirror
+        if mir.owner(self.routes.ctypes.data) is not None:
+            mir.buffer_of(self.routes).download(self.routes)
+        return self.routes.copy()
+
+    def xsplit(self, i):
+        """The NM_SPLIT tables of layer i with an expert device (all programs share them): mine (-1:
+        the device's experts, its pairs to the CPU's task) and rest (-1: the others, the pairs here)."""
+        e = self._xsplit.get(i)
+        if e is None:
+            E = self.cfg.moe[i][0]
+            e = self._xsplit[i] = (np.zeros(E, np.int32), np.zeros(E, np.int32))
+            self._split_fill(i)
+        return e
+
+    def _split_fill(self, i):
+        mine, rest = self._xsplit[i]
+        held = self.xdev.held[i, :mine.size].astype(bool)
+        mine[:] = np.where(held, -1, 0)
+        rest[:] = np.where(held, 0, -1)
+
+    def refresh_experts(self):
+        """Between prompts (no run in flight): the expert device's experts anew by the routing since the
+        last call and before (half for each REFRESH_HALF tokens since; the routing profile breaks the
+        ties of the experts not chosen yet): the experts of the text at hand. A conversation's own turns
+        predict its next, another's do not (three two-turn chats: the pairs of the second turns that no
+        GPU holds 11-19% -> 4-6%, its decode 30.5-34.6 -> 37.7-38.6 tok/s; 400-1300 experts, 0.5-1.6
+        GB in 0.07-0.22 s). Return (experts copied, bytes, seconds), or None."""
+        if self.xdev is None or self.routes is None:
+            return None
+        now = self.route_counts()
+        new = (now - self._seen).astype(np.float64)
+        self._seen = now
+        if not new.any():
+            return None
+        if self._score is None:
+            self._score = np.zeros_like(new)
+            for i in self.cfg.moe:
+                c = np.asarray(self.counts[i], np.float64) if self.counts and i in self.counts else None
+                if c is not None and c.sum() > 0:
+                    self._score[i, :c.size] = 1e-6 * c / c.sum()
+        tokens = new.sum() / sum(k for _E, _n, k in self.cfg.moe.values())
+        self._score = 0.5 ** (tokens / REFRESH_HALF) * self._score + new
+        t0 = time.time()
+        n, nbytes = self.xdev.refresh(self._score)
+        for i in self._xsplit:
+            self._split_fill(i)
+            for a in self._xsplit[i]:
+                self.mirror.buffer_of(a).upload(a)
+        return n, nbytes, time.time() - t0

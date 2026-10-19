@@ -397,6 +397,27 @@ __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t
     }
 }
 
+/* GP_NM_HOT_MOE's experts (operand 22, the tables: 0 or none, the slots): the key of pair p's expert
+ * (its slot, or with the tables its id; < 0: not run here), and the rows from row of its up (op 4) or
+ * down (5) matrix of m rows of rb bytes: the slot's in the stack, or the table's address of the expert
+ * (NM_GROUP_MOE's pup / pdn: a hot slot or the host memory the GPU maps; a pair of idx -1 is another
+ * GPU's). */
+#define NM_TAB (r->tag[22] == GP_T_INT && r->v[22] != 0)
+__device__ __forceinline__ int nm_hot_key(const gp_rec *r, const int64_t *e, int p)
+{
+    const int x = DP(const int, 1)[p];
+    return NM_TAB ? x : DP(const int, 3)[x];
+}
+
+__device__ __forceinline__ const uint8_t *nm_hot_w(const gp_rec *r, const int64_t *e, int op, int p, int key,
+                                                   int m, int row, size_t rb)
+{
+    if (NM_TAB) {
+        return (const uint8_t *)(intptr_t)DP(const int64_t, op)[DP(const int, 1)[p]] + (size_t)row * rb;
+    }
+    return DP(const uint8_t, op) + ((size_t)key * m + row) * rb;
+}
+
 /* GP_NM_HOT_MOE: x, idx, val, slots, up, down, act, de, out, k, L, inner, t; a warp for each row
  * of each pair (grid: rows / 4, pairs) */
 __global__ void k_nm_hot_up(const gp_rec *r, const int64_t *e)
@@ -404,12 +425,12 @@ __global__ void k_nm_hot_up(const gp_rec *r, const int64_t *e)
     PDL_START();
     const int k = DI(9), L = DI(10), inner = DI(11), pr = blockIdx.y;
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    const int slot = DP(const int, 3)[DP(const int, 1)[pr]];
+    const int slot = nm_hot_key(r, e, pr);
     if (row >= inner || slot < 0) {
         return;
     }
     const size_t rb = nm_q2_rb(L);
-    const uint8_t *w = DP(const uint8_t, 4) + ((size_t)slot * inner + row) * rb;
+    const uint8_t *w = nm_hot_w(r, e, 4, pr, slot, inner, row, rb);
     float v = nm_q2_row_f(w, DP(const float, 0) + (size_t)(pr / k) * L, L);
     if (threadIdx.x % 32 == 0) {
         v = fmaxf(v, 0.f);
@@ -425,11 +446,11 @@ __global__ void k_nm_hot_down(const gp_rec *r, const int64_t *e)
     if (row >= L) {
         return;
     }
-    const int slot = DP(const int, 3)[DP(const int, 1)[pr]];
+    const int slot = nm_hot_key(r, e, pr);
     float v = 0.f;
     if (slot >= 0) {
         const size_t rb = nm_q2_rb(inner);
-        const uint8_t *w = DP(const uint8_t, 5) + ((size_t)slot * L + row) * rb;
+        const uint8_t *w = nm_hot_w(r, e, 5, pr, slot, L, row, rb);
         v = nm_q2_row_f(w, DP(const float, 6) + (size_t)pr * inner, inner) * DP(const float, 2)[pr];
     }
     if (threadIdx.x % 32 == 0) {
@@ -896,12 +917,12 @@ __global__ void k_nm_hot_up8(const gp_rec *r, const int64_t *e)
     __syncthreads();
     const int k = DI(9), L = DI(10), inner = DI(11), pr = blockIdx.y, lane = threadIdx.x % 32;
     const int row = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * NM_HR;
-    const int slot = DP(const int, 3)[DP(const int, 1)[pr]];
+    const int slot = nm_hot_key(r, e, pr);
     if (row >= inner || slot < 0) {
         return;
     }
     const size_t rb = nm_q2_rb(L);
-    const uint8_t *w = DP(const uint8_t, 4) + ((size_t)slot * inner + row) * rb;
+    const uint8_t *w = nm_hot_w(r, e, 4, pr, slot, inner, row, rb);
     const int8_t *q = DP(const int8_t, 13) + (size_t)(pr / k) * L;
     const float *s = DP(const float, 14) + (size_t)(pr / k) * (L / 32);
     const int8_t *ql = r->tag[17] != GP_T_NONE && DP(const int8_t, 17) != NULL ?
@@ -924,7 +945,7 @@ __global__ void k_nm_hot_qa(const gp_rec *r, const int64_t *e)
         return;
     }
     const int pr = (int)(b / (inner / 32));
-    if (DP(const int, 3)[DP(const int, 1)[pr]] < 0) {
+    if (nm_hot_key(r, e, pr) < 0) {
         return;
     }
     if (r->tag[18] != GP_T_NONE && DP(int8_t, 18) != NULL) {
@@ -951,10 +972,10 @@ __global__ void k_nm_hot_down8(const gp_rec *r, const int64_t *e)
     const int k = DI(9), L = DI(10), inner = DI(11), j = blockIdx.y, lane = threadIdx.x % 32, q = threadIdx.x / 32;
     const int row = blockIdx.x * NM_HR;
     const size_t rb = nm_q2_rb(inner);
-    const int pr = j * k + q, slot = DP(const int, 3)[DP(const int, 1)[pr]];
+    const int pr = j * k + q, slot = nm_hot_key(r, e, pr);
     float acc[NM_HR] = {};
     if (slot >= 0) {
-        const uint8_t *w = DP(const uint8_t, 5) + ((size_t)slot * L + row) * rb;
+        const uint8_t *w = nm_hot_w(r, e, 5, pr, slot, L, row, rb);
         const int8_t *qa = DP(const int8_t, 15) + (size_t)pr * inner;
         const float *sa = DP(const float, 16) + (size_t)pr * (inner / 32);
         const int8_t *ql = r->tag[18] != GP_T_NONE && DP(const int8_t, 18) != NULL ?
@@ -1013,9 +1034,8 @@ __device__ __forceinline__ int nm_hg_pairs(const gp_rec *r, const int64_t *e, in
     __shared__ uint32_t mk[4];
     __shared__ int before;
     const int i = threadIdx.x;
-    const int *slots = DP(const int, 3), *idx = DP(const int, 1);
-    const int sp = slots[idx[p]];
-    const int si = i < np ? slots[idx[i]] : -1;
+    const int sp = nm_hot_key(r, e, p);
+    const int si = i < np ? nm_hot_key(r, e, i) : -1;
     if (i == 0) {
         before = 0;
     }
@@ -1119,11 +1139,12 @@ __global__ void __launch_bounds__(128, NM_HGB) k_nm_hg_up(const gp_rec *r, const
     __syncthreads();
     const int8_t *ql = r->tag[17] != GP_T_NONE && DP(const int8_t, 17) != NULL ? DP(const int8_t, 17) : NULL;
     const int row = (blockIdx.x * 4 + wp) * R;
-    const int slot = DP(const int, 3)[DP(const int, 1)[blockIdx.y]];
+    const int slot = nm_hot_key(r, e, blockIdx.y);
     const size_t rb = nm_q2_rb(L);
+    const uint8_t *w = nm_hot_w(r, e, 4, blockIdx.y, slot, inner, row, rb);
     for (int m0 = 0; m0 < n; m0 += P) {
         float acc[P][R] = {};
-        nm_hg_rows<R, P>(DP(const uint8_t, 4) + ((size_t)slot * inner + row) * rb, rb, L, min(P, n - m0), xo + m0,
+        nm_hg_rows<R, P>(w, rb, L, min(P, n - m0), xo + m0,
                          DP(const int8_t, 13), ql, DP(const float, 14), lane, sg, acc);
         /* (value m R + rr in the lanes (m R + rr) 32 / (P R)) */
         float v = nm_wsum<P * R>(&acc[0][0], lane);
@@ -1155,11 +1176,12 @@ __global__ void __launch_bounds__(128, NM_HGB) k_nm_hg_down(const gp_rec *r, con
     __syncthreads();
     const int8_t *ql = r->tag[18] != GP_T_NONE && DP(const int8_t, 18) != NULL ? DP(const int8_t, 18) : NULL;
     const int row = (blockIdx.x * 4 + wp) * R;
-    const int slot = DP(const int, 3)[DP(const int, 1)[blockIdx.y]];
+    const int slot = nm_hot_key(r, e, blockIdx.y);
     const size_t rb = nm_q2_rb(inner);
+    const uint8_t *w = nm_hot_w(r, e, 5, blockIdx.y, slot, L, row, rb);
     for (int m0 = 0; m0 < n; m0 += P) {
         float acc[P][R] = {};
-        nm_hg_rows<R, P>(DP(const uint8_t, 5) + ((size_t)slot * L + row) * rb, rb, inner, min(P, n - m0), xo + m0,
+        nm_hg_rows<R, P>(w, rb, inner, min(P, n - m0), xo + m0,
                          DP(const int8_t, 15), ql, DP(const float, 16), lane, sg, acc);
         const float v = nm_wsum<P * R>(&acc[0][0], lane);
         const int m = lane / (32 / (P * R)) / R, rr = lane / (32 / (P * R)) % R;
@@ -1198,11 +1220,10 @@ __global__ void k_nm_hg_sum(const gp_rec *r, const int64_t *e)
     if (c >= L) {
         return;
     }
-    const int *slots = DP(const int, 3), *idx = DP(const int, 1) + (size_t)j * k;
     const float *de = DP(const float, 7) + (size_t)j * k * L;
     float s = 0.f;
     for (int q = 0; q < k; ++q) {
-        if (slots[idx[q]] >= 0) {
+        if (nm_hot_key(r, e, j * k + q) >= 0) {
             s += de[(size_t)q * L + c];
         }
     }

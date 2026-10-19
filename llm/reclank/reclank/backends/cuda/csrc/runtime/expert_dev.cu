@@ -401,6 +401,29 @@ static int rc_gpu_ex_nm_store_in(int layer, int count, const void *up, const voi
     return 0;
 }
 
+/* Nemotron: n experts of a layer into its slots anew (NmExpertDevice.refresh: between prompts, no
+ * job in flight): expert i's up_per and dn_per bytes from the host addresses up[i], dn[i] into slot
+ * slot[i], then the layer's slot table (experts values; its last entry stays -1). The layer keeps its
+ * count of slots. */
+static int rc_gpu_ex_nm_put_in(int layer, int n, const int32_t *slot, const int64_t *up, const int64_t *dn,
+                               size_t up_per, size_t dn_per, const int32_t *slots, int experts)
+{
+    ex_dev *x = &gg_ex;
+    if (layer < 0 || layer >= x->layers || x->gu[layer] == NULL || experts != x->experts_l[layer]) {
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        CK(cudaMemcpyAsync(x->gu[layer] + (size_t)slot[i] * up_per, (const void *)(intptr_t)up[i], up_per,
+                           cudaMemcpyHostToDevice, gg_stream));
+        CK(cudaMemcpyAsync(x->dn[layer] + (size_t)slot[i] * dn_per, (const void *)(intptr_t)dn[i], dn_per,
+                           cudaMemcpyHostToDevice, gg_stream));
+    }
+    CK(cudaMemcpyAsync(x->slots_d[layer], slots, (size_t)experts * sizeof(int32_t), cudaMemcpyHostToDevice,
+                       gg_stream));
+    CK(cudaStreamSynchronize(gg_stream));
+    return 0;
+}
+
 /* Nemotron: t tokens of k pairs each (idx: the expert of each pair, or -1 for those this GPU does
  * not run; weights w) on their latent rows h: one GP_NM_HOT_MOE record (int8 x and act in two
  * planes, as the primary's NM_HOT_MOE; t 2-8 by expert, k_nm_hg_*) */
@@ -625,6 +648,13 @@ extern "C" int rc_gpu_ex_nm_store(int layer, int count, const void *up, const vo
 {
     void *ctx = ex_enter();
     return ex_leave(ctx, rc_gpu_ex_nm_store_in(layer, count, up, dn, up_per, dn_per, inner, slots, experts));
+}
+
+extern "C" int rc_gpu_ex_nm_put(int layer, int n, const int32_t *slot, const int64_t *up, const int64_t *dn,
+                                size_t up_per, size_t dn_per, const int32_t *slots, int experts)
+{
+    void *ctx = ex_enter();
+    return ex_leave(ctx, rc_gpu_ex_nm_put_in(layer, n, slot, up, dn, up_per, dn_per, slots, experts));
 }
 
 /* er_ctx post_t (GP_NM_REMOTE_POST: a group of t tokens): a Nemotron job, or a Gemma one */

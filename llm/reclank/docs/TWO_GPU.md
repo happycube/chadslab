@@ -8,7 +8,10 @@ weights, the cache, the hot experts) and the 1070 as more room for experts.
 
 Status (branch `two-gpu`, October 2026): Gemma 4 26B, Nemotron 3.5 Bolt and
 Qwen3.6 35B-A3B run on both cards. Nemotron gains the most, about 3x. Gemma
-and Qwen gain little, because their steps are the 3060's own work.
+and Qwen gain little, because their steps are the 3060's own work. On branch
+`nm-split` (section 7) Nemotron's steps run its zero-copy experts on the
+step's kernels and its 1070 follows the conversation: decode 26.6 -> 41.2
+tok/s on the docs.
 
 ## 1. Running it
 
@@ -213,7 +216,130 @@ The drafter's draft program varies from run to run (12 to 32 ms a round,
 on either tree), so its speedup swings with it; the verify group is 75-77
 ms on both.
 
-## 7. Bugs found on the way
+## 7. Nemotron: where the second card's work goes (branch `nm-split`)
+
+A step on both cards (nsys, a 1K prompt of the docs, 39.0 ms a step): the
+3060 was busy 37.4 ms of it, the 1070 2.5 ms. 15.9 ms of the 3060's was
+`k_nm_gtile_tc`, the tiles of `NM_GROUP_MOE` on a single token. The zero
+copy itself was small: the routing profile has 4% of the pairs on no GPU.
+
+### The routing of real chats
+
+`RECLANK_NM_ROUTES=1` makes every program count each layer's choices
+(`GP_COUNT`; `NemotronGPU.route_counts()`). Four chats of two turns of 256
+tokens each (`scratch nemotron_routes.py`), the share of a step's pairs:
+
+| chat | the 3060 (34% of the experts) | the 1070 (45%) | no GPU | zero copy a step |
+|---|---|---|---|---|
+| code | 0.45-0.48 | 0.42-0.43 | 0.11-0.13 | 49-58 MB |
+| a story | 0.31 | 0.49-0.51 | 0.19 | 85-89 MB |
+| a summary of this doc | 0.55 | 0.39 | 0.06 | 27-29 MB |
+| a hash map, explained | 0.42-0.43 | 0.46 | 0.12 | 54-56 MB |
+
+The profile predicted 63% on the 3060, 33% on the 1070 and 4% on no GPU;
+the fixed sets hold less of real chats. Offline, on these counts: a 1070
+set picked by the chat's own first turn (the downtime after it, the next
+prompt not known yet) takes the second turn's no-GPU pairs from 12.5, 18.5,
+5.9 and 12.1% to 6.3, 4.6, 3.2 and 5.0%. Another chat's routing does not
+help (13.2, 18.2, 7.6, 10.5%). A pick within each layer's own count of
+slots does as well as one across layers, so the 1070's stacks keep their
+sizes; re-picking the 3060's set too adds little.
+
+### The step's kernels on the zero-copy tables
+
+`NM_GROUP_MOE`'s grid is every expert by every tile of 32 rows (240-496
+experts by 32-80 tiles): for one token, 7,680 to 35,712 blocks of 256
+threads for about 6 live experts, 100-380 us a matrix whatever the bytes.
+`NM_HOT_MOE` now takes the tables instead of slots (operand 22): each
+expert's address, a slot on the GPU or the host memory the GPU maps, and
+every pair of idx >= 0 runs (the 1070's pairs are -1). So the step's
+kernels (`k_nm_hot_up8`/`down8`: a warp on 4 rows of a pair;
+`k_nm_hg_*` for 2-8 rows) read the cold experts straight from the host.
+`RECLANK_NM_ZC_ROWS` (default 8; 0: the tiles for all).
+
+| | the tiles | the tables |
+|---|---|---|
+| both cards, decode after 1K of the docs | 26.6 | 39.3 |
+| the 3060 alone, decode after 4K of the docs | 21.9 | 24.9 |
+| both, a run of 4 rows | 56.5 ms | 45 ms |
+| both, a verify group of 8 rows | 71.8 ms | 62.4 ms |
+| the 3060's routed-expert kernels a step | 15.9 ms | 3.8 ms |
+
+The logits: KL at most 1.2e-3 from the tiles (the same products, summed in
+another order), the same argmax.
+
+### The shared expert during the wait
+
+The 3060 then waited 2.47 ms a step for the 1070 (`k_await`): a layer's
+round trip (the signal, the CPU's task, the post, the 1070's kernels, the
+copy back, the flag; about 150 us) outlasts the 3060's own experts.
+`NmEmit.moe` now returns the wait and the sum, and `compile_nemotron_step`
+emits them after the shared expert, which does not need the routed ones:
+39.3 -> 41.2 tok/s, the same logits bit for bit.
+
+### The 1070's experts by the conversation (the downtime between prompts)
+
+With an expert device the programs count the routing (`GP_COUNT`).
+`NemotronGPU.refresh_experts()` re-picks the 1070's experts of each layer
+by the routing since its last call (the routing before weighs half for
+each 128 tokens since, `RECLANK_NM_REFRESH_HALF`; the profile breaks the
+ties), copies those that come into the slots of those that leave
+(`rc_gpu_ex_nm_put`, from the pinned host stacks), and updates the CPU's
+held table and the 3060's `NM_SPLIT` tables. The server calls it when its
+job queue is empty (`ModelWorker` -> `engine.idle()`), so it runs after an
+answer is out, not before its end. `RECLANK_NM_REFRESH=0` keeps the
+profile's set.
+
+Three chats of two turns (`scratch nemotron_refresh.py`), the second turns,
+decode tok/s (the pairs no GPU holds); before the shared expert's overlap:
+
+| chat | no refresh | old routing at half a turn | at a quarter | none (only the last turn) |
+|---|---|---|---|---|
+| code | 34.3 (12.4%) | 37.9 (6.3%) | 38.0 (6.3%) | 37.9 (6.4%) |
+| a story | 30.5 (18.7%) | 36.8 (7.4%) | 36.9 (7.3%) | 38.6 (3.7%) |
+| a hash map | 34.6 (11.1%) | 36.6 (7.5%) | 37.6 (5.9%) | 37.7 (6.2%) |
+
+The decay by tokens (half a turn of 128 tokens) gives about the last
+column on full turns, without letting a short answer undo the turns before
+it. A refresh copies 400-1300 experts (0.5-1.6 GB) in 0.07-0.22 s. The
+first turn of a new topic gains nothing.
+
+Through the server (both cards, the story chat, 200 tokens a turn, with the
+shared expert's overlap): the first turn 31.2 tok/s, then the refresh in
+the idle (1390 experts, 1.79 GB, 0.24 s), the second 39.9 tok/s.
+
+### The drafter
+
+The LiLiCorr drafter, 256 tokens of the code prompt (both cards): plain
+decode 33.0 tok/s, the drafter 50.6 (verify 79 ms a round, 3.9 of 7 drafts
+taken). The tokens part from plain greedy at token 185 (at 99-120 before:
+a verify group's dense kernels are not a step's).
+
+A verify group of 8 rows (62 ms on the docs) is another balance than a
+step: the 3060 is busy 61.4 ms (the 8-row dense products 19.8, the routed
+experts 21.9 with their zero copy, `k_await` 7.9), the 1070 24.4 ms (its
+`k_nm_hg_up` 14.1, `k_nm_hg_down` 9.0: the IQ2_XXS decode is compute bound
+on Pascal). Here the 1070 limits, not the 3060.
+
+A step now (nsys, both cards, 26.2 ms under the profiler): the 3060 is
+busy 25.7 ms: the NVFP4 matrices 8.3 (`k_nv4_gemv2`), the Q8_0 ones 4.4,
+the shared experts 2.2, the routed experts 3.8 (about 3.2 of it their zero
+copy), `k_await` 1.5; the 1070 2.5 ms. A step is the 3060's dense work
+now; the 1070 has room for more experts (more memory), not more work.
+
+### Ways not taken
+
+- The 1070 reads the cold experts too (zero copy on its own link): its
+  round trip would outlast the 3060's layer in a step, and in a verify
+  group the 1070 is already the slower card.
+- The 1070 runs the shared experts: they would lengthen its round trip by
+  more than they save the 3060, which now runs them in the wait.
+- The 1070 takes dense work (half the rows of the Mamba projections): a
+  round trip for each matrix, 80 a step.
+- The cold experts split across both links (each card half the rows of
+  each): at most half the 3060's zero copy, about 1.6 ms of a step.
+
+## 8. Bugs found on the way
 
 - Nemotron ran past its cache with no check: `NM_KV` wrote the rows of a
   run past `max_len` into the next buffers on the GPU, and a later prompt's
@@ -233,18 +359,20 @@ ms on both.
   3060's `k_await` waits for a CPU task that waits for the 1070, and traps
   after 60 s.
 
-## 8. Other measurements of this work
+## 9. Other measurements of this work
 
 The 1070 with 4 GB of ballast (a 4 GB card), Gemma 26B in Maxwell mode
 (`RECLANK_GPU_CC=52`): 16K prompt 265 tok/s, decode 23.4; 32K 213 and 21.2
 (regular mode at 32K: 233 and 22.3).
 
-## 9. Open
+## 10. Open
 
 - Gemma and Qwen: the 1070 could take dense work (layers), not only experts.
 - The prompts do not use the 1070 (Gemma stages its cold experts; Nemotron
   and Qwen read them by zero copy or the CPU).
-- Nemotron's verify group: the CPU idles while the 3060 reads the cold
-  experts by zero copy; a share of them on the CPU would balance it.
+- Nemotron's verify group: the 1070's IQ2_XXS group kernels (`k_nm_hg_*`,
+  compute bound on sm_61) are its limit; the 3060 waits 7.9 ms of 62.
+- Nemotron's refresh only between prompts: one after the first 64 steps of
+  a long answer would halve the rest's zero copy (offline: 10.8 -> 5.1%).
 - nsys with two cards (a switch to start the device on the main thread).
 - Qwen's profile from more text, the prompts too.

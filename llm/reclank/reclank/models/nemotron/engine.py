@@ -191,6 +191,12 @@ class GpuRunner:
         if self.mtp is not None:
             self.mtp.pend = None
 
+    def idle(self):
+        r = self.g.refresh_experts()
+        if r is not None and r[0]:
+            print("[nemotron] the expert GPU's experts follow the text: %d new (%.2f GB) in %.2f s" % (
+                r[0], r[1] / 1e9, r[2]), file=sys.stderr, flush=True)
+
 
 class NemotronEngine(Engine):
     family = FAMILY
@@ -451,6 +457,12 @@ class NemotronEngine(Engine):
         return ThinkGuard.of(prompt_ids, self.tokenizer.t.special, eos_ids,
                              think_budget(self.think_budget, max_tokens, len(force)), force, wrap_at,
                              self.wrap_think, self.wrap_answer, self.ends_line)
+
+    def idle(self):
+        """Between requests (server/worker.py: no job waits): the runner's work of the downtime."""
+        idle = getattr(self.run, "idle", None)
+        if idle is not None:
+            idle()
 
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
         spans = list(getattr(prompt_ids, "spans", ()) or ())
