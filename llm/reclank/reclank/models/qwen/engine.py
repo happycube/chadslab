@@ -475,6 +475,12 @@ class QwenEngine(Engine):
             h0 = H[-1].copy()
         return logits, h0
 
+    def idle(self):
+        """Between requests (server/worker.py: no job waits): the expert device's experts by the
+        conversation (QwenGPU.refresh_experts)."""
+        from reclank.backends.cuda.devices import idle_refresh
+        idle_refresh(self.dev, "qwen")
+
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
         n = len(prompt_ids)
         # for a crash report: the request as it ran

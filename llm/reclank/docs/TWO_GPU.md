@@ -282,12 +282,12 @@ emits them after the shared expert, which does not need the routed ones:
 With an expert device the programs count the routing (`GP_COUNT`).
 `NemotronGPU.refresh_experts()` re-picks the 1070's experts of each layer
 by the routing since its last call (the routing before weighs half for
-each 128 tokens since, `RECLANK_NM_REFRESH_HALF`; the profile breaks the
+each 128 tokens since, `RECLANK_EXPERT_REFRESH_HALF`; the profile breaks the
 ties), copies those that come into the slots of those that leave
 (`rc_gpu_ex_nm_put`, from the pinned host stacks), and updates the CPU's
 held table and the 3060's `NM_SPLIT` tables. The server calls it when its
 job queue is empty (`ModelWorker` -> `engine.idle()`), so it runs after an
-answer is out, not before its end. `RECLANK_NM_REFRESH=0` keeps the
+answer is out, not before its end. `RECLANK_EXPERT_REFRESH=0` keeps the
 profile's set.
 
 Three chats of two turns (`scratch nemotron_refresh.py`), the second turns,
@@ -308,11 +308,47 @@ Through the server (both cards, the story chat, 200 tokens a turn, with the
 shared expert's overlap): the first turn 31.2 tok/s, then the refresh in
 the idle (1390 experts, 1.79 GB, 0.24 s), the second 39.9 tok/s.
 
+The refresh is the expert device's own now (`devices._refresh`,
+`rc_gpu_ex_put` for the three stores), so Qwen and Gemma have it too
+(`devices.refresh_hot`): their HotCache counts every selection of the
+steps, the expert device's too (`HotCache.routes`), and the prompts'
+`GP_COUNT`; the idle re-picks the expert device's experts among those the
+3060's slots do not hold or take, and `HotCache.exclude` follows.
+`RECLANK_EXPERT_REFRESH=0` turns it off for all three. Through the server,
+the same three chats of two turns (256 tokens, decode tok/s; the pairs no
+GPU held):
+
+| second turn | Qwen, no refresh | Qwen, refresh | Gemma, no refresh | Gemma, refresh |
+|---|---|---|---|---|
+| code | 52.3 (10.1%) | 52.1 (8.5%) | 72.3 (0.0%) | 72.9 (0.0%) |
+| a story | 52.1 (4.0%) | 55.3 (4.4%) | 68.7 (0.0%) | 70.4 (0.0%) |
+| a hash map | 53.9 (7.7%) | 54.3 (5.4%) | 73.1 (0.0%) | 74.2 (0.0%) |
+
+MTP on the same tree (256 tokens, `RECLANK_MTP_STOP=0.9`, tok/s):
+
+| | plain | 1 draft | 2 drafts | 3 drafts |
+|---|---|---|---|---|
+| Gemma 26B, both cards (the q4_0 assistant) | 76.5 | 84.7 | 88.3 | 85.1 |
+| Qwen3.6, both cards (its MTP layer) | 59.5 | 56.6 | 63.7 | 64.0 |
+| Qwen3.6, the 3060 alone | 61.7 | 64.7 | 63.3 | 61.7 |
+
+On a short prompt the 1070 costs Qwen a little (plain and one draft): its
+round trip outlasts the CPU's few cold experts; after 4K it gains (57.0
+against 53.5, section 6).
+
+Little for either: their 3060 slots already follow the text step by step
+(HotCache), so the 1070 holds a tail its first set covered about as well,
+and Gemma's experts fit the two cards (0.0-0.2% of the pairs on the CPU).
+Nor do they need the overlap: Qwen's shared expert is part of
+`KQ_HOT_MOE`, the GPU's part between the signal and the wait, and
+Gemma's step (`forms.py`) emits the router and the experts before the
+dense MLP.
+
 ### The drafter
 
-The LiLiCorr drafter, 256 tokens of the code prompt (both cards): plain
-decode 33.0 tok/s, the drafter 50.6 (verify 79 ms a round, 3.9 of 7 drafts
-taken). The tokens part from plain greedy at token 185 (at 99-120 before:
+The LiLiCorr drafter, 256 tokens of the code prompt (both cards; three
+runs): plain decode 33.0 tok/s, the drafter 51.7-51.9 (1.57x; draft 12.3
+ms and verify 79 ms a round, 3.9 of 7 drafts taken). The tokens part from plain greedy at token 185 (at 99-120 before:
 a verify group's dense kernels are not a step's).
 
 A verify group of 8 rows (62 ms on the docs) is another balance than a

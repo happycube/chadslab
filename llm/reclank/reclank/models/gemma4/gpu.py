@@ -1836,6 +1836,15 @@ class ModelGPU(WarmPool, ProgramLRU):
         kw["scores"] = np.empty(need, dtype=np.float32)
         return kw
 
+    def refresh_experts(self):
+        """Between prompts (the engine's idle): the expert device's experts by the conversation's
+        routing (devices.refresh_hot). Return (experts copied, bytes, seconds), or None."""
+        from reclank.backends.cuda.devices import expert_device, refresh_hot
+        st = getattr(self, "_xstate", None)
+        if st is None:
+            st = self._xstate = {}
+        return refresh_hot(expert_device(self.model), self.hot_cache, st)
+
     def step(self, tokens, pos):
         """Run a step of one token. Return the hidden state after the final
         norm, shape (1, hidden)."""

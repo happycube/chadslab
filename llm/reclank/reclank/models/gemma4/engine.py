@@ -242,6 +242,12 @@ class GemmaEngine(Engine):
                           tool=(tt["tool_open"], tt["tool_close"]), open_id=tt["open"],
                           ends_line=tt.get("ends_line"))
 
+    def idle(self):
+        """Between requests (server/worker.py: no job waits): the expert device's experts by the
+        conversation (ModelGPU.refresh_experts)."""
+        from reclank.backends.cuda.devices import idle_refresh
+        idle_refresh(getattr(self.model, "_gpu", None), "gemma")
+
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids, session=None):
         """Yield one token id at a time for a prompt. session: the
         conversation id of the client, or None (core/session.py ContextDir)."""

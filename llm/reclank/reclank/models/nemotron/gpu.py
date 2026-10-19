@@ -92,12 +92,6 @@ ZC_MIN = int(os.environ["RECLANK_NM_ZC_MIN"]) if os.environ.get("RECLANK_NM_ZC_M
 # 7680-35712 blocks for ~6 experts, 0.1-0.4 ms a matrix on the RTX 3060, 15.9 ms of a 39 ms step).
 # RECLANK_NM_ZC_ROWS=0: NM_GROUP_MOE for all.
 ZC_ROWS = int(os.environ.get("RECLANK_NM_ZC_ROWS", "8"))
-# refresh_experts (between prompts: the engine's idle): RECLANK_NM_REFRESH=0 keeps the expert device's
-# first set (the routing profile's); the routing before a call weighs half for each REFRESH_HALF tokens
-# of the new (three two-turn chats, the second turns: a half-life of a turn or more 37.1-37.5 tok/s, none
-# 38.1; a few tokens of a short answer should not undo the turns before them)
-REFRESH = os.environ.get("RECLANK_NM_REFRESH", "1") != "0"
-REFRESH_HALF = float(os.environ.get("RECLANK_NM_REFRESH_HALF", "128"))
 # Super: the time of a run of each size, s (the 3090 and the Xeon, real text, NM_PLAN's groups, 17% hot;
 # 2048 and 4096, staged, from a prompt of 8K tokens against 1024's there, their programs' making included):
 # NemotronGPU.parts picks the runs of a prompt by it (RECLANK_NM_GROUP_COST "size:s,...")
@@ -109,6 +103,11 @@ if os.environ.get("RECLANK_NM_GROUP_COST"):
 # the GPU
 PLAN_CPU = float(os.environ.get("RECLANK_NM_PLAN_CPU", "12600"))
 PLAN_GPU = float(os.environ.get("RECLANK_NM_PLAN_GPU", "300000"))
+# refresh_experts (between prompts: the engine's idle; backends/cuda/devices.py REFRESH, REFRESH_HALF):
+# RECLANK_EXPERT_REFRESH=0 keeps the expert device's first set (the routing profile's); the routing
+# before a call weighs half for each RECLANK_EXPERT_REFRESH_HALF tokens (128) of the new (three
+# two-turn chats, the second turns: a half-life of a turn or more 37.1-37.5 tok/s, none 38.1; a few
+# tokens of a short answer should not undo the turns before them)
 # the slowest link to the host for it (GB/s, measured at start): a group of 1024 tokens pulls the cold
 # experts once (~12 GB with a quarter hot), so even 0.8 GB/s (a P102-100 at x4 Gen1, ~64 tok/s) beats
 # 4-6 cores (~30 tok/s); below this the CPU takes the cold experts of a prompt
@@ -877,6 +876,7 @@ class NemotronGPU:
         # every program counts the router's choices of each layer here (GP_COUNT; route_counts() reads
         # them back): with an expert device (refresh_experts), or RECLANK_NM_ROUTES=1
         Em = max(E for E, _n, _k in cfg.moe.values())
+        from reclank.backends.cuda.devices import REFRESH
         self.routes = (np.zeros((cfg.layers, Em), np.int32) if self.xdev is not None and REFRESH
                        or os.environ.get("RECLANK_NM_ROUTES") == "1" else None)
         self._xsplit = {}
@@ -1442,12 +1442,13 @@ class NemotronGPU:
 
     def refresh_experts(self):
         """Between prompts (no run in flight): the expert device's experts anew by the routing since the
-        last call and before (half for each REFRESH_HALF tokens since; the routing profile breaks the
+        last call and before (half for each REFRESH_HALF tokens since, devices.py; the profile breaks the
         ties of the experts not chosen yet): the experts of the text at hand. A conversation's own turns
         predict its next, another's do not (three two-turn chats: the pairs of the second turns that no
         GPU holds 11-19% -> 4-6%, its decode 30.5-34.6 -> 37.7-38.6 tok/s; 400-1300 experts, 0.5-1.6
         GB in 0.07-0.22 s). Return (experts copied, bytes, seconds), or None."""
-        if self.xdev is None or self.routes is None:
+        from reclank.backends.cuda.devices import REFRESH, REFRESH_HALF
+        if self.xdev is None or self.routes is None or not REFRESH:
             return None
         now = self.route_counts()
         new = (now - self._seen).astype(np.float64)
@@ -1463,7 +1464,7 @@ class NemotronGPU:
         tokens = new.sum() / sum(k for _E, _n, k in self.cfg.moe.values())
         self._score = 0.5 ** (tokens / REFRESH_HALF) * self._score + new
         t0 = time.time()
-        n, nbytes = self.xdev.refresh(self._score)
+        n, nbytes = self.xdev.refresh({i: self._score[i] for i in self.cfg.moe})
         for i in self._xsplit:
             self._split_fill(i)
             for a in self._xsplit[i]:

@@ -36,6 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import numpy as np
 
@@ -111,6 +112,92 @@ class ErCtx(ctypes.Structure):
                 ("experts", ctypes.c_int64), ("alive", ctypes.c_int64), ("post_t", ctypes.c_void_p)]
 
 
+def _put_api(lib):
+    vp, i = ctypes.c_void_p, ctypes.c_int
+    lib.rc_gpu_ex_put.argtypes = [i, i, vp, vp, vp, vp, i]
+
+
+def _refresh(dev, score, busy):
+    """An expert device's experts anew (between prompts: no job may run): in each layer of dev.slots
+    (expert -> slot or -1), its count of slots of the best experts by score (layer: a score for each
+    expert, higher first) that busy (layer: a mask, the primary's) leaves; those that come take the
+    slots of those that leave (rc_gpu_ex_put, the parts from dev.srcs(layer, expert) of dev.pers(layer)
+    bytes). dev.held changes in place (the CPU's GP_*REMOTE_POST reads it). Return (experts copied,
+    bytes)."""
+    n = nbytes = 0
+    for li, slots in dev.slots.items():
+        E = slots.size
+        have = slots >= 0
+        sc = np.asarray(score[li][:E], np.float64) if li in score else np.zeros(E)
+        if li in busy:
+            sc = np.where(np.asarray(busy[li][:E], bool), -np.inf, sc)
+        want = np.zeros(E, bool)
+        # (the experts here first among equals: no copy for a tie)
+        want[np.lexsort((~have, -sc))[:int(have.sum())]] = True
+        come, go = np.flatnonzero(want & ~have), np.flatnonzero(have & ~want)
+        if not len(come):
+            continue
+        free = slots[go].copy()
+        slots[go] = -1
+        slots[come] = free
+        src = np.array([dev.srcs(li, int(e)) for e in come], np.int64)
+        per = np.array(dev.pers(li), np.uint64)
+        dev.check(dev.lib.rc_gpu_ex_put(li, len(come), free.ctypes.data, src.ctypes.data, per.ctypes.data,
+                                        slots.ctypes.data, E))
+        dev.held[li, :E] = want
+        n += len(come)
+        nbytes += len(come) * int(per.sum())
+    return n, nbytes
+
+
+REFRESH = os.environ.get("RECLANK_EXPERT_REFRESH", "1") != "0"
+# the routing before a refresh weighs half for each REFRESH_HALF tokens of the routing since
+REFRESH_HALF = float(os.environ.get("RECLANK_EXPERT_REFRESH_HALF", "128"))
+
+
+def refresh_hot(xdev, hc, state):
+    """Between prompts: the experts of expert device xdev anew by the routing that HotCache hc saw
+    since the last call (hc.routes: the steps' selections, the expert device's too, and the prompts'
+    GP_COUNT) and before it (half for each REFRESH_HALF tokens since; state keeps the score), among the
+    experts that hc's slots do not hold or take; then hc.exclude follows xdev.held. Return (experts
+    copied, bytes, seconds), or None."""
+    if xdev is None or hc is None or not REFRESH or not hasattr(xdev, "slots"):
+        return None
+    new = hc.routes.astype(np.float64)
+    hc.routes[:] = 0
+    if not new.any():
+        return None
+    tokens = new.sum() / (hc.top_k * new.shape[0])
+    old = state.get("score")
+    state["score"] = new if old is None else 0.5 ** (tokens / REFRESH_HALF) * old + new
+    rows = [e["layer"] for e in hc.layers]
+    score = {li: state["score"][r] for r, li in enumerate(rows)}
+    busy = {li: hc.held[r] | hc.incoming[r] for r, li in enumerate(rows)}
+    t0 = time.time()
+    n, nbytes = _refresh(xdev, score, busy)
+    if hc.exclude is not None:
+        hc.exclude[:] = xdev.held[rows].astype(bool)
+    return n, nbytes, time.time() - t0
+
+
+def idle_refresh(gpu, tag):
+    """An engine's idle (server/worker.py: no job waits): gpu.refresh_experts(), and a line of it and
+    of the steps' pairs since the last call that no GPU held (HotCache's counts)."""
+    refresh = getattr(gpu, "refresh_experts", None)
+    if refresh is None:
+        return
+    hc = getattr(gpu, "hot_cache", None)
+    cpu = "" if hc is None or not hc.pairs else "; the pairs on no GPU %.1f%%" % (100.0 * hc.cpu_pairs / hc.pairs)
+    if hc is not None:
+        hc.pairs = hc.cpu_pairs = 0
+    r = refresh()
+    if r is not None and r[0]:
+        print("[%s] the expert GPU's experts follow the text: %d new (%.2f GB) in %.2f s%s" % (
+            tag, r[0], r[1] / 1e9, r[2], cpu), file=sys.stderr, flush=True)
+    elif cpu:
+        print("[%s] %s" % (tag, cpu[2:]), file=sys.stderr, flush=True)
+
+
 class ExpertDevice:
     """A GPU of experts for the steps of model (see the module text)."""
 
@@ -132,11 +219,14 @@ class ExpertDevice:
         lib.rc_gpu_ex_store.argtypes = [i, i, vp, vp, vp, i]
         lib.rc_gpu_ex_post.argtypes = [i, i, vp, vp, vp]
         lib.rc_gpu_ex_wait.argtypes = [vp]
+        _put_api(lib)
 
         def check(rc):
             if rc != 0:
                 raise RuntimeError("expert device %s: %s" % (gpu["name"], lib.rc_gpu_last_error().decode()))
 
+        self.model, self.check = model, check
+        self.slots = {}             # layer: expert -> its slot here, or -1 (refresh)
         # the pinned buffers on the GPU's node (first touch by a thread there)
         old = os.sched_getaffinity(0)
         if gpu["numa"] >= 0 and numa.enabled():
@@ -147,6 +237,7 @@ class ExpertDevice:
             w = model._layers[0]
             gu0, dn0 = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
             gu_per, dn_per = gu0[0].nbytes, dn0[0].nbytes
+            self._per = (gu_per, 0, dn_per)
             dn_rows = dn0.shape[1]
             check(lib.rc_gpu_ex_init(L, hidden, inner, dn_rows, gu_per, dn_per))
             budget = gb * 1e9 if gb else free.value - 0.8e9
@@ -166,6 +257,7 @@ class ExpertDevice:
                 dn = np.ascontiguousarray(lw["experts.down_proj"][0][mine])
                 slots = np.full(E, -1, dtype=np.int32)
                 slots[mine] = np.arange(len(mine), dtype=np.int32)
+                self.slots[layer] = slots
                 check(lib.rc_gpu_ex_store(layer, len(mine), gu.ctypes.data, dn.ctypes.data, slots.ctypes.data, E))
         finally:
             os.sched_setaffinity(0, old)
@@ -179,6 +271,16 @@ class ExpertDevice:
         print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB) after the first %d" % (
             gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(self.held.sum()),
             self.held.sum() * (gu_per + dn_per) / 1e9, skip), file=sys.stderr, flush=True)
+
+    def srcs(self, layer, e):
+        lw = self.model._layers[layer]
+        return (lw["experts.gate_up_proj"][0][e].ctypes.data, 0, lw["experts.down_proj"][0][e].ctypes.data)
+
+    def pers(self, layer):
+        return self._per
+
+    def refresh(self, score, busy):
+        return _refresh(self, score, busy)
 
 
 class NmExpertDevice:
@@ -201,7 +303,7 @@ class NmExpertDevice:
         lib.rc_gpu_ex_open.argtypes = [i, ctypes.POINTER(sz)]
         lib.rc_gpu_ex_nm_init.argtypes = [i, i, i, i]
         lib.rc_gpu_ex_nm_store.argtypes = [i, i, vp, vp, sz, sz, i, vp, i]
-        lib.rc_gpu_ex_nm_put.argtypes = [i, i, vp, vp, vp, sz, sz, vp, i]
+        _put_api(lib)
 
         def check(rc):
             if rc != 0:
@@ -267,35 +369,21 @@ class NmExpertDevice:
             gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(held.sum()), used / 1e9,
             round(100 * self.share), round(100 * g.hot_share)), file=sys.stderr, flush=True)
 
-    def refresh(self, score):
-        """The experts here anew by score (layers x experts: higher first): in each layer, its count of
-        slots of the best experts that g does not hold; those that leave give their slots to those that
-        come (copied from the host stacks; no job may run: between prompts). held changes in place (the
-        CPU's NM_REMOTE_POST reads it). Return (experts copied, bytes)."""
-        g, n, nbytes = self.g, 0, 0
-        for li, slots in self.slots.items():
-            E = slots.size
-            have = slots >= 0
-            sc = np.where(g.hot[li][0] >= 0, -np.inf, np.asarray(score[li][:E], np.float64))
-            # (the experts here first among equals: no copy for a tie)
-            want = np.zeros(E, bool)
-            want[np.lexsort((~have, -sc))[:int(have.sum())]] = True
-            come, go = np.flatnonzero(want & ~have), np.flatnonzero(have & ~want)
-            if not len(come):
-                continue
-            free = slots[go].copy()
-            slots[go] = -1
-            slots[come] = free
-            upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
-            pu, pd = upm.data.nbytes // E, dnm.data.nbytes // E
-            ups = np.array([upm.data.ctypes.data + int(e) * pu for e in come], np.int64)
-            dns = np.array([dnm.data.ctypes.data + int(e) * pd for e in come], np.int64)
-            self.check(self.lib.rc_gpu_ex_nm_put(li, len(come), free.ctypes.data, ups.ctypes.data, dns.ctypes.data,
-                                                 pu, pd, slots.ctypes.data, E))
-            self.held[li, :E] = want
-            n += len(come)
-            nbytes += len(come) * (pu + pd)
-        return n, nbytes
+    def srcs(self, li, e):
+        upm, dnm = self.g.m.experts(li, "up"), self.g.m.experts(li, "down")
+        E = self.slots[li].size
+        return (upm.data.ctypes.data + e * (upm.data.nbytes // E), 0, dnm.data.ctypes.data + e * (dnm.data.nbytes // E))
+
+    def pers(self, li):
+        upm, dnm = self.g.m.experts(li, "up"), self.g.m.experts(li, "down")
+        E = self.slots[li].size
+        return (upm.data.nbytes // E, 0, dnm.data.nbytes // E)
+
+    def refresh(self, score, busy=None):
+        """The experts here anew by score (_refresh), among those g does not hold (its hot stacks)."""
+        if busy is None:
+            busy = {li: self.g.hot[li][0] >= 0 for li in self.slots}
+        return _refresh(self, score, busy)
 
 
 class QwenExpertDevice:
@@ -321,10 +409,14 @@ class QwenExpertDevice:
         lib.rc_gpu_ex_open.argtypes = [i, ctypes.POINTER(sz)]
         lib.rc_gpu_ex_kq_init.argtypes = [i, i, i, i]
         lib.rc_gpu_ex_kq_store.argtypes = [i, i, vp, vp, vp, sz, sz, sz, i, i, vp, i]
+        _put_api(lib)
 
         def check(rc):
             if rc != 0:
                 raise RuntimeError("expert device %s: %s" % (gpu["name"], lib.rc_gpu_last_error().decode()))
+
+        self.g, self.check = g, check
+        self.slots = {}             # layer: expert -> its slot here, or -1 (refresh)
 
         nl = max(layers) + 1
         old = os.sched_getaffinity(0)
@@ -335,7 +427,7 @@ class QwenExpertDevice:
             check(lib.rc_gpu_ex_open(gpu["cuda"], ctypes.byref(free)))
             check(lib.rc_gpu_ex_kq_init(nl, cfg.hidden_size, cfg.moe_inter, cfg.top_k))
             budget = gb * 1e9 if gb else free.value - 0.8e9
-            nbs = {li: [g._expert_nb(m) for m in g.stores[li]["mats"]] for li in layers}
+            nbs = self._nbs = {li: [g._expert_nb(m) for m in g.stores[li]["mats"]] for li in layers}
             per = {li: sum(nbs[li]) for li in layers}
             counts = getattr(g, "profile", None)
             flat = []
@@ -367,6 +459,7 @@ class QwenExpertDevice:
                     blocks.append(np.concatenate([_host_bytes(int(srcs[x]), nb) for x in mine]))
                 slots = np.full(E, -1, np.int32)
                 slots[mine] = np.arange(len(mine), dtype=np.int32)
+                self.slots[li] = slots
                 gm, _um, dm = st["mats"]
                 check(lib.rc_gpu_ex_kq_store(li, len(mine), blocks[0].ctypes.data, blocks[1].ctypes.data,
                                              blocks[2].ctypes.data, nbs[li][0], nbs[li][1], nbs[li][2],
@@ -383,6 +476,17 @@ class QwenExpertDevice:
         print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB) after the first %d" % (
             gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(held.sum()), used / 1e9, skip),
             file=sys.stderr, flush=True)
+
+    def srcs(self, li, e):
+        st = self.g.stores[li]
+        return tuple(int(self.g._expert_srcs(li, name, m, nb)[e]) for name, m, nb in
+                     zip(("gate_proj", "up_proj", "down_proj"), st["mats"], self._nbs[li]))
+
+    def pers(self, li):
+        return tuple(self._nbs[li])
+
+    def refresh(self, score, busy):
+        return _refresh(self, score, busy)
 
 
 def qwen_expert_device(g):

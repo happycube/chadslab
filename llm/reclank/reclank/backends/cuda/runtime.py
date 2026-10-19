@@ -1317,6 +1317,12 @@ class HotCache:
         self.copies = 0
         self.steps = 0
         self.cold = 0
+        # The selections since the last refresh of an expert device (devices.refresh_hot): the steps'
+        # (the expert device's experts too) and the groups' (GP_COUNT); and the pairs of the steps
+        # and of their groups, and those no GPU held (the CPU's)
+        self.routes = np.zeros(self.score.shape, dtype=np.float32)
+        self.pairs = 0
+        self.cpu_pairs = 0
         # The pool of warm experts (set_pool): None, or an ExpertPool, and
         # the rows whose experts fit its blocks
         self.pool = None
@@ -1543,6 +1549,13 @@ class HotCache:
         n = sels.shape[0]
         if n == 0 or rows.size == 0:
             return
+        ok = sels >= 0
+        R, E = rows.size, self.score.shape[1]
+        self.routes[rows] += np.bincount((np.arange(R)[None, :, None] * E + sels)[ok],
+                                         minlength=R * E).reshape(R, E)
+        on = self.held[rows] if self.exclude is None else self.held[rows] | self.exclude[rows]
+        self.pairs += int(ok.sum())
+        self.cpu_pairs += int((ok & ~np.take_along_axis(on[None], np.maximum(sels, 0), axis=2)).sum())
         if self.exclude is not None:
             sels = sels.copy()
             ex = self.exclude[rows]
@@ -1609,6 +1622,7 @@ class HotCache:
         if t > MT_CPU:
             self.last = self.counts.copy()      # for ModelGPU.plan_mix
         c = self.counts[self.count_rows].astype(np.float32)
+        self.routes += c
         self.total += self.counts[self.count_rows]
         self.run += c
         self.counts[:] = 0

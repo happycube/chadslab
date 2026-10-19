@@ -401,26 +401,39 @@ static int rc_gpu_ex_nm_store_in(int layer, int count, const void *up, const voi
     return 0;
 }
 
-/* Nemotron: n experts of a layer into its slots anew (NmExpertDevice.refresh: between prompts, no
- * job in flight): expert i's up_per and dn_per bytes from the host addresses up[i], dn[i] into slot
- * slot[i], then the layer's slot table (experts values; its last entry stays -1). The layer keeps its
- * count of slots. */
-static int rc_gpu_ex_nm_put_in(int layer, int n, const int32_t *slot, const int64_t *up, const int64_t *dn,
-                               size_t up_per, size_t dn_per, const int32_t *slots, int experts)
+/* n experts of a layer into its slots anew (an expert device's refresh, devices.py: between prompts,
+ * no job in flight): part p of expert i (p: Gemma's gate_up, Qwen's gate, Nemotron's up; Qwen's up;
+ * the down) from the host address src[3 i + p] (0: none) of per[p] bytes into slot slot[i] of the
+ * part's stack, then the layer's slot table (experts values: the device's of Qwen and Nemotron, its
+ * last entry staying -1; the host's of Gemma's posts). The layer keeps its count of slots. */
+static int rc_gpu_ex_put_in(int layer, int n, const int32_t *slot, const int64_t *src, const size_t *per,
+                            const int32_t *slots, int experts)
 {
     ex_dev *x = &gg_ex;
-    if (layer < 0 || layer >= x->layers || x->gu[layer] == NULL || experts != x->experts_l[layer]) {
+    uint8_t **stk[3] = {x->gu, x->up, x->dn};
+    if (layer < 0 || layer >= x->layers || x->gu == NULL || x->gu[layer] == NULL) {
         return -1;
     }
     for (int i = 0; i < n; ++i) {
-        CK(cudaMemcpyAsync(x->gu[layer] + (size_t)slot[i] * up_per, (const void *)(intptr_t)up[i], up_per,
-                           cudaMemcpyHostToDevice, gg_stream));
-        CK(cudaMemcpyAsync(x->dn[layer] + (size_t)slot[i] * dn_per, (const void *)(intptr_t)dn[i], dn_per,
-                           cudaMemcpyHostToDevice, gg_stream));
+        for (int p = 0; p < 3; ++p) {
+            if (per[p] == 0 || src[3 * i + p] == 0) {
+                continue;
+            }
+            if (stk[p] == NULL || stk[p][layer] == NULL) {
+                return -1;
+            }
+            CK(cudaMemcpyAsync(stk[p][layer] + (size_t)slot[i] * per[p], (const void *)(intptr_t)src[3 * i + p],
+                               per[p], cudaMemcpyHostToDevice, gg_stream));
+        }
     }
-    CK(cudaMemcpyAsync(x->slots_d[layer], slots, (size_t)experts * sizeof(int32_t), cudaMemcpyHostToDevice,
-                       gg_stream));
+    if (x->slots_d != NULL && x->slots_d[layer] != NULL) {
+        CK(cudaMemcpyAsync(x->slots_d[layer], slots, (size_t)experts * sizeof(int32_t), cudaMemcpyHostToDevice,
+                           gg_stream));
+    }
     CK(cudaStreamSynchronize(gg_stream));
+    if (x->slots != NULL && x->slots[layer] != NULL) {
+        memcpy(x->slots[layer], slots, (size_t)experts * sizeof(int32_t));
+    }
     return 0;
 }
 
@@ -650,11 +663,11 @@ extern "C" int rc_gpu_ex_nm_store(int layer, int count, const void *up, const vo
     return ex_leave(ctx, rc_gpu_ex_nm_store_in(layer, count, up, dn, up_per, dn_per, inner, slots, experts));
 }
 
-extern "C" int rc_gpu_ex_nm_put(int layer, int n, const int32_t *slot, const int64_t *up, const int64_t *dn,
-                                size_t up_per, size_t dn_per, const int32_t *slots, int experts)
+extern "C" int rc_gpu_ex_put(int layer, int n, const int32_t *slot, const int64_t *src, const size_t *per,
+                             const int32_t *slots, int experts)
 {
     void *ctx = ex_enter();
-    return ex_leave(ctx, rc_gpu_ex_nm_put_in(layer, n, slot, up, dn, up_per, dn_per, slots, experts));
+    return ex_leave(ctx, rc_gpu_ex_put_in(layer, n, slot, src, per, slots, experts));
 }
 
 /* er_ctx post_t (GP_NM_REMOTE_POST: a group of t tokens): a Nemotron job, or a Gemma one */

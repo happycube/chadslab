@@ -2310,6 +2310,15 @@ class QwenGPU(WarmPool, ProgramLRU):
 
     # ---- the runs ----
 
+    def refresh_experts(self):
+        """Between prompts (the engine's idle): the expert device's experts by the conversation's
+        routing (devices.refresh_hot). Return (experts copied, bytes, seconds), or None."""
+        from reclank.backends.cuda.devices import refresh_hot
+        st = getattr(self, "_xstate", None)
+        if st is None:
+            st = self._xstate = {}
+        return refresh_hot(getattr(self, "xdev", None), getattr(self, "hot_cache", None), st)
+
     def step(self, token, pos):
         """Run one token at position pos. logits() gives its logits."""
         self._warm_on()
