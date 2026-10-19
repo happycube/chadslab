@@ -342,5 +342,45 @@ AVX2 and the AVX-512 VNNI tiers). A thread on a 5376 x 4096 shared expert 9.3 ->
 too), 6 threads 1.65 -> 1.25 ms. Used by NM_LIN2 for 1 to 3 tokens (4 and more take the tiled form)
 and by nm_moe_few's up and down rows (a step and a group of up to 4). The step 825 -> 802 ms (AVX2;
 the IQ2 of NM_LIN2 163 -> 145, NM_MOE 159 -> 150), a group of 3 2234 -> 1980; the AVX-512 VNNI tier
-631 -> 609 and 1780 -> 1489. Not done: the NVFP4 projections (half of a step) have no rows form
-without VNNI; the tiled form at 8 tokens trails the 512-bit tiers by 12%.
+631 -> 609 and 1780 -> 1489. Not done: the tiled form at 8 tokens trails the 512-bit tiers by 12%.
+
+**The NVFP4 projections without VNNI (kq_rows_x2_nv4, kernels/kq/nmx2.c):** NM_LIN2 took the KQ_NV4
+rows (the Mamba in_proj and out_proj: half of a CPU step on the AVX2 tier) a row on a token at a time
+through kq_dot_x2: |w| and the signs on the two planes of x, two vpmaddubsw, two vpmaddwd by ones, a
+shift, the two E4M3 scales in scalars (18 cycles a block of 32 at 1.2 GHz). Now x is int16 (128 hi +
+lo) in the even then the odd values of each 32 (each thread makes it for its tokens); the codes of a
+block broadcast to both halves (the low nibbles in the low half, the high ones in the high: vpsrlvd),
+the values by vpshufb, the even and the odd bytes made int16 times 256 by a shift and an and (no
+shuffle), two vpmaddwd: the int32 lane m holds the values 4m..4m+3, the integers of kq_dot_x2; the two
+scales by broadcasts from the table and a blend, times 0.5 xs / 256 (exact: powers of two on normal
+floats; an xs under 2^-100 takes kq_dot_x2), 4 rows a pass on a token, a row on 2 or 3 tokens (the
+decode once). The same bits (the logits of 4 steps and a group of 3 on the AVX2 and the AVX-512
+tiers). A thread: in_proj 18560 x 4096 36.2 -> 12.8 ms, out_proj 4096 x 8192 15.3 -> 5.2 (5.6 cycles
+a block from the L2: the ports); 6 threads both 8.8 -> 3.1 ms, on 3 tokens 25.6 -> 6.1. The AVX2 step
+(6 threads, 1.2 GHz) 810 -> 563 ms, a group of 3 1973 -> 1213; the AVX-512 tier without VNNI (the same
+kernel) 802 -> 566 and 1940 -> 1174. At 6 threads the products
+read 20 GB/s (7 before): scaled by cores and clock, a desktop of 8 cores at 4 GHz on dual-channel
+DDR4 (35 GB/s) would be near the DRAM bound on a token with either form (not measured), so there the
+gain is mostly in the groups of 2-3 tokens (the decode and the products once for the tokens). Tried: the pairs by vpshufb (three shuffles a block, 7%
+slower), the scales of 4 blocks by a gather and vpermps (slower than the broadcasts here; gathers are
+slower still on Haswell and Zen 1-2).
+
+**The NVFP4 projections on VNNI (kq_rows_x2_nv4v, kernels/kq/nmx2.c):** after the above the AVX2 tier
+ran a step faster than the AVX-512 VNNI one (563 against 609 ms). kq_rows4_x2_vnni and kq_rows4_x2_512
+took x as two unsigned planes against the int8 values of 4 rows: three vpdpbusd (the planes and the
+ones) and the correction 16512 sum(w), and each token in its own pass over the rows (t passes from
+DRAM). Now x is int16 as above (the even and the odd values of each 64 for the 512-bit form), the
+values int16 (the even and the odd bytes sign-extended by shifts: exact, so no factor to take back),
+vpmaddwd + vpdpwssd: the same int32 lanes, signed by signed, no correction; the decode of a row once
+for 2 or 3 tokens. Each width keeps the scales, the lanes of the sums and the float order of its old
+kernel: the same bits on each tier (the logits of 4 steps and a group of 3 on the AVX-512 VNNI tier;
+a cut of the two matrices to 4064 and 8160 columns for the 256-bit form, the one of the AVX2-VNNI tier,
+here with vpdpwssd of AVX512VL). The 512-bit form takes the codes of 2 blocks by two broadcasts of 128
+bits (the second masked: no shuffle) and the nibbles by vpsrlvq; 4 rows a pass on a token, 2 on 2
+tokens, 4 on 3. The row kernels are not inlined (inlined in the caller's loop the 512-bit one ran 20%
+slower) and the full groups of 8 blocks have a fixed loop (a bound read at run time: 6% slower). On 6
+threads (in_proj + out_proj): the 512-bit form 3.97 -> 3.0 ms on a token from DRAM, 10.6 -> 4.4 on 3
+tokens (the matrices partly in the L3); the 256-bit one 8.0 -> 3.6 and 23.7 -> 8.3. The VNNI step 609 -> 563 ms, a group of 3 1494 -> 1101.
+On a token the step's NVFP4 records (117 + 48 ms on VNNI, 115 + 45 on AVX2) read about 15 GB/s on both
+tiers, below the 20-23 GB/s of the same kernels on rotating copies in a harness: the step there is no
+longer bound by the kernel's instructions (a software prefetch gave nothing).

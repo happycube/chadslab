@@ -248,6 +248,132 @@ static void kq_rows_x2_iq2(const uint8_t *w, size_t rb, int type, int cols, int 
 }
 #endif
 
+#if defined(__AVX2__)
+#define NM_NV4_XP (3 * 8192)   /* the int16 x of the tokens a thread makes (t cols at most: 48 KB) */
+
+/* x of a token as int16 (128 hi + lo: exact) for the KQ_NV4 rows forms: the even values of each span
+ * of 32 (the 256-bit forms) or 64 (the 512-bit one), then the odd ones */
+static void kq_nv4_x16(const int8_t *xh, const int8_t *xl, int cols, int span, int16_t *xp)
+{
+    for (int b = 0; b < cols / 32; ++b) {
+        const __m256i h = _mm256_loadu_si256((const __m256i *)(xh + 32 * b));
+        const __m256i l = _mm256_loadu_si256((const __m256i *)(xl + 32 * b));
+        const __m256i v0 = _mm256_add_epi16(_mm256_slli_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(h)), 7),
+                                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(l)));
+        const __m256i v1 = _mm256_add_epi16(_mm256_slli_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(h, 1)), 7),
+                                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(l, 1)));
+        /* the even values (sign-extended low halves of the int32 lanes) and the odd, packed back in order */
+        __m256i e = _mm256_packs_epi32(_mm256_srai_epi32(_mm256_slli_epi32(v0, 16), 16),
+                                       _mm256_srai_epi32(_mm256_slli_epi32(v1, 16), 16));
+        __m256i o = _mm256_packs_epi32(_mm256_srai_epi32(v0, 16), _mm256_srai_epi32(v1, 16));
+        int16_t *pe = span == 64 ? xp + 64 * (b / 2) + 16 * (b & 1) : xp + 32 * b;
+        _mm256_storeu_si256((__m256i *)pe, _mm256_permute4x64_epi64(e, _MM_SHUFFLE(3, 1, 2, 0)));
+        _mm256_storeu_si256((__m256i *)(pe + span / 2), _mm256_permute4x64_epi64(o, _MM_SHUFFLE(3, 1, 2, 0)));
+    }
+}
+#endif
+
+#if defined(__AVX2__) && !((defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__))
+/* ---------- KQ_NV4 rows on int16 x without VNNI: R rows a pass, on T tokens (kq_rows_x2_nv4) ----------
+ * kq_dot_x2 takes a row on a token 32 values at a time: |w| and the signs on the two planes of x,
+ * two vpmaddubsw, two vpmaddwd by ones, a shift, the two scales in scalars (18 cycles a block on the
+ * Xeon). Here x is int16 in the even then the odd values of each 32 (kq_nv4_x16, by each thread for
+ * its tokens); the codes broadcast to both halves, the low nibbles in the low half and the high ones
+ * in the high (vpsrlvd), the values by vpshufb, the even bytes and the odd ones made int16 times 256
+ * by a shift and an and (no shuffle), two vpmaddwd against the even and the odd x: the int32 lane m
+ * holds the values 4m..4m+3, the integers of kq_dot_x2 times 256. The two scales of a block by
+ * broadcasts from kq_e4m3_tab and a blend, times the token's 0.5 xs / 256 (the 256 taken back
+ * exactly: powers of two on normal floats, kq_nv4_fd checks xs), the fmadd into the 8 lanes, the
+ * sum, times g: the bits of kq_dot_x2. A thread on the 1.2 GHz Xeon: in_proj 18560 x 4096 36.2 ->
+ * 12.8 ms, out_proj 4096 x 8192 15.3 -> 5.2 ms. */
+
+/* the factors 0.5 xs / 256 of the blocks of a token; 0 when an xs is so small that a scale over 256
+ * would be subnormal (kq_dot_x2 then) */
+static int kq_nv4_fd(const float *xs, int cols, float *fd)
+{
+    int ok = 1;
+    for (int b = 0; b < cols / 32; ++b) {
+        fd[b] = 0.5f * xs[b] * (1.f / 256.f);
+        if (xs[b] != 0.f && fabsf(xs[b]) < 0x1p-100f) {
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* R rows (from w, rb apart) on T tokens (xp cols apart, fd cols / 32 apart): out[r + j ots] */
+#define KQ_NV4_RT(R, T)                                                                                            \
+    static __attribute__((noinline)) void kq_nv4_rt_##R##_##T(const uint8_t *w, size_t rb, int cols,             \
+                                                              const int16_t *xp, const float *fd, float *out,     \
+                                                              size_t ots)                                         \
+    {                                                                                                              \
+        const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_e2m1x2));            \
+        const __m256i m4 = _mm256_set1_epi8(15), hm = _mm256_set1_epi16((short)0xff00);                           \
+        const __m256i shv = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);                                            \
+        const int nb = cols / 32;                                                                                  \
+        __m256 acc[R][T];                                                                                          \
+        for (int r = 0; r < R; ++r)                                                                                \
+            for (int j = 0; j < T; ++j)                                                                            \
+                acc[r][j] = _mm256_setzero_ps();                                                                   \
+        for (int b = 0; b < nb; ++b) {                                                                             \
+            __m256i xe[T], xo[T];                                                                                  \
+            __m256 f[T];                                                                                           \
+            for (int j = 0; j < T; ++j) {                                                                          \
+                xe[j] = _mm256_loadu_si256((const __m256i *)(xp + (size_t)j * cols + 32 * b));                   \
+                xo[j] = _mm256_loadu_si256((const __m256i *)(xp + (size_t)j * cols + 32 * b + 16));              \
+                f[j] = _mm256_broadcast_ss(fd + (size_t)j * nb + b);                                               \
+            }                                                                                                      \
+            for (int r = 0; r < R; ++r) {                                                                          \
+                const uint8_t *wr = w + r * rb;                                                                    \
+                const __m256i q = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_nv4_codes(wr, b))); \
+                const __m256i v = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srlv_epi32(q, shv), m4));      \
+                const __m256i we = _mm256_slli_epi16(v, 8), wo = _mm256_and_si256(v, hm);                         \
+                const uint8_t *sc = kq_nv4_scales(wr, cols, b);                                                    \
+                const __m256 e = _mm256_blend_ps(_mm256_broadcast_ss(kq_e4m3_tab + sc[0]),                        \
+                                                 _mm256_broadcast_ss(kq_e4m3_tab + sc[1]), 0xf0);                 \
+                for (int j = 0; j < T; ++j) {                                                                      \
+                    const __m256i n = _mm256_add_epi32(_mm256_madd_epi16(we, xe[j]), _mm256_madd_epi16(wo, xo[j])); \
+                    acc[r][j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(n), _mm256_mul_ps(e, f[j]), acc[r][j]);        \
+                }                                                                                                  \
+            }                                                                                                      \
+        }                                                                                                          \
+        for (int r = 0; r < R; ++r) {                                                                              \
+            const float g = kq_nv4_g(w + r * rb, cols);                                                            \
+            for (int j = 0; j < T; ++j)                                                                            \
+                out[r + j * ots] = kq_x2_hsum(acc[r][j]) * g;                                                      \
+        }                                                                                                          \
+    }
+KQ_NV4_RT(4, 1)
+KQ_NV4_RT(1, 1)
+KQ_NV4_RT(1, 2)
+KQ_NV4_RT(1, 3)
+#undef KQ_NV4_RT
+
+/* nr rows of KQ_NV4 on t tokens (1 to 3) of x by kq_nv4_x16 and kq_nv4_fd: out[r + j ots], each the bits
+ * of kq_dot_x2 */
+static void kq_rows_x2_nv4(const uint8_t *w, size_t rb, int cols, int nr, const int16_t *xp, const float *fd,
+                           int t, float *out, size_t ots)
+{
+    int r = 0;
+    if (t == 1) {
+        for (; r + 4 <= nr; r += 4) {
+            kq_nv4_rt_4_1(w + r * rb, rb, cols, xp, fd, out + r, ots);
+        }
+        for (; r < nr; ++r) {
+            kq_nv4_rt_1_1(w + r * rb, rb, cols, xp, fd, out + r, ots);
+        }
+    } else if (t == 2) {
+        for (; r < nr; ++r) {
+            kq_nv4_rt_1_2(w + r * rb, rb, cols, xp, fd, out + r, ots);
+        }
+    } else {
+        for (; r < nr; ++r) {
+            kq_nv4_rt_1_3(w + r * rb, rb, cols, xp, fd, out + r, ots);
+        }
+    }
+}
+#endif
+
 #if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
 #define NM_X2_VNNI 1
 /* 4 rows of KQ_NV4 or Q8_0 against x as two planes on VNNI: the planes made unsigned once (hu = hi +
@@ -371,6 +497,217 @@ static void kq_rows4_x2_512(const uint8_t *w, size_t rb, int type, int cols, con
     }
     for (int r = 0; r < nr; ++r) {
         out[r] = _mm512_reduce_add_ps(acc[r]);
+    }
+}
+#endif
+
+#if defined(NM_X2_VNNI)
+/* ---------- KQ_NV4 rows on int16 x on VNNI: R rows a pass, on T tokens (kq_rows_x2_nv4v) ----------
+ * kq_rows4_x2_vnni and kq_rows4_x2_512 take x as two unsigned planes against the int8 values of 4
+ * rows: three vpdpbusd (the planes and the ones), the correction 16512 sum(w), and each token in its
+ * own pass over the rows (t passes from DRAM). Here x is int16 (kq_nv4_x16), the values int16 (the
+ * even bytes and the odd ones sign-extended by shifts), vpmaddwd + vpdpwssd: the same int32 lanes
+ * (signed by signed: no correction); the decode of a row once for 2 or 3 tokens. The scales, the
+ * lanes of the sums and their float order those of the old kernel of each width: the same bits on
+ * each tier. The 512-bit form: the codes of 2 blocks by two broadcasts of 128 bits (the second
+ * masked: no shuffle), the nibbles by vpsrlvq. in_proj 18560 x 4096 + out_proj 4096 x 8192 on 6
+ * threads of the 1.2 GHz Xeon: the 512-bit form 3.97 -> 3.0 ms on a token (from DRAM), 10.6 -> 4.4 on
+ * 3 (partly in the L3); the 256-bit one (vpdpwssd of AVX512VL here) 8.0 -> 3.6 and 23.7 -> 8.3. */
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define KQ_DPWSSD256(a, w, x) _mm256_dpwssd_epi32(a, w, x)
+#else
+#define KQ_DPWSSD256(a, w, x) _mm256_dpwssd_avx_epi32(a, w, x)
+#endif
+
+/* kq_rows4_x2_vnni's bits: R rows (from w, rb apart) on T tokens (xp cols apart, the span 32; xs cols /
+ * 32 apart): out[r + j ots] */
+#define KQ_NV4V_RT(R, T)                                                                                           \
+    static __attribute__((noinline)) void kq_nv4v_rt_##R##_##T(const uint8_t *w, size_t rb, int cols,            \
+                                                               const int16_t *xp, const float *xs, float *out,    \
+                                                               size_t ots)                                        \
+    {                                                                                                              \
+        const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_e2m1x2));            \
+        const __m256i m4 = _mm256_set1_epi8(15);                                                                   \
+        const __m256i shv = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);                                            \
+        const int nb = cols / 32;                                                                                  \
+        __m256 acc[R][T], gv[R];                                                                                   \
+        for (int r = 0; r < R; ++r) {                                                                              \
+            gv[r] = _mm256_set1_ps(kq_nv4_g(w + r * rb, cols));                                                    \
+            for (int j = 0; j < T; ++j)                                                                            \
+                acc[r][j] = _mm256_setzero_ps();                                                                   \
+        }                                                                                                          \
+        for (int b = 0; b < nb; ++b) {                                                                             \
+            __m256i xe[T], xo[T];                                                                                  \
+            __m256 hx[T];                                                                                          \
+            for (int j = 0; j < T; ++j) {                                                                          \
+                xe[j] = _mm256_loadu_si256((const __m256i *)(xp + (size_t)j * cols + 32 * b));                   \
+                xo[j] = _mm256_loadu_si256((const __m256i *)(xp + (size_t)j * cols + 32 * b + 16));              \
+                hx[j] = _mm256_set1_ps(0.5f * xs[(size_t)j * nb + b]);                                             \
+            }                                                                                                      \
+            for (int r = 0; r < R; ++r) {                                                                          \
+                const uint8_t *wr = w + r * rb;                                                                    \
+                const __m256i q = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_nv4_codes(wr, b))); \
+                const __m256i v = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srlv_epi32(q, shv), m4));      \
+                const __m256i we = _mm256_srai_epi16(_mm256_slli_epi16(v, 8), 8), wo = _mm256_srai_epi16(v, 8);   \
+                const uint8_t *sc = kq_nv4_scales(wr, cols, b);                                                    \
+                const __m256 e = _mm256_blend_ps(_mm256_broadcast_ss(kq_e4m3_tab + sc[0]),                        \
+                                                 _mm256_broadcast_ss(kq_e4m3_tab + sc[1]), 0xf0);                 \
+                for (int j = 0; j < T; ++j) {                                                                      \
+                    /* the scale of kq_rows4_x2_vnni: (0.5 xs g) e */                                              \
+                    const __m256i n = KQ_DPWSSD256(_mm256_madd_epi16(we, xe[j]), wo, xo[j]);                       \
+                    acc[r][j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(n), _mm256_mul_ps(_mm256_mul_ps(hx[j], gv[r]), e), \
+                                                acc[r][j]);                                                        \
+                }                                                                                                  \
+            }                                                                                                      \
+        }                                                                                                          \
+        for (int r = 0; r < R; ++r)                                                                                \
+            for (int j = 0; j < T; ++j)                                                                            \
+                out[r + j * ots] = kq_x2_hsum(acc[r][j]);                                                          \
+    }
+KQ_NV4V_RT(4, 1)
+KQ_NV4V_RT(1, 1)
+KQ_NV4V_RT(1, 2)
+KQ_NV4V_RT(1, 3)
+#undef KQ_NV4V_RT
+
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+/* a group of up to 8 blocks from b8 (nq of them, even) for KQ_NV4Z_RT */
+#define KQ_NV4Z_GROUP(R, T, b8, nq)                                                                                \
+    {                                                                                                              \
+        __m512 xsv[T];                                                                                             \
+        for (int j = 0; j < T; ++j)                                                                                \
+            xsv[j] = _mm512_permutexvar_ps(two, _mm512_castps256_ps512(_mm256_loadu_ps(xs + (size_t)j * nbt + (b8)))); \
+        for (int r = 0; r < R; ++r) {                                                                              \
+            const __m512i ix = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)kq_nv4_scales(w + r * rb, cols, b8))); \
+            const __m512 e = _mm512_i32gather_ps(ix, kq_e4m3_tab, 4);                                             \
+            for (int j = 0; j < T; ++j)                                                                            \
+                scl[r][j] = _mm512_mul_ps(_mm512_mul_ps(e, xsv[j]), _mm512_set1_ps(g[r]));                         \
+        }                                                                                                          \
+        for (int q = 0; q < (nq); q += 2) {                                                                        \
+            const int b = (b8) + q;                                                                                \
+            __m512i xe[T], xo[T];                                                                                  \
+            for (int j = 0; j < T; ++j) {                                                                          \
+                xe[j] = _mm512_loadu_si512((const void *)(xp + (size_t)j * cols + 32 * b));                       \
+                xo[j] = _mm512_loadu_si512((const void *)(xp + (size_t)j * cols + 32 * b + 32));                  \
+            }                                                                                                      \
+            for (int r = 0; r < R; ++r) {                                                                          \
+                const uint8_t *wr = w + r * rb;                                                                    \
+                __m512i z = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_nv4_codes(wr, b)));        \
+                z = _mm512_mask_broadcast_i32x4(z, 0xff00, _mm_loadu_si128((const __m128i *)kq_nv4_codes(wr, b + 1))); \
+                /* [A lo, A hi, B lo, B hi]: the values of blocks b, b + 1 in order */                             \
+                const __m512i v = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srlv_epi64(z, shv), m4));      \
+                const __m512i we = _mm512_srai_epi16(_mm512_slli_epi16(v, 8), 8), wo = _mm512_srai_epi16(v, 8);   \
+                for (int j = 0; j < T; ++j) {                                                                      \
+                    const __m512i n = _mm512_dpwssd_epi32(_mm512_madd_epi16(we, xe[j]), wo, xo[j]);                \
+                    acc[r][j] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(n), _mm512_permutexvar_ps(sp[q / 2], scl[r][j]), \
+                                                acc[r][j]);                                                        \
+                }                                                                                                  \
+            }                                                                                                      \
+        }                                                                                                          \
+    }
+
+/* kq_rows4_x2_512's bits (cols a multiple of 64): R rows on T tokens (xp the span 64): out[r + j ots]
+ * (not inlined: in the caller's loop it ran 20% slower) */
+#define KQ_NV4Z_RT(R, T)                                                                                           \
+    static __attribute__((noinline)) void kq_nv4z_rt_##R##_##T(const uint8_t *w, size_t rb, int cols,            \
+                                                               const int16_t *xp, const float *xs, float *out,    \
+                                                               size_t ots)                                        \
+    {                                                                                                              \
+        const __m512i lut = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kq_e2m1x2));                 \
+        const __m512i m4 = _mm512_set1_epi8(15);                                                                   \
+        const __m512i shv = _mm512_setr_epi64(0, 0, 4, 4, 0, 0, 4, 4);                                            \
+        const __m512i sp[4] = {                                                                                    \
+            _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0),                                      \
+            _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4),                                      \
+            _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8),                              \
+            _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12)};                     \
+        const __m512i two = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);                      \
+        const int nbt = cols / 32;                                                                                 \
+        __m512 acc[R][T], scl[R][T];                                                                               \
+        float g[R];                                                                                                \
+        for (int r = 0; r < R; ++r) {                                                                              \
+            g[r] = 0.5f * kq_nv4_g(w + r * rb, cols);                                                              \
+            for (int j = 0; j < T; ++j)                                                                            \
+                acc[r][j] = _mm512_setzero_ps();                                                                   \
+        }                                                                                                          \
+        int b8 = 0;                                                                                                \
+        for (; b8 + 8 <= nbt; b8 += 8)                                                                             \
+            KQ_NV4Z_GROUP(R, T, b8, 8)                                                                             \
+        if (b8 < nbt)                                                                                              \
+            KQ_NV4Z_GROUP(R, T, b8, nbt - b8)                         /* (even: cols % 64 == 0) */                 \
+        for (int r = 0; r < R; ++r)                                                                                \
+            for (int j = 0; j < T; ++j)                                                                            \
+                out[r + j * ots] = _mm512_reduce_add_ps(acc[r][j]);                                                \
+    }
+KQ_NV4Z_RT(4, 1)
+KQ_NV4Z_RT(1, 1)
+KQ_NV4Z_RT(2, 2)
+KQ_NV4Z_RT(1, 2)
+KQ_NV4Z_RT(4, 3)
+KQ_NV4Z_RT(1, 3)
+#undef KQ_NV4Z_RT
+#undef KQ_NV4Z_GROUP
+#endif
+
+/* the span of kq_nv4_x16 for kq_rows_x2_nv4v */
+static inline int kq_nv4v_span(int cols)
+{
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    return cols % 64 == 0 ? 64 : 32;
+#else
+    (void)cols;
+    return 32;
+#endif
+}
+
+/* nr rows of KQ_NV4 on t tokens (1 to 3) of x by kq_nv4_x16 (kq_nv4v_span): out[r + j ots], each the bits
+ * of the old kernel of its width */
+static void kq_rows_x2_nv4v(const uint8_t *w, size_t rb, int cols, int nr, const int16_t *xp, const float *xs,
+                            int t, float *out, size_t ots)
+{
+    int r = 0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    if (cols % 64 == 0) {
+        if (t == 1) {
+            for (; r + 4 <= nr; r += 4) {
+                kq_nv4z_rt_4_1(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+            for (; r < nr; ++r) {
+                kq_nv4z_rt_1_1(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+        } else if (t == 2) {
+            for (; r + 2 <= nr; r += 2) {
+                kq_nv4z_rt_2_2(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+            for (; r < nr; ++r) {
+                kq_nv4z_rt_1_2(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+        } else {
+            for (; r + 4 <= nr; r += 4) {
+                kq_nv4z_rt_4_3(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+            for (; r < nr; ++r) {
+                kq_nv4z_rt_1_3(w + r * rb, rb, cols, xp, xs, out + r, ots);
+            }
+        }
+        return;
+    }
+#endif
+    if (t == 1) {
+        for (; r + 4 <= nr; r += 4) {
+            kq_nv4v_rt_4_1(w + r * rb, rb, cols, xp, xs, out + r, ots);
+        }
+        for (; r < nr; ++r) {
+            kq_nv4v_rt_1_1(w + r * rb, rb, cols, xp, xs, out + r, ots);
+        }
+    } else if (t == 2) {
+        for (; r < nr; ++r) {
+            kq_nv4v_rt_1_2(w + r * rb, rb, cols, xp, xs, out + r, ots);
+        }
+    } else {
+        for (; r < nr; ++r) {
+            kq_nv4v_rt_1_3(w + r * rb, rb, cols, xp, xs, out + r, ots);
+        }
     }
 }
 #endif
@@ -784,6 +1121,20 @@ static void nm_lin2_body(const int8_t *xh, const int8_t *xl, const float *xs, co
     }
 #endif
 #if defined(NM_X2_VNNI)
+    if (type == KQ_NV4 && t <= 3 && t * cols <= NM_NV4_XP && cols % 32 == 0) {
+        /* each thread makes the int16 x of the tokens, then the rows in tasks of 16 (kq_rows_x2_nv4v) */
+        int16_t xp[NM_NV4_XP] __attribute__((aligned(64)));
+        const int span = kq_nv4v_span(cols);
+        for (int j = 0; j < t; ++j) {
+            kq_nv4_x16(xh + (size_t)j * cols, xl + (size_t)j * cols, cols, span, xp + (size_t)j * cols);
+        }
+        #pragma omp for schedule(dynamic, 4)
+        for (int r0 = 0; r0 < rows; r0 += 16) {
+            int nr = r0 + 16 < rows ? 16 : rows - r0;
+            kq_rows_x2_nv4v(w + (size_t)r0 * rb, rb, cols, nr, xp, xs, t, out + r0, (size_t)rows);
+        }
+        return;
+    }
     if ((type == KQ_NV4 || type == KQ_Q8_0) && cols <= 16384) {
         /* each thread makes the unsigned planes of a token once, then its share of the groups of 4
          * rows (static: contiguous rows a thread, as kq_linear_body) */
@@ -822,6 +1173,27 @@ static void nm_lin2_body(const int8_t *xh, const int8_t *xl, const float *xs, co
             kq_rows_x2_iq2(w + (size_t)r0 * rb, rb, type, cols, nr, xh, xl, xs, t, out + r0, 1, (size_t)rows);
         }
         return;
+    }
+#endif
+#if defined(__AVX2__) && !defined(NM_X2_VNNI)
+    if (type == KQ_NV4 && t <= 3 && t * cols <= NM_NV4_XP && cols % 32 == 0) {
+        /* each thread makes the int16 x of the tokens (the same in all: the same ok), then the rows
+         * in tasks of 16 (kq_rows_x2_nv4) */
+        int16_t xp[NM_NV4_XP] __attribute__((aligned(32)));
+        float fd[NM_NV4_XP / 32];
+        int ok = 1;
+        for (int j = 0; j < t; ++j) {
+            kq_nv4_x16(xh + (size_t)j * cols, xl + (size_t)j * cols, cols, 32, xp + (size_t)j * cols);
+            ok &= kq_nv4_fd(xs + (size_t)j * (cols / 32), cols, fd + (size_t)j * (cols / 32));
+        }
+        if (ok) {
+            #pragma omp for schedule(dynamic, 4)
+            for (int r0 = 0; r0 < rows; r0 += 16) {
+                int nr = r0 + 16 < rows ? 16 : rows - r0;
+                kq_rows_x2_nv4(w + (size_t)r0 * rb, rb, cols, nr, xp, fd, t, out + r0, (size_t)rows);
+            }
+            return;
+        }
     }
 #endif
     #pragma omp for schedule(dynamic, 4)
