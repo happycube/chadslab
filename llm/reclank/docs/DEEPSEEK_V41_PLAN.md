@@ -1129,3 +1129,19 @@ groups of 2 to 8 against plain steps: the same bits. A step 37.1 -> 36.6 ms; pro
 (warm), the prompt of 5018 tokens 12.93 -> 12.48 s; verify groups within their noise; DSpark the
 same tokens (1.13x, 1.01x, 1.28x). RECLANK_DS_HC_STEP=0: the records of before (2: the CPU's sums
 with the three records, a check).
+**A race of the CPU tasks (the server's crash, a general protection fault in gp_step):** a step's
+GP_AWAIT does not wait for a CPU task with no cold expert (the count 0), so the GPU can reach the
+next layer's signal while the runner still starts that task (late: a busy runner), and the signal's
+copies changed the task's inputs under it: hp, vp and ip are one set for all the layers of a
+program. Threads of the parts read the count at different times, the scratch laid out for each
+one's count and pair_of read past what the sort wrote (the float64 sums of flag 2048: a wild
+address). Fixed at the source: GP_SIGNAL's operand 11, the flag out of the task that last read
+those arrays, which the signal waits for (signal_wait: done long before, one read of the flag; a
+step 44.4 ms with it and without at the same clocks); DeepSeek's steps and Nemotron's tasks
+(d.bufs, its AWAIT skips at any size) pass it; Qwen and Gemma give each layer its own arrays.
+Hardened: the parts lay out the scratch for k0, the first thread of a part reads the count once
+(the others after A's barrier), each id is read once and checked (moe_sort_pairs, the small body,
+the parts), the positions bounded in the sums; kq_moe_body clamps the count, GP_MOE_N reads it once
+(copyprivate) and bounds its search, the remote posts check the ids. RECLANK_CPU_TASK_DELAY_US
+(the runner late by that much before each task) with the chain: the same bits (a prompt of 1024
+and 12 steps); the verify rows against the steps the same bits.

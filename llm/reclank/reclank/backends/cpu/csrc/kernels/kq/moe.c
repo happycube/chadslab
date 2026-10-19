@@ -207,8 +207,11 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
 #endif
     if (kcount != NULL) {
         /* One token with a count of experts in memory: the cold experts of a
-         * GPU step (GP_HOT_SPLIT writes the count). */
-        k = *kcount;
+         * GPU step (GP_HOT_SPLIT writes the count). Read once, and at most the
+         * k of the record (the scratch is for that many: pinned memory that
+         * the GPU writes) */
+        int kc = *(const volatile int32_t *)kcount;
+        k = kc < 0 ? 0 : kc < k ? kc : k;
     }
     if (kq_e3_bits((int)mats[1])) {
         /* the MUL1 experts of an EXL3 model (kernels/kq/exl3_moe.c) */

@@ -57,7 +57,7 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.INT4_LINEAR_MT: (2,), P.INT4_MULTI4_MT: (4, 8, 12, 16),
         P.RMS_NORM_MULTI4: (6, 10, 14, 18), P.GELU_MUL_INT4: (5,),
         P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,),
-        P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
+        P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9, 11), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
         P.CPU_TASK: (0, 1, 2), P.MOE_COMBINE: (5,),     # (MOE_COMBINE: the rows of the CPU, pinned)
         P.DS_COMBINE: (3,), P.DS_EMBED: (0,),     # (DS_EMBED: the table in pinned host memory)
         P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,)}  # (the CPU's sums of its experts, pinned)
@@ -1242,6 +1242,10 @@ class HotCache:
     At most max_ins experts change in each step. RECLANK_GPU_HOT_DECAY and
     RECLANK_GPU_HOT_INS change decay and max_ins. See SPLIT_PLAN.md.
     """
+
+    # (rows x experts) bool, or None: the experts an expert device holds (set in __init__ and by
+    # devices.py; here too for the caches made without __init__, as scripts/check_hotcache.py does)
+    exclude = None
 
     def __init__(self, dev, decay=None, max_ins=None, layers=None, top_k=None):
         """layers (or None for a ModelGPU) gives one dict for each layer

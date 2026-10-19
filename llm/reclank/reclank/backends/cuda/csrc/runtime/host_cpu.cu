@@ -1,4 +1,5 @@
 /* ---------- the host side ---------- */
+#include <unistd.h>  /* (usleep: RECLANK_CPU_TASK_DELAY_US) */
 
 /* The runner of a CPU program: gemma_run of the CPU library. Python gives its
  * address with rc_gpu_set_cpu_runner. */
@@ -97,6 +98,31 @@ __device__ __forceinline__ void block_copy4(void *dst, const void *src, size_t n
     }
 }
 
+/* GP_SIGNAL's operand 11 (or none): the flag out of the CPU task that last read the pinned arrays
+ * this signal writes. An AWAIT with a count of 0 does not wait for its task, so the GPU can reach the
+ * next signal while the runner still runs that task (late: the runner was busy); the copies would
+ * then change its input under it (its count, its experts: a CPU program read past its arrays, a
+ * general protection fault in gp_step). The signal waits for that task first (it is done long
+ * before, but for that case: one read of the flag). */
+__device__ __forceinline__ void signal_wait(const gp_rec *r, const int64_t *e)
+{
+    if (r->tag[11] == GP_T_NONE || di(r, e, 11) == 0) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        volatile int64_t *prev = DP(volatile int64_t, 11);
+        int64_t v = di(r, e, 1);
+        uint64_t t0 = rc_globaltimer();
+        while (*prev < v) {
+            rc_nanosleep(256);
+            if (rc_globaltimer() - t0 > 60ull * 1000000000ull) {
+                __trap();           /* the task before never ended in 60 s: an error, not a hang */
+            }
+        }
+    }
+    __syncthreads();
+}
+
 __device__ void signal_body(const gp_rec *r, const int64_t *e, int k0 = 0)
 {
     for (int k = k0; k < 3; ++k) {
@@ -115,6 +141,7 @@ __device__ void signal_body(const gp_rec *r, const int64_t *e, int k0 = 0)
 __global__ void k_signal(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
+    signal_wait(r, e);
     signal_body(r, e);
 }
 
@@ -128,6 +155,7 @@ __global__ void __launch_bounds__(256) k_ds_route_signal(const gp_rec *r, const 
     /* the input rows (copy 0: x of the experts, ready before the router) go first, their writes over
      * PCIe in flight while the router and the split run; the copies of the split's outputs after */
     const gp_rec *r0 = r;
+    signal_wait(rg, e);
     {
         const gp_rec *r = rg;
         if (di(r, e, 2) != 0) {
@@ -293,6 +321,19 @@ static int gg_cpu_task(const gp_rec *r, const int64_t *henv)
         }
     }
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    {
+        /* RECLANK_CPU_TASK_DELAY_US: the runner late by that much before each task (a test of the
+         * order of the signals: the GPU then reaches the next signal first after an AWAIT that does
+         * not wait, and signal_wait must keep that task's input) */
+        static int delay = -1;
+        if (delay < 0) {
+            const char *dv = getenv("RECLANK_CPU_TASK_DELAY_US");
+            delay = dv ? atoi(dv) : 0;
+        }
+        if (delay > 0) {
+            usleep((useconds_t)delay);
+        }
+    }
     double t1 = gg_clock();
     if (gg_lane_b) {
         gg_lb_prog = (const int64_t *)(intptr_t)r->v[0];

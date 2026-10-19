@@ -116,13 +116,16 @@ static void kq_moe_small_body(const int32_t *ids, const float *val, int t, int k
             }
         }
         double sb1 = mprof ? omp_get_wtime() : 0.0;
-        /* moe_sort_pairs */
+        /* moe_sort_pairs (each id read once and checked; pair_of holds them between the passes) */
         for (int e = 0; e <= ne; ++e) {
             cnt[e] = 0;
         }
         for (int q = 0; q < t * k; ++q) {
-            if (ids[q] >= 0) {
-                cnt[ids[q]]++;
+            int e = ids[q];
+            e = e >= 0 && e < experts ? e : -1;
+            pair_of[q] = e;
+            if (e >= 0) {
+                cnt[e]++;
             }
         }
         if (shared) {
@@ -150,7 +153,7 @@ static void kq_moe_small_body(const int32_t *ids, const float *val, int t, int k
         }
         nused_p[2] = nused_p[3] = nused_p[4] = nused_p[5] = nused_p[7] = nused_p[8] = 0;
         for (int q = 0; q < t * k; ++q) {
-            int e = ids[q];
+            int e = pair_of[q];
             if (e < 0) {
                 pair_of[q] = -1;
                 continue;

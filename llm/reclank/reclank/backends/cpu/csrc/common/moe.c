@@ -14,7 +14,11 @@
  * each sorted pair; pair_of gives the sorted pair of each slot (j * k + s,
  * then t * k + j for the shared expert). *nused gets the count of used.
  * start[ne] gets the count of pairs. A negative id is no expert (an expert
- * of a GPU step that the GPU computes): its pair_of is -1. */
+ * of a GPU step that the GPU computes): its pair_of is -1. Each id is read
+ * once, and one outside 0 .. experts - 1 is no expert too (the ids are in
+ * pinned memory that the GPU writes: a second read could differ, and a count
+ * or a position past the arrays would follow); pair_of holds the checked ids
+ * between the two passes. */
 static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int shared, int *cnt,
                            int *start, int *used, int *pair_tok, int *pair_of, int *nused)
 {
@@ -25,8 +29,11 @@ static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int sh
             cnt[e] = 0;
         }
         for (int q = 0; q < t * k; ++q) {
-            if (ids[q] >= 0) {
-                cnt[ids[q]]++;
+            int e = ids[q];
+            e = e >= 0 && e < experts ? e : -1;
+            pair_of[q] = e;
+            if (e >= 0) {
+                cnt[e]++;
             }
         }
         if (shared) {
@@ -43,7 +50,7 @@ static void moe_sort_pairs(const int32_t *ids, int t, int k, int experts, int sh
         }
         start[ne] = a;
         for (int q = 0; q < t * k; ++q) {
-            int e = ids[q];
+            int e = pair_of[q];
             if (e < 0) {
                 pair_of[q] = -1;
                 continue;

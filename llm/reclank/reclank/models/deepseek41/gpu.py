@@ -55,6 +55,9 @@ GROUP = int(os.environ.get("RECLANK_DS_GROUP", "2048"))
 # programs give the logits of every row and keep what restore undoes; their
 # rows have the bits of a step (the attention splits its keys up to here)
 VERIFY_MAX = 8
+# RECLANK_DS_SIGNAL_CHAIN=0: a step's signals do not wait for the task before (signal_wait; a test:
+# with RECLANK_CPU_TASK_DELAY_US the inputs of a task with no cold expert then change under it)
+SIGNAL_CHAIN = os.environ.get("RECLANK_DS_SIGNAL_CHAIN", "1") != "0"
 # the groups of a prompt: the largest multiple of GROUP_STEP tokens up to the
 # group, below it the powers of two (each group reads every cold expert
 # again: the prompt of 1414 tokens in 1408 + 4 + 2 in place of 1024 + 256 +
@@ -595,6 +598,10 @@ class DSV41GPU:
             own.append(np.zeros(t, np.int32))
             hcs_cnt = own[-1]
         pend_f, pend_a = {}, {}       # lane -> the layer whose FFN / attention post waits for the next record
+        # lane -> the flags of its last CPU task: a step's GP_AWAIT does not wait for a task with no
+        # cold expert, so the next signal waits for it before it writes the pinned inputs that task
+        # reads (hp, vp, ip are one set for all the layers: GP_SIGNAL operand 11, signal_wait)
+        last_task = {}
         hq = dict(qh=z(t, dim, dtype=np.int8), ql=z(t, dim, dtype=np.int8), xs=z(t, dim // 32),
                   act=z(t * k, 2 * I), act2=z(t * k, I), aqh=z(t * k, I, dtype=np.int8),
                   aql=z(t * k, I, dtype=np.int8), axs=z(t * k, I // 32), de=z(t * k, dim))
@@ -832,7 +839,10 @@ class DSV41GPU:
             fl[:] = 0
             prog.keep.append(fl)
             hpl, vpl = S(hp), S(vp, k)
-            prog.emit(P.SIGNAL, fl[0:1], seq, S(xa), hpl, hpl.nbytes, cold_val, vpl, vpl.nbytes, cold, ipl, ipl.nbytes)
+            prev = last_task.get(j) if t == 1 and SIGNAL_CHAIN else None     # (t > 1: GP_AWAIT always waits)
+            last_task[j] = fl
+            prog.emit(P.SIGNAL, fl[0:1], seq, S(xa), hpl, hpl.nbytes, cold_val, vpl, vpl.nbytes, cold, ipl, ipl.nbytes,
+                      prev[1:2] if prev is not None else None)
             if local:
                 ffn_local(j, i)
             if hcs:

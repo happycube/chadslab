@@ -276,7 +276,13 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         return;
     }
     const int part = tid / team, lt = tid % team;
-    const int k = kcount != NULL ? *kcount : k0;    /* the cold experts of one token (GP_HOT_SPLIT) */
+    /* k: the pairs of a token, k0 or (kcount: a step's cold experts, GP_HOT_SPLIT) the count in pinned
+     * memory that the GPU writes. The first thread of the part reads it once (phase A) and the others
+     * take that value after A's barrier (nused_p[1]): two reads could differ (the GPU's next signal,
+     * an AWAIT that did not wait), and threads with other counts read pair_of past what the sort
+     * wrote (a general protection fault in gp_step). The scratch is laid out for k0 (the size of
+     * rc_kq_moe_part_scratch), so every thread places the arrays alike whatever the count. */
+    int k = k0;
     const int a0 = gu[2 * part], ni = gu[2 * part + 1], c0 = dn[2 * part], nd = dn[2 * part + 1];
     const int64_t *pm = pm_all + 12 * part;
     const uint8_t *Gw = (const uint8_t *)(intptr_t)pm[0], *Uw = (const uint8_t *)(intptr_t)pm[4];
@@ -302,7 +308,7 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
     const int one = one_on && x2 && (flags & 256) && Gt == KQ_MXX && Ut == KQ_MXX && Dt == KQ_MXX;
     const size_t rbd = kq_row_bytes(Dt, inner);
     const int ne = experts, nph = hidden / 32, npi = inner / 32;
-    int P = t * k;
+    int P = t * k0;
     uint8_t *p = (uint8_t *)(intptr_t)scr[part];
     int *cnt = (int *)ma_take(&p, (size_t)(ne + 1) * 4);
     int *start = (int *)ma_take(&p, (size_t)(ne + 1) * 4);
@@ -422,12 +428,21 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
      * thread); then the rows of the pairs (shared), in the scratch of the
      * part (kq_moe_small_body). One thread for all of it took 8 us a token. */
     if (lt == 0 || team == 1) {
+        int kc = kcount != NULL ? *(const volatile int32_t *)kcount : k0;
+        kc = kc < 0 ? 0 : kc < k0 ? kc : k0;
+        nused_p[1] = kc;
+        k = kc;
+        P = t * kc;
         for (int e = 0; e <= ne; ++e) {
             cnt[e] = 0;
         }
+        /* each id read once and checked (pair_of holds them until the second pass) */
         for (int q = 0; q < P; ++q) {
-            if (ids[q] >= 0) {
-                cnt[ids[q]]++;
+            int e = ids[q];
+            e = e >= 0 && e < ne ? e : -1;
+            pair_of[q] = e;
+            if (e >= 0) {
+                cnt[e]++;
             }
         }
         int a = 0, nu = 0;
@@ -441,7 +456,7 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         }
         start[ne] = a;
         for (int q = 0; q < P; ++q) {
-            int e = ids[q];
+            int e = pair_of[q];
             if (e < 0) {
                 pair_of[q] = -1;
                 continue;
@@ -475,6 +490,7 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
     }
     KQ_PP(0);
     kq_part_barrier(part, team);
+    k = nused_p[1];         /* (the first thread's count: see k above) */
     KQ_PP(1);
     /* the block of expert e of matrix m (0 gate, 1 up, 2 down; KQ_E3) */
 #define KQ_E3_BLK(m, e) ((m) == 0 ? Gw + (size_t)(e) * Gs : (m) == 1 ? Uw + (size_t)(e) * Us : Dw + (size_t)(e) * Ds)
@@ -813,6 +829,9 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
          * columns c0 to c0 + nd of row j k + sl of out */
         kq_part_share(t * k, lt, team, &lo, &hi);
         for (int q = lo; q < hi; ++q) {
+            if (pair_of[q] >= P) {
+                continue;           /* (not a pair of this run: see k above) */
+            }
             if (pair_of[q] >= 0 && b12x) {
                 /* y = bf16(bf16(D2) bf16(w g_down)): g_down in the header of the expert's group */
                 float gd;
@@ -840,7 +859,7 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
             double o = 0.0;
             for (int sl = 0; sl < k; ++sl) {
                 int pos = pair_of[j * k + sl];
-                if (pos >= 0) {
+                if (pos >= 0 && pos < P) {
                     o += (double)(dsv ? de[(size_t)pos * nd + c] : val[j * k + sl] * de[(size_t)pos * nd + c]);
                 }
             }
@@ -855,6 +874,7 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
         float o = 0.f;
         for (int sl = 0; sl < k; ++sl) {
             int pos = pair_of[j * k + sl];
+            pos = pos < P ? pos : -1;
             if (pos >= 0 && b12x) {
                 float gd;
                 memcpy(&gd, Dw + (size_t)exp_of[pos] * Ds + (size_t)Dr * rbd, 4);

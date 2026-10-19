@@ -364,7 +364,10 @@ static void gp_remote_post(const gp_rec *r, const int64_t *e)
         const float *h = GP_P(const float, 0);
         const float *val = GP_P(const float, 1);
         const int32_t *idx = GP_P(const int32_t, 2);
-        int cnt = *GP_P(const int32_t, 3);
+        /* (the count and the ids in pinned memory that the GPU writes: the count read once and at most
+         * ER_MAXK, an id outside the layer's experts not posted) */
+        int cnt = *GP_P(const volatile int32_t, 3);
+        cnt = cnt < 0 ? 0 : cnt < ER_MAXK ? cnt : ER_MAXK;
         er_ctx *ctx = GP_P(er_ctx, 4);
         int layer = GP_I(5);
         int32_t *lidx = GP_P(int32_t, 7);
@@ -377,6 +380,9 @@ static void gp_remote_post(const gp_rec *r, const int64_t *e)
         int n = 0, m = 0;
         for (int j = 0; j < cnt; ++j) {
             int x = idx[j];
+            if (x < 0 || x >= ctx->experts) {
+                continue;
+            }
             if (ctx->alive && held[x] && n < ER_MAXK) {
                 ids[n] = x;
                 w[n] = val[j];
@@ -444,7 +450,7 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
                 int c = cold[p];
                 lcold[p] = c;
                 gidx[p] = -1;
-                if (c >= 0 && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP && held[c]) {
+                if (c >= 0 && c < ctx->experts && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP && held[c]) {
                     gidx[p] = c;
                     lcold[p] = -1;
                     ++n;
@@ -473,7 +479,7 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
         for (int p = 0; p < np; ++p) {
             int c = cold[p];
             lcold[p] = c;
-            if (c >= 0 && ctx->alive && held[c] && n < ER_MAXK) {
+            if (c >= 0 && c < ctx->experts && ctx->alive && held[c] && n < ER_MAXK) {
                 ids[n] = c;
                 w[n] = val[p];
                 at[n] = p;
@@ -524,7 +530,9 @@ static void gp_moe_one(const gp_rec *r, const int64_t *e)
     const float *h = GP_P(const float, 0);
     const float *val = GP_P(const float, 1);
     const int32_t *idx = GP_P(const int32_t, 2);
-    int top_k = r->op == GP_MOE_N ? *GP_P(const int32_t, 3) : GP_I(3);
+    /* GP_MOE_N: the count in pinned memory that the GPU writes, read once by the thread of the
+     * single below and given to all (copyprivate: two reads could differ), at most 64 */
+    int top_k = r->op == GP_MOE_N ? 0 : GP_I(3);
     const uint8_t *gu_w = GP_P(const uint8_t, 4);
     const float *gu_s = GP_P(const float, 5);
     const uint8_t *dn_w = GP_P(const uint8_t, 6);
@@ -538,8 +546,12 @@ static void gp_moe_one(const gp_rec *r, const int64_t *e)
     float *act2 = GP_P(float, 14);
     float *de = GP_P(float, 15);
     float *out = GP_P(float, 16);
-    #pragma omp single
+    #pragma omp single copyprivate(top_k)
     {
+        if (r->op == GP_MOE_N) {
+            int kc = *GP_P(const volatile int32_t, 3);
+            top_k = kc < 0 ? 0 : kc < 64 ? kc : 64;
+        }
         /* np.unique: the router gives distinct experts, so a sort is enough. */
         for (int j = 0; j < top_k; ++j) {
             ids[j] = idx[j];
@@ -563,10 +575,12 @@ static void gp_moe_one(const gp_rec *r, const int64_t *e)
         }
         for (int j = 0; j < top_k; ++j) {
             int s = 0;
-            while (idx[s] != ids[j]) {
+            while (s < top_k && idx[s] != ids[j]) {
                 ++s;
             }
-            gp_add_scaled(out, de + (size_t)j * (size_t)dn_rows, val[s], dn_rows);
+            if (s < top_k) {
+                gp_add_scaled(out, de + (size_t)j * (size_t)dn_rows, val[s], dn_rows);
+            }
         }
     }
 }

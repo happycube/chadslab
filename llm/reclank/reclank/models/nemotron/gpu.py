@@ -170,6 +170,10 @@ class NmEmit:
         self._scr = {}
         self._new = {}                  # cols: (src, the record that wrote it) since quant
         self._done = {}                 # cols: the src the int8 rows of cols hold
+        # the flags of the last CPU task of this program: its GP_AWAIT does not wait with no cold pair
+        # (cnt 0), so the next signal waits for it before it writes the pinned rows that task reads
+        # (bufs: one set for all the layers; GP_SIGNAL operand 11, signal_wait)
+        self._last_fl = None
 
     def quant(self, prog, src, cols):
         """compile_nemotron_step: the float rows src (t x cols) are new. Their int8 rows are made once,
@@ -269,8 +273,10 @@ class NmEmit:
                 fl[:] = 0
                 prog.keep.append(fl)
                 seq = prog.slot("seq")
+                prev, self._last_fl = self._last_fl, fl
                 prog.emit(P.SIGNAL, fl[0:1], seq, lat, bufs["lat"], bufs["lat"].nbytes, val, bufs["val"],
-                          bufs["val"].nbytes, S("cold", t * k, np.int32), bufs["cold"], bufs["cold"].nbytes)
+                          bufs["val"].nbytes, S("cold", t * k, np.int32), bufs["cold"], bufs["cold"].nbytes,
+                          prev[1:2] if prev is not None else None)
             prog.emit(P.NM_GROUP_MOE, lat, gidx, val, pup, pdn, S("qx", t * L, np.int8), S("sx", t * L // 32),
                       S("act", t * k * Im), S("qa", t * k * Im, np.int8), S("sa", t * k * Im // 32),
                       S("de", t * k * L), gout, S("work", 2 * Em + 1 + t * k, np.int32), k, L, inner, t, E,
@@ -307,8 +313,9 @@ class NmEmit:
         fl[:] = 0
         prog.keep.append(fl)
         seq = prog.slot("seq")
+        prev, self._last_fl = self._last_fl, fl
         prog.emit(P.SIGNAL, fl[0:1], seq, lat, bufs["lat"], bufs["lat"].nbytes, val, bufs["val"],
-                  bufs["val"].nbytes, cold, bufs["cold"], bufs["cold"].nbytes)
+                  bufs["val"].nbytes, cold, bufs["cold"], bufs["cold"].nbytes, prev[1:2] if prev is not None else None)
         self._hot(prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im)
         # the CPU's part: the cold pairs on the full stacks in host memory (a run of up to 8 rows:
         # those of an expert device's experts on it, its sum added after)
@@ -486,7 +493,8 @@ class NemotronGPU:
 
     def bufs(self, t):
         """The pinned rows of the CPU's part of a run of t rows (all layers share them: the tasks
-        run in order, and each layer's AWAIT copies its rows before the next layer signals)."""
+        run in order, and each layer's AWAIT copies its rows before the next layer signals; with no
+        cold pair the AWAIT does not wait, so the next signal waits for the task: NmEmit._last_fl)."""
         b = self._bufs.get(t)
         if b is None:
             cfg = self.cfg
