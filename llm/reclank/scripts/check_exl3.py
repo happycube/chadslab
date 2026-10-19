@@ -10,7 +10,9 @@ backends/cpu/csrc/kernels/kq/exl3.c) on random tiles, for each K:
    scripts/exl3_reference.py): the decoder bit for bit against the float16
    weights of ExLlamaV3, and the products against its forward;
 4. with --gpu: the GPU products (GP_KQ_LINEAR of a KQ_E3 matrix) against the
-   CPU.
+   CPU: the GEMV (dp4a) and, from 32 rows on, the tensor cores (k_e3_mma);
+   and the int16 x of the tensor cores (that of a group of experts) against
+   NumPy.
 
     python scripts/check_exl3.py [--ref DIR] [--gpu]
 """
@@ -102,6 +104,37 @@ def check_gpu(rng, Ks, shapes, ts):
     return ok
 
 
+def check_gpu_x16(rng, Ks, shapes, ts):
+    """The int16 x of the tensor cores (rc_gpu_e3_linear_x16: the body of
+    k_e3g_mma, a group of MUL1 experts) against NumPy (the weights decoded,
+    the transforms, x itself): the error of int16 x, where int8 x gives about
+    -40 dB."""
+    from reclank.backends.cuda.gpumm import Buffer
+    from reclank.backends.cuda.runtime import _check, lib
+    ok = True
+    for K in Ks:
+        for k, n in shapes:
+            for t in ts:
+                blk, tr, suh, svh = random_block(rng, K, k, n)
+                x = rng.standard_normal((t, k)).astype(np.float32)
+                x[:, rng.integers(0, k)] *= 30
+                ref = x.astype(np.float64) @ weights(tr, suh, svh, k, n)
+                bw, bx, by = Buffer(blk.nbytes), Buffer(x.nbytes), Buffer(4 * t * n)
+                bw.upload(blk)
+                bx.upload(x)
+                y8, y16 = np.empty((t, n), np.float32), np.empty((t, n), np.float32)
+                _check(lib().rc_gpu_e3_linear(bw.ptr, K, n, k, bx.ptr, t, by.ptr, 0.0))
+                by.download(y8)
+                _check(lib().rc_gpu_e3_linear_x16(bw.ptr, K, n, k, bx.ptr, t, by.ptr))
+                by.download(y16)
+                d8, d16 = db(ref, y8), db(ref, y16)
+                good = d16 < -70
+                ok &= good
+                print("GPU x16 K %d %5d x %5d, t %3d: vs NumPy %6.1f dB (int8 x %6.1f dB)%s" % (
+                    K, k, n, t, d16, d8, "" if good else "  FAIL"))
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", default=None)
@@ -113,8 +146,13 @@ def main():
     ok = check_cpu(rng, Ks, [(256, 384), (512, 256)], 1)
     ok &= check_cpu(rng, [4, 6], [(2048, 512), (512, 2048)], 5)
     if args.gpu:
-        ok &= check_gpu(rng, Ks, [(256, 384), (512, 256)], [1, 3])
-        ok &= check_gpu(rng, [3, 4, 6], [(3840, 4096), (15360, 3840)], [1, 8, 37])
+        ok &= check_gpu(rng, Ks, [(256, 384), (512, 256)], [1, 3, 40, 130])
+        ok &= check_gpu(rng, [3, 4, 6], [(3840, 4096), (15360, 3840)], [1, 8, 37, 200])
+        ok &= check_gpu_x16(rng, Ks, [(256, 384), (512, 256)], [32, 40, 130])
+        ok &= check_gpu_x16(rng, [4, 5, 6], [(2560, 640), (640, 2560)], [64, 200])
+        # long slices (the loop over the blocks of a slice, as a group's one slice)
+        ok &= check_gpu_x16(rng, [5], [(2560, 640)], [2112])
+        ok &= check_gpu_x16(rng, [4, 6], [(3840, 4096)], [200])
     print("check_exl3: %s" % ("OK" if ok else "FAILED"))
     sys.exit(0 if ok else 1)
 

@@ -60,6 +60,29 @@ static float kq2_q8_0(const uint8_t *w, int cols, const int8_t *xq, const float 
     return kq2_hsum(acc);
 }
 
+/* NVFP4 rows (KQ_NV4): the codes of a block of 32 to int8 (twice the E2M1 value: 0 .. 12 with a
+ * sign, vpshufb of kq_e2m1x2), values 0-15 in the low lane and 16-31 in the high one, so the
+ * low 4 int32 lanes have the scale of values 0-15 and the high 4 that of 16-31; |w| with the
+ * sign on x (12 * 127 * 2: no saturation), the float matrix scale g at the end. */
+static float kq2_nv4(const uint8_t *w, int cols, const int8_t *xq, const float *xs)
+{
+    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_e2m1x2));
+    const __m128i m4 = _mm_set1_epi8(15);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < cols / 32; ++b) {
+        __m128i q = _mm_loadu_si128((const __m128i *)kq_nv4_codes(w, b));
+        __m256i c = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m4), _mm_and_si128(q, m4));
+        __m256i v = _mm256_shuffle_epi8(lut, c);
+        __m256i x = _mm256_loadu_si256((const __m256i *)(xq + 32 * b));
+        __m256i s = KQ2_DOT(_mm256_setzero_si256(), _mm256_abs_epi8(v), _mm256_sign_epi8(x, v));
+        const uint8_t *sc = kq_nv4_scales(w, cols, b);
+        float f = 0.5f * xs[b];
+        __m256 scale = _mm256_set_m128(_mm_set1_ps(f * kq_e4m3(sc[1])), _mm_set1_ps(f * kq_e4m3(sc[0])));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, acc);
+    }
+    return kq2_hsum(acc) * kq_nv4_g(w, cols);
+}
+
 static float kq2_q45k(const uint8_t *w, int cols, int five, const int8_t *xq, const float *xs,
                       const float *xm)
 {
@@ -150,6 +173,25 @@ static float kq2_f32(const float *w, int cols, const float *x)
     return s;
 }
 
+/* Q4_0: the codes q (0 .. 15) on x, then -8 d times the sums of x (xm): w = d (q - 8) */
+static float kq2_q4_0(const uint8_t *w, int cols, const int8_t *xq, const float *xs, const float *xm)
+{
+    __m256 acc = _mm256_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    float off = 0.f;
+    for (int b = 0; b < cols / 32; ++b) {
+        const uint8_t *blk = w + (size_t)b * 18;
+        __m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+        __m256i u = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m4), _mm_and_si128(q, m4));
+        __m256i x = _mm256_loadu_si256((const __m256i *)(xq + 32 * b));
+        __m256i s = KQ2_DOT(_mm256_setzero_si256(), u, x);
+        const float d = kq_h(blk);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), _mm256_set1_ps(d * xs[b]), acc);
+        off += d * (xm[2 * b] + xm[2 * b + 1]);
+    }
+    return kq2_hsum(acc) - 8.f * off;
+}
+
 /* One row on one token, when this file has a form for the type: *out gets
  * it and the return is 1; else 0 (kq_dot1 runs its float loop). */
 static int kq_dot2(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
@@ -158,6 +200,9 @@ static int kq_dot2(const uint8_t *w, int type, int cols, const int8_t *xq, const
     switch (type) {
     case KQ_Q8_0:
         *out = kq2_q8_0(w, cols, xq, xs);
+        return 1;
+    case KQ_Q4_0:
+        *out = kq2_q4_0(w, cols, xq, xs, xm);
         return 1;
     case KQ_Q4_K:
     case KQ_Q5_K:
@@ -171,6 +216,9 @@ static int kq_dot2(const uint8_t *w, int type, int cols, const int8_t *xq, const
             return 0;
         }
         *out = kq2_q6k(w, cols, xq, xs, xm);
+        return 1;
+    case KQ_NV4:
+        *out = kq2_nv4(w, cols, xq, xs);
         return 1;
     case KQ_F32:
         if (x == NULL) {

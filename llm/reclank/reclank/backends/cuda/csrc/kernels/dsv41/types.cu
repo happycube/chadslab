@@ -43,7 +43,7 @@ __device__ __forceinline__ void mxx_group_x2(const uint8_t *wg, int cols, const 
         int a[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            a[i] = 128 * __dp4a(wv[i], xv, 0) + __dp4a(wv[i], xlv, 0);
+            a[i] = 128 * rc_dp4a(wv[i], xv, 0) + rc_dp4a(wv[i], xlv, 0);
             a[i] += __shfl_xor_sync(RC_FULL_MASK, a[i], 4);
             a[i] += __shfl_xor_sync(RC_FULL_MASK, a[i], 8);
             a[i] += __shfl_xor_sync(RC_FULL_MASK, a[i], 16);

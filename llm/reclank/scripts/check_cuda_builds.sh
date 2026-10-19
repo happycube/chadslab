@@ -2,7 +2,7 @@
 # Build the CUDA library for each arch with each toolkit (compile only; no
 # GPU needed), and report which builds pass (REFACTOR_PLAN.md, section 4.2):
 #
-#   scripts/check_cuda_builds.sh [ARCH ...]       default: 61 70 75 80 86 89 90 120 121
+#   scripts/check_cuda_builds.sh [ARCH ...]       default: 52 61 70 75 80 86 89 90 120 121
 #
 # The toolkits are /usr/local/cuda-12* and /usr/local/cuda-13* (CUDA_DIRS
 # sets others). A toolkit that does not know an arch is skipped (CUDA 13
@@ -11,7 +11,7 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 CSRC=$HERE/../reclank/backends/cuda/csrc
 INC=$HERE/../reclank/backends/include
-ARCHS=${*:-61 70 75 80 86 89 90 120 121}
+ARCHS=${*:-52 61 70 75 80 86 89 90 120 121}
 DIRS=${CUDA_DIRS:-$(ls -d /usr/local/cuda-12* /usr/local/cuda-13* 2>/dev/null | sort -V)}
 OUT=${TMPDIR:-/tmp}/reclank-cuda-builds
 mkdir -p "$OUT"

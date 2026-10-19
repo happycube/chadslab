@@ -15,7 +15,7 @@ from server.backend import Backend  # noqa: E402
 from server.options import parser  # noqa: E402
 from server.worker import ModelWorker  # noqa: E402
 
-FAMILIES = ("gemma4", "qwen", "deepseek41")
+FAMILIES = ("gemma4", "qwen", "deepseek41", "nemotron")
 
 
 def family_module(name):
@@ -23,6 +23,8 @@ def family_module(name):
         from reclank.models.gemma4 import engine
     elif name == "deepseek41":
         from reclank.models.deepseek41 import engine
+    elif name == "nemotron":
+        from reclank.models.nemotron import engine
     else:
         from reclank.models.qwen import engine
     return engine
@@ -56,17 +58,23 @@ def build(opts):
     else:
         engine, d = worker.load(lambda: mod.load(opts, meta, worker))
     worker.engine = engine
+    if len(getattr(engine, "lanes", None) or [engine]) > 1:
+        from server.worker import LaneScheduler
+        worker.lanes = LaneScheduler(engine.lanes)
     pick = lambda v, k: d.get(k) if v is None else v  # noqa: E731
     backend = Backend(engine, worker, model_id=opts.model_id or d.get("model_id", "reclank"),
                       thinking=d.get("thinking"), max_tokens=pick(opts.max_tokens, "max_tokens"),
                       temperature=pick(opts.temperature, "temperature"), top_k=pick(opts.top_k, "top_k"),
                       top_p=pick(opts.top_p, "top_p"), mtp_accept=opts.mtp_accept,
-                      mtp_floor=opts.mtp_floor, media_dir=opts.media_dir)
+                      mtp_floor=opts.mtp_floor, media_dir=opts.media_dir,
+                      repetition_penalty=d.get("repetition_penalty"))
     backend.no_think_below = max(0, opts.no_think_below)
     backend.max_floor = opts.max_tokens_floor
     backend.floor_min = opts.max_tokens_floor_min
-    print("%s: sampling temperature=%s top_p=%s top_k=%s" % (
-        family, backend.temperature, backend.top_p, backend.top_k), flush=True)
+    print("%s: sampling temperature=%s top_p=%s top_k=%s%s" % (
+        family, backend.temperature, backend.top_p, backend.top_k,
+        " repetition_penalty=%s" % backend.repetition_penalty if backend.repetition_penalty else ""),
+        flush=True)
     if opts.debug:
         os.makedirs(opts.debug, exist_ok=True)
         backend.debug = opts.debug

@@ -1663,8 +1663,19 @@ def k_enc_linear(c, lin, x, out=None):
         kq = getattr(lin, "q8", None)
     m = lin.w.shape[0] if kq is None else kq.rows
     out = c.buffer((n, m)) if out is None else out
+    # FP4-Local's vision (models/qwen/vision.py): the input of the linear in bfloat16 values or as
+    # dynamic MXFP8 (in place: the inputs of the encoder's linears are buffers of their own), the
+    # output rounded to bfloat16
+    act = getattr(lin, "act", None)
+    if act == "bf16":
+        c.p.emit(BF16_ROUND, x, n * k)
+    elif act == "mx8":
+        c.p.emit(MX8_ACT, x, n * k)
     if kq is not None:
-        return _k_enc_linear_kq(c, lin, kq, x, n, m, k, out)
+        out = _k_enc_linear_kq(c, lin, kq, x, n, m, k, out)
+        if act is not None:
+            c.p.emit(BF16_ROUND, out, n * m)
+        return out
     wbf = 1 if lin.w.dtype == np.uint16 else 0
     inf = float("inf")
     scratch = None
@@ -1682,6 +1693,8 @@ def k_enc_linear(c, lin, x, out=None):
              inf if lin.imax is None else float(lin.imax),
              -inf if lin.omin is None else float(lin.omin),
              inf if lin.omax is None else float(lin.omax), scratch, x16)
+    if act is not None:
+        c.p.emit(BF16_ROUND, out, n * m)
     return out
 
 

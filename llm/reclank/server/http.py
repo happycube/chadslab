@@ -455,10 +455,31 @@ class _Handler(BaseHTTPRequestHandler):
         sampler = backend.sampler(req)
         eos = backend.stop_ids()
         model_id = req.get("model") or backend.model_id
+        # the lane of the request (--lanes 2: server/backend.py route), else None
+        route = getattr(backend, "route", None)
+        self._lane = route(req, self.headers, prompt_ids) if route is not None else None
+        from server.backend import session_of
+        self._session = session_of(req, self.headers)
+        self._lane_tokens = backend.route_tokens() if self._lane is not None else 0
         if req.get("stream"):
             self._stream(req, prompt_ids, max_tokens, sampler, stops, eos, model_id, chat)
         else:
             self._block(prompt_ids, max_tokens, sampler, stops, eos, model_id, chat)
+
+    def _gen(self, backend, prompt_ids, max_tokens, sampler, eos):
+        lane = getattr(self, "_lane", None)
+        # the conversation id of the client (server/backend.py session_of), for
+        # an engine that keys its contexts by it (Gemma's --context-dir)
+        sid = getattr(self, "_session", None)
+        kw = {"session": sid} if sid is not None and getattr(backend, "takes_session", False) else {}
+        if lane is None:
+            return backend.generate(prompt_ids, max_tokens, sampler, eos, **kw)
+        return backend.generate(prompt_ids, max_tokens, sampler, eos, lane=lane,
+                                tokens=getattr(self, "_lane_tokens", 0), **kw)
+
+    def _guard(self, backend):
+        g = getattr(backend, "guard", None)
+        return g(getattr(self, "_lane", None)) if g is not None else backend.lock
 
     def _ids(self, prompt_ids, max_tokens, sampler, eos):
         """Run the generation. Return the token ids and the finish reason."""
@@ -466,7 +487,7 @@ class _Handler(BaseHTTPRequestHandler):
         tok = backend.tokenizer
         out = []
         finish = "length"
-        for token in backend.generate(prompt_ids, max_tokens, sampler, eos):
+        for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos):
             out.append(token)
             if token in eos:
                 finish = "stop"
@@ -494,7 +515,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _block(self, prompt_ids, max_tokens, sampler, stops, eos, model_id, chat):
         backend = self.server.backend
         try:
-            with backend.lock:
+            with self._guard(backend):
                 out, finish = self._ids(prompt_ids, max_tokens, sampler, eos)
         except Exception as exc:
             # an answer, not a closed connection (the client sees why); the
@@ -590,8 +611,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         def worker():
             try:
-                with backend.lock:
-                    for token in backend.generate(prompt_ids, max_tokens, sampler, eos):
+                with self._guard(backend):
+                    for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos):
                         q.put(("token", token))
                         if done.is_set():
                             break

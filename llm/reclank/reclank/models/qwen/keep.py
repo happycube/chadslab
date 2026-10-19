@@ -47,6 +47,9 @@ from reclank.formats.gguf import BF12, BF16, F32, GGUF, Q8_0, RQ8_0, tensor_byte
 
 LAYOUT = "tensors-v1"
 MODEL = "qwen4exp"
+# the GGUF files the weightkeeper takes as they are (layout_gguf): Qwen3.8 and
+# Qwen3.5/3.6 MoE (qwen35moe, as llama.cpp writes them; QwenGGUF of qwen35.py)
+GGUF_MODELS = (MODEL, "qwen35moe", "gemma4")
 ALIGN = 64
 TYPES = {"bf12": BF12, "bf16": BF16, "q8": Q8_0, "rq8": RQ8_0}
 CHUNK = 64 << 20              # the bytes of an item of the bulk read (the n-gram rows)
@@ -468,13 +471,16 @@ def holds(ckpt):
     """True when the weightkeeper of this user holds the checkpoint at ckpt in
     this layout (no map: the status)."""
     from reclank.runtime import weightkeeper as W
-    try:
-        c = W.request("status")
-        with c:
-            st = json.loads(W._recv_msg(c))
-    except (OSError, ValueError):
-        return False
-    return st.get("layout") == LAYOUT and os.path.realpath(st.get("checkpoint", "")) == os.path.realpath(ckpt)
+    _path, st = W.find(ckpt)
+    return st is not None and st.get("layout") == LAYOUT
+
+
+def gguf_or_kept(path, **kw):
+    """The tensors of a GGUF file: the weightkeeper's (KeptGGUF) when one holds
+    it, else the file (GGUF(path, **kw))."""
+    if path.endswith(".gguf") and holds(path):
+        return KeptGGUF(path)
+    return GGUF(path, **kw)
 
 
 def is_orig(path):
@@ -501,8 +507,8 @@ class KeptGGUF(GGUF):
         self.path = ckpt
         self.w = w or W.attach(ckpt=ckpt)
         ix = self.w.index
-        if ix.get("layout") != LAYOUT or ix.get("model") != MODEL:
-            raise ValueError("the weightkeeper holds %s (%s), not Qwen3.8" % (ix.get("model"), ix.get("layout")))
+        if ix.get("layout") != LAYOUT or ix.get("model") not in GGUF_MODELS:
+            raise ValueError("the weightkeeper holds %s (%s), not Qwen" % (ix.get("model"), ix.get("layout")))
         self.index = ix
         self.meta = {k: v for k, v in ix["meta"]}
         self.tensors = {n: (tuple(int(x) for x in d["dims"]), int(d["type"]), 0)
@@ -514,17 +520,50 @@ class KeptGGUF(GGUF):
         self.expert_node = None
         self.parts = []
         self.kept = True
+        # the rest of GGUF.__init__ that a model reads (the Gemma loader: the
+        # runtime names of the tensors)
+        self.version, self._stage, self._skip = 3, [], set()
+        self._to_gguf = {}
+        for gname in self._order:
+            try:
+                self._to_gguf[self._name(gname)] = gname
+            except KeyError:
+                continue
 
     def raw(self, gname):
         d = self.index["tensors"][gname]
         dims, t, _o = self.tensors[gname]
-        if d["place"] != "node":
+        if d["place"] == "experts" and len(d["parts"]) == 1 and list(d["parts"][0][2]) == list(range(d["E"])):
+            # one node holds every expert, in order: the stack whole, as the file has it
+            # (the Gemma 26B on a machine of one socket)
+            a = self.w.tensor(gname)[0][1].reshape(-1)
+        elif d["place"] != "node":
             raise ValueError("%s is split between the nodes (experts(), row_addrs())" % gname)
-        a = self.w.tensor(gname)
+        else:
+            a = self.w.tensor(gname)
         from reclank.formats.gguf import _BLOCK_DT, _ROW_BYTES
         if t in _ROW_BYTES:
             return a, dims, t
         return a.view(_BLOCK_DT[t]), dims, t
+
+    def _blocks(self, hf_name, first, nblk):
+        """The blocks of a tensor by its runtime name (GGUF._blocks; get,
+        get_bf16, q6k_blocks): those of raw."""
+        return self.raw(self._gguf(hf_name))[0][first:first + nblk]
+
+    def meta_strings(self, key):
+        """A metadata string array (GGUF.meta_strings): a large one (the tokens
+        of the tokenizer) stays in the file, so it is read there."""
+        item = self.meta[key]
+        if not isinstance(item, dict) or "__array__" not in item:
+            return list(item)
+        import mmap
+        with open(self.index["file"], "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            self._mm = mm
+            try:
+                return super().meta_strings(key)
+            finally:
+                self._mm = None
 
     def experts(self, gname):
         """A stack of experts split between the nodes: [(node, uint8 (n, nb), the
@@ -626,12 +665,13 @@ def export_gguf(g, out, log=print):
 # ---------------------------------------------------------------- from a GGUF file
 
 def detect_gguf(path):
-    """A GGUF file of qwen4exp (the file of export_gguf, or of convert_q8_gguf.py)."""
+    """A GGUF file of qwen4exp (the file of export_gguf, or of convert_q8_gguf.py),
+    or of qwen35moe (Qwen3.5/3.6 MoE as llama.cpp writes them)."""
     if not (path.endswith(".gguf") and os.path.isfile(path)):
         return False
     g = GGUF(path, stage=False)
     try:
-        return g.meta.get("general.architecture") == MODEL
+        return g.meta.get("general.architecture") in GGUF_MODELS
     finally:
         g.close()
 
@@ -667,7 +707,7 @@ def _tname(t):
 
 
 def layout_gguf(path, nodes, share, o):
-    """The index of the tensors of a qwen4exp GGUF file in the weightkeeper: the
+    """The index of the tensors of a qwen4exp or qwen35moe GGUF file in the weightkeeper: the
     places of layout() (the experts of each layer split between the nodes by
     expert, the n-gram table by rows, the rest on the GPU's node), the types
     as the file has them (a copy, no conversion)."""
@@ -722,8 +762,9 @@ def layout_gguf(path, nodes, share, o):
         ts = sorted({_tname(d["type"]) for d in tens.values() if d["kind"] == k})
         return "/".join(ts) or "-"
     meta = [[k, _plain(v)] for k, v in g.meta.items() if k != "general.alignment"]
-    a = MODEL + "."
-    out = dict(layout=LAYOUT, model=MODEL, source="gguf", file=os.path.abspath(path), base=int(g._base),
+    model = g.meta.get("general.architecture", MODEL)
+    a = model + "."
+    out = dict(layout=LAYOUT, model=model, source="gguf", file=os.path.abspath(path), base=int(g._base),
                offs=offs, nodes=list(nodes), share=list(share), gu=[], dn=[],
                L=int(g.meta.get(a + "block_count", 0)), E=int(g.meta.get(a + "expert_count", 0)),
                hidden=int(g.meta.get(a + "embedding_length", 0)),

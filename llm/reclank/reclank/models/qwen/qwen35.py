@@ -18,6 +18,22 @@ The model has two kinds of layers (config.layer_types):
 Each layer then has 256 experts (8 for each token) and a shared expert with
 a sigmoid gate.
 
+LFM2-MoE (LiquidAI LFM2.5-24B-A2B, the GGUF architecture lfm2moe;
+docs/LFM25_24B_PLAN.md) runs on the same classes (cfg.family "lfm2"):
+
+- conv layers in place of the DeltaNet: in_proj to B, C, x; C times the
+  causal depthwise convolution of kernel 3 of B * x; out_proj;
+- full attention with no output gate, RoPE on all the values of a head;
+- the first layers a dense SwiGLU MLP; the others 64 experts (4 for each
+  token) with no shared expert, chosen by sigmoid scores plus an expert bias
+  (the weights the chosen scores, normed);
+- the head tied to the embeddings.
+
+The dense models of the Qwen3.5 architecture (qwen3_5: Qwen3.8-27B, the GGUF
+architecture qwen35 of scripts/convert_qwen35_dense_gguf.py) have the layers
+of Qwen3.5 with a SwiGLU MLP in place of the experts: every layer is a dense
+layer (cfg.dense_layers), no experts.
+
 The weights come from a GGUF file of llama.cpp (QwenGGUF, QwenGGUFCPU,
 QwenGGUFProgram). Qwen and QwenCPU hold the parts that do not depend on the
 form of the weights; the GGUF classes give the weights.
@@ -74,11 +90,16 @@ class QwenConfig:
         self.lin_k_dim = t["linear_key_head_dim"]
         self.lin_v_dim = t["linear_value_head_dim"]
         self.conv_kernel = t["linear_conv_kernel_dim"]
-        # experts
-        self.num_experts = t["num_experts"]
-        self.top_k = t["num_experts_per_tok"]
-        self.moe_inter = t["moe_intermediate_size"]
-        self.shared_inter = t["shared_expert_intermediate_size"]
+        # experts (a dense model, qwen3_5_text: an MLP in every layer)
+        if "num_experts" in t:
+            self.num_experts = t["num_experts"]
+            self.top_k = t["num_experts_per_tok"]
+            self.moe_inter = t["moe_intermediate_size"]
+            self.shared_inter = t["shared_expert_intermediate_size"]
+        else:
+            self.num_experts = self.top_k = self.moe_inter = self.shared_inter = 0
+            self.dense_layers = self.num_hidden_layers
+            self.dense_inter = t["intermediate_size"]
         self.eos_token_ids = c.get("eos_token_id", t.get("eos_token_id"))
         # The order of the value heads of the linear layers. The MLX files
         # (and transformers) keep the heads of one key head together:
@@ -97,9 +118,12 @@ class QwenConfig:
 
     @classmethod
     def from_gguf(cls, g):
-        """The config of a qwen35moe GGUF file (the metadata of llama.cpp)."""
+        """The config of a qwen35moe GGUF file (the metadata of llama.cpp), or
+        of a qwen35 file (the dense models: an MLP in every layer)."""
         m = g.meta
         a = m.get("general.architecture", "qwen35moe")
+        if a == "lfm2moe":
+            return cls.from_lfm2_gguf(g)
 
         def k(name, default=None):
             return m.get("%s.%s" % (a, name), default)
@@ -125,14 +149,72 @@ class QwenConfig:
         cfg.lin_k_dim = int(k("ssm.state_size"))
         cfg.lin_v_dim = int(k("ssm.inner_size")) // cfg.lin_v_heads
         cfg.conv_kernel = int(k("ssm.conv_kernel"))
-        cfg.num_experts = int(k("expert_count"))
-        cfg.top_k = int(k("expert_used_count"))
-        cfg.moe_inter = int(k("expert_feed_forward_length"))
-        cfg.shared_inter = int(k("expert_shared_feed_forward_length"))
+        if a == "qwen35":
+            cfg.num_experts = cfg.top_k = cfg.moe_inter = cfg.shared_inter = 0
+            cfg.dense_layers = n
+            cfg.dense_inter = int(k("feed_forward_length"))
+        else:
+            cfg.num_experts = int(k("expert_count"))
+            cfg.top_k = int(k("expert_used_count"))
+            cfg.moe_inter = int(k("expert_feed_forward_length"))
+            cfg.shared_inter = int(k("expert_shared_feed_forward_length"))
         cfg.vocab_size = int(g.tensors["output.weight"][0][1])
         cfg.eos_token_ids = None
         cfg.v_tiled = True
         cfg.kv_form = default_kv_form()
+        return cfg
+
+    @classmethod
+    def from_lfm2_gguf(cls, g):
+        """The config of an lfm2moe GGUF file (LFM2-MoE: the metadata of
+        llama.cpp; head_count_kv is 0 for each conv layer)."""
+        m = g.meta
+
+        def k(name, default=None):
+            return m.get("lfm2moe.%s" % name, default)
+
+        cfg = cls.__new__(cls)
+        n = int(k("block_count"))
+        kv = [int(v) for v in k("attention.head_count_kv")]
+        cfg.raw = {}
+        cfg.family = "lfm2"
+        cfg.hidden_size = int(k("embedding_length"))
+        cfg.num_hidden_layers = n
+        cfg.layer_types = ["full_attention" if kv[i] else "conv" for i in range(n)]
+        cfg.rms_norm_eps = float(k("attention.layer_norm_rms_epsilon", 1e-5))
+        cfg.num_heads = int(k("attention.head_count"))
+        cfg.num_kv_heads = max(kv)
+        cfg.head_dim = cfg.hidden_size // cfg.num_heads
+        cfg.rope_theta = float(k("rope.freq_base"))
+        cfg.rotary_dim = cfg.head_dim
+        cfg.mrope_section = None
+        cfg.attn_gate = False
+        # the conv layers: the kernel (l_cache) on hidden channels
+        cfg.conv_kernel = int(k("shortconv.l_cache"))
+        cfg.lin_k_heads = cfg.lin_v_heads = cfg.lin_k_dim = cfg.lin_v_dim = 0
+        cfg.num_experts = int(k("expert_count"))
+        cfg.top_k = int(k("expert_used_count"))
+        cfg.moe_inter = int(k("expert_feed_forward_length"))
+        cfg.shared_inter = 0
+        cfg.dense_layers = int(k("leading_dense_block_count", 0))
+        cfg.dense_inter = int(k("feed_forward_length"))
+        cfg.router = "sigmoid"
+        cfg.router_scale = float(k("expert_weights_scale", 1.0))
+        cfg.vocab_size = int(g.tensors["token_embd.weight"][0][1])
+        cfg.eos_token_ids = None
+        cfg.v_tiled = False
+        # int16 rows by default (RECLANK_QWEN_KV overrides). The router of
+        # LFM2 chooses on small margins (the 4th against the 5th expert: a
+        # median of 0.012, 6.6% of the rows under 1e-3) and its copies of
+        # earlier text are sharp, so a small error of the cache rows moves
+        # the run off the reference: over 2970 rows of the reference prompts
+        # (each row a step), the KL (top 64) is 6e-3 for int16, 3.5e-2 for
+        # 12-bit rows, 8.1e-2 for int8 (and 5.0e-3 for a relative noise of
+        # 1e-5 on float32 rows, 2.1e-2 for 1e-4). The loss of the real text
+        # of the prompts (2458 tokens) does not move: 3.828 float32, 3.833
+        # int16, 3.820 12-bit, 3.819 int8. int16 keeps the runs on the
+        # reference (the checks), at 21 KB a token (int8: 11 KB).
+        cfg.kv_form = os.environ.get("RECLANK_QWEN_KV") or "int16"
         return cfg
 
     @property
@@ -145,6 +227,8 @@ class QwenConfig:
 
     @property
     def conv_dim(self):
+        if getattr(self, "family", "qwen") == "lfm2":
+            return self.hidden_size             # the channels of the short convolution
         return 2 * self.lin_key_dim + self.lin_value_dim
 
 
@@ -176,7 +260,9 @@ def softplus(x):
 # the output back, as the rq8 cache of Gemma; rk8v8: the keys rq8, the values
 # int8 (the rotation spreads the outlier channels of the keys; the values have
 # none to spread); Qwen3.6).
-QUANT_FORMS = ("int16", "int8", "k16v8", "tq6", "rq8", "rk8v8")
+# e4m3 (FP4-Local, docs/FP4LOCAL_PLAN.md 2.9: vLLM's --kv-cache-dtype fp8): the int8 form whose bytes
+# are E4M3 codes and whose scales are 1 (cops.set_kv_e4m3, rc_gpu_set_kv_e4m3), in every full layer.
+QUANT_FORMS = ("int16", "int8", "k16v8", "tq6", "rq8", "rk8v8", "e4m3")
 KEY_ROT = ("tq6", "rq8", "rk8v8")       # rotated keys: the queries rotated
 VAL_ROT = ("tq6", "rq8")                # rotated values: the output back
 # RECLANK_QWEN_KV_FIRST: the form of the first full attention layer under a
@@ -192,7 +278,9 @@ KV_FIRST = os.environ.get("RECLANK_QWEN_KV_FIRST", "f32")
 def layer_kv_form(form, cfg, i):
     """The form of the cache of the full attention layer i under the form
     of the cache: the first full layer takes KV_FIRST."""
-    if form in QUANT_FORMS and KV_FIRST != "same":
+    if form in QUANT_FORMS and KV_FIRST != "same" and form != "e4m3":
+        # (LFM2 too: with its first full layer int16, the doc prompt of the
+        # reference left it at row 253: KL 2.6e-2 against 1.5e-3)
         first = next(j for j, t in enumerate(cfg.layer_types) if t == "full_attention")
         if i == first:
             return KV_FIRST
@@ -209,8 +297,8 @@ def kv_dtypes(form):
     """The dtypes of the keys and of the values of a quantized form."""
     if form == "tq6":
         return np.uint8, np.uint8
-    return (np.int8 if form in ("int8", "rq8", "rk8v8") else np.int16,
-            np.int8 if form in ("int8", "rq8", "rk8v8", "k16v8") else np.int16)
+    return (np.int8 if form in ("int8", "rq8", "rk8v8", "e4m3") else np.int16,
+            np.int8 if form in ("int8", "rq8", "rk8v8", "k16v8", "e4m3") else np.int16)
 
 
 def kv_row_bytes(form, per):
@@ -257,6 +345,9 @@ class QwenCache:
                 # position-major (positions, kv heads, head_dim), as all the caches
                 shape = (max_len, cfg.num_kv_heads, cfg.head_dim)
                 self.kv[i] = [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]
+            elif t == "conv":
+                # LFM2: the last kernel - 1 rows of B * x
+                self.conv[i] = np.zeros((cfg.conv_kernel - 1, cfg.hidden_size), np.float32)
             else:
                 self.conv[i] = np.zeros((cfg.conv_kernel - 1, cfg.conv_dim), np.float32)
                 self.state[i] = np.zeros((cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim),
@@ -318,6 +409,11 @@ def kv_store(cache, i, k, v, pos):
     if layer_quant(cache, i):
         kq, ks, vq, vs = cache.kv[i]
         lf = cache.layer_form.get(i, cache.kv_form)
+        if lf == "e4m3":
+            for src, q, sc in ((k, kq, ks), (v, vq, vs)):
+                q[pos:pos + t] = cops.kv_e4m3_codes(src).reshape(t, -1).view(np.int8)
+                sc[pos:pos + t] = 1.0
+            return
         if lf in ("rq8", "rk8v8"):
             k = tq6.rotate(k)                       # the rows rotated in each 32 values
         if lf == "rq8":
@@ -344,6 +440,9 @@ def kv_rows(cache, i, n):
         for key, (q, sc) in ((True, cache.kv[i][0:2]), (False, cache.kv[i][2:4])):
             if q.dtype == np.uint8:
                 x = tq6.dequantize(q[:n], sc[:n])
+            elif lf == "e4m3":
+                from reclank.formats.nvfp4_st import E4M3
+                x = E4M3[q[:n].view(np.uint8)]
             else:
                 x = q[:n].astype(np.float32).reshape(n, -1, 32) * sc[:n, :, None]
                 if lf == "rq8" or (key and lf == "rk8v8"):
@@ -415,8 +514,12 @@ class Qwen:
         p = "layers.%d.self_attn." % i
         t = h.shape[0]
         nq, nk, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
-        qg = (h @ self.W(p + "q_proj").T).reshape(t, nq, 2 * hd)
-        q, gate = qg[..., :hd], qg[..., hd:].reshape(t, nq * hd)
+        gated = getattr(cfg, "attn_gate", True)
+        if gated:
+            qg = (h @ self.W(p + "q_proj").T).reshape(t, nq, 2 * hd)
+            q, gate = qg[..., :hd], qg[..., hd:].reshape(t, nq * hd)
+        else:
+            q = (h @ self.W(p + "q_proj").T).reshape(t, nq, hd)
         k = (h @ self.W(p + "k_proj").T).reshape(t, nk, hd)
         v = (h @ self.W(p + "v_proj").T).reshape(t, nk, hd)
         q = rms_norm(q, self.t(p + "q_norm.weight"), cfg.rms_norm_eps)
@@ -446,8 +549,51 @@ class Qwen:
             w = np.exp(s)
             w /= w.sum(axis=-1, keepdims=True)
             out[:, hq] = w @ V[kh, :n]
-        o = out.reshape(t, nq * hd) * sigmoid(gate)
+        o = out.reshape(t, nq * hd)
+        if gated:
+            o = o * sigmoid(gate)
         return o @ self.W(p + "o_proj").T
+
+    def short_conv(self, i, h, cache, pos):
+        """The double-gated short convolution of LFM2: B, C, x = in_proj(h);
+        C times the causal depthwise convolution of B * x (the last
+        kernel - 1 rows of B * x in the cache); out_proj."""
+        cfg = self.cfg
+        p = "layers.%d.conv." % i
+        t, hid, kk = h.shape[0], cfg.hidden_size, cfg.conv_kernel
+        bcx = h @ self.W(p + "in_proj").T                          # (t, 3 hidden)
+        b, c, xx = bcx[:, :hid], bcx[:, hid:2 * hid], bcx[:, 2 * hid:]
+        w = self.t(p + "conv.weight").reshape(hid, kk)
+        xs = np.concatenate([cache.conv[i], b * xx], axis=0)       # (kernel - 1 + t, hidden)
+        y = np.zeros((t, hid), np.float32)
+        for j in range(kk):
+            y += xs[j:j + t] * w[:, j]
+        cache.conv[i] = xs[-(kk - 1):].copy()
+        return (c * y) @ self.W(p + "out_proj").T
+
+    def dense_mlp(self, i, h):
+        """The dense SwiGLU MLP of the first layers of LFM2 (of every layer of
+        a dense model)."""
+        p = "layers.%d.mlp." % i
+        act = silu(h @ self.W(p + "gate_proj").T) * (h @ self.W(p + "up_proj").T)
+        return act @ self.W(p + "down_proj").T
+
+    def route(self, i, logits):
+        """The experts (t, k) and their weights of the router logits of
+        layer i: softmax, top k, normed (Qwen3.5); or (LFM2) the sigmoid
+        scores, the top k of score + expert bias, the k scores normed."""
+        cfg = self.cfg
+        if getattr(cfg, "router", "softmax") == "sigmoid":
+            sc = sigmoid(logits)
+            ch = sc + self.t("layers.%d.mlp.expert_bias" % i)
+            top = np.argsort(-ch, axis=-1, kind="stable")[:, :cfg.top_k]
+            val = np.take_along_axis(sc, top, axis=-1)
+            return top, val / (val.sum(axis=-1, keepdims=True) + 1e-6) * cfg.router_scale
+        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = e / e.sum(axis=-1, keepdims=True)
+        top = np.argsort(-probs, axis=-1, kind="stable")[:, :cfg.top_k]
+        val = np.take_along_axis(probs, top, axis=-1)
+        return top, val / val.sum(axis=-1, keepdims=True)
 
     def linear_attention(self, i, h, cache, pos):
         cfg = self.cfg
@@ -498,12 +644,7 @@ class Qwen:
     def moe(self, i, h):
         cfg = self.cfg
         p = "layers.%d.mlp." % i
-        logits = h @ self.W(p + "gate").T                          # (t, experts)
-        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
-        probs = e / e.sum(axis=-1, keepdims=True)
-        top = np.argsort(-probs, axis=-1, kind="stable")[:, :cfg.top_k]
-        val = np.take_along_axis(probs, top, axis=-1)
-        val = val / val.sum(axis=-1, keepdims=True)
+        top, val = self.route(i, h @ self.W(p + "gate").T)
         gm, um, dm = (self.mat(p + "switch_mlp." + n) for n in ("gate_proj", "up_proj", "down_proj"))
         out = np.zeros_like(h)
         for x in np.unique(top):
@@ -511,6 +652,8 @@ class Qwen:
             hx = h[rows]
             act = silu(hx @ gm.dequant(expert=x).T) * (hx @ um.dequant(expert=x).T)
             out[rows] += (act @ dm.dequant(expert=x).T) * val[rows, slots][:, None]
+        if not cfg.shared_inter:
+            return out
         sp = p + "shared_expert."
         sh = silu(h @ self.W(sp + "gate_proj").T) * (h @ self.W(sp + "up_proj").T)
         sh = sh @ self.W(sp + "down_proj").T
@@ -523,9 +666,13 @@ class Qwen:
         h = rms_norm(x, self.t(p + "input_layernorm.weight"), cfg.rms_norm_eps)
         if cfg.layer_types[i] == "full_attention":
             x = x + self.full_attention(i, h, cache, pos)
+        elif cfg.layer_types[i] == "conv":
+            x = x + self.short_conv(i, h, cache, pos)
         else:
             x = x + self.linear_attention(i, h, cache, pos)
         h = rms_norm(x, self.t(p + "post_attention_layernorm.weight"), cfg.rms_norm_eps)
+        if i < getattr(cfg, "dense_layers", 0):
+            return x + self.dense_mlp(i, h)
         return x + self.moe(i, h)
 
     def forward(self, ids, cache, start_pos=0, hook=None, media=None):
@@ -658,7 +805,7 @@ class QwenCPU(Qwen):
 
 # ---- the step as a program of records (gemma_run, one parallel region) --------
 
-def compile_qwen_step(model, t, verify=False):
+def compile_qwen_step(model, t, verify=False, mtp=False):
     """Compile a step of t tokens of the model (a QwenCPU) into a program of
     records: one parallel region for the whole step, as the Gemma step.
 
@@ -668,7 +815,14 @@ def compile_qwen_step(model, t, verify=False):
 
     verify makes an MTP verify group: the linear layers do not change their
     state; each writes a log (names["log.<layer>"]) that QwenGGUFProgram.commit
-    applies for the accepted tokens."""
+    applies for the accepted tokens.
+
+    mtp compiles the MTP layer (blk.<layers>.nextn, as vLLM's Qwen3-Next MTP)
+    in place of the model: the inputs are names["e"] (the embeddings of the
+    tokens at pos + j) and names["h"] (the hidden states after the final norm
+    at pos + j - 1); eh_proj of [enorm(e), hnorm(h)], one full attention layer
+    with its experts, then shared_head_norm to names["xn"] (the input of the
+    head, and the h of the next draft)."""
     from reclank.ir import program as P
     cfg = model.cfg
     prog = P.Program()
@@ -678,9 +832,20 @@ def compile_qwen_step(model, t, verify=False):
     k, E, inner = cfg.top_k, cfg.num_experts, cfg.moe_inter
     f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
     x, xn = f32(t, hid), f32(t, hid)
-    wide = max(cd, nq * 2 * hd, vd, nq * hd)
+    wide = max(cd, nq * 2 * hd, vd, nq * hd, 2 * hid if mtp else 0)
+    # the MTP layer is a full attention layer after the last one
+    ltype = lambda i: cfg.layer_types[i] if i < len(cfg.layer_types) else "full_attention"  # noqa: E731
+    # LFM2 (cfg.family "lfm2"): conv layers, attention with no gate, dense
+    # MLPs in the first layers, the sigmoid router with the expert bias
+    lfm = getattr(cfg, "family", "qwen") == "lfm2"
+    gated = getattr(cfg, "attn_gate", True)
+    dense_n = getattr(cfg, "dense_layers", 0)
+    if lfm:
+        wide = max(wide, 3 * hid)
+    if dense_n:
+        wide = max(wide, cfg.dense_inter)
     xb = model.x_buffers(t, wide)
-    scratch = model.moe_scratch(t)
+    scratch = model.moe_scratch(t) if E else None
     # model.pack_temps (the GPU, ir/alloc.pack): each layer has buffers of
     # its own (prog.temps), which the packer then places by liveness; else
     # every layer reuses the same ones
@@ -698,13 +863,26 @@ def compile_qwen_step(model, t, verify=False):
         gn = t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0)
         if not fresh:
             o = [wide] * 4 + [nq * hd] * 3
-        elif cfg.layer_types[i] == "full_attention":
+        elif lfm:
+            # LFM2: o1 the in_proj (3 hidden) or q; the dense MLP of the first
+            # layers its gate, up, and act in o1, o2, o3; gate the output of
+            # the short convolution
+            di = cfg.dense_inter if i < dense_n else 0
+            if cfg.layer_types[i] == "full_attention":
+                o = [max(nq * hd, di), max(nk * hd, di), max(nk * hd, di), hid, nq * hd, 0, nq * hd]
+            else:
+                o = [max(3 * hid, di), di, di, hid, 0, hid, 0]
+            gn = 0
+        elif ltype(i) == "full_attention":
             o = [nq * 2 * hd, nk * hd, nk * hd, hid, nq * hd, nq * hd, nq * hd]
             gn = 0
         else:
             o = [cd, vd, cfg.lin_v_heads, hid, cfg.lin_v_heads, vd, 0]
-        return (tmp(t, hid), *[tmp(t, n) if n else None for n in o], tmp(t, hid), tmp(t, E),
-                tmp(t, k), tmp(t, k, dtype=np.int32), tmp(t, 1), tmp(gn) if gn else None,
+        if fresh and not lfm and i < dense_n:
+            # a dense model: the gate, up, and act of the MLP in o1, o2, o3
+            o[:3] = [max(n, cfg.dense_inter) for n in o[:3]]
+        return (tmp(t, hid), *[tmp(t, n) if n else None for n in o], tmp(t, hid), tmp(t, max(E, 1)),
+                tmp(t, max(k, 1)), tmp(t, max(k, 1), dtype=np.int32), tmp(t, 1), tmp(gn) if gn else None,
                 tmp(t, nk * hd) if kv16 and (not fresh or quant_layer(i)) else None)
     prog.names.update(x=x, xn=xn)
     pos = prog.slot("pos")
@@ -761,7 +939,7 @@ def compile_qwen_step(model, t, verify=False):
         a = "layers.%d.self_attn." % i
         prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(a + "q_norm.weight"),
                   model.F(a + "k_norm.weight"), cos, sin, None, None, 0, pos, t, nq, nk, hd,
-                  cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate, kbuf)
+                  cfg.rotary_dim, eps, float(hd ** -0.5), qout, gate if gated else None, kbuf)
         base = [prog.slot("%s.%d" % (nm, i)) for nm in ("kq", "ks", "vq", "vs")]
         # the int8 forms (layer_kv_form): 1 byte for a value, other records
         lf = layer_kv_form(form, cfg, i)
@@ -805,8 +983,36 @@ def compile_qwen_step(model, t, verify=False):
         prog.names["log.%d" % i] = log
         return log
 
+    # RQ8_0 experts (model.rot_experts; scripts/convert_lfm25_gguf.py --experts
+    # rq8): the experts read x rotated in each 32 values (their act the
+    # kernels rotate: kq_set_moe_rot); the router reads x
+    rot_x = getattr(model, "rot_experts", False)
+    hr_one = None
+
+    def rot_input():
+        nonlocal hr_one
+        if fresh:
+            a = P.lazy_zeros((t, hid))
+            prog.temps.append(a)
+            return a
+        if hr_one is None:
+            hr_one = np.zeros((t, hid), np.float32)
+        return hr_one
+
+    layers, final = range(model.n_layers), "norm.weight"
+    if mtp:
+        L = cfg.num_hidden_layers
+        n = "layers.%d.nextn." % L
+        e, hin, en, hn, cat = f32(t, hid), f32(t, hid), f32(t, hid), f32(t, hid), f32(t, 2 * hid)
+        prog.names.update(e=e, h=hin)
+        prog.emit(P.RMS_NORM, e, model.F(n + "enorm.weight"), en, t, hid, eps)
+        prog.emit(P.RMS_NORM, hin, model.F(n + "hnorm.weight"), hn, t, hid, eps)
+        prog.emit(P.HC_CAT, en, hn, cat, t, 1, hid)         # (one stream: each row [en, hn])
+        quant(cat, 2 * hid)
+        lin(n + "eh_proj", x)
+        layers, final = [L], n + "shared_head_norm.weight"
     layer_begin = getattr(model, "layer_begin", None)
-    for i in range(model.n_layers):
+    for i in layers:
         p = "layers.%d." % i
         if fresh and i > 0:
             h, o1, o2, o3, o4, att, gate, qout, mo, logits, val, idx, slog, gscr, kbuf = \
@@ -815,7 +1021,7 @@ def compile_qwen_step(model, t, verify=False):
             layer_begin(prog, i)
         prog.emit(P.RMS_NORM, x, model.F(p + "input_layernorm.weight"), h, t, hid, eps)
         quant(h, hid)
-        if cfg.layer_types[i] == "full_attention":
+        if ltype(i) == "full_attention":
             a = p + "self_attn."
             lin(a + "q_proj", o1)
             lin(a + "k_proj", o2)
@@ -826,7 +1032,7 @@ def compile_qwen_step(model, t, verify=False):
                 prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(a + "q_norm.weight"),
                           model.F(a + "k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
                           prog.slot("V.%d" % i), hs, pos, t, nq, nk, hd, cfg.rotary_dim, eps,
-                          float(hd ** -0.5), qout, gate)
+                          float(hd ** -0.5), qout, gate if gated else None)
             if quant_layer(i):
                 pass
             elif hasattr(model, "emit_attn"):
@@ -835,9 +1041,19 @@ def compile_qwen_step(model, t, verify=False):
             else:
                 prog.emit(P.ATTN_F32H, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i),
                           scores, att, nq, nk, hd, t, pos, hs, 0, 0)
-            prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
+            if gated:
+                prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
             lin(a + "o_proj", o4)
+        elif ltype(i) == "conv":
+            # LFM2: in_proj to B, C, x; C times the short convolution of B x
+            c = p + "conv."
+            lin(c + "in_proj", o1)
+            prog.emit(P.SHORT_CONV, o1, prog.slot("conv.%d" % i),
+                      model.F(c + "conv.weight", (hid, cfg.conv_kernel)), gate, t, hid,
+                      cfg.conv_kernel, prog.slot("nreal"))
+            quant(gate, hid)
+            lin(c + "out_proj", o4)
         else:
             a = p + "linear_attn."
             lin(a + "in_proj_qkv", o1)
@@ -857,12 +1073,38 @@ def compile_qwen_step(model, t, verify=False):
         prog.emit(P.RMS_NORM, x, model.F(p + "post_attention_layernorm.weight"), h, t, hid, eps)
         quant(h, hid)
         m = p + "mlp."
-        lin(m + "gate", logits)
-        lin(m + "shared_expert_gate", slog)
-        prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
-        model.emit_moe(prog, xb, m, idx, val, slog, scratch, mo)
+        if i < dense_n:
+            # the dense SwiGLU MLP (LFM2: of the first layers; a dense model:
+            # of every layer)
+            di = cfg.dense_inter
+            lin(m + "gate_proj", o1)
+            lin(m + "up_proj", o2)
+            prog.emit(P.ENC_SILU_MUL, o1, o2, o3, t * di)
+            quant(o3, di)
+            lin(m + "down_proj", mo)
+        elif getattr(cfg, "router", "softmax") == "sigmoid":
+            # LFM2: sigmoid scores, the expert bias for the choice; no shared expert
+            lin(m + "gate", logits)
+            prog.emit(P.ROUTER_SIG, logits, t, E, k, val, idx, model.F(m + "expert_bias"),
+                      float(getattr(cfg, "router_scale", 1.0)))
+            if rot_x:
+                hr = rot_input()
+                prog.emit(P.COPY, h, hr, t * hid * 4)
+                prog.emit(P.TQ_ROT, hr, t * hid // 32, 0)
+                quant(hr, hid)
+            model.emit_moe(prog, xb, m, idx, val, None, scratch, mo)
+        else:
+            lin(m + "gate", logits)
+            lin(m + "shared_expert_gate", slog)
+            prog.emit(P.ROUTER_TOPK, logits, t, E, k, val, idx)
+            if rot_x:
+                hr = rot_input()
+                prog.emit(P.COPY, h, hr, t * hid * 4)
+                prog.emit(P.TQ_ROT, hr, t * hid // 32, 0)
+                quant(hr, hid)
+            model.emit_moe(prog, xb, m, idx, val, slog, scratch, mo)
         prog.emit(P.ADD, x, mo, x, t * hid)
-    prog.emit(P.RMS_NORM, x, model.F("norm.weight"), xn, t, hid, eps)
+    prog.emit(P.RMS_NORM, x, model.F(final), xn, t, hid, eps)
     prog.tokens = t
     return prog.finish()
 
@@ -876,6 +1118,16 @@ def bind_qwen_step(prog, model, cache, pos):
           "scores": scores_buffer(cfg, pos + t)}
     kw.update(cache_params(model, cache))
     prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
+
+
+def mtp_cache_params(mcache):
+    """The slots of the cache of the MTP layer (Qwen4MTPCache: layer
+    mcache.layer, in the form of QwenCache)."""
+    L = mcache.layer
+    if mcache.layer_form.get(L, mcache.kv_form) in QUANT_FORMS:
+        return {"%s.%d" % (nm, L): a for nm, a in zip(("kq", "ks", "vq", "vs"), mcache.kv[L])}
+    K, V = mcache.kv[L]
+    return {"K.%d" % L: K, "V.%d" % L: V, "hs": K.shape[2]}
 
 
 def scores_buffer(cfg, n):
@@ -897,6 +1149,8 @@ def cache_params(model, cache):
             K, V = cache.kv[i]
             kw["K.%d" % i], kw["V.%d" % i] = K, V
             kw["hs"] = K.shape[2]           # position-major: a head stride of head_dim
+        elif cfg.layer_types[i] == "conv":
+            kw["conv.%d" % i] = cache.conv[i]
         else:
             kw["conv.%d" % i], kw["S.%d" % i] = cache.conv[i], cache.state[i]
     return kw
@@ -913,8 +1167,8 @@ class _QwenRuns:
 
     CHUNK = 512
 
-    def __init__(self, path, cfg=None, layers=None):
-        super().__init__(path, cfg, layers)
+    def __init__(self, path, cfg=None, layers=None, **kw):
+        super().__init__(path, cfg, layers, **kw)
         self.programs = {}
 
     def program(self, t):
@@ -957,6 +1211,28 @@ class _QwenRuns:
         cache.n = start + n
         self._pending = None
 
+    def mtp_step(self, Hs, ids, mcache, pos):
+        """The MTP layer (compile_qwen_step mtp) on rows j: the hidden state
+        after the final norm at pos + j - 1 (Hs) and the token at pos + j.
+        Return the input of the head (the draft of the token at pos + j + 1),
+        twice: it is also the h of the next draft (as Qwen4CPU.mtp_step's
+        streams)."""
+        t = len(ids)
+        prog = self.programs.get(("mtp", t))
+        if prog is None:
+            prog = self.programs[("mtp", t)] = compile_qwen_step(self, t, mtp=True)
+        cos, sin = self.rope(rope_positions(mcache, pos, t))
+        kw = {"pos": pos, "cos": np.ascontiguousarray(cos), "sin": np.ascontiguousarray(sin),
+              "scores": scores_buffer(self.cfg, pos + t)}
+        kw.update(mtp_cache_params(mcache))
+        prog.bind(**{k: v for k, v in kw.items() if k in prog.by_name})
+        prog.names["e"][:] = self.embed(ids)
+        prog.names["h"][:] = Hs.reshape(t, -1)
+        prog.run()
+        mcache.n = pos + t
+        xn = prog.names["xn"].copy()
+        return xn, xn
+
     def forward(self, ids, cache, start_pos=0, hook=None, media=None):
         ids = list(ids)
         out = []
@@ -991,7 +1267,38 @@ _GGUF_NAMES = {
     "mlp.shared_expert.down_proj": "ffn_down_shexp",
     "mlp.switch_mlp.gate_proj": "ffn_gate_exps", "mlp.switch_mlp.up_proj": "ffn_up_exps",
     "mlp.switch_mlp.down_proj": "ffn_down_exps",
+    "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down",
+    # the MTP layer (blk.<layers>, a file of its own: QwenGGUF mtp)
+    "nextn.eh_proj": "nextn.eh_proj", "nextn.enorm.weight": "nextn.enorm",
+    "nextn.hnorm.weight": "nextn.hnorm", "nextn.shared_head_norm.weight": "nextn.shared_head_norm",
 }
+
+
+# LFM2-MoE (llama.cpp lfm2moe): the names that differ from Qwen3.5
+_LFM2_GGUF_NAMES = dict(_GGUF_NAMES, **{
+    "post_attention_layernorm.weight": "ffn_norm",
+    "conv.in_proj": "shortconv.in_proj", "conv.out_proj": "shortconv.out_proj",
+    "conv.conv.weight": "shortconv.conv",
+    "mlp.expert_bias": "exp_probs_b.bias",
+})
+
+
+def lfm2_gguf_name(name, tied=True):
+    """The GGUF name of a weight of this module in an lfm2moe file: the
+    final norm is token_embd_norm, and the head is the embeddings (tied), or
+    output.weight in a file that has one (convert_lfm25_gguf.py --dense rq8:
+    the head in RQ8_0, the embeddings in BF12)."""
+    if name == "norm.weight":
+        return "token_embd_norm.weight"
+    if name == "lm_head" and not tied:
+        return "output.weight"
+    if name in ("embed_tokens", "lm_head"):
+        return "token_embd.weight"
+    _l, i, rest = name.split(".", 2)
+    g = _LFM2_GGUF_NAMES[rest]
+    if not g.endswith(".bias"):
+        g += ".weight"
+    return "blk.%s.%s" % (i, g)
 
 
 def gguf_name(name):
@@ -1031,18 +1338,29 @@ class QwenGGUF(Qwen):
     - the norm weights have the 1 added, as in the MLX files;
     - the value heads are in tiled order (config.v_tiled)."""
 
-    def __init__(self, path, cfg=None, layers=None):
-        from reclank.formats.gguf import GGUF
+    def __init__(self, path, cfg=None, layers=None, mtp=None):
+        from reclank.formats.gguf import GGUF, GGUFAttached
+        from reclank.models.qwen import keep
         self.path = path
-        self.g = GGUF(path)
+        # the weightkeeper's tensors when it holds the file (scripts/weightkeeper.py
+        # FILE.gguf: loaded once, mapped by each run), else the file
+        self.g = keep.KeptGGUF(path) if path.endswith(".gguf") and keep.holds(path) else GGUF(path)
+        if mtp is not None:
+            # the MTP layer in a file of its own (unsloth's quant drops it from the model's file)
+            self.g = GGUFAttached(self.g, [mtp])
         self.cfg = cfg or QwenConfig.from_gguf(self.g)
         self.n_layers = layers or self.cfg.num_hidden_layers
         self._deq = {}
+        if getattr(self.cfg, "family", "qwen") == "lfm2":
+            tied = "output.weight" not in self.g.tensors
+            self.gname = lambda name: lfm2_gguf_name(name, tied)
+        else:
+            self.gname = gguf_name
 
     def W(self, name):
         w = self._deq.get(name)
         if w is None:
-            w = self.g.dequant(gguf_name(name))
+            w = self.g.dequant(self.gname(name))
             if w.ndim == 1:
                 w = w.reshape(1, -1)
             w = self._deq[name] = w
@@ -1052,20 +1370,21 @@ class QwenGGUF(Qwen):
         if name.endswith("linear_attn.A_log"):
             i = name.split(".")[1]
             return np.log(-self.g.dequant("blk.%s.ssm_a" % i)).astype(np.float32)
-        return self.g.dequant(gguf_name(name)).astype(np.float32)
+        return self.g.dequant(self.gname(name)).astype(np.float32)
 
     def mat(self, name, full=None):
-        return _GExperts(self.g, gguf_name(name))
+        return _GExperts(self.g, self.gname(name))
 
     def embed(self, ids):
         return self.g.dequant("token_embd.weight", rows=np.asarray(ids, dtype=np.int64))
 
     def logits(self, h, chunk=16384):
-        rows = self.g.tensors["output.weight"][0][1]
+        head = self.gname("lm_head")
+        rows = self.g.tensors[head][0][1]
         out = np.empty((h.shape[0], rows), np.float32)
         for r0 in range(0, rows, chunk):
             r = np.arange(r0, min(rows, r0 + chunk))
-            out[:, r] = h @ self.g.dequant("output.weight", rows=r).T
+            out[:, r] = h @ self.g.dequant(head, rows=r).T
         return out
 
 
@@ -1113,15 +1432,40 @@ class QwenGGUFCPU(QwenCPU):
 
     t = QwenGGUF.t
 
-    def __init__(self, path, cfg=None, layers=None):
-        QwenGGUF.__init__(self, path, cfg, layers)
+    def __init__(self, path, cfg=None, layers=None, mtp=None):
+        QwenGGUF.__init__(self, path, cfg, layers, mtp)
         self._m = {}
         self._f = {}
+        # RQ8_0 experts (all the routed experts of the file, or none): the
+        # MoE kernels rotate the act of each pair before the down product
+        # (kq_set_moe_rot: a state of the process), and the program rotates
+        # their x (compile_qwen_step)
+        from reclank.formats.gguf import ROT_BASE
+        kinds = {t in ROT_BASE for n, (_d, t, _o) in self.g.tensors.items() if "_exps." in n}
+        assert len(kinds) <= 1, "rotated experts must be all the experts of the file, or none"
+        self.rot_experts = kinds == {True}
+        cops.kq_set_moe_rot(self.rot_experts)
 
     def M(self, name, full=None):
         m = self._m.get(name)
         if m is None:
-            m = self._m[name] = KMat(self.g, gguf_name(name))
+            gname = self.gname(name)
+            d = self.g.index["tensors"].get(gname, {}) if getattr(self.g, "kept", False) else {}
+            if d.get("place") == "experts":
+                # a stack of experts in the weightkeeper (as qwen38.Qwen4CPU.K): data
+                # holds those of the first node; kept, all the nodes (the GPU takes
+                # them as its split, gpu35.QwenGPU._kept_split)
+                m = KMat.__new__(KMat)
+                m.kept = self.g.experts(gname)
+                m.data = m.kept[0][1].reshape(-1)
+                m.type, m.cols, m.rows = int(d["type"]), int(d["dims"][0]), int(d["dims"][1])
+                from reclank.formats.gguf import ROT_BASE
+                m.rot = m.type in ROT_BASE
+                m.type = ROT_BASE.get(m.type, m.type)
+                m.nb = int(d["nb"])
+            else:
+                m = KMat(self.g, gname)
+            self._m[name] = m
         return m
 
     def QX(self, h):
@@ -1142,12 +1486,13 @@ class QwenGGUFCPU(QwenCPU):
 
     def moe_mats(self, p):
         ms = [self.M(p + "switch_mlp." + n) for n in ("gate_proj", "up_proj", "down_proj")]
-        ss = [self.M(p + "shared_expert." + n) for n in ("gate_proj", "up_proj", "down_proj")]
-        if any(m.rot for m in ms + ss):
-            raise ValueError("Qwen3.6: rotated experts (RQ8_0, RQ6_K, ...) are not supported; only "
-                             "the dense matrices may be rotated")
+        ss = [self.M(p + "shared_expert." + n) for n in ("gate_proj", "up_proj", "down_proj")] \
+            if self.cfg.shared_inter else []
+        if any(m.rot for m in ss) or (any(m.rot for m in ms) and not self.rot_experts):
+            raise ValueError("rotated experts (RQ8_0, RQ6_K, ...) must be all the routed experts "
+                             "of the file; a rotated shared expert is not supported")
         g, u, d = (m.c() for m in ms)
-        shared = [m.c() for m in ss]
+        shared = [m.c() for m in ss] if ss else None
         return cops.kq_moe_mats(g, u, d, shared)
 
     def moe_scratch(self, t):
@@ -1185,10 +1530,91 @@ class QwenGGUFCPU(QwenCPU):
     def emit_moe(self, prog, xb, p, idx, val, slog, scratch, out):
         from reclank.ir import program as P
         cfg = self.cfg
+        from reclank.formats.gguf import BF12
+        # BF12 experts (LFM2) read the float32 rows (hf) of x; RQ8_0 experts
+        # x and the act with the precision of int16 (two int8 planes, act bit
+        # 32 of KQ_MOE, as Qwen4CPU): the GPU reads float32 x, and with int8
+        # x the CPU left the GPU at row 9 of a prompt
+        extra = ((None, 0, xb["src"]) if self.M(p + "switch_mlp.gate_proj").type == BF12 else
+                 (None, 32, xb["src"]) if getattr(self, "rot_experts", False) else ())
         prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
                   cfg.num_experts, self.moe_mats(p), slog, cfg.hidden_size, cfg.moe_inter,
-                  scratch, out)
+                  scratch, out, *extra)
 
 
 class QwenGGUFProgram(_QwenRuns, QwenGGUFCPU):
     """QwenGGUFCPU with the step as one program."""
+
+
+# ---- the EXL3 directories of ExLlamaV3 (docs/EXL3_PLAN.md) --------------------
+
+class _FMat:
+    """A float32 matrix of the products (the float16 tensors of an EXL3
+    directory: in_proj_a, in_proj_b), as a KMat."""
+
+    rot = False
+
+    def __init__(self, w):
+        w = np.ascontiguousarray(w, np.float32)
+        self.rows, self.cols = w.shape
+        self.type = 0
+        self.data = w.reshape(-1).view(np.uint8)
+
+    def c(self):
+        return (self.data, self.type)
+
+
+# the RMSNorm weights that the checkpoint keeps as w - 1 (transformers adds
+# the 1; the GGUF files hold 1 + w): not the gated norm of the DeltaNet
+_PLUS1 = ("input_layernorm.weight", "post_attention_layernorm.weight", "q_norm.weight", "k_norm.weight")
+
+
+class QwenEXL3CPU(QwenGGUFCPU):
+    """QwenCPU on an EXL3 directory (reclank/formats/exl3.py) of a model of
+    the Qwen3.5 architecture: the MUL1 matrices as they are (the types
+    KQ_E3_BASE + K of the products: backends/cpu/csrc/kernels/kq/exl3.c),
+    the other tensors as in the checkpoint (the norms take their 1, the value
+    heads of the DeltaNet stay in the grouped order: cfg.v_tiled False), the
+    embeddings bfloat16. The dense models only (Qwen3.8-27B): an MoE
+    directory has its experts as matrices of their own."""
+
+    def __init__(self, path, cfg=None, layers=None):
+        from reclank.formats.exl3 import EXL3Dir
+        self.d = EXL3Dir(path)
+        self.cfg = cfg or QwenConfig(path)
+        assert not self.cfg.num_experts, "the EXL3 path takes the dense models only"
+        self.n_layers = layers or self.cfg.num_hidden_layers
+        self._m = {}
+        self._f = {}
+        self._emb = None
+        self.rot_experts = False
+        cops.kq_set_moe_rot(False)
+
+    @staticmethod
+    def key(name):
+        """The checkpoint name of a weight of this module."""
+        return name if name == "lm_head" else "model.language_model." + name
+
+    def M(self, name, full=None):
+        m = self._m.get(name)
+        if m is None:
+            k = self.key(name)
+            m = self.d.e3(k) if self.d.is_e3(k) else _FMat(self.d.get(k + ".weight"))
+            self._m[name] = m
+        return m
+
+    def t(self, name):
+        w = np.asarray(self.d.get(self.key(name)), np.float32)
+        if name == "norm.weight" or name.endswith(_PLUS1):
+            w = w + 1.0
+        return w
+
+    def embed(self, ids):
+        if self._emb is None:
+            self._emb = self.d.get_bf16(self.key("embed_tokens.weight"))
+        rows = self._emb[np.asarray(ids, np.int64)]
+        return (rows.astype(np.uint32) << 16).view(np.float32)
+
+
+class QwenEXL3Program(_QwenRuns, QwenEXL3CPU):
+    """QwenEXL3CPU with the step as one program."""

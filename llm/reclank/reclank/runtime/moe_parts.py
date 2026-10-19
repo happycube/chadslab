@@ -114,7 +114,7 @@ def node_budget(node):
 AUTO_SHARE0 = 0.55
 
 
-def shares(parts, total=0, home=None, nodes_=None):
+def shares(parts, total=0, home=None, nodes_=None, s0_auto=AUTO_SHARE0):
     """The share of the rows of each part. RECLANK_GPU_PART_SHARE: "auto" (the
     default) AUTO_SHARE0 to part 0 of two (equal shares of more) when the rows
     a part copies to its node fit there (node_budget; total: the bytes of the
@@ -129,7 +129,7 @@ def shares(parts, total=0, home=None, nodes_=None):
         return [s0] + [(1.0 - s0) / (parts - 1)] * (parts - 1)
     share = [1.0 / parts] * parts
     if parts == 2:
-        share = [AUTO_SHARE0, 1.0 - AUTO_SHARE0]
+        share = [s0_auto, 1.0 - s0_auto]
     for p, nd in enumerate(nodes_ or []):
         if p == 0 or nd == home or total <= 0:
             continue
@@ -171,13 +171,51 @@ def home_node(a):
     return found.pop() if len(found) == 1 else None
 
 
+def is_e3(t):
+    """A KQ_E3 type (the MUL1 blocks of EXL3, kernels/kq/exl3.c)."""
+    return 70 < int(t) <= 78
+
+
+def e3_bytes(K, k, n):
+    """The bytes of the block of a k x n KQ_E3 matrix: the trellis, suh, svh."""
+    return k * n * K // 8 + 2 * (k + n)
+
+
+def part_rows(m, E, r0, nr, nd):
+    """A copy on node nd of the rows r0 to r0 + nr of each of the E experts
+    of m: (array, the bytes of an expert there). The rows of a KQ_E3 matrix
+    are its outputs, the columns of its trellis (k / 16 x n / 16 tiles of 32
+    K bytes, row by row): the copy is the block of a k x nr matrix (the tile
+    columns r0 / 16 on, in each row of tiles; all of suh; svh r0 to r0 + nr)."""
+    if not is_e3(m.type):
+        rb = m.data.nbytes // (E * m.rows)
+        dst = numa.empty_on((E, nr * rb), np.uint8, nd, strict=True)
+        dst[:] = m.data.reshape(E, m.rows * rb)[:, r0 * rb:(r0 + nr) * rb]
+        return dst, nr * rb
+    K, k, n = int(m.type) - 70, m.cols, m.rows
+    per, sub, tb = e3_bytes(K, k, n), e3_bytes(K, k, nr), 32 * K
+    tr, trs = k * n * K // 8, k * nr * K // 8
+    src = m.data.reshape(E, per)
+    dst = numa.empty_on((E, sub), np.uint8, nd, strict=True)
+    st = np.lib.stride_tricks.as_strided
+    tiles = st(src[:, (r0 // 16) * tb:], shape=(E, k // 16, nr // 16, tb), strides=(per, n // 16 * tb, tb, 1),
+               writeable=False)
+    st(dst, shape=(E, k // 16, nr // 16, tb), strides=(sub, nr // 16 * tb, tb, 1))[:] = tiles
+    dst[:, trs:trs + 2 * k] = src[:, tr:tr + 2 * k]
+    dst[:, trs + 2 * k:] = src[:, tr + 2 * k + 2 * r0:tr + 2 * k + 2 * (r0 + nr)]
+    return dst, sub
+
+
 class ExpertParts:
     """The rows of the experts of each part and the programs of GP_RUN_PARTS."""
 
-    def __init__(self, mats, E, hidden, inner, cpus, quiet=False):
+    def __init__(self, mats, E, hidden, inner, cpus, quiet=False, on_node=None):
         """mats: layer -> (gate, up, down) matrices of the experts (KMat: data,
         type, rows, cols; data has the E experts). cpus: the CPUs of each
-        part (part_cpus)."""
+        part (part_cpus). on_node(i, j, node): all the experts of matrix j
+        (0 gate, 1 up, 2 down) of layer i in the memory of node, or None (the
+        weightkeeper's experts whole on each node: the parts read them there,
+        no copy)."""
         self.E, self.hidden, self.inner = E, hidden, inner
         self.cpus = cpus
         self.nparts = len(cpus)
@@ -186,9 +224,15 @@ class ExpertParts:
         total = sum(m.data.nbytes for ms in mats.values() for m in ms)
         first = next(iter(mats.values()))[0] if mats else None
         home = home_node(first.data) if first is not None else None
-        self.share = shares(self.nparts, total, home, self.nodes)
-        self.gu = split(inner, self.nparts, share=self.share)
-        self.dn = split(hidden, self.nparts, share=self.share)
+        # KQ_E3: the rows of a part in blocks of 128 (the transform of the
+        # outputs), those of gate and up as one range of their 2 inner outputs
+        # (moe_part.c; two parts: all of gate, all of up), even shares by
+        # default (the decode of the trellis, not the reads, takes the time)
+        self.e3 = first is not None and is_e3(first.type)
+        self.share = shares(self.nparts, total, home, self.nodes, 0.5 if self.e3 else AUTO_SHARE0)
+        align = 128 if self.e3 else 32
+        self.gu = split(2 * inner if self.e3 else inner, self.nparts, align=align, share=self.share)
+        self.dn = split(hidden, self.nparts, align=align, share=self.share)
         self.desc = {}          # layer -> [int64 12 for each part]
         self.keep = []
         t0 = time.time()
@@ -197,18 +241,26 @@ class ExpertParts:
             descs = []
             for p, nd in enumerate(self.nodes):
                 d = []
-                for m, (r0, nr) in ((G, self.gu[p]), (U, self.gu[p]), (D, self.dn[p])):
-                    rows = m.rows
-                    rb = m.data.nbytes // (E * rows)
-                    if home_node(m.data) == nd:
-                        d += [m.data.ctypes.data, m.type, rows * rb, r0]
+                gu = [self.gu[p], self.gu[p]]
+                if self.e3:
+                    a0, n = self.gu[p]
+                    gu = [(min(a0, inner), min(a0 + n, inner) - min(a0, inner)),
+                          (max(a0, inner) - inner, max(a0 + n, inner) - max(a0, inner))]
+                for j, (m, (r0, nr)) in enumerate(((G, gu[0]), (U, gu[1]), (D, self.dn[p]))):
+                    if nr == 0:
+                        # (none of the matrix in this part: an empty block)
+                        d += [0, m.type, e3_bytes(int(m.type) - 70, m.cols, 0), 0]
                         continue
-                    src = m.data.reshape(E, rows * rb)
-                    dst = numa.empty_on((E, nr * rb), np.uint8, nd, strict=True)
-                    dst[:] = src[:, r0 * rb:(r0 + nr) * rb]
+                    full = on_node(i, j, nd) if on_node is not None else None
+                    if full is None and home_node(m.data) == nd:
+                        full = m.data
+                    if full is not None:
+                        d += [full.ctypes.data, m.type, full.nbytes // E, r0]
+                        continue
+                    dst, per = part_rows(m, E, r0, nr, nd)
                     self.keep.append(dst)
                     copied += dst.nbytes
-                    d += [dst.ctypes.data, m.type, nr * rb, 0]
+                    d += [dst.ctypes.data, m.type, per, 0]
                 descs.append(np.array(d, dtype=np.int64))
             self.desc[i] = descs
         self.cpus_arr = np.array([c for cs in cpus for c in cs], dtype=np.int32)
@@ -216,10 +268,10 @@ class ExpertParts:
         self.gu_arr = np.array(self.gu, dtype=np.int32).reshape(-1)
         self.dn_arr = np.array(self.dn, dtype=np.int32).reshape(-1)
         if not quiet and os.environ.get("RECLANK_QUIET") != "1":
-            print("the experts in %d parts (nodes %s, CPUs %s): the rows of inner %s, of hidden %s; "
+            print("the experts in %d parts (nodes %s, CPUs %s): the rows of %s %s, of hidden %s; "
                   "%.1f GB of rows copied in %.1f s" % (
                       self.nparts, self.nodes, ["%d-%d" % (c[0], c[-1]) for c in cpus],
-                      [n for _a, n in self.gu], [n for _a, n in self.dn], copied / 1e9,
+                      "gate and up" if self.e3 else "inner", [n for _a, n in self.gu], [n for _a, n in self.dn], copied / 1e9,
                       time.time() - t0), file=sys.stderr)
 
     @classmethod
@@ -234,6 +286,7 @@ class ExpertParts:
         self.cpus, self.nparts, self.team = cpus, len(cpus), len(cpus[0])
         self.nodes = list(part_nodes) if part_nodes is not None else nodes()[:self.nparts]
         self.share = None
+        self.e3 = False
         self.gu, self.dn = [tuple(x) for x in gu], [tuple(x) for x in dn]
         self.desc = {i: [np.asarray(d, np.int64) for d in ds] for i, ds in desc.items()}
         self.keep = []
@@ -244,12 +297,12 @@ class ExpertParts:
         return self
 
     @classmethod
-    def make(cls, mats, E, hidden, inner):
+    def make(cls, mats, E, hidden, inner, on_node=None):
         """ExpertParts when RECLANK_GPU_PARTS=1 and the machine has two or
         more NUMA nodes, else None."""
         if not wanted() or not numa.enabled() or len(nodes()) < 2:
             return None
-        return cls(mats, E, hidden, inner, part_cpus())
+        return cls(mats, E, hidden, inner, part_cpus(), on_node=on_node)
 
     def program(self, i, t, k, hf, ids, val, out, kcount, flags, bufs):
         """The CPU program of the cold experts of layer i: GP_RUN_PARTS (the
@@ -257,8 +310,9 @@ class ExpertParts:
         the scratch that the layers share (they run one at a time)."""
         hidden, inner, E = self.hidden, self.inner, self.E
         act2 = bufs.get("act2")
-        if act2 is None or act2.shape[0] < t * k:
-            act2 = bufs["act2"] = np.zeros((t * k, inner), np.float32)
+        w = 2 * inner if self.e3 else inner     # (KQ_E3: the outputs of gate and up)
+        if act2 is None or act2.shape[0] < t * k or act2.shape[1] != w:
+            act2 = bufs["act2"] = np.zeros((t * k, w), np.float32)
         scr = []
         for p in range(self.nparts):
             (_a0, ni), (_c0, nd) = self.gu[p], self.dn[p]

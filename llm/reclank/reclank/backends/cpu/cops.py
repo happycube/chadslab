@@ -47,6 +47,13 @@ def have_vnni():
 # tokens to each expert, so the tile is the better kernel for it.
 INT4_TILE_TOKENS = int(os.environ.get("RECLANK_INT4_TILE_TOKENS", "2"))
 _lib = None
+# a GPU run: the CUDA libraries build beside this one (backends/cuda/devices.py prebuild)
+if os.environ.get("RECLANK_GPU") == "1" or os.environ.get("RECLANK_EXPERT_GPUS", "").strip():
+    try:
+        from reclank.backends.cuda.devices import prebuild as _cuda_prebuild
+        _cuda_prebuild(primary=True)
+    except Exception:
+        pass
 try:
     _path = _cpu_build.build(TIER)
     if _path is not None:
@@ -150,12 +157,19 @@ try:
         _lib.rc_kq_linear.restype = None
         _lib.rc_kq_rows.argtypes = [_void_p, _int, _int, _void_p, _int, _void_p]
         _lib.rc_kq_rows.restype = None
+        _lib.rc_nm_linear2.argtypes = [_void_p, _int, _int, _int, _void_p, _int, _void_p]
+        _lib.rc_nm_linear2.restype = None
+        _lib.rc_nm_moe_scratch_bytes.argtypes = [_int, _int, _int, _int]
+        _lib.rc_nm_moe_scratch_bytes.restype = ctypes.c_size_t
         _lib.rc_kq_to_q8_0.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
         _lib.rc_kq_to_q8_0.restype = None
         _lib.rc_kq_to_q6_k.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
         _lib.rc_kq_to_q6_k.restype = None
         _lib.rc_kq_to_qk.argtypes = [_void_p, _int, ctypes.c_int64, _int, _int, _void_p]
         _lib.rc_kq_to_qk.restype = None
+        _lib.rc_kq_to_qk_opt.argtypes = [_void_p, ctypes.c_int64, _int, _int, _void_p, _int, _int,
+                                         _void_p, _void_p]
+        _lib.rc_kq_to_qk_opt.restype = None
         _lib.rc_exl3_decode.argtypes = [_void_p, _int, _int, _int, _int, _void_p]
         _lib.rc_exl3_decode.restype = None
         _lib.rc_e3_linear.argtypes = [_void_p, _int, _int, _int, _void_p, _int, _void_p]
@@ -174,6 +188,18 @@ try:
         _lib.rc_kq_nv4_pack.restype = None
         _lib.rc_kq_nvx_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.rc_kq_nvx_pack.restype = None
+        _lib.rc_csf_decode.argtypes = [_void_p, _int, _int, _void_p, ctypes.c_int64, _void_p, _void_p]
+        _lib.rc_csf_decode.restype = None
+        _lib.rc_kq_nvx_linear_f.argtypes = [_void_p, _int, _int, _void_p, _int, _void_p, _int]
+        _lib.rc_kq_nvx_linear_f.restype = None
+        _lib.rc_set_kv_e4m3.argtypes = [_int]
+        _lib.rc_set_kv_e4m3.restype = None
+        _lib.rc_kv_e4m3_codes.argtypes = [_void_p, ctypes.c_int64, _void_p]
+        _lib.rc_kv_e4m3_codes.restype = None
+        _lib.rc_kq_a4_quant.argtypes = [_void_p, _int, _int, ctypes.c_float, _void_p, _void_p]
+        _lib.rc_kq_a4_quant.restype = None
+        _lib.rc_kq_nvx_linear_a4.argtypes = [_void_p, _int, _int, _void_p, _void_p, _int, _void_p]
+        _lib.rc_kq_nvx_linear_a4.restype = None
         _lib.rc_kq_mxx_pack.argtypes = [_void_p, _void_p, _int, _int, _void_p]
         _lib.rc_kq_mxx_pack.restype = ctypes.c_int64
         _lib.rc_kq_mxx_pack_serial.argtypes = [_void_p, _void_p, _int, _int, _void_p]
@@ -199,6 +225,9 @@ try:
         _lib.rc_kq_pack_q8x16.restype = None
         _lib.rc_kq_gather.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.rc_kq_gather.restype = None
+        _lib.rc_e3_ngram_decode.argtypes = [_void_p, ctypes.c_int64, _int, _int, _void_p, _void_p, _void_p,
+                                            _void_p]
+        _lib.rc_e3_ngram_decode.restype = None
         _lib.rc_kq_memcpy_par.argtypes = [_void_p, _void_p, ctypes.c_int64]
         _lib.rc_kq_memcpy_par.restype = None
         _lib.rc_kq_set_node0_share.argtypes = [ctypes.c_float]
@@ -682,6 +711,20 @@ def kq_rows(w, type_, cols, ids):
 KQ_Q8_0, KQ_BF16, KQ_NV4, KQ_NVX = 8, 30, 51, 53
 
 
+def nm_linear2(w, type_, rows, cols, x):
+    """x (t x cols float32) times a matrix of IQ2_XXS, KQ_NV4 or Q8_0 rows on x as int16 in two int8
+    planes (Nemotron's head): t x rows."""
+    x = np.ascontiguousarray(x, np.float32)
+    out = np.empty((x.shape[0], rows), np.float32)
+    _lib.rc_nm_linear2(w.ctypes.data, type_, rows, cols, x.ctypes.data, x.shape[0], out.ctypes.data)
+    return out
+
+
+def nm_moe_scratch(t, k, latent, inner):
+    """The scratch of a GP_NM_MOE record (Nemotron's latent experts) of t tokens."""
+    return np.zeros(int(_lib.rc_nm_moe_scratch_bytes(t, k, latent, inner)), np.uint8)
+
+
 def kq_to_q8_0(src, cols):
     """Q8_0 blocks (uint8, rows x cols / 32 * 34) of a matrix: bfloat16 as
     uint16, or float32."""
@@ -716,6 +759,24 @@ def kq_to_qk(src, cols, bits):
     _lib.rc_kq_to_qk(src.ctypes.data, 1 if src.dtype == np.uint16 else 0, rows, cols, bits,
                      out.ctypes.data)
     return out
+
+
+def kq_to_qk_opt(src, cols, bits, dsel=None, dbits=0, mbits=0, err=False):
+    """kq_to_qk with the better encoder of convert.c (rc_kq_to_qk_opt: unit
+    weights, a d/dmin grid, the 6-bit neighbours of each scale and min; the
+    same block format). src float32 (rows x cols, cols a multiple of 256).
+    dsel (int8, one for each block of 256, or None): a selector in the low
+    dbits of d and the next mbits of dmin. err: also return the squared error
+    of each block (float64)."""
+    assert cols % 256 == 0 and bits in (4, 5), (cols, bits)
+    src = np.ascontiguousarray(src, dtype=np.float32)
+    rows = src.size // cols
+    out = np.empty(rows * (cols // 256) * (144 if bits == 4 else 176), dtype=np.uint8)
+    e = np.empty(rows * (cols // 256), np.float64) if err else None
+    d = None if dsel is None else np.ascontiguousarray(dsel, dtype=np.int8)
+    _lib.rc_kq_to_qk_opt(src.ctypes.data, rows, cols, bits, None if d is None else d.ctypes.data,
+                         dbits, mbits, out.ctypes.data, None if e is None else e.ctypes.data)
+    return (out, e) if err else out
 
 
 EXL3_CODEBOOKS = {"3inst": 0, "mcg": 1, "mul1": 2, "mul1x": 3}
@@ -899,6 +960,23 @@ def kq_gather(addrs, nbytes):
     return out
 
 
+def e3_ngram_decode(packed, K, tab, bias, head):
+    """The float32 rows of the packed n-gram rows of EXL3 (n x words, int16):
+    formats/exl3_qwen4.ngram_decode with the bias of row r bias[head[r]]
+    (kernels/kq/exl3.c)."""
+    packed = np.ascontiguousarray(packed, dtype=np.int16)
+    n, words = packed.shape
+    dim = (words - 1) * 16 // K
+    tab = np.ascontiguousarray(tab, dtype=np.float32)
+    bias = np.ascontiguousarray(bias, dtype=np.float32)
+    head = np.ascontiguousarray(head, dtype=np.int64)
+    assert bias.shape[-1] == dim and dim <= 1024 and tab.size == 65536
+    out = np.empty((n, dim), np.float32)
+    _lib.rc_e3_ngram_decode(packed.ctypes.data, n, words, K, tab.ctypes.data, bias.ctypes.data,
+                            head.ctypes.data, out.ctypes.data)
+    return out
+
+
 def kq_nv4_row_bytes(cols):
     """A KQ_NV4 row: the codes, the scales, the scale of the matrix, zeros to
     a multiple of 16 bytes (backends/cpu/csrc/kernels/kq)."""
@@ -920,6 +998,67 @@ def kq_nvx_pack(ws, ss, gs, rows, cols, out):
     g = np.ascontiguousarray(gs, dtype=np.float32)
     assert out.nbytes >= n * rows * kq_nvx_row_bytes(cols)
     _lib.rc_kq_nvx_pack(wp.ctypes.data, sp.ctypes.data, g.ctypes.data, n, rows, cols, out.ctypes.data)
+
+
+def csf_decode(fixed, exceptions, rows, c, out=None):
+    """The E4M3 block scales (uint8 rows x c) of an NVFP4 matrix stored in the CSF
+    encoding "csf" (fixed: uint8 [rows / 16, 16 (1 + c / 2)], exceptions: uint32 [n];
+    csrc/kernels/kq/convert.c rc_csf_decode). Returns (scales, stats): stats a dict of
+    the checks (bad_base, bad_exc, inside, max_base, zeros, subnormal)."""
+    fixed = np.ascontiguousarray(fixed, dtype=np.uint8)
+    exc = np.ascontiguousarray(exceptions, dtype=np.uint32).reshape(-1)
+    assert rows % 16 == 0 and c % 2 == 0 and fixed.size == rows // 16 * 16 * (1 + c // 2)
+    if out is None:
+        out = np.empty((rows, c), dtype=np.uint8)
+    st = np.zeros(6, dtype=np.int64)
+    _lib.rc_csf_decode(fixed.ctypes.data, rows, c, exc.ctypes.data, exc.size, out.ctypes.data, st.ctypes.data)
+    return out, dict(zip(("bad_base", "bad_exc", "inside", "max_base", "zeros", "subnormal"), map(int, st)))
+
+
+def kq_nvx_linear_f(w, rows, cols, x, raw=False):
+    """x (n x cols float32) times a KQ_NVX matrix with the A16 products of FP4-Local (exact
+    weights, float32 sums in order; raw: without the matrix's global scale)."""
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1, cols)
+    out = np.empty((x.shape[0], rows), dtype=np.float32)
+    _lib.rc_kq_nvx_linear_f(np.ascontiguousarray(w).ctypes.data, rows, cols, x.ctypes.data, x.shape[0],
+                            out.ctypes.data, 1 if raw else 0)
+    return out
+
+
+def set_kv_e4m3(on):
+    """The FP8 cache of FP4-Local in the int8 form of the cache: E4M3 codes, the scales 1 (a state of
+    the process: the writes and the readers of the int8 cache)."""
+    _lib.rc_set_kv_e4m3(1 if on else 0)
+
+
+def kv_e4m3_codes(x):
+    """The E4M3 codes (uint8) of the values of x (to nearest even, saturating)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    out = np.empty(x.shape, np.uint8)
+    _lib.rc_kv_e4m3_codes(x.ctypes.data, x.size, out.ctypes.data)
+    return out
+
+
+def kq_a4_quant(x, gs):
+    """Rows of x (n x cols float32) to FP4-Local's A4 form: (q, sx): twice the E2M1 values (int8)
+    and the E4M3 scale of each 16 (float32)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    n, cols = x.reshape(-1, x.shape[-1]).shape
+    q = np.empty((n, cols), np.int8)
+    sx = np.empty((n, cols // 16), np.float32)
+    _lib.rc_kq_a4_quant(x.ctypes.data, n, cols, float(gs), q.ctypes.data, sx.ctypes.data)
+    return q, sx
+
+
+def kq_nvx_linear_a4(w, rows, cols, q, sx):
+    """A4 x (q, sx of kq_a4_quant) times a KQ_NVX matrix whose heads hold the A4 global scale
+    (bytes 4-7): the sum of (q sf)(E2M1 s) times g / gs."""
+    q = np.ascontiguousarray(q, dtype=np.int8).reshape(-1, cols)
+    sx = np.ascontiguousarray(sx, dtype=np.float32)
+    out = np.empty((q.shape[0], rows), dtype=np.float32)
+    _lib.rc_kq_nvx_linear_a4(np.ascontiguousarray(w).ctypes.data, rows, cols, q.ctypes.data, sx.ctypes.data,
+                             q.shape[0], out.ctypes.data)
+    return out
 
 
 def kq_nv4_pack(ws, ss, gs, rows, cols, out):

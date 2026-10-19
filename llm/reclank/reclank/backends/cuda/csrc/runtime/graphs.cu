@@ -41,7 +41,7 @@ static int gg_boundary(gg_prog *g, const gp_rec *r)
         int bad = gg_fetch_error;
         pthread_mutex_unlock(&gg_mu);
         if (bad) {
-            snprintf(gg_error, sizeof(gg_error), "a copy of the weights of the experts failed");
+            snprintf(gg_error, sizeof(gg_error), "a copy of the weights of the experts failed: %s", gg_fetch_why);
             return -1;
         }
         if (ms) {

@@ -64,7 +64,15 @@ static double gg_clock(void)
 #include "opcodes.h"
 #include "port.cuh"
 
-static cudaStream_t gg_stream;
+/* The stream of the programs: the calling thread's (gg_tstream: lane B of
+ * docs/LANES_PLAN.md, rc_gpu_lane), else the model's. */
+static cudaStream_t gg_main_stream;
+/* The device of this copy of the library (rc_gpu_init): the threads it starts
+ * select it first, as CUDA gives a new thread device 0 (the 3060 and the 1070
+ * of a box both visible, the steps on the 3060: a copy worker on the 1070). */
+static int gg_device;
+static __thread cudaStream_t gg_tstream;
+#define gg_stream (gg_tstream != NULL ? gg_tstream : gg_main_stream)
 static char gg_error[256];
 
 #define CK(x)                                                                   \

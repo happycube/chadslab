@@ -5,10 +5,13 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_F32: return (size_t)cols * 4;
     case KQ_Q8_0: return (size_t)cols / 32 * 34;
     case KQ_Q5_1: return (size_t)cols / 32 * 24;
+    case KQ_Q4_0: return (size_t)cols / 32 * 18;
     case KQ_IQ4_NL: return (size_t)cols / 32 * 18;
     case KQ_Q4_K: return (size_t)cols / 256 * 144;
     case KQ_Q5_K: return (size_t)cols / 256 * 176;
     case KQ_Q6_K: return (size_t)cols / 256 * 210;
+    case KQ_IQ2_XXS: return (size_t)cols / 256 * 66;
+    case KQ_IQ2R: return ((size_t)cols / 4 + (size_t)cols / 128 + 7) / 8 * 8;
     case KQ_BF16: return (size_t)cols * 2;
     case KQ_NV4: return ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) / 16 * 16;
     case KQ_Q8X16: return (size_t)cols / 32 * 36;      /* a group of 16 rows: 16 times this */
@@ -19,6 +22,7 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_BF12: return ((size_t)cols + (size_t)cols / 2 + (size_t)cols / 32 + 15) / 16 * 16;
     case KQ_BF12X16: return (size_t)cols / 32 * 49;    /* a group of 16 rows: 16 times this */
     case KQ_MXX: return (size_t)cols / 32 * 17;        /* a group of 16 rows: 16 times this */
+    case KQ_MXF8: return ((size_t)cols + (size_t)cols / 32 + 15) / 16 * 16;
     }
     return 0;
 }
@@ -151,9 +155,29 @@ static void kq_nvx_values(const uint8_t *wg, int rin, int cols, float *out)
         for (int v = 0; v < 32; ++v) {
             int c = (blk[32 * (v / 4) + 4 * r8 + v % 4] >> sh) & 15;
             float sc = kq_e4m3_tab[blk[256 + 16 * (v / 16) + rin]];
-            out[32 * b + v] = 0.5f * g * sc * (float)e2[c];
+            out[32 * b + v] = (0.5f * sc * (float)e2[c]) * g;     /* exact, then one rounding */
         }
     }
+}
+
+/* float32 rounded to bfloat16 (to nearest even; finite values), as float32 */
+static inline float kq_bf16r(float v)
+{
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+    memcpy(&v, &u, 4);
+    return v;
+}
+
+/* The act of FP4-Local's contract (b12x W4A16 and A4, docs/FP4LOCAL_PLAN.md): g and u to bfloat16,
+ * h = bf16(bf16(g sigma(g)) u) */
+static inline float kq_b12x_act(float g, float u)
+{
+    g = kq_bf16r(g);
+    u = kq_bf16r(u);
+    /* (rc_dexp: the bits of the GPU's moe_b12x_act) */
+    return kq_bf16r(kq_bf16r(g * (1.f / (1.f + rc_dexp(-g)))) * u);
 }
 
 static inline float kq_bf16(uint16_t h)

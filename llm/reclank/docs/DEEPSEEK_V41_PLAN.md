@@ -824,7 +824,7 @@ reading its new experts (6 tokens in a row choose 22.6 distinct experts a
 layer, 3.8 a token: the real routes of prompt3). Plain 13.6-14.7 tokens/s,
 DSpark 14.8-15.7 (1.00-1.14x).
 
-**The DSpark experts in the RAM of node 1** (DSpark(where="cpu1"), the
+**The DSpark experts in the RAM of node 1** (DSpark(where="cpu1"), then the
 default: a part of node 1's CPUs runs them, GP_CPU_TASK in the draft): the
 GPU's memory goes to the main model's hot experts (10 GB: 13 slots a layer),
 and plain steps go from 13.6-14.7 to 17.4-17.8 tokens/s, the best now. The
@@ -1040,3 +1040,92 @@ its own module against both from one node); the context at
   library on the decoded text of each id; the port must give the same
   99092 ids (the count is checked; a table of the 129280 ids from the
   reference's code is the test).
+
+**The host and the small records of a step (1017 checkpoint, the weightkeeper, 12 GB of hot experts):**
+a step 43.5-44.3 -> 38.6 ms. nsys (cuda-graph-trace node): 1524 kernels, 10 graphs a step; the GPU
+waits 23 ms for the CPU's experts (k_await). (1) The head (129280 x 5120 BF12, one token) on the
+CUDA-core kernel (k_kq_linear_bf12<1>) in place of k_kq_bf12_tc<8>: 1.81 -> 1.26 ms (a rule of
+shape: one token, 4096 columns or more, 16384 rows or more); the logits pinned: their copy 0.22 ->
+0.11 ms. (2) k_ds_hc_post made its coefficients in one thread of each block (the Sinkhorn of 4 x 4:
+20 iterations of 32 divisions, 25 us a record, 80 a step): now a warp (ds_hc_coef_warp: lane 4 j + k
+an entry, each sum gathered by shuffles in ds_hc_coef's order: the same bits). (3) The hot experts'
+observe and plan of a step (0.84 ms) run while the GPU ends the next step (rc_gpu_run returns with
+the last CPU task, before the head); their copies start a token later (the step's time the same).
+The logits the same bits (prompt and steps; RECLANK_GPU_BF12_TC=0 on both sides for the head);
+prompt3 against the reference as before (steps KL 3.61e-2, 16 of 17). Not a gain: more copies a
+token (RECLANK_DS_HOT_BUDGET 8, 12: the 15 slots a layer bound the hold, not the copies); the link
+of this 3090 gives 8 GB/s (Gen3 x16), so a cold expert by DMA (18.7 MB) costs 2.3 ms against the
+CPU's ~0.1 ms of a step: no gain from moving the cold experts over PCIe.
+
+**DSpark pays (1017 checkpoint, the weightkeeper):** why it did not, measured (the true tokens as the
+drafts, rc_gpu_profile, nsys): a step 39.8 ms (CPU tasks 19.9, the GPU's ~20 serial with them); a
+verify group of 2 58 ms, 3 70, 4 89 (the CPU's tasks 39.5 for 2, 69.4 for 4: each row brings ~3.8 new
+cold experts, about 5 ms each, the products at the DRAM's rate; the halves A and B overlap, but each
+half reads all the FP8 weights again: 41 ms of kernels for 2 rows, so the GPU is the bound there); the
+draft 12.6 ms. (1) The DSpark experts in the RAM of both nodes (DSpark(where="cpu"), the default):
+each block's rows of gate and up and of down split as the weightkeeper's, a part a node, run by the
+teams of the main parts (the draft runs between the main model's programs); its CPU task 5.6 -> 3.1
+ms, the draft 12.6 -> 9.5 ms, the same drafts and confidences (where="cpu1" keeps node 1 alone). (2)
+The parts (moe_part.c, fuse): a unit of B is 16 rows of gate and the same 16 of up, whose act its
+thread makes at once (phase C took a thread for each pair, 27 us a layer, then a barrier): a step
+38.8 -> 37.6 ms, the same bits (prompt and steps; RECLANK_PART_FUSE=0 the phases of before); not for
+the groups of the dynamic split (a prompt 3% slower: the prompt keeps its phases). Tried, slower: D
+(the int16 act) in units of a pair and a group of 32 over all the threads (E 0.4 ms slower a step:
+its rows written by many cores), and for a token alone its int16 row read by every pair (no rows of
+the pairs nor their barrier: B 2.3 ms slower). The three real prompts, 160 tokens greedy, the same
+tokens as plain decoding: plain 28.5 / 29.8 / 26.8 tokens/s, DSpark 31.7 / 28.9 / 32.5 (1.11x,
+0.97x, 1.21x; drafts accepted 0.74 / 0.47 / 0.74); before, with the DSpark experts on node 1, 1.00x,
+0.99x, 1.02x. Not a gain: the FP8 products of a step (k_fp8b32_gemv) read at 630-800 GB/s on the
+large matrices where a plain read of the same size reaches 768 (585 for 12 MB); 16-byte loads, a
+block a row (wo_b alone 68.6 -> 59.4 us) and wq_a with wkv in one launch would give about 0.6 ms a
+pass. The ceiling on this machine: a verify group of 2 at max(CPU, GPU) (~42 ms) and a draft of ~8 ms
+give about 1.3x; prompt2's drafts (accepted 0.47-0.53) are the case where the choice of the verify
+length still loses.
+The verify length by the cutoff of the MTP drafters (DSpark(stop), dspark.STOP 0.9, RECLANK_MTP_STOP
+wins): the drafts while the survival of their prefix (the product of the sigmoids of the confidences)
+is at least 0.9, and the first under it when its survival is at least 0.3 (STOP_FLOOR,
+RECLANK_DSPARK_STOP_FLOOR). On the three prompts: the rates' choice of before 1.11x / 0.97x / 1.21x;
+0.9 with the first under it always 1.08 / 0.98 / 1.21; never 1.09 / 1.04 / 1.08 (rounds of no draft
+waste the draft, and "auto" then takes plain steps); floor 0.5 1.14 / 1.04 / 1.18; floor 0.3 1.12 /
+1.03 / 1.22 (DSpark 31.5 / 30.6 / 32.8 tokens/s against plain 28.1 / 29.6 / 27.0), the default.
+**A verify group's rows the bits of a step again; the small records of a step:** the head of one
+token on the CUDA-core kernel (above) had left a verify group's rows on the tensor cores: each row
+1.5e-5 from the step's logits (the greedy tokens the same, the bits not). Now the head of 1 to 8
+tokens is on the CUDA cores (runner.cu: long rows, 16384 rows or more), 2 to 8 by
+k_kq_linear_bf12_r (4 rows a warp, each token's x loaded once for them: k_kq_linear_bf12<NT> read
+x again for each row, 160 KB for 8 tokens, more than an SM's L1: 0.75 ms more a token); each row
+and token the operations of a token alone: the head 1.39 ms for 2 tokens (tensor cores 1.80), 1.76
+for 3 (1.81), 2.61 for 8 (1.90). The rows of verify groups of 2 to 8 (68 rows of the real tokens)
+against plain steps: the same bits. A verify group of 2: the hot and shared experts of both rows
+after B's signal in one record each (A's are read only by its ffn_post): 51.0 -> 49.4 ms, the GPU
+its bound; not for more rows (the CPU the bound: A's experts filled the GPU's wait for B's task, 6
+rows 103 -> 106). The step's records on the way to each CPU task (nsys: the gaps between kernels
+near 0, so a fused kernel saves its own fixed time only): GP_DS_ROUTER, GP_HOT_SPLIT and GP_SIGNAL
+of a step in one kernel (k_ds_route_signal, the rows of x to the host first: 22.4 -> 20.0 us);
+k_ds_combine loads the CPU's rows before it sums them (16.9 -> 15.5 us: the PCIe reads of ~94 KB
+a layer the rest); the post's q and comb made by GP_DS_HC_PRE's extra blocks from the sublayer's
+mixes (k_ds_hc_post 5.7 -> 2.8 us, the pre 6.5 -> 6.9). A step 37.8 -> 37.3 ms, the same bits. The
+three prompts: plain 28.7 / 30.1 / 26.4 tokens/s, DSpark 31.9 / 31.1 / 33.3 (1.11x, 1.03x, 1.26x),
+the same tokens.
+**Sums in another order (GP_DS_HC_STEP):** the records on the way between two CPU tasks that only
+the order of their sums kept apart: k_ds_combine (15.4 us: the CPU's de row of each cold pair over
+PCIe, ~94 KB a layer) and the post, mixes and pre of each sublayer (2.8 + 8.9 + 6.9 us, twice a
+layer). (1) The CPU sums its cold pairs of each token (GP_KQ_MOE_PART flag 2048: float64 rows, 40 KB
+a token), the GPU its hot pairs while the CPU's task runs (GP_DS_COMBINE operand 9, float64), and the
+post adds the two in float64 and rounds once: a float sum of the CPU's and the GPU's parts would
+depend on which experts are hot (the hot set changes from token to token: a verify group's rows were
+then not a step's, up to 5 in the logits); six floats add exactly in float64 in practice, so the
+float of the total does not depend on where an expert ran, as before. (2) GP_DS_HC_STEP: a sublayer's
+post with the next one's mixes and pre in one kernel (64 columns a block, 8 warps; the last block of
+a token adds the blocks' sums in a fixed order, scales x, and makes the next post's q and comb), the
+attention's post at each FFN, the FFN's at the next layer's attention (not before the engram layers,
+nor the first layer of a program, nor the last FFN). 14.7 us a record against 18.6 for the three
+(and the combine at the FFN's); the step's records on the way 15.2 -> 14.3 ms (nsys). The pinned
+operands of the CPU's sums keep their host address (runtime.SKIP). Other bits: against the
+reference the same (prompt2 steps KL 4.0e-6 against 3.8e-6, top tokens 17 of 17; prompt2's prompt
+2.3e-3 against 1.7e-4, prompt1 and prompt3 within their noise); against the bits of before KL mean
+1e-4 (prompt2) to 1e-2 (a prompt of 1024: the routes of a few tokens change). The rows of verify
+groups of 2 to 8 against plain steps: the same bits. A step 37.1 -> 36.6 ms; prompt3 3.80 -> 3.72 s
+(warm), the prompt of 5018 tokens 12.93 -> 12.48 s; verify groups within their noise; DSpark the
+same tokens (1.13x, 1.01x, 1.28x). RECLANK_DS_HC_STEP=0: the records of before (2: the CPU's sums
+with the three records, a check).

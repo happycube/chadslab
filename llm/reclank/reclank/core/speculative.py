@@ -24,6 +24,11 @@ which keeps a cache of its own: observe gives it the rows to run).
 
     for t in stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids, n):
         ...
+
+A target with verify_co (QwenTarget with coop: the lanes of the server) hands
+its runs to a scheduler: the stream yields a DeviceOp there, and the
+scheduler runs it (alone, or as a pair with another lane's) and sends None
+back (server/worker.py). Its consumer passes the DeviceOps up (yield from).
 """
 from __future__ import annotations
 
@@ -33,6 +38,37 @@ import time
 import numpy as np
 
 from reclank.core import ops
+
+
+class DeviceOp:
+    """A run that a generation hands to the scheduler of the lanes (server/worker.py): "run" (a
+    step of one token or a verify group of more, tokens at pos, on the lane's cache), or "pause"
+    (a prompt between its parts: the other lane may run)."""
+
+    __slots__ = ("kind", "tokens", "pos")
+
+    def __init__(self, kind, tokens=(), pos=0):
+        self.kind, self.tokens, self.pos = kind, list(tokens), pos
+
+    def __repr__(self):
+        return "DeviceOp(%s, %d tokens at %d)" % (self.kind, len(self.tokens), self.pos)
+
+
+def relay(gen, on_item=None):
+    """yield from gen, and call on_item(item) for each item that is not a DeviceOp (a token).
+    Return the value of gen."""
+    r = None
+    while True:
+        try:
+            x = gen.send(r)
+        except StopIteration as stop:
+            return stop.value
+        if isinstance(x, DeviceOp):
+            r = yield x
+            continue
+        if on_item is not None:
+            on_item(x)
+        r = yield x
 
 
 def greedy_pick(logits):
@@ -142,7 +178,10 @@ def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_toke
             d = drafter.draft(nxt, h, pos, k, eos_ids) if k > 0 else []
             t1 = time.perf_counter()
             batch = [nxt] + d
-            rp = target.verify(batch, pos, pick)
+            if hasattr(target, "verify_co"):
+                rp = yield from target.verify_co(batch, pos, pick)
+            else:
+                rp = target.verify(batch, pos, pick)
             in_set = rp.in_set()
             # Row j gives the token after batch[j]: a kept draft, or the pick
             # there (the last token of the round).
@@ -232,8 +271,9 @@ class QwenTarget:
     layer). on_commit(tokens, streams), if given, is told the kept tokens
     and their streams (serve_qwen4: its ids and the stream of the end)."""
 
-    def __init__(self, dev, on_commit=None):
+    def __init__(self, dev, on_commit=None, coop=False):
         self.dev, self.on_commit = dev, on_commit
+        self.coop = coop        # the runs go to the scheduler of the lanes (DeviceOp)
         self.n = 0
         self.H = None
 
@@ -242,6 +282,16 @@ class QwenTarget:
             self.dev.verify(tokens, pos)
         else:
             self.dev.step(tokens[0], pos)
+        self.n = len(tokens)
+        self.H = self.dev.streams(self.n)
+        return RowPicker(self, self.n, pick)
+
+    def verify_co(self, tokens, pos, pick):
+        """verify as a generator: with coop the scheduler runs the step or the verify group (a
+        DeviceOp), else this does."""
+        if not self.coop:
+            return self.verify(tokens, pos, pick)
+        yield DeviceOp("run", tokens, pos)
         self.n = len(tokens)
         self.H = self.dev.streams(self.n)
         return RowPicker(self, self.n, pick)
@@ -305,6 +355,15 @@ class QwenMTPDrafter:
         last group)."""
         d = hm = None
         p = 1.0
+        if not self.mtp_cpu and hasattr(self.dev, "mtp_rows"):
+            # (the rows of a prompt in mixed groups: Qwen4GPU.mtp_rows)
+            hm = self.dev.mtp_rows(H, ids, pos)
+            if self.stop > 0:
+                tk, pr = self.dev.argmax(prob=True)
+                d, p = int(tk[0]), float(pr[0])
+            else:
+                d = int(self.dev.argmax()[0])
+            return d, p, hm
         for c0 in range(0, len(ids), 256):
             c1 = min(len(ids), c0 + 256)
             if self.mtp_cpu:

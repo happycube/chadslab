@@ -31,12 +31,15 @@ CPU_CHECKS = [
     "check_server",
     "check_tq6",
     "check_bf12_moe",
+    "check_hotcache",
 ]
 GPU_CHECKS = [
     "check_attn_dense",
     "check_bf12_gpu",
     "check_qsa_score --pos 3000 --rows 600,4,1",
     "check_dp4a",
+    "check_mxf8",
+    "check_nv4",
     "check_attn_f32t",
     "check_router_bias",
     "check_argmax",

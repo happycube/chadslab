@@ -58,7 +58,7 @@ CHAIN = {
 OLD_ARCH = {"avx2": "avx2", "avx512": "avx512", "vnni": "avx512_vnni"}
 
 ORDER = [
-    "common/head.c", "common/team_warn.c",
+    "common/head.c", "common/team_warn.c", "common/hotcache.c",
     "kernels/base.c", "kernels/int8.c", "kernels/int4.c", "kernels/bf16_gemm.c",
     "kernels/int8_pipe.c", "kernels/q6k.c", "kernels/router.c", "kernels/qkv_rope.c",
     "kernels/attn_decode.c", "kernels/kv16.c", "kernels/attn_split.c", "kernels/elem.c",
@@ -66,14 +66,14 @@ ORDER = [
     "kernels/fused.c", "kernels/attn_prefill.c", "kernels/attn_prefill_qc.c", "kernels/ct.c",
     "kernels/bodies.c",
     "common/moe.c",
-    "kernels/kq/formats.c", "kernels/kq/helpers.c", "kernels/kq/exl3.c", "kernels/kq/dot2/",
+    "kernels/kq/formats.c", "kernels/kq/helpers.c", "kernels/kq/iq2.c", "kernels/kq/exl3.c", "kernels/kq/dot2/",
     "kernels/kq/dots.c", "kernels/kq/tiles.c",
     "kernels/kq/x16.c", "kernels/kq/nvx.c", "kernels/kq/q4x.c", "kernels/kq/q4x_entry.c",
-    "kernels/kq/x16f.c", "kernels/kq/convert.c", "kernels/kq/moe_scratch.c", "kernels/kq/mxx.c",
+    "kernels/kq/x16f.c", "kernels/kq/convert.c", "kernels/kq/moe_scratch.c", "kernels/kq/nmx2.c", "kernels/kq/mxx.c",
     "kernels/kq/moe_numa.c", "kernels/kq/exl3_moe.c", "kernels/kq/moe_small.c", "kernels/kq/moe.c",
     "kernels/kq/pack.c",
     "common/deltanet.c", "common/hyperconn.c", "common/qsa.c",
-    "common/ops_qwen.c", "common/parts.c", "kernels/kq/moe_part.c", "common/interp.c", "common/run.c",
+    "common/ops_qwen.c", "common/nemotron.c", "common/parts.c", "kernels/kq/moe_part.c", "common/interp.c", "common/run.c",
 ]
 
 

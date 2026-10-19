@@ -15,19 +15,38 @@ __device__ __forceinline__ float i4f(uint32_t q, int s)
     return __uint_as_float(((q >> s) & 15u) | 0x4B000000u) - 8388616.f;
 }
 
+/* The value nibble - 8 of the 4 bits of q at bit s (s <= 16) with no shift:
+ * the nibble masked in place, with the bits of 2^23, is the float
+ * 2^23 + n 2^s (exact while n 2^s < 2^23), and one FMA by the power of two
+ * 2^-s less 2^(23-s) + 8 gives n - 8 exactly (one rounding of an exact
+ * value). A LOP3 and an FFMA, where i4f takes a shift (half the rate on
+ * Maxwell and Pascal), a LOP3 and an FADD: the same values, so the same bits
+ * (MAXWELL_PLAN.md, section 3.2). */
+template <int S>
+__device__ __forceinline__ float i4m(uint32_t q)
+{
+    const float f = __uint_as_float((q & (15u << S)) | 0x4B000000u);
+    return fmaf(f, 1.f / (float)(1u << S), -(8388608.f / (float)(1u << S) + 8.f));
+}
+
 /* The 8 products of the 4 bytes q (lane sub of a block) with x, in one
- * order. int4_row and k_mt_int4_rows use it, so a token of a group gets the
- * bits of a step. */
+ * order: the first product, then an FMA for each next one, written out, so
+ * the bits do not hang on the products that nvcc fuses (a sum of products
+ * lets it fuse either one, and the choice moved with the decode).
+ * int4_row and k_mt_int4_rows use it, so a token of a group gets the bits
+ * of a step. The high nibbles of bits 20, 24 and 28 take one shift of q by
+ * 12 (to bits 8, 12 and 16) and the decode of i4m. */
 __device__ __forceinline__ float int4_part(uint32_t q, float4 xl, float4 xh)
 {
-    return i4f(q, 0) * xl.x
-         + i4f(q, 8) * xl.y
-         + i4f(q, 16) * xl.z
-         + i4f(q, 24) * xl.w
-         + i4f(q, 4) * xh.x
-         + i4f(q, 12) * xh.y
-         + i4f(q, 20) * xh.z
-         + i4f(q, 28) * xh.w;
+    const uint32_t h = q >> 12;
+    float s = i4m<0>(q) * xl.x;
+    s = fmaf(i4m<8>(q), xl.y, s);
+    s = fmaf(i4m<16>(q), xl.z, s);
+    s = fmaf(i4m<12>(h), xl.w, s);
+    s = fmaf(i4m<4>(q), xh.x, s);
+    s = fmaf(i4m<12>(q), xh.y, s);
+    s = fmaf(i4m<8>(h), xh.z, s);
+    return fmaf(i4m<16>(h), xh.w, s);
 }
 
 __device__ __forceinline__ float int4_row(const uint8_t *wr, const float *x, int cols)

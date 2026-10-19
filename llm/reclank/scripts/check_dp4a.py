@@ -26,6 +26,17 @@ from reclank.ir import program as P  # noqa: E402
 from reclank.backends.cuda.runtime import GPUProgram, Mirror  # noqa: E402
 from reclank.backends.cpu import cops  # noqa: E402
 
+
+def _x2_qmax():
+    """X2_QMAX of the int16 form (kernels/gemm/int4_q8.cu: 128 hi + lo, |lo| <= 64)."""
+    import re
+    src = os.path.join(os.path.dirname(P.__file__), "..", "backends", "cuda", "csrc", "kernels", "gemm",
+                       "int4_q8.cu")
+    return float(re.search(r"#define X2_QMAX (\d+)", open(src).read()).group(1))
+
+
+X2_QMAX = _x2_qmax()
+
 TYPES = {8: ("Q8_0", 34, 32), 12: ("Q4_K", 144, 256), 13: ("Q5_K", 176, 256), 14: ("Q6_K", 210, 256)}
 
 
@@ -44,12 +55,19 @@ def q4_blocks(rng, rows, cols):
 
 
 def quant_x(x, qmax):
-    """x as the GPU quantizes it (k_quant_q8: 127; k_quant_x2: 16256)."""
+    """x as the GPU quantizes it (k_quant_q8: 127; k_quant_x2: X2_QMAX)."""
     t, cols = x.shape
-    b = x.reshape(t, -1, 32)
-    s = np.abs(b).max(-1) / qmax
-    q = np.rint(b / np.where(s > 0, s, 1)[..., None])
-    return (q * s[..., None]).reshape(t, cols)
+    b = x.reshape(t, -1, 32).astype(np.float32)
+    m = np.abs(b).max(-1)
+    if qmax == 127.0:
+        s = m / qmax
+        q = np.rint(b / np.where(s > 0, s, 1)[..., None])
+        return (q * s[..., None]).reshape(t, cols)
+    # the operations of k_quant_x2 in float32: q = rint(x (qmax / m)), the scale m / qmax
+    qm = np.float32(qmax)
+    iv = np.where(m > 0, qm / np.where(m > 0, m, 1), 0).astype(np.float32)
+    q = np.clip(np.rint((b * iv[..., None]).astype(np.float32)), -qmax, qmax)
+    return (q.astype(np.float64) * (m / qm).astype(np.float32)[..., None]).reshape(t, cols)
 
 
 def kq_weights(type_, rng, rows, cols):
@@ -87,7 +105,7 @@ def main():
     for rows, cols, t in ((384, 1024, 200), (300, 1056, 77)):
         w, s, wf = q4_blocks(rng, rows, cols)
         x = rng.standard_normal((t, cols)).astype(np.float32)
-        for i8, qmax in ((1, 127.0), (2, 16256.0)):
+        for i8, qmax in ((1, 127.0), (2, X2_QMAX)):
             out = np.zeros((t, rows), np.float32)
             got = run(lambda p: p.emit(P.INT4_LINEAR_MT, x, w, s, out, rows, cols, t), out, mirror, i8)
             ref = quant_x(x, qmax).astype(np.float64) @ wf.astype(np.float64).T
@@ -103,7 +121,7 @@ def main():
     xm = np.empty((t, cols // 16), np.float32)
     cops.kq_quant_x(x, xq, xs, xm)
     xd = xq.astype(np.float64) * np.repeat(xs, 32, axis=1)
-    x16 = quant_x(x, 16256.0).astype(np.float64)
+    x16 = quant_x(x, X2_QMAX).astype(np.float64)
     for type_, (name, _, _) in TYPES.items():
         w = kq_weights(type_, rng, rows, cols)
         wf = cops.kq_rows(w, type_, cols, np.arange(rows)).astype(np.float64)

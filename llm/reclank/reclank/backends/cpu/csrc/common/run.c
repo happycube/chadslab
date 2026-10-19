@@ -217,8 +217,14 @@ static int gp_run_parts_task(const int64_t *prog, const gp_rec *r, int limit)
     return gp_fail == 2 ? -4 : gp_fail ? -3 : 0;
 }
 
+/* A null program: the calling thread lets its team of OpenMP threads go
+ * (the helper of GP_CPU_START when it has no program, runtime/host_cpu.cu). */
 int rc_run_task(const int64_t *prog, int limit)
 {
+    if (prog == NULL) {
+        omp_pause_resource_all(omp_pause_soft);
+        return 0;
+    }
     if (prog[0] != GP_MAGIC) {
         return -1;
     }

@@ -76,9 +76,30 @@ static inline __attribute__((always_inline)) __m256i as_load16(const void *p, co
 #define AS_EL(p, i) (I8 ? (float)((const int8_t *)(p))[i] : (float)((const int16_t *)(p))[i])
 
 /* out[i] = (float)row[i] * scale of the group of i, for hd values. */
+/* FP4-Local's FP8 cache (docs/FP4LOCAL_PLAN.md 2.9): the bytes of the int8 cache are E4M3 codes, the
+ * scales 1 (rc_set_kv_e4m3; GP_KV_WRITE8 writes them so). */
+static int rc_kv_e4m3 = 0;
+static float rc_kv_e4m3_tab[256];
+
+void rc_set_kv_e4m3(int on)
+{
+    for (int b = 0; b < 256; ++b) {
+        int e = (b >> 3) & 15, m = b & 7;
+        float v = e == 0 ? (float)m / 512.f : ldexpf(1.f + (float)m / 8.f, e - 7);
+        rc_kv_e4m3_tab[b] = (b & 0x80) ? -v : v;
+    }
+    rc_kv_e4m3 = on;
+}
+
 static inline __attribute__((always_inline)) void as_row(const void *row, const float *sc, int hd,
                                                          float *out, const int I8)
 {
+    if (I8 == 1 && rc_kv_e4m3) {
+        for (int i = 0; i < hd; ++i) {
+            out[i] = rc_kv_e4m3_tab[((const uint8_t *)row)[i]] * sc[i / 32];
+        }
+        return;
+    }
     if (I8 == 2) {
         for (int gg = 0; gg < hd / 32; ++gg) {
             tq6_deq32((const uint8_t *)row + (size_t)gg * 24, sc[gg], out + (size_t)gg * 32);

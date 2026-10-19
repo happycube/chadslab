@@ -37,7 +37,15 @@ __host__ __device__ __forceinline__ int kd_format(int type)
 template <int F>
 __device__ __forceinline__ void kd_load_w(uint8_t *dst, const uint8_t *wrow, int cols, int k0)
 {
-    if (F == KD_Q5K) {
+    if (F == KT_Q40) {
+        /* the blocks of the step (4, or fewer at the end of the row: 704 columns
+         * of the 26B's down rows): 18 bytes each, 4-byte copies (a row of 22
+         * blocks, 396 bytes, keeps 4-byte alignment only) */
+        int lane = threadIdx.x % 32, nbk = min(4, cols / 32 - k0 / 32);
+        for (int i = lane; i < 18 * nbk / 4; i += 32) {
+            cp_async4(dst + 4 * i, wrow + (size_t)(k0 / 32) * 18 + 4 * i);
+        }
+    } else if (F == KD_Q5K) {
         int lane = threadIdx.x % 32;
         const uint8_t *blk = wrow + (size_t)(k0 / 256) * 176;
         if (lane < 3) {
@@ -149,7 +157,9 @@ __device__ void kt_tile_dp4a(const uint8_t *w, size_t rb, int rows, int n0, int 
     int (*dw)[KD_WS] = (int (*)[KD_WS])(&ss[KD_BM][0]);
     float *sdl = (float *)&dw[KT_BN][0], *sdh = sdl + KT_BN, *smn = sdh + KT_BN;
     const int tid = threadIdx.x, warp = tid / 32, rg = tid % 16, tg = tid / 16;
-    const int nb = cols / 32, steps = F == KT_Q4X ? (cols + KT_K - 1) / KT_K : cols / KT_K;
+    /* KT_Q4X, KT_Q40: a last step of fewer than 4 blocks (cols a multiple of 32) */
+    constexpr bool PART = F == KT_Q4X || F == KT_Q40;
+    const int nb = cols / 32, steps = PART ? (cols + KT_K - 1) / KT_K : cols / KT_K;
     float acc[4][8];
     #pragma unroll
     for (int u = 0; u < 4; ++u) {
@@ -164,11 +174,11 @@ __device__ void kt_tile_dp4a(const uint8_t *w, size_t rb, int rows, int n0, int 
     };
     for (int st = 0; st < steps; ++st) {
         const int k0 = st * KT_K;
-        const int nbk = F == KT_Q4X ? min(4, nb - k0 / 32) : 4;
+        const int nbk = PART ? min(4, nb - k0 / 32) : 4;
         /* the step: x, its scales, the raw rows of w (as kt_tile) */
         for (int e = tid; e < KD_BM * KT_K / 16; e += blockDim.x) {
             int m = e / (KT_K / 16), kk = (e % (KT_K / 16)) * 16;
-            if (F != KT_Q4X || kk < 32 * nbk) {
+            if (!PART || kk < 32 * nbk) {
                 cp_async16(&as_[m][kk], xq + (size_t)xrow(m) * cols + k0 + kk);
                 if (X2) {
                     cp_async16(&as_[m][KT_K + kk], xl + (size_t)xrow(m) * cols + k0 + kk);
@@ -395,6 +405,217 @@ __global__ void __launch_bounds__(256, 2) k_qmoe_dn_dp4a(const gp_rec *r, const 
     kt_tile_dp4a<KFD, X2>(W, kq_row_bytes(x < E ? DI(12) : DI(16), inner), hidden,
                           blockIdx.x * KT_BN, inner, xr, sr, ur, NULL, n, out, (size_t)hidden, kdsm,
                           X2 ? xl + (size_t)p0 * inner : NULL);
+}
+
+/* GP_MOE_GPU with int4 (Q4_0) experts on dp4a: the experts of the 26B where the
+ * CPU keeps no KQ_Q4X copies (an AVX-512 CPU without VNNI), in place of the
+ * float32 tiles of k_moe_gemm. X2: x in the int16 form (two int8 planes). */
+template <int X2>
+__global__ void __launch_bounds__(256, 2) k_moe_gemm_q40_dp4a(const gp_rec *r, const int64_t *e,
+                                                              const int8_t *xq, const float *xs,
+                                                              const float *xsum, int gather,
+                                                              const int64_t *wtab, int rows,
+                                                              int cols, float *out,
+                                                              const int8_t *xl)
+{
+    PDL_START();
+    __shared__ __align__(16) uint8_t kdsm[KD_SMEM(X2)];
+    const int *tiles = DP(const int, 16);
+    const int *off = DP(const int, 12);
+    int tile = blockIdx.y;
+    if (tile >= tiles[0]) {
+        return;
+    }
+    int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile];
+    int q1 = min(off[ex + 1], q0 + GM);
+    size_t rb = (size_t)(cols / 32) * 18, nbx = (size_t)(cols / 32);
+    const uint8_t *W = (const uint8_t *)(intptr_t)wtab[ex];
+    if (gather) {
+        kt_tile_dp4a<KT_Q40, X2>(W, rb, rows, blockIdx.x * KT_BN, cols, xq, xs, xsum,
+                                 DP(const int, 14) + q0, q1 - q0, out + (size_t)q0 * rows,
+                                 (size_t)rows, kdsm, xl);
+    } else {
+        kt_tile_dp4a<KT_Q40, X2>(W, rb, rows, blockIdx.x * KT_BN, cols, xq + (size_t)q0 * cols,
+                                 xs + (size_t)q0 * nbx, xsum + (size_t)q0 * nbx, NULL, q1 - q0,
+                                 out + (size_t)q0 * rows, (size_t)rows, kdsm,
+                                 X2 ? xl + (size_t)q0 * cols : NULL);
+    }
+}
+
+/* k_moe_q40_x2: k_moe_gemm_q40_dp4a<1> (Q4_0 experts, x in the int16 form) in
+ * a tile of its own. kt_tile_dp4a decodes the 128 rows of w of each block of
+ * 32 columns to int8 words in shared memory (two barriers a block), and its
+ * inner loop loads the words of w for each plane of x. Here a step of 128
+ * columns loads x (both planes), its scales, and the raw codes of w (16 bytes
+ * a block and row, and the scale as a float), with two barriers; a thread
+ * keeps the words of x of its 4 pairs in registers and reads the 16 bytes of
+ * a row of w once for both planes. The codes stay 0..15 in dp4a, and the 8
+ * comes off with the sums of x: sum (c - 8) q = sum c q - 8 sum q, all exact
+ * in int32, so isum = 128 (sum of hi) + (sum of lo) is that of kt_tile_dp4a,
+ * and the float steps (fmaf((float) isum, s d, acc) block by block) are its own:
+ * the same bits. Thread (tg, rg) = (tid / 16, tid % 16): pairs tg + 16 u, rows
+ * rg + 16 i of the tile (64 pairs by 128 rows), as kt_tile_dp4a. */
+#define Q40T_XS 144                 /* the bytes of a row of x of a step (128 and 16 of pad) */
+#define Q40T_WS 80                  /* the bytes of the codes of a row of w of a step (64 and 16) */
+
+__global__ void __launch_bounds__(256, 2) k_moe_q40_x2(const gp_rec *r, const int64_t *e, const int8_t *xq,
+                                                       const float *xs, int gather, const int64_t *wtab,
+                                                       int rows, int cols, float *out, const int8_t *xl)
+{
+    PDL_START();
+    __shared__ __align__(16) int8_t xh_s[KD_BM][Q40T_XS];
+    __shared__ __align__(16) int8_t xl_s[KD_BM][Q40T_XS];
+    __shared__ float xs_s[KD_BM][4];
+    __shared__ __align__(16) uint8_t wq_s[KT_BN][Q40T_WS];
+    __shared__ float wd_s[KT_BN][4];
+    const int *tiles = DP(const int, 16);
+    const int *off = DP(const int, 12);
+    int tile = blockIdx.y;
+    if (tile >= tiles[0]) {
+        return;
+    }
+    const int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile];
+    const int mcount = min(off[ex + 1], q0 + GM) - q0;
+    const int n0 = blockIdx.x * KT_BN;
+    const uint8_t *W = (const uint8_t *)(intptr_t)wtab[ex];
+    const size_t rb = (size_t)(cols / 32) * 18;
+    const int nb = cols / 32, steps = (cols + KT_K - 1) / KT_K;
+    const int tid = threadIdx.x, rg = tid % 16, tg = tid / 16;
+    const int *ptok = gather ? DP(const int, 14) + q0 : NULL;
+    auto xrow = [&](int m) {
+        int mm = m < mcount ? m : mcount - 1;
+        return ptok ? ptok[mm] : q0 + mm;
+    };
+    float acc[4][8];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[u][i] = 0.f;
+        }
+    }
+    for (int st = 0; st < steps; ++st) {
+        const int k0 = st * KT_K, nbk = min(4, nb - k0 / 32);
+        /* x: 64 rows by 4 blocks of 32 bytes, both planes (16-byte loads) */
+        for (int x = tid; x < 2 * KD_BM * 8; x += 256) {
+            int pl = x / (KD_BM * 8), m = (x / 8) % KD_BM, ch = x % 8;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (ch / 2 < nbk) {
+                const int8_t *src = (pl ? xl : xq) + (size_t)xrow(m) * cols + k0 + 16 * ch;
+                v = *(const uint4 *)src;
+            }
+            *(uint4 *)&(pl ? xl_s : xh_s)[m][16 * ch] = v;
+        }
+        {
+            int m = tid / 4, b = tid % 4;
+            xs_s[m][b] = b < nbk ? xs[(size_t)xrow(m) * nb + k0 / 32 + b] : 0.f;
+        }
+        /* w: 128 rows by 4 blocks: the scale as a float, the 16 bytes of codes */
+        for (int x = tid; x < KT_BN * 4; x += 256) {
+            int nn = x / 4, b = x % 4;
+            uint4 c = make_uint4(0u, 0u, 0u, 0u);
+            float d = 0.f;
+            if (b < nbk) {
+                const uint16_t *blk = (const uint16_t *)(W + (size_t)min(n0 + nn, rows - 1) * rb +
+                                                         (size_t)(k0 / 32 + b) * 18);
+                d = __half2float(__ushort_as_half(blk[0]));
+                c.x = (uint32_t)blk[1] | ((uint32_t)blk[2] << 16);
+                c.y = (uint32_t)blk[3] | ((uint32_t)blk[4] << 16);
+                c.z = (uint32_t)blk[5] | ((uint32_t)blk[6] << 16);
+                c.w = (uint32_t)blk[7] | ((uint32_t)blk[8] << 16);
+            }
+            *(uint4 *)&wq_s[nn][16 * b] = c;
+            wd_s[nn][b] = d;
+        }
+        __syncthreads();
+        #pragma unroll 1
+        for (int b = 0; b < nbk; ++b) {
+            /* the words of x of the 4 pairs (values 4c.. in word c, 16 + 4c.. in 4 + c) and their sums */
+            int xh[4][8], xw[4][8], sh[4], sl[4];
+            float s[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int m = tg + 16 * u;
+                int4 a0 = *(const int4 *)&xh_s[m][32 * b], a1 = *(const int4 *)&xh_s[m][32 * b + 16];
+                int4 c0 = *(const int4 *)&xl_s[m][32 * b], c1 = *(const int4 *)&xl_s[m][32 * b + 16];
+                xh[u][0] = a0.x; xh[u][1] = a0.y; xh[u][2] = a0.z; xh[u][3] = a0.w;
+                xh[u][4] = a1.x; xh[u][5] = a1.y; xh[u][6] = a1.z; xh[u][7] = a1.w;
+                xw[u][0] = c0.x; xw[u][1] = c0.y; xw[u][2] = c0.z; xw[u][3] = c0.w;
+                xw[u][4] = c1.x; xw[u][5] = c1.y; xw[u][6] = c1.z; xw[u][7] = c1.w;
+                int th = 0, tl = 0;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    th = rc_dp4a(0x01010101, xh[u][c], th);
+                    tl = rc_dp4a(0x01010101, xw[u][c], tl);
+                }
+                sh[u] = th;
+                sl[u] = tl;
+                s[u] = xs_s[m][b];
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int nn = rg + 16 * i;
+                uint4 cw = *(const uint4 *)&wq_s[nn][16 * b];
+                const float d = wd_s[nn][b];
+                int lo[4] = {(int)(cw.x & 0x0f0f0f0fu), (int)(cw.y & 0x0f0f0f0fu), (int)(cw.z & 0x0f0f0f0fu),
+                             (int)(cw.w & 0x0f0f0f0fu)};
+                int hi[4] = {(int)((cw.x >> 4) & 0x0f0f0f0fu), (int)((cw.y >> 4) & 0x0f0f0f0fu),
+                             (int)((cw.z >> 4) & 0x0f0f0f0fu), (int)((cw.w >> 4) & 0x0f0f0f0fu)};
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    int ih = 0, il = 0;
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        ih = rc_dp4a(lo[c], xh[u][c], ih);
+                        ih = rc_dp4a(hi[c], xh[u][4 + c], ih);
+                        il = rc_dp4a(lo[c], xw[u][c], il);
+                        il = rc_dp4a(hi[c], xw[u][4 + c], il);
+                    }
+                    int isum = 128 * (ih - 8 * sh[u]) + (il - 8 * sl[u]);
+                    acc[u][i] = fmaf((float)isum, s[u] * d, acc[u][i]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        int m = tg + 16 * u;
+        if (m >= mcount) {
+            continue;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int n = n0 + rg + 16 * i;
+            if (n < rows) {
+                out[(size_t)(q0 + m) * rows + n] = acc[u][i];
+            }
+        }
+    }
+}
+
+/* RECLANK_GPU_Q40_TILE=0 keeps kt_tile_dp4a for the x2 form (a test). */
+static int q40_tile_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_Q40_TILE");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
+/* RECLANK_GPU_MOE_Q40: the int4 experts of a large group on dp4a (Pascal): "x2"
+ * x in the int16 form (the default), "i8" int8 x, "0" the float32 tiles (the
+ * bits of before). */
+static int moe_q40_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *v = getenv("RECLANK_GPU_MOE_Q40");
+        mode = v == NULL || !strcmp(v, "x2") ? 2 : !strcmp(v, "i8") ? 1 : 0;
+    }
+    return mode;
 }
 
 /* GP_MOE_GPU with KQ_Q4X experts on dp4a (k_moe_gemm_q4x). */

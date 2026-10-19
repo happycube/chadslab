@@ -8,6 +8,9 @@
 // a float64 attention on the host (small N). WIN > 0: a sliding layer
 // (k_attn_fdts: head_dim 256, 8 key heads; query j sees rows N + j - WIN to
 // N + j - 1). The GPU rests at a low clock: the first runs bring it up.
+// KO=1 (FORM 0, a global layer): the cache of keys only of the 26B (ko_tab:
+// the values from the key rows, KORD turned pairs (64) with random angles);
+// no CHECK. OUT=file: the outputs as float32 (to compare two builds).
 //
 //     nvcc -O3 -arch=native -o bench_attn_fdtc scripts/bench_attn_fdtc.cu
 //     ./bench_attn_fdtc [N 100000] [FORM 0] [CHECK 0] [T 1] [WIN 0] [BASE 0]
@@ -28,6 +31,8 @@ int main(int argc, char **argv)
     int win = argc > 5 ? atoi(argv[5]) : 0;
     int base0 = argc > 6 ? atoi(argv[6]) : 0;      // the position of row 0 (a window)
     const int qh = 16, kvh = win ? 8 : 2, hd = win ? 256 : 512, rs = kvh * hd;
+    const int ko = getenv("KO") && atoi(getenv("KO")) && form == 0 && !win;
+    if (ko) check = 0;
     int rows = n + T - 1;
     std::mt19937 rng(1);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -48,13 +53,27 @@ int main(int argc, char **argv)
     for (auto &x : q) x = nd(rng) * 0.06f;
     void *dk, *dv, *dks, *dvs, *dq, *dout, *dout1, *dpart, *dsc;
     size_t kb = form == 1 ? nv : 2 * nv, vb = form == 0 ? 2 * nv : nv;
-    cudaMalloc(&dk, kb); cudaMalloc(&dv, vb);
+    cudaMalloc(&dk, kb);
+    if (ko) { vb = 0; dv = dk; } else cudaMalloc(&dv, vb);
     cudaMalloc(&dks, nv / 8); cudaMalloc(&dvs, nv / 8);
     cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dout, q.size() * 4); cudaMalloc(&dout1, q.size() * 4);
     cudaMalloc(&dsc, 64);
     cudaMalloc(&dpart, GG_PART_FLOATS * 4);
     cudaMemcpy(dk, form == 1 ? (void *)k8.data() : (void *)k16.data(), kb, cudaMemcpyHostToDevice);
-    cudaMemcpy(dv, form == 0 ? (void *)v16.data() : (void *)v8.data(), vb, cudaMemcpyHostToDevice);
+    if (!ko) cudaMemcpy(dv, form == 0 ? (void *)v16.data() : (void *)v8.data(), vb, cudaMemcpyHostToDevice);
+    if (ko) {   // ko_tab: KORD turned pairs of 256, random angles (positions < 2^20)
+        const int rd = getenv("KORD") ? atoi(getenv("KORD")) : 64, nhi = 4096;
+        std::uniform_real_distribution<float> ud(0.f, 6.2831853f);
+        std::vector<float2> hi((size_t)nhi * rd), lo((size_t)256 * rd);
+        for (auto &c : hi) { float t = ud(rng); c = make_float2(cosf(t), sinf(t)); }
+        for (auto &c : lo) { float t = ud(rng); c = make_float2(cosf(t), sinf(t)); }
+        void *dhi, *dlo;
+        cudaMalloc(&dhi, hi.size() * 8); cudaMalloc(&dlo, lo.size() * 8);
+        cudaMemcpy(dhi, hi.data(), hi.size() * 8, cudaMemcpyHostToDevice);
+        cudaMemcpy(dlo, lo.data(), lo.size() * 8, cudaMemcpyHostToDevice);
+        ko_tab t = {(const float2 *)dhi, (const float2 *)dlo, rd, 256, nhi};
+        cudaMemcpyToSymbol(g_ko, &t, sizeof(t));
+    }
     cudaMemcpy(dks, (form == 1 ? ks8 : ks).data(), nv / 8, cudaMemcpyHostToDevice);
     cudaMemcpy(dvs, (form == 0 ? vs : vs8).data(), nv / 8, cudaMemcpyHostToDevice);
     cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
@@ -104,6 +123,11 @@ int main(int argc, char **argv)
     if (err != cudaSuccess) { printf("error %s\n", cudaGetErrorString(err)); return 1; }
     std::vector<float> out((size_t)T * qh * hd), out1(out.size());
     cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost);
+    if (getenv("OUT")) {
+        FILE *f = fopen(getenv("OUT"), "wb");
+        fwrite(out.data(), 4, out.size(), f);
+        fclose(f);
+    }
     // each query alone at its position (a window: a buffer without its
     // first rows, as after a drop of old rows)
     int same = 1;
@@ -136,7 +160,7 @@ int main(int argc, char **argv)
     cudaEventElapsedTime(&ms, e0, e1);
     ms /= reps;
     double mb = (win ? (double)(win + T - 1) / rows : 1.0) * (kb + vb + nv / 4) / 1e6;
-    printf("n %d form %d, %d queries, %d chunks: %.3f ms, %.0f GB/s%s\n", n, form, T, nb, ms, mb / ms,
+    printf("n %d form %d%s, %d queries, %d chunks: %.3f ms, %.0f GB/s%s\n", n, form, ko ? " (keys only)" : "", T, nb, ms, mb / ms,
            T > 1 ? (same ? "; each query as alone: same bits" : "; each query as alone: DIFFERENT") : "");
     if (check) {
         double emax = 0, rmax = 0;

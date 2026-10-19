@@ -18,6 +18,7 @@
  */
 #define DS_HC 4
 #define DS_NMIX ((2 + DS_HC) * DS_HC)
+#define DS_NCOEF (DS_HC + DS_HC * DS_HC)      /* the post q and comb of a token (GP_DS_HC_PRE's coef) */
 
 /* The caches (the window rings, the compressed rows, the index keys): a row of
  * hd values in one of these forms. The records take the form of the caches
@@ -348,6 +349,56 @@ __device__ void ds_hc_coef(const float *raw, const float *sc, const float *base,
     }
 }
 
+/* ds_hc_coef's post q and comb by a warp (all 32 lanes call it): lane 4 j + k (and its copy in
+ * lanes 16-31) the entry [j][k]; each sum of a row or a column gathered by shuffles and added in
+ * ds_hc_coef's order, so the same floats. One thread took 20 iterations of 32 divisions: 25 us a
+ * k_ds_hc_post, 80 of them a step. */
+__device__ void ds_hc_coef_warp(const float *raw, const float *sc, const float *base, float eps, int iters,
+                                float *q, float *comb)
+{
+    const int lane = threadIdx.x % 32, l = lane & 15, j = l >> 2, k = l & 3, half = lane & 16;
+    if (lane < DS_HC) {
+        q[lane] = 2.f * ds_sigmoid(raw[DS_HC + lane] * sc[1] + base[DS_HC + lane]);
+    }
+    float c = raw[2 * DS_HC + DS_HC * j + k] * sc[2] + base[2 * DS_HC + DS_HC * j + k];
+    float v[DS_HC];
+#pragma unroll
+    for (int i = 0; i < DS_HC; ++i) {
+        v[i] = __shfl_sync(RC_FULL_MASK, c, half + DS_HC * j + i);
+    }
+    float m = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < DS_HC; ++i) {
+        m = fmaxf(m, v[i]);
+    }
+    c = expf(c - m);
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < DS_HC; ++i) {
+        s += __shfl_sync(RC_FULL_MASK, c, half + DS_HC * j + i);
+    }
+    c = c / s + eps;
+    for (int it = 0; it < iters; ++it) {
+        if (it > 0) {
+            s = 0.f;
+#pragma unroll
+            for (int i = 0; i < DS_HC; ++i) {
+                s += __shfl_sync(RC_FULL_MASK, c, half + DS_HC * j + i);
+            }
+            c /= s + eps;
+        }
+        s = 0.f;
+#pragma unroll
+        for (int i = 0; i < DS_HC; ++i) {
+            s += __shfl_sync(RC_FULL_MASK, c, half + DS_HC * i + k);
+        }
+        c /= s + eps;
+    }
+    if (lane < DS_HC * DS_HC) {
+        comb[lane] = c;
+    }
+}
+
 /* GP_DS_HC_MIX: h [t, n] (the streams side by side), fn [24, n], raw [t, 24],
  * t, n, eps. raw = (h . fn_m) / sqrt(mean h^2 + eps). A block for each (m, j). */
 __global__ void __launch_bounds__(256) k_ds_hc_mix(const gp_rec *r, const int64_t *e)
@@ -371,11 +422,25 @@ __global__ void __launch_bounds__(256) k_ds_hc_mix(const gp_rec *r, const int64_
 
 /* GP_DS_HC_PRE: h [t, 4, dim], raw [t, 24] (null: stream 0, the first layer),
  * sc [3], base [24], w [dim] (null: no norm), out [t, dim], t, dim, eps,
- * hc_eps. out = the norm of sum_k p_k h_k, times w. A block for each token. */
+ * hc_eps; then (or none) raw2 [t, 24], sc2, base2, iters, coef [t, 20]. out =
+ * the norm of sum_k p_k h_k, times w. A block for each token; with coef, t
+ * blocks more give the post q and comb of raw2 (ds_hc_coef_warp) to coef, the
+ * coefficients of the GP_DS_HC_POST of the sublayer, made here beside the
+ * pre's work (its 20 iterations of the Sinkhorn were the first 3 us of each
+ * k_ds_hc_post, on the way of every layer). */
 __global__ void __launch_bounds__(1024) k_ds_hc_pre(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     int j = blockIdx.x, dim = DI(7);
+    if (j >= DI(6)) {
+        j -= DI(6);
+        if (threadIdx.x < 32) {
+            float *cf = DP(float, 14) + (size_t)j * DS_NCOEF;
+            ds_hc_coef_warp(DP(const float, 10) + (size_t)j * DS_NMIX, DP(const float, 11), DP(const float, 12),
+                            df(r, e, 9), DI(13), cf, cf + DS_HC);
+        }
+        return;
+    }
     __shared__ float p[DS_HC];
     const float *raw = DP(const float, 1);
     if (threadIdx.x == 0) {
@@ -410,27 +475,60 @@ __global__ void __launch_bounds__(1024) k_ds_hc_pre(const gp_rec *r, const int64
     }
 }
 
+/* The y of a post at (j, c): operand ky0 float [t, dim], or with operand k64 set the float64 sum of the
+ * GPU's pairs (GP_DS_COMBINE's operand 9) plus row j of the CPU's float64 sums (operand kcpu: pinned,
+ * read past the caches; not when the count of operand kcnt, the cold experts of a step, is 0: the GPU
+ * did not wait for the CPU then), as a float; then plus y2 (operand ky2) when given. */
+__device__ __forceinline__ float ds_post_y(const gp_rec *r, const int64_t *e, int ky0, int ky2, int kcpu, int kcnt,
+                                           int k64, int j, int dim, int c)
+{
+    float y;
+    if (r->tag[k64] != GP_T_NONE && DI(k64)) {
+        double v = DP(const double, ky0)[(size_t)j * dim + c];
+        if (r->tag[kcpu] != GP_T_NONE && DP(const double, kcpu) != NULL &&
+            (r->tag[kcnt] == GP_T_NONE || DP(const int, kcnt) == NULL || *DP(const int, kcnt) > 0)) {
+            v += __ldcv(DP(const double, kcpu) + (size_t)j * dim + c);
+        }
+        y = (float)v;
+    } else {
+        y = DP(const float, ky0)[(size_t)j * dim + c];
+    }
+    const float *y2 = DP(const float, ky2);
+    if (y2) {
+        y += y2[(size_t)j * dim + c];
+    }
+    return y;
+}
+
 /* GP_DS_HC_POST: y [t, dim], y2 [t, dim] (or null: added to y), res [t, 4,
  * dim], raw [t, 24], sc, base, out [t, 4, dim] (may be res), t, dim, hc_eps,
- * iters. out_k = q_k y + sum_j comb_jk res_j. */
+ * iters, then coef [t, 20] or none (q and comb made by the GP_DS_HC_PRE of the
+ * sublayer), then cpu (the CPU's float64 sums of its experts, pinned), its
+ * count and y64 (y the GPU's float64 sums; ds_post_y), or none. out_k = q_k y
+ * + sum_j comb_jk res_j. */
 __global__ void __launch_bounds__(256) k_ds_hc_post(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     int j = blockIdx.y, dim = DI(8), c = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ float q[DS_HC], comb[DS_HC * DS_HC];
-    if (threadIdx.x == 0) {
-        ds_hc_coef(DP(const float, 3) + (size_t)j * DS_NMIX, DP(const float, 4), DP(const float, 5),
-                   df(r, e, 9), DI(10), NULL, q, comb);
+    if (r->tag[11] != GP_T_NONE && DP(const float, 11) != NULL) {
+        if (threadIdx.x < DS_NCOEF) {
+            float v = DP(const float, 11)[(size_t)j * DS_NCOEF + threadIdx.x];
+            if (threadIdx.x < DS_HC) {
+                q[threadIdx.x] = v;
+            } else {
+                comb[threadIdx.x - DS_HC] = v;
+            }
+        }
+    } else if (threadIdx.x < 32) {
+        ds_hc_coef_warp(DP(const float, 3) + (size_t)j * DS_NMIX, DP(const float, 4), DP(const float, 5),
+                        df(r, e, 9), DI(10), q, comb);
     }
     __syncthreads();
     if (c >= dim) {
         return;
     }
-    float y = DP(const float, 0)[(size_t)j * dim + c];
-    const float *y2 = DP(const float, 1);
-    if (y2) {
-        y += y2[(size_t)j * dim + c];
-    }
+    float y = ds_post_y(r, e, 0, 1, 12, 13, 14, j, dim, c);
     const float *res = DP(const float, 2) + (size_t)j * DS_HC * dim + c;
     float rv[DS_HC];
     for (int k = 0; k < DS_HC; ++k) {
@@ -443,6 +541,198 @@ __global__ void __launch_bounds__(256) k_ds_hc_post(const gp_rec *r, const int64
             o += comb[DS_HC * i + k] * rv[i];
         }
         out[(size_t)k * dim] = o;
+    }
+}
+
+/* GP_DS_HC_STEP: the GP_DS_HC_POST of a sublayer, then the GP_DS_HC_MIX and the GP_DS_HC_PRE of the
+ * next, in one kernel. Operands: y [t, dim] (or float64 with y64), y2 or null, cpu (pinned float64) or
+ * null, its count or null (ds_post_y), h [t, 4, dim] (in place), coef [t, 20] (the post's q, comb), fn
+ * [24, 4 dim], raw [t, 24] (out: the next sublayer's mixes), praw [t, 24] or null, psc, pbase (the
+ * pre's p: ds_hc_coef; null: stream 0), w [dim], x [t, dim] (out: the pre), nsc, nbase, ncoef [t, 20]
+ * (out: the next post's q and comb from raw), part [t, DS_HCS_NB, 26] (scratch), cnt [t] (int, 0
+ * between runs), t, dim, eps, hc_eps, iters, y64. A block of DS_HCS_C columns for each (block,
+ * token): warp w the post of stream w % 4 on half w / 4 of the columns, warps 0, 1 x = sum_k p_k h_k,
+ * each warp 3 of the 24 mixes; the block's sums of the mixes, of h^2 and of x^2 to part; the last
+ * block of a token (a counter) puts all the blocks' sums in shared memory, adds them (a warp for each,
+ * in a fixed order), writes raw, scales x by its norm and w (warps 1-7) and makes ncoef (warp 0). The
+ * sums in another order than the three kernels': other bits (the same for a token alone and in a
+ * group). 14.7 us a record against 18.6 for the three (and the 15.4 of k_ds_combine at the FFN's).
+ * Tried: 128 columns a block, a column a thread (2 warps an SM read fn: 28 us); 32 columns and 4
+ * warps (17 us: the last block's sums one L2 load after another, then its 96 threads' scaling). */
+#define DS_HCS_C 64             /* the columns of a block */
+#define DS_HCS_T 256            /* its threads: 8 warps */
+#define DS_HCS_W (DS_HCS_T / 32)
+#define DS_HCS_NB 128           /* the most blocks of a token (dim <= 8192) */
+#define DS_HCS_S (DS_NMIX + 2)
+__global__ void __launch_bounds__(DS_HCS_T) k_ds_hc_step(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    const int b = blockIdx.x, j = blockIdx.y, nb = gridDim.x, tid = threadIdx.x;
+    const int lane = tid % 32, warp = tid / 32;
+    const int dim = DI(19), n = DS_HC * dim, c0 = b * DS_HCS_C;
+    const float eps = df(r, e, 20), hc_eps = df(r, e, 21);
+    __shared__ float q[DS_HC], comb[DS_HC * DS_HC], p[DS_HC];
+    __shared__ float hn[DS_HC][DS_HCS_C];
+    __shared__ float ys[DS_HCS_C];
+    __shared__ float red[DS_HCS_S + 2];
+    __shared__ float tot[DS_HCS_S];
+    __shared__ int last;
+    if (tid < DS_NCOEF) {
+        float v = DP(const float, 5)[(size_t)j * DS_NCOEF + tid];
+        if (tid < DS_HC) {
+            q[tid] = v;
+        } else {
+            comb[tid - DS_HC] = v;
+        }
+    } else if (tid >= 32 && tid < 32 + DS_HC) {
+        const int k = tid - 32;
+        const float *praw = DP(const float, 8);
+        p[k] = praw ? ds_sigmoid(praw[(size_t)j * DS_NMIX + k] * DP(const float, 9)[0] + DP(const float, 10)[k]) +
+                          hc_eps
+                    : (k == 0 ? 1.f : 0.f);
+    } else if (tid >= 64 && tid < 64 + DS_HCS_C) {
+        /* y once a column (its row of the CPU over PCIe once) */
+        ys[tid - 64] = ds_post_y(r, e, 0, 1, 2, 3, 23, j, dim, c0 + tid - 64);
+    }
+    __syncthreads();
+    /* the post: warp w stream w % 4 of the half w / 4 of the columns */
+    {
+        const int k = warp % DS_HC, cl = (warp / DS_HC) * 32 + lane, c = c0 + cl;
+        const float *h = DP(const float, 4) + (size_t)j * n + c;
+        float rv[DS_HC];
+#pragma unroll
+        for (int i = 0; i < DS_HC; ++i) {
+            rv[i] = h[(size_t)i * dim];
+        }
+        float o = q[k] * ys[cl];
+#pragma unroll
+        for (int i = 0; i < DS_HC; ++i) {
+            o += comb[DS_HC * i + k] * rv[i];
+        }
+        hn[k][cl] = o;
+    }
+    __syncthreads();
+    {
+        const int k = warp % DS_HC, cl = (warp / DS_HC) * 32 + lane;
+        DP(float, 4)[(size_t)j * n + (size_t)k * dim + c0 + cl] = hn[k][cl];
+    }
+    if (warp < 2) {
+        /* x and the sums of h^2 and x^2 of the half warp of the columns */
+        const int cl = warp * 32 + lane;
+        float x = p[0] * hn[0][cl];
+#pragma unroll
+        for (int k = 1; k < DS_HC; ++k) {
+            x += p[k] * hn[k][cl];
+        }
+        DP(float, 12)[(size_t)j * dim + c0 + cl] = x;
+        float hh = 0.f;
+#pragma unroll
+        for (int k = 0; k < DS_HC; ++k) {
+            hh += hn[k][cl] * hn[k][cl];
+        }
+        float xx = x * x;
+        for (int o = 16; o > 0; o >>= 1) {
+            hh += __shfl_xor_sync(RC_FULL_MASK, hh, o);
+            xx += __shfl_xor_sync(RC_FULL_MASK, xx, o);
+        }
+        if (lane == 0) {
+            red[DS_NMIX + 2 * warp] = hh;           /* (the two halves, added below in order) */
+            red[DS_NMIX + 2 * warp + 1] = xx;
+        }
+    }
+    /* the mixes: warp w the 3 from 3 w, lane l the columns l and l + 32 */
+    {
+        const float *fn = DP(const float, 6) + c0 + lane;
+        constexpr int PER = DS_NMIX / DS_HCS_W;
+        float d[PER];
+#pragma unroll
+        for (int u = 0; u < PER; ++u) {
+            const int m = warp * PER + u;
+            float s = 0.f;
+#pragma unroll
+            for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+                for (int k = 0; k < DS_HC; ++k) {
+                    s += hn[k][hf * 32 + lane] * fn[(size_t)m * n + (size_t)k * dim + hf * 32];
+                }
+            }
+            d[u] = s;
+        }
+#pragma unroll
+        for (int u = 0; u < PER; ++u) {
+            float v = d[u];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+            }
+            if (lane == 0) {
+                red[warp * PER + u] = v;
+            }
+        }
+    }
+    __syncthreads();
+    float *part = DP(float, 16) + ((size_t)j * DS_HCS_NB + b) * DS_HCS_S;
+    if (tid < DS_NMIX) {
+        part[tid] = red[tid];
+    } else if (tid < DS_HCS_S) {
+        const int a = tid - DS_NMIX;                 /* 0: h^2, 1: x^2 */
+        part[tid] = red[DS_NMIX + a] + red[DS_NMIX + 2 + a];
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(DP(int, 17) + j, 1) == nb - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    /* the blocks' sums: all of them into shared memory first (one pass of loads, not one L2 round
+     * trip after another), then a warp for each value, lane l the blocks l, l + 32, ... and a fixed
+     * tree */
+    __shared__ __align__(16) float pst[DS_HCS_NB * DS_HCS_S];
+    {
+        const float *pp = DP(const float, 16) + (size_t)j * DS_HCS_NB * DS_HCS_S;
+        const int nv = nb * DS_HCS_S;
+        for (int i = tid; i < nv; i += DS_HCS_T) {
+            pst[i] = __ldcg(pp + i);
+        }
+    }
+    __syncthreads();
+    for (int m = warp; m < DS_HCS_S; m += DS_HCS_W) {
+        float v = 0.f;
+        for (int bb = lane; bb < nb; bb += 32) {
+            v += pst[bb * DS_HCS_S + m];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+        }
+        if (lane == 0) {
+            tot[m] = v;
+        }
+    }
+    __syncthreads();
+    const float rs = 1.f / sqrtf(tot[DS_NMIX] / (float)n + eps);
+    if (tid < DS_NMIX) {
+        tot[tid] = tot[tid] * rs;
+        DP(float, 7)[(size_t)j * DS_NMIX + tid] = tot[tid];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float *cf = DP(float, 15) + (size_t)j * DS_NCOEF;
+        ds_hc_coef_warp(tot, DP(const float, 13), DP(const float, 14), hc_eps, DI(22), cf, cf + DS_HC);
+        if (tid == 0) {
+            DP(int, 17)[j] = 0;
+        }
+    } else {
+        const float sx = 1.f / sqrtf(tot[DS_NMIX + 1] / (float)dim + eps);
+        const float4 *w4 = (const float4 *)DP(const float, 11);
+        float4 *x4 = (float4 *)(DP(float, 12) + (size_t)j * dim);
+#pragma unroll 2
+        for (int i = tid - 32; i < dim / 4; i += DS_HCS_T - 32) {
+            float4 a = __ldcg(x4 + i), ww = w4[i];
+            x4[i] = make_float4(a.x * sx * ww.x, a.y * sx * ww.y, a.z * sx * ww.z, a.w * sx * ww.w);
+        }
     }
 }
 
@@ -1510,10 +1800,9 @@ __global__ void __launch_bounds__(512) k_ds_attn_join(const gp_rec *r, const int
  * sqrt(softplus(logit)); the k best of s + bias (bias_vl for a token of an
  * image span: vis[j] != 0; ties to the lower expert); the weights s / sum s
  * times scale (model.py Gate). A block of 256 threads for each token. */
-__global__ void __launch_bounds__(256) k_ds_router(const gp_rec *r, const int64_t *e)
+__device__ void ds_router_body(const gp_rec *r, const int64_t *e, int j)
 {
-    PDL_START();
-    int j = blockIdx.x, E = DI(5), k = DI(6);
+    int E = DI(5), k = DI(6);
     __shared__ float s[512], b[512];
     __shared__ float bv[8];
     __shared__ int bi[8], pick[16];
@@ -1573,6 +1862,12 @@ __global__ void __launch_bounds__(256) k_ds_router(const gp_rec *r, const int64_
             DP(float, 3)[(size_t)j * k + c] = s[pick[c]] / sum * df(r, e, 7);
         }
     }
+}
+
+__global__ void __launch_bounds__(256) k_ds_router(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    ds_router_body(r, e, blockIdx.x);
 }
 
 /* GP_DS_SWIGLU: g, u, out, n, limit: silu(min(g, limit)) clamp(u, -limit, limit). */
@@ -1856,6 +2151,7 @@ __global__ void __launch_bounds__(128) k_ds_hot_tc(const gp_rec *r, const int64_
  * of the CPU: a step, those of its cold pairs in their order (GP_HOT_SPLIT);
  * a group, row p for each cold pair p (GP_HOT_SPLIT_MT)), out [t, H], k, H, t, mt
  * (1: the rows of GP_HOT_SPLIT_MT also when t is 1). */
+#define DS_COMBINE_K 8
 __global__ void __launch_bounds__(256) k_ds_combine(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -1871,9 +2167,41 @@ __global__ void __launch_bounds__(256) k_ds_combine(const gp_rec *r, const int64
      * row p for pair p (GP_HOT_SPLIT_MT: operand 8 set; a lane of one token of
      * a verify group too) */
     int packed = DI(7) == 1 && !DI(8);
-    for (int s = 0; s < k; ++s) {
-        int p = tok * k + s;
-        acc += map[idx[p]] >= 0 ? de[(size_t)p * H + c] : __ldcv(rows + (size_t)(packed ? n++ : p) * H + c);
+    if (r->tag[9] != GP_T_NONE && DI(9)) {
+        /* the GPU's pairs alone in float64 into out (double [t, H]; the CPU sums its own: ds_post_y),
+         * before the CPU's task ends */
+        double ad = 0.0;
+        for (int s = 0; s < k; ++s) {
+            int p = tok * k + s;
+            if (map[idx[p]] >= 0) {
+                ad += (double)de[(size_t)p * H + c];
+            }
+        }
+        DP(double, 4)[(size_t)tok * H + c] = ad;
+        return;
+    }
+    /* (the values loaded first: the CPU's rows come over PCIe, each a round trip, so they are in
+     * flight together, not one after the other: 16.9 -> 15.5 us, the rest the PCIe reads; the sum in the order) */
+    float v[DS_COMBINE_K];
+    if (k <= DS_COMBINE_K) {
+        #pragma unroll
+        for (int s = 0; s < DS_COMBINE_K; ++s) {
+            if (s < k) {
+                int p = tok * k + s;
+                v[s] = map[idx[p]] >= 0 ? de[(size_t)p * H + c] : __ldcv(rows + (size_t)(packed ? n++ : p) * H + c);
+            }
+        }
+        #pragma unroll
+        for (int s = 0; s < DS_COMBINE_K; ++s) {
+            if (s < k) {
+                acc += v[s];
+            }
+        }
+    } else {
+        for (int s = 0; s < k; ++s) {
+            int p = tok * k + s;
+            acc += map[idx[p]] >= 0 ? de[(size_t)p * H + c] : __ldcv(rows + (size_t)(packed ? n++ : p) * H + c);
+        }
     }
     DP(float, 4)[(size_t)tok * H + c] = acc;
 }

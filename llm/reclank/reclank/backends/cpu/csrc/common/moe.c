@@ -76,7 +76,8 @@ static void moe_combine(const float *de, const int *pair_of, const float *val,
     for (int x = 0; x < t * nb; ++x) {
         int j = x / nb, c0 = (x % nb) * 64;
         float *o = out + (size_t)j * hidden;
-        float sw = shared ? 1.f / (1.f + expf(-shared_logit[j])) : 0.f;
+        /* (no shared_logit: an ungated shared expert, weight 1 (GLM-5.3)) */
+        float sw = !shared ? 0.f : shared_logit != NULL ? 1.f / (1.f + expf(-shared_logit[j])) : 1.f;
         const float *sd = shared ? de + (size_t)pair_of[t * k + j] * hidden : NULL;
         for (int c = c0; c < c0 + 64; ++c) {
             o[c] = shared ? sw * sd[c] : 0.f;

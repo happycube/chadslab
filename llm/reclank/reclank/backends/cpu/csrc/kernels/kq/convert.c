@@ -1,5 +1,21 @@
 /* ---------- the conversions of the safetensors loader (reclank/formats/nvfp4_st.py) ---------- */
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+/* lrintf for the values of the encoders (well inside int): the conversion
+ * rounds by MXCSR, to the nearest even as lrintf, inline (lrintf went
+ * through the PLT) */
+static inline int kq_lrint(float v)
+{
+#if defined(__SSE2__)
+    return _mm_cvtss_si32(_mm_set_ss(v));
+#else
+    return (int)lrintf(v);
+#endif
+}
+
 /* One row of cols float values to Q8_0 blocks (as quantize_row_q8_0 of ggml). */
 static void kq_row_to_q8_0(const float *x, int cols, uint8_t *dst)
 {
@@ -62,7 +78,7 @@ static float kq_qx_quants(int n, int nmax, const float *x, uint8_t *L)
     }
     float iscale = -nmax / max, sumlx = 0.f, suml2 = 0.f;
     for (int i = 0; i < n; ++i) {
-        int l = (int)lrintf(iscale * x[i]);
+        int l = kq_lrint(iscale * x[i]);
         l = l < -nmax ? -nmax : (l > nmax - 1 ? nmax - 1 : l);
         L[i] = (uint8_t)(l + nmax);
         float w = x[i] * x[i];
@@ -78,7 +94,7 @@ static float kq_qx_quants(int n, int nmax, const float *x, uint8_t *L)
         iscale = -(nmax + 0.1f * is) / max;
         sumlx = suml2 = 0.f;
         for (int i = 0; i < n; ++i) {
-            int l = (int)lrintf(iscale * x[i]);
+            int l = kq_lrint(iscale * x[i]);
             l = l < -nmax ? -nmax : (l > nmax - 1 ? nmax - 1 : l);
             float w = x[i] * x[i];
             sumlx += w * x[i] * l;
@@ -86,7 +102,7 @@ static float kq_qx_quants(int n, int nmax, const float *x, uint8_t *L)
         }
         if (suml2 > 0.f && sumlx * sumlx > best * suml2) {
             for (int i = 0; i < n; ++i) {
-                int l = (int)lrintf(iscale * x[i]);
+                int l = kq_lrint(iscale * x[i]);
                 l = l < -nmax ? -nmax : (l > nmax - 1 ? nmax - 1 : l);
                 L[i] = (uint8_t)(l + nmax);
             }
@@ -120,7 +136,7 @@ static void kq_block_to_q6_k(const float *x, uint8_t *y)
     float d = kq_h((const uint8_t *)&dh);
     int8_t *sc = (int8_t *)(y + 192);
     for (int ib = 0; ib < 16; ++ib) {
-        int v = (int)lrintf(iscale * scales[ib]);
+        int v = kq_lrint(iscale * scales[ib]);
         sc[ib] = (int8_t)(v > 127 ? 127 : v);
     }
     for (int j = 0; j < 256; ++j) {
@@ -128,7 +144,7 @@ static void kq_block_to_q6_k(const float *x, uint8_t *y)
         if (dd == 0.f) {
             continue;
         }
-        int l = (int)lrintf(x[j] / dd);
+        int l = kq_lrint(x[j] / dd);
         l = l < -32 ? -32 : (l > 31 ? 31 : l);
         L[j] = (uint8_t)(l + 32);
     }
@@ -197,7 +213,7 @@ static float kq_qkx2_quants(int n, int nmax, const float *x, const float *weight
     }
     float iscale = nmax / (max - min), scale = 1 / iscale, best = 0;
     for (int i = 0; i < n; ++i) {
-        int l = (int)lrintf(iscale * (x[i] - min));
+        int l = kq_lrint(iscale * (x[i] - min));
         L[i] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
         float diff = scale * L[i] + min - x[i];
         best += weights[i] * diff * diff;
@@ -206,7 +222,7 @@ static float kq_qkx2_quants(int n, int nmax, const float *x, const float *weight
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; ++i) {
-            int l = (int)lrintf(iscale * (x[i] - min));
+            int l = kq_lrint(iscale * (x[i] - min));
             l = l < 0 ? 0 : (l > nmax ? nmax : l);
             Laux[i] = (uint8_t)l;
             float w = weights[i];
@@ -238,6 +254,132 @@ static float kq_qkx2_quants(int n, int nmax, const float *x, const float *weight
     *the_min = -min;
     return scale;
 }
+
+#if defined(__AVX512F__)
+/* kq_qkx2_quants of 32 values with unit weights (the better encoder), the
+ * trials of the scale in the lanes: lane k sums its values in the order of
+ * the scalar loop, with the same float steps, so each trial gives the same
+ * sums and errors, and the trials are taken in the same order. */
+#ifndef KQ_XL_FMA
+#define KQ_XL_FMA 1
+#endif
+static float kq_qkx2_unit(int nmax, const float *x, uint8_t *L, float *the_min, float rmin, float rdelta,
+                          int nstep)
+{
+    const int n = 32;
+    float weights[32];
+    for (int i = 0; i < n; ++i) {
+        weights[i] = 1.f;
+    }
+    float min = x[0], max = x[0], sum_w = weights[0], sum_x = sum_w * x[0];
+    for (int i = 1; i < n; ++i) {
+        min = x[i] < min ? x[i] : min;
+        max = x[i] > max ? x[i] : max;
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
+    }
+    if (min > 0) {
+        min = 0;
+    }
+    if (max == min) {
+        memset(L, 0, (size_t)n);
+        *the_min = -min;
+        return 0.f;
+    }
+    float iscale = nmax / (max - min), scale = 1 / iscale, best = 0;
+    for (int i = 0; i < n; ++i) {
+        int l = kq_lrint(iscale * (x[i] - min));
+        L[i] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
+        float diff = scale * L[i] + min - x[i];
+        best += weights[i] * diff * diff;
+    }
+    /* The trials from start on, with the min of now; at the first that wins,
+     * the min changes (as in the scalar loop, where the later trials use
+     * the new min and max - min), so the trials after it run again. */
+    const int ns = nstep + 1;
+    const __m512i top = _mm512_set1_epi32(nmax), zero = _mm512_setzero_si512();
+    float isc[32], sl[32], sl2[32], sxl[32], ts[32], tm[32], er[32];
+    int ok[32];
+    for (int start = 0; start < ns;) {
+        for (int is = 0; is < 32; ++is) {
+            isc[is] = is >= start && is < ns ? (rmin + rdelta * is + nmax) / (max - min) : 0.f;
+        }
+        const int v0 = start / 16, v1 = (ns + 15) / 16;
+        for (int v = v0; v < v1; ++v) {
+            const __m512 vi = _mm512_loadu_ps(isc + 16 * v);
+            __m512 a_l = _mm512_setzero_ps(), a_l2 = _mm512_setzero_ps(), a_xl = _mm512_setzero_ps();
+            for (int i = 0; i < n; ++i) {
+                const __m512 xm = _mm512_set1_ps(x[i] - min), xi = _mm512_set1_ps(x[i]);
+                __m512i l = _mm512_cvtps_epi32(_mm512_mul_ps(vi, xm));
+                __m512 lf = _mm512_cvtepi32_ps(_mm512_min_epi32(_mm512_max_epi32(l, zero), top));
+                a_l = _mm512_add_ps(a_l, lf);
+                a_l2 = _mm512_fmadd_ps(lf, lf, a_l2);
+#if KQ_XL_FMA
+                a_xl = _mm512_fmadd_ps(lf, xi, a_xl);
+#else
+                a_xl = _mm512_add_ps(a_xl, _mm512_mul_ps(lf, xi));
+#endif
+            }
+            _mm512_storeu_ps(sl + 16 * v, a_l);
+            _mm512_storeu_ps(sl2 + 16 * v, a_l2);
+            _mm512_storeu_ps(sxl + 16 * v, a_xl);
+        }
+        for (int is = 16 * v0; is < 16 * v1; ++is) {
+            ok[is] = 0;
+            ts[is] = tm[is] = 0.f;
+            if (is < start || is >= ns) {
+                continue;
+            }
+            float sum_l = sl[is], sum_l2 = sl2[is], sum_xl = sxl[is];
+            float D = sum_w * sum_l2 - sum_l * sum_l;
+            if (D > 0) {
+                float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+                float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+                if (this_min > 0) {
+                    this_min = 0;
+                    this_scale = sum_xl / sum_l2;
+                }
+                ok[is] = 1;
+                ts[is] = this_scale;
+                tm[is] = this_min;
+            }
+        }
+        for (int v = v0; v < v1; ++v) {
+            const __m512 vi = _mm512_loadu_ps(isc + 16 * v), vs = _mm512_loadu_ps(ts + 16 * v),
+                         vm = _mm512_loadu_ps(tm + 16 * v);
+            __m512 err = _mm512_setzero_ps();
+            for (int i = 0; i < n; ++i) {
+                const __m512 xm = _mm512_set1_ps(x[i] - min), xi = _mm512_set1_ps(x[i]);
+                __m512i l = _mm512_cvtps_epi32(_mm512_mul_ps(vi, xm));
+                __m512 lf = _mm512_cvtepi32_ps(_mm512_min_epi32(_mm512_max_epi32(l, zero), top));
+                __m512 diff = _mm512_sub_ps(_mm512_fmadd_ps(vs, lf, vm), xi);
+                err = _mm512_fmadd_ps(diff, diff, err);
+            }
+            _mm512_storeu_ps(er + 16 * v, err);
+        }
+        int win = -1;
+        for (int is = start; is < ns; ++is) {
+            if (ok[is] && er[is] < best) {
+                win = is;
+                break;
+            }
+        }
+        if (win < 0) {
+            break;
+        }
+        for (int i = 0; i < n; ++i) {            /* the codes of the winner, with the min it ran with */
+            int l = kq_lrint(isc[win] * (x[i] - min));
+            L[i] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
+        }
+        best = er[win];
+        scale = ts[win];
+        min = tm[win];
+        start = win + 1;
+    }
+    *the_min = -min;
+    return scale;
+}
+#endif
 
 /* get_scale_min_k4 of ggml: the 6-bit scale and min of sub-block j. */
 static void kq_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
@@ -279,7 +421,7 @@ static void kq_block_to_qk(const float *x, uint8_t *y, int bits)
     float inv_min = max_min > 0 ? 63.f / max_min : 0.f;
     memset(scales_q, 0, 12);
     for (int j = 0; j < 8; ++j) {
-        int ls = (int)lrintf(inv_scale * scales[j]), lm = (int)lrintf(inv_min * mins[j]);
+        int ls = kq_lrint(inv_scale * scales[j]), lm = kq_lrint(inv_min * mins[j]);
         ls = ls > 63 ? 63 : ls;
         lm = lm > 63 ? 63 : lm;
         if (j < 4) {
@@ -302,7 +444,7 @@ static void kq_block_to_qk(const float *x, uint8_t *y, int bits)
         }
         const float dm = m0 * m;
         for (int ii = 0; ii < 32; ++ii) {
-            int l = (int)lrintf((x[32 * j + ii] + dm) / d);
+            int l = kq_lrint((x[32 * j + ii] + dm) / d);
             L[32 * j + ii] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
         }
     }
@@ -370,6 +512,287 @@ void rc_kq_to_qk(const void *src, int bf16, int64_t rows, int cols, int bits, ui
     }
 }
 
+/* ---- Q4_K / Q5_K with a better encoder (rc_kq_to_qk_opt) ----
+ *
+ * The same blocks as kq_block_to_qk (any reader takes them), from a better
+ * search (the RQ4 study, work/rq4best4: -0.21 dB on the weights of LFM2.5,
+ * -0.18 at the outputs, against the ggml encoder):
+ * - the scale and min of each sub-block from kq_qkx2_quants with unit
+ *   weights (the squared error itself, not ggml's av_x + |x|);
+ * - d and dmin among f16(base (1 + 0.01 k)), |k| <= 3, each pair with the
+ *   6-bit scales and mins rounded through 1 / d, 1 / dmin;
+ * - each sub-block also tries the 6-bit neighbours (+-1) of its scale and
+ *   min; the least squared error wins.
+ * dsel (or null): one value for each super-block; its low dbits go to the
+ * low mantissa bits of d and the next mbits to those of dmin (each rounded
+ * up to them): a selector that costs no byte (the free rotation choice of
+ * the study: 4 rotations a super-block). err (or null) gets the squared
+ * error of each super-block. */
+
+/* the squared error of a sub-block of 32 with step d0 sc and offset m0 m;
+ * out (or null) gets the values */
+static double kq_qk_sub_err(const float *x, float d0, float m0, int sc, int m, int nmax, float *out)
+{
+    const float d = d0 * sc, dm = m0 * m;
+    double e = 0;
+    for (int i = 0; i < 32; ++i) {
+        int l = 0;
+        if (d != 0.f) {
+            l = kq_lrint((x[i] + dm) / d);
+            l = l < 0 ? 0 : (l > nmax ? nmax : l);
+        }
+        float v = d * (float)l - dm;
+        if (out) {
+            out[i] = v;
+        }
+        double df = (double)v - x[i];
+        e += df * df;
+    }
+    return e;
+}
+
+static int kq_q6_round(float v)
+{
+    int r = kq_lrint(v);
+    return r > 63 ? 63 : (r < 0 ? 0 : r);
+}
+
+/* f16 h with its low bits set to sel, not smaller in magnitude */
+static uint16_t kq_f16_up(uint16_t h, int sel, int bits)
+{
+    if (bits == 0) {
+        return h;
+    }
+    uint32_t sign = h & 0x8000, mag = h & 0x7fff, mk = (1u << bits) - 1;
+    uint32_t m2 = (mag & ~mk) | (uint32_t)sel;
+    if (m2 < mag) {
+        m2 += 1u << bits;
+    }
+    return (uint16_t)(sign | m2);
+}
+
+#if defined(__AVX512F__)
+/* the values d l - dm of 16 values t (already x + dm) for the step d, l =
+ * lrintf(t / d) clamped to 0..nmax, as kq_qk_sub_err (the rounding and the
+ * clamp in float give the codes of the conversion: |t / d| stays far below
+ * 2^31) */
+static inline __m512 kq_vals16(__m512 t, __m512 vd, __m512 vtop, __m512 vdm)
+{
+    __m512 l = _mm512_roundscale_ps(_mm512_div_ps(t, vd), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    l = _mm512_min_ps(_mm512_max_ps(l, _mm512_setzero_ps()), vtop);
+    return _mm512_sub_ps(_mm512_mul_ps(vd, l), vdm);
+}
+
+/* the squared errors of a sub-block of 32 for the 9 pairs (ls + a, lm + b),
+ * a, b in -1..1 (e[3 (a + 1) + (b + 1)]), as kq_qk_sub_err: the same codes
+ * and values. A step d of 0 (ls + a = 0) gives the codes 0 as there. The
+ * squares of the float differences are exact in double, and so are their
+ * sums here, so the order of the sums does not change the errors. */
+static inline void kq_qk_sub_err9(const float *x, float d0, float m0, int ls, int lm, int nmax, double *e)
+{
+    const __m512 xa = _mm512_loadu_ps(x), xb = _mm512_loadu_ps(x + 16);
+    const __m512 vtop = _mm512_set1_ps((float)nmax);
+    __m512d xd[4];
+    xd[0] = _mm512_cvtps_pd(_mm512_castps512_ps256(xa));
+    xd[1] = _mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(xa), 1)));
+    xd[2] = _mm512_cvtps_pd(_mm512_castps512_ps256(xb));
+    xd[3] = _mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(xb), 1)));
+    __m256d s4[9];
+    for (int a = 0; a < 3; ++a) {
+        const float d = d0 * (ls + a - 1);
+        const __m512 vd = _mm512_set1_ps(d);
+        for (int b = 0; b < 3; ++b) {
+            const __m512 vdm = _mm512_set1_ps(m0 * (lm + b - 1));
+            __m512 va, vb;
+            if (d != 0.f) {
+                va = kq_vals16(_mm512_add_ps(xa, vdm), vd, vtop, vdm);
+                vb = kq_vals16(_mm512_add_ps(xb, vdm), vd, vtop, vdm);
+            } else {
+                va = vb = _mm512_sub_ps(_mm512_setzero_ps(), vdm);
+            }
+            __m512i ia = _mm512_castps_si512(va), ib = _mm512_castps_si512(vb);
+            __m512d f0 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_castsi512_si256(ia))), xd[0]);
+            __m512d f1 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_extracti64x4_epi64(ia, 1))), xd[1]);
+            __m512d f2 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_castsi512_si256(ib))), xd[2]);
+            __m512d f3 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_extracti64x4_epi64(ib, 1))), xd[3]);
+            __m512d acc = _mm512_mul_pd(f0, f0);
+            acc = _mm512_fmadd_pd(f1, f1, acc);
+            acc = _mm512_fmadd_pd(f2, f2, acc);
+            acc = _mm512_fmadd_pd(f3, f3, acc);
+            s4[3 * a + b] = _mm256_add_pd(_mm512_castpd512_pd256(acc), _mm512_extractf64x4_pd(acc, 1));
+        }
+    }
+    for (int k = 0; k < 8; k += 4) {         /* 4 sums at a time: [e k, e k+1, e k+2, e k+3] */
+        __m256d h01 = _mm256_hadd_pd(s4[k], s4[k + 1]), h23 = _mm256_hadd_pd(s4[k + 2], s4[k + 3]);
+        __m256d r4 = _mm256_add_pd(_mm256_permute2f128_pd(h01, h23, 0x20), _mm256_permute2f128_pd(h01, h23, 0x31));
+        _mm256_storeu_pd(e + k, r4);
+    }
+    __m128d h = _mm_add_pd(_mm256_castpd256_pd128(s4[8]), _mm256_extractf128_pd(s4[8], 1));
+    e[8] = _mm_cvtsd_f64(_mm_add_sd(h, _mm_unpackhi_pd(h, h)));
+}
+#endif
+
+/* the 6-bit scales and mins of the 8 sub-blocks for d0, m0, each the best of
+ * its rounding and the 8 neighbours; the total squared error */
+static double kq_qk_choose(const float *x, const float *scales, const float *mins, float d0, float m0,
+                           int nmax, int *LS, int *LM)
+{
+    float is = d0 > 0 ? 1.f / d0 : 0.f, im = m0 > 0 ? 1.f / m0 : 0.f;
+    double tot = 0;
+    for (int j = 0; j < 8; ++j) {
+        int ls = kq_q6_round(is * scales[j]), lm = kq_q6_round(im * mins[j]), l0 = ls, m0i = lm;
+#if defined(__AVX512F__)
+        double e9[9];
+        kq_qk_sub_err9(x + 32 * j, d0, m0, l0, m0i, nmax, e9);
+        double best = e9[4];
+#else
+        double best = kq_qk_sub_err(x + 32 * j, d0, m0, ls, lm, nmax, NULL);
+#endif
+        for (int a = -1; a <= 1; ++a) {
+            for (int b = -1; b <= 1; ++b) {
+                int s2 = l0 + a, m2 = m0i + b;
+                if ((a == 0 && b == 0) || s2 < 0 || s2 > 63 || m2 < 0 || m2 > 63) {
+                    continue;
+                }
+#if defined(__AVX512F__)
+                double e = e9[3 * (a + 1) + (b + 1)];
+#else
+                double e = kq_qk_sub_err(x + 32 * j, d0, m0, s2, m2, nmax, NULL);
+#endif
+                if (e < best) {
+                    best = e;
+                    ls = s2;
+                    lm = m2;
+                }
+            }
+        }
+        LS[j] = ls;
+        LM[j] = lm;
+        tot += best;
+    }
+    return tot;
+}
+
+static double kq_block_to_qk_opt(const float *x, uint8_t *y, int bits, int sel, int dbits, int mbits)
+{
+    const int nmax = bits == 4 ? 15 : 31;
+    uint8_t L[256], Laux[32];
+    float weights[32], mins[8], scales[8], max_scale = 0.f, max_min = 0.f;
+    for (int l = 0; l < 32; ++l) {
+        weights[l] = 1.f;
+    }
+    for (int j = 0; j < 8; ++j) {
+#if defined(__AVX512F__)
+        (void)weights;
+        (void)Laux;
+        scales[j] = bits == 4 ? kq_qkx2_unit(nmax, x + 32 * j, L + 32 * j, &mins[j], -1.f, 0.1f, 20)
+                              : kq_qkx2_unit(nmax, x + 32 * j, L + 32 * j, &mins[j], -0.5f, 0.1f, 15);
+#else
+        scales[j] = bits == 4
+            ? kq_qkx2_quants(32, nmax, x + 32 * j, weights, L + 32 * j, &mins[j], Laux, -1.f, 0.1f, 20)
+            : kq_qkx2_quants(32, nmax, x + 32 * j, weights, L + 32 * j, &mins[j], Laux, -0.5f, 0.1f, 15);
+#endif
+        max_scale = scales[j] > max_scale ? scales[j] : max_scale;
+        max_min = mins[j] > max_min ? mins[j] : max_min;
+    }
+    int LS[8], LM[8], bLS[8], bLM[8];
+    double best = 1e300;
+    uint16_t bdh = 0, bmh = 0;
+    for (int ka = -3; ka <= 3; ++ka) {
+        for (int kb = -3; kb <= 3; ++kb) {
+            uint16_t d2 = kq_f32_to_f16(max_scale / 63.f * (1.f + 0.01f * ka));
+            uint16_t m2 = kq_f32_to_f16(max_min / 63.f * (1.f + 0.01f * kb));
+            if (sel >= 0) {
+                d2 = kq_f16_up(d2, sel & ((1 << dbits) - 1), dbits);
+                m2 = kq_f16_up(m2, (sel >> dbits) & ((1 << mbits) - 1), mbits);
+            }
+            double e = kq_qk_choose(x, scales, mins, kq_h((const uint8_t *)&d2), kq_h((const uint8_t *)&m2),
+                                    nmax, LS, LM);
+            if (e < best) {
+                best = e;
+                bdh = d2;
+                bmh = m2;
+                memcpy(bLS, LS, sizeof LS);
+                memcpy(bLM, LM, sizeof LM);
+            }
+        }
+    }
+    float d0 = kq_h((const uint8_t *)&bdh), m0 = kq_h((const uint8_t *)&bmh);
+    uint8_t sq[12];
+    memset(sq, 0, 12);
+    for (int j = 0; j < 8; ++j) {
+        int ls = bLS[j], lm = bLM[j];
+        if (j < 4) {
+            sq[j] = (uint8_t)ls;
+            sq[j + 4] = (uint8_t)lm;
+        } else {
+            sq[j + 4] = (uint8_t)((ls & 0xF) | ((lm & 0xF) << 4));
+            sq[j - 4] |= (uint8_t)((ls >> 4) << 6);
+            sq[j] |= (uint8_t)((lm >> 4) << 6);
+        }
+        const float d = d0 * ls, dm = m0 * lm;
+        if (d == 0.f) {
+            continue;       /* (the codes of kq_qkx2_quants stay) */
+        }
+        for (int i = 0; i < 32; ++i) {
+            int l = kq_lrint((x[32 * j + i] + dm) / d);
+            L[32 * j + i] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
+        }
+    }
+    memcpy(y, &bdh, 2);
+    memcpy(y + 2, &bmh, 2);
+    memcpy(y + 4, sq, 12);
+    if (bits == 4) {
+        uint8_t *q = y + 16;
+        for (int j = 0; j < 256; j += 64) {
+            for (int l = 0; l < 32; ++l) {
+                q[l] = (uint8_t)(L[j + l] | (L[j + l + 32] << 4));
+            }
+            q += 32;
+        }
+    } else {
+        uint8_t *qh = y + 16, *ql = y + 48;
+        memset(qh, 0, 32);
+        uint8_t m1 = 1, m2 = 2;
+        for (int n = 0; n < 256; n += 64) {
+            for (int j = 0; j < 32; ++j) {
+                int l1 = L[n + j], l2 = L[n + j + 32];
+                if (l1 > 15) {
+                    l1 -= 16;
+                    qh[j] |= m1;
+                }
+                if (l2 > 15) {
+                    l2 -= 16;
+                    qh[j] |= m2;
+                }
+                ql[j] = (uint8_t)(l1 | (l2 << 4));
+            }
+            m1 = (uint8_t)(m1 << 2);
+            m2 = (uint8_t)(m2 << 2);
+            ql += 32;
+        }
+    }
+    return best;
+}
+
+/* Q4_K / Q5_K rows (float32, cols a multiple of 256) with the better encoder;
+ * dsel (rows x cols / 256, or null), dbits, mbits: the selector of each
+ * super-block in the low bits of d / dmin; err (or null): the squared error
+ * of each super-block. */
+void rc_kq_to_qk_opt(const float *src, int64_t rows, int cols, int bits, const int8_t *dsel, int dbits,
+                     int mbits, uint8_t *dst, double *err)
+{
+    const int bb = bits == 4 ? 144 : 176, nb = cols / 256;
+    #pragma omp parallel for schedule(static)
+    for (int64_t x = 0; x < rows * nb; ++x) {
+        double e = kq_block_to_qk_opt(src + (size_t)x * 256, dst + (size_t)x * bb, bits,
+                                      dsel ? dsel[x] : -1, dbits, mbits);
+        if (err) {
+            err[x] = e;
+        }
+    }
+}
+
 /* The NVFP4 matrices of n experts (ModelOpt: w, rows x cols / 2 bytes, value
  * 2i in the low 4 bits of byte i; s, rows x cols / 16 E4M3 scales; g, the
  * float32 scale) to KQ_NV4 rows: dst gets n matrices of rows rows. wp and sp
@@ -428,6 +851,52 @@ void rc_kq_nvx_pack(const int64_t *wp, const int64_t *sp, const float *g, int n,
             }
         }
     }
+}
+
+/* The E4M3 block scales of an NVFP4 matrix (rows x c scales) from the CSF
+ * encoding "csf" of Qwen3.8-Flash-Next-FP4-Local (byte-window4-fixed-stream-
+ * u24-exceptions/1; flashinfer scripts/convert_csf_blocks.py _logical_source):
+ * fixed holds rows / 16 slabs of 16 row bases, then the 4-bit codes of the 16
+ * rows (c / 2 bytes a row, the low nibble the even column); a scale is its
+ * row's base plus its code. Then each exception word w puts the byte w >> 24
+ * at the row-major position w & 0xFFFFFF. stats (6 int64): [0] bases above
+ * 240, [1] exceptions out of order or out of range, [2] exceptions inside
+ * their row's window (redundant), [3] the largest base, [4] zero scales,
+ * [5] E4M3 subnormal scales (codes 1-7) after the exceptions. */
+void rc_csf_decode(const uint8_t *fixed, int rows, int c, const uint32_t *exc, int64_t n, uint8_t *out,
+                   int64_t *stats)
+{
+    int rb = c / 2, sb = 16 * (1 + rb);
+    int64_t bad_base = 0, bad_exc = 0, inside = 0, maxb = 0, zeros = 0, sub = 0;
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *slab = fixed + (size_t)(r / 16) * sb;
+        int base = slab[r % 16];
+        const uint8_t *codes = slab + 16 + (size_t)(r % 16) * rb;
+        bad_base += base > 240;
+        maxb = base > maxb ? base : maxb;
+        uint8_t *o = out + (size_t)r * c;
+        for (int j = 0; j < c; ++j) {
+            o[j] = (uint8_t)(base + ((codes[j >> 1] >> (4 * (j & 1))) & 15));
+        }
+    }
+    int64_t prev = -1, total = (int64_t)rows * c;
+    for (int64_t i = 0; i < n; ++i) {
+        int64_t pos = exc[i] & 0xFFFFFF;
+        uint8_t v = (uint8_t)(exc[i] >> 24);
+        if (pos <= prev || pos >= total) {
+            ++bad_exc;
+            continue;
+        }
+        prev = pos;
+        int base = fixed[(size_t)(pos / c / 16) * sb + (pos / c) % 16];
+        inside += v >= base && v <= base + 15;
+        out[pos] = v;
+    }
+    for (int64_t i = 0; i < total; ++i) {
+        zeros += (out[i] & 0x7F) == 0;
+        sub += (out[i] & 0x78) == 0 && (out[i] & 7) != 0;
+    }
+    stats[0] = bad_base, stats[1] = bad_exc, stats[2] = inside, stats[3] = maxb, stats[4] = zeros, stats[5] = sub;
 }
 
 /* Copy n rows of bytes bytes from the addresses addrs (rows of a memory map

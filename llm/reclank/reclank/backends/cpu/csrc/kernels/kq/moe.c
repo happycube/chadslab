@@ -170,6 +170,7 @@ static int kq_mats_bf12(const int64_t *mats)
     return 0;
 }
 
+#define KQ_A4_MAXC 8192      /* (the largest hidden of the A4 rows: a row on the stack) */
 static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, const int32_t *ids,
                         const float *val, int t, int k, int experts, const int64_t *mats,
                         const float *shared_logit, int hidden, int inner, uint8_t *scratch,
@@ -212,7 +213,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
     if (kq_e3_bits((int)mats[1])) {
         /* the MUL1 experts of an EXL3 model (kernels/kq/exl3_moe.c) */
         kq_e3_moe_body(ids, val, t, k, experts, mats, shared_logit, hidden, inner, out, hf, mats1,
-                       slot1, slot0);
+                       slot1, slot0, act_flags, scratch);
         return;
     }
     if ((act_flags & 8) && hf != NULL && t <= 4 && !exact && !q16) {
@@ -254,6 +255,15 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         D1 = kq_mat_of(mats1 + 4);
     }
     int shared = SG.w != NULL;
+    /* act bit 2048 (FP4-Local, docs/FP4LOCAL_PLAN.md 2.2): the A4 contract of b12x for the prompt
+     * rows on KQ_NVX experts: x to NVFP4 with the layer's gs1 (the heads of the gate matrices, bytes
+     * 4-7), kq_nvx_rows_a4 (alpha = g / gs1), the act kq_b12x_act, requantized with the expert's gs2
+     * (the heads of its down matrix), the down rows y = bf16(alpha2 sum), the sum of w y */
+    const int a4 = (act_flags & 2048) && hf != NULL && G.type == KQ_NVX && U.type == KQ_NVX && D.type == KQ_NVX &&
+                   !shared;
+    if (a4) {
+        x2 = 0;
+    }
     int ne = experts + shared;
     int P = t * k + (shared ? t : 0);
     int nph = hidden / 32, npi = inner / 32;
@@ -353,6 +363,17 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
             }
             continue;
         }
+        if (a4) {
+            float gs1;
+            memcpy(&gs1, G.w + 4, 4);
+            float xr[KQ_A4_MAXC];
+            for (int i = 0; i < hidden; ++i) {
+                xr[i] = kq_bf16r(hf[(size_t)j * hidden + i]);
+            }
+            kq_a4_quant(xr, hidden, gs1, xq + (size_t)q * hidden, xm + (size_t)q * (hidden / 16));
+            kq_nvx_xsum(xq + (size_t)q * hidden, 1, hidden, xn + (size_t)q * xns);
+            continue;
+        }
         if (bf12 && !exact) {
             /* the float32 rows for the KQ_BF12 matrices (kq_rows_bf12_f), in de
              * as for exact; the int8 rows below for the others */
@@ -433,6 +454,11 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
                            (size_t)hidden, n, act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
             continue;
         }
+        if (a4) {
+            kq_nvx_rows_a4(w + (size_t)r * rb, hidden, xq + (size_t)s0 * hidden, xm + (size_t)s0 * (hidden / 16),
+                           xn + (size_t)s0 * xns, n, act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
+            continue;
+        }
         if (exact) {
             kq_rows_f_any(w + (size_t)r * rb, m.type, ngu, hidden, de + (size_t)s0 * hidden,
                           (size_t)hidden, n, act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
@@ -473,6 +499,28 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
     }
     /* silu(gate) * up (gelu: the tanh GELU of the Gemma 4 26B), and its
      * quantization for down. */
+    if (a4) {
+    #pragma omp for schedule(static)
+    for (int q = 0; q < P; ++q) {
+        float *a = act + (size_t)q * 2 * inner;
+        for (int i = 0; i < inner; ++i) {
+            a[i] = kq_b12x_act(a[i], a[inner + i]);
+        }
+        int lo = 0, hi = ne;            /* the expert of pair q: start[lo] <= q < start[lo + 1] */
+        while (hi - lo > 1) {
+            int mid = (lo + hi) / 2;
+            if (start[mid] <= q) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        float gs2;
+        memcpy(&gs2, D.w + (size_t)lo * hidden * kq_row_bytes(KQ_NVX, inner) + 4, 4);
+        kq_a4_quant(a, inner, gs2, aq + (size_t)q * inner, am + (size_t)q * (inner / 16));
+        kq_nvx_xsum(aq + (size_t)q * inner, 1, inner, an + (size_t)q * ans);
+    }
+    } else {
     #pragma omp for schedule(static)
     for (int q = 0; q < P; ++q) {
         float *a = act + (size_t)q * 2 * inner;
@@ -541,6 +589,7 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
             }
         }
     }
+    }       /* (a4) */
     if (gp) {
         gt[5] = omp_get_wtime();
     }
@@ -575,6 +624,11 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
         if (m.type == KQ_BF12 && (bf12 || exact)) {
             kq_rows_bf12_f(w + (size_t)r * rb, rb, ndn, inner, act + (size_t)s0 * 2 * inner,
                            (size_t)2 * inner, n, de + (size_t)s0 * hidden + r, (size_t)hidden);
+            continue;
+        }
+        if (a4) {
+            kq_nvx_rows_a4(w + (size_t)r * rb, inner, aq + (size_t)s0 * inner, am + (size_t)s0 * (inner / 16),
+                           an + (size_t)s0 * ans, n, de + (size_t)s0 * hidden + r, (size_t)hidden);
             continue;
         }
         if (exact) {
@@ -614,6 +668,16 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
     if (gp) {
         gt[6] = glast;
         gt[7] = omp_get_wtime();
+    }
+    if (a4) {
+        /* y = bf16(alpha2 sum) of each pair (the down rows of b12x's A4) */
+        #pragma omp for schedule(static)
+        for (int q = 0; q < P; ++q) {
+            float *d = de + (size_t)q * hidden;
+            for (int i = 0; i < hidden; ++i) {
+                d[i] = kq_bf16r(d[i]);
+            }
+        }
     }
     if (rowsf) {
         moe_rows(de, pair_of, t, k, hidden, out);

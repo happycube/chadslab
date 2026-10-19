@@ -29,6 +29,8 @@ typedef struct {
     size_t w16_n;
     float *btp;          /* the parts of the sums of k_kq_bf12_tc of class 1, and their counts */
     int *btc;
+    float *nv8;          /* the column shares of k_nm_t8 */
+    size_t nv8_n;
     int8_t *kqx;         /* the int8 rows of the products of large groups (k_kq_tc) */
     size_t kqx_n;        /* its values; then xs and xsum, kqx_n / 32 floats each */
     int tc;              /* 1: the tensor cores for a large group */
@@ -95,10 +97,9 @@ __device__ __forceinline__ void block_copy4(void *dst, const void *src, size_t n
     }
 }
 
-__global__ void k_signal(const gp_rec *r, const int64_t *e)
+__device__ void signal_body(const gp_rec *r, const int64_t *e, int k0 = 0)
 {
-    PDL_START();
-    for (int k = 0; k < 3; ++k) {
+    for (int k = k0; k < 3; ++k) {
         if (di(r, e, 2 + 3 * k) != 0) {
             block_copy4(DP(void, 3 + 3 * k), DP(const void, 2 + 3 * k), (size_t)di(r, e, 4 + 3 * k));
         }
@@ -109,6 +110,39 @@ __global__ void k_signal(const gp_rec *r, const int64_t *e)
         *DP(volatile int64_t, 0) = di(r, e, 1);
         __threadfence_system();
     }
+}
+
+__global__ void k_signal(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    signal_body(r, e);
+}
+
+/* GP_DS_ROUTER of one token, the GP_HOT_SPLIT after it and the GP_SIGNAL after that in one block (a
+ * DeepSeek V4.1 step: three kernels of one block each, 7.9 + 4.5 + 10 us and their gaps, on the way
+ * to the CPU's task of every layer). The same operations in the same order. */
+__global__ void __launch_bounds__(256) k_ds_route_signal(const gp_rec *r, const int64_t *e, const gp_rec *rs,
+                                                         const gp_rec *rg)
+{
+    PDL_START();
+    /* the input rows (copy 0: x of the experts, ready before the router) go first, their writes over
+     * PCIe in flight while the router and the split run; the copies of the split's outputs after */
+    const gp_rec *r0 = r;
+    {
+        const gp_rec *r = rg;
+        if (di(r, e, 2) != 0) {
+            block_copy4(DP(void, 3), DP(const void, 2), (size_t)di(r, e, 4));
+        }
+    }
+    ds_router_body(r0, e, 0);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        hot_split_body(rs, e);
+        __threadfence();
+    }
+    __syncthreads();
+    signal_body(rg, e, 1);
 }
 
 __global__ void k_await(const gp_rec *r, const int64_t *e)
@@ -163,7 +197,83 @@ extern "C" int rc_gpu_task_stats(double *out)
     return 0;
 }
 
-/* Run a GP_CPU_TASK on the host: wait for flag in, run, write flag out. */
+/* ---------- lane B (docs/LANES_PLAN.md) ----------
+ * rc_gpu_lane(1) gives the calling thread a stream of its own (gg_tstream)
+ * and makes it lane B: it runs a step program of its own at the same time as
+ * the model thread runs lane A's. The CPU programs of the cold experts run in
+ * the parts, OpenMP teams of the thread that runs them, and the teams of a
+ * second thread put the threads over the CPUs (server/worker.py); so lane B
+ * never runs a CPU program: at each GP_CPU_TASK it waits for its signal, puts
+ * the program in the mailbox, and waits; the model thread runs it while it
+ * waits for its own signals (gg_cpu_task) and, after its run, until lane B is
+ * done (rc_gpu_lane_serve). One program at a time on the one team. */
+static cudaStream_t gg_lane_stream;
+static __thread int gg_lane_b;
+static const int64_t *volatile gg_lb_prog;
+static int gg_lb_state;         /* 0 empty, 1 a program to run, 2 done, -1 it failed */
+static double gg_lb_cpu;        /* the measures of lane B's programs (rc_gpu_lane_stats) */
+static int64_t gg_lb_n;
+
+/* The model thread: run the program of lane B's mailbox, if there is one. */
+static inline void gg_lane_serve_one(void)
+{
+    if (__atomic_load_n(&gg_lb_state, __ATOMIC_ACQUIRE) != 1) {
+        return;
+    }
+    double t0 = gg_clock();
+    int rc = gg_cpu_run == NULL ? -1 : gg_cpu_run(gg_lb_prog, -1);
+    gg_lb_cpu += gg_clock() - t0;
+    ++gg_lb_n;
+    __atomic_store_n(&gg_lb_state, rc == 0 ? 2 : -1, __ATOMIC_RELEASE);
+}
+
+/* The seconds of lane B's CPU programs (run by the model thread) and their count since the last
+ * call, to out[0] and out[1] (rc_gpu_task_stats has the model thread's own). */
+extern "C" int rc_gpu_lane_stats(double *out)
+{
+    out[0] = gg_lb_cpu;
+    out[1] = (double)gg_lb_n;
+    gg_lb_cpu = 0.0;
+    gg_lb_n = 0;
+    return 0;
+}
+
+extern "C" int rc_gpu_lane(int on)
+{
+    if (on && gg_lane_stream == NULL) {
+        CK(cudaStreamCreateWithFlags(&gg_lane_stream, cudaStreamNonBlocking));
+    }
+    gg_tstream = on ? gg_lane_stream : NULL;
+    gg_lane_b = on != 0;
+    return 0;
+}
+
+/* The model thread, after its run: lane B's programs until *done (lane B's
+ * thread sets it after its run). */
+extern "C" int rc_gpu_lane_serve(const int64_t *done)
+{
+    double t0 = gg_clock();
+    while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {
+        gg_lane_serve_one();
+        __builtin_ia32_pause();
+        if (gg_clock() - t0 > 60.0) {
+            snprintf(gg_error, sizeof(gg_error), "rc_gpu_lane_serve: lane B not done in 60 s");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Wait for the work of the calling thread's stream. */
+extern "C" int rc_gpu_lane_sync(void)
+{
+    CK(cudaStreamSynchronize(gg_stream));
+    return 0;
+}
+
+/* Run a GP_CPU_TASK on the host: wait for flag in, run, write flag out. The
+ * model thread runs lane B's programs while it waits; lane B's thread hands
+ * its own to the model thread. */
 static int gg_cpu_task(const gp_rec *r, const int64_t *henv)
 {
     volatile int64_t *fin = (volatile int64_t *)(intptr_t)r->v[1];
@@ -171,24 +281,47 @@ static int gg_cpu_task(const gp_rec *r, const int64_t *henv)
     int64_t v = hi(r, henv, 3);
     double t0 = gg_clock();
     while (*fin < v) {
+        if (!gg_lane_b) {
+            gg_lane_serve_one();
+        }
         __builtin_ia32_pause();
         if (gg_clock() - t0 > 30.0) {
-            snprintf(gg_error, sizeof(gg_error), "GP_CPU_TASK: no signal of the GPU in 30 s");
+            snprintf(gg_error, sizeof(gg_error), "GP_CPU_TASK%s: no signal of the GPU in 30 s (flag %lld, "
+                     "waits for %lld; lane B's mailbox %d)", gg_lane_b ? " of lane B" : "",
+                     (long long)*fin, (long long)v, __atomic_load_n(&gg_lb_state, __ATOMIC_RELAXED));
             return -1;
         }
     }
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     double t1 = gg_clock();
-    if (gg_cpu_run == NULL || gg_cpu_run((const int64_t *)(intptr_t)r->v[0], -1) != 0) {
+    if (gg_lane_b) {
+        gg_lb_prog = (const int64_t *)(intptr_t)r->v[0];
+        __atomic_store_n(&gg_lb_state, 1, __ATOMIC_RELEASE);
+        int st;
+        while ((st = __atomic_load_n(&gg_lb_state, __ATOMIC_ACQUIRE)) == 1) {
+            __builtin_ia32_pause();
+            if (gg_clock() - t1 > 30.0) {
+                snprintf(gg_error, sizeof(gg_error), "GP_CPU_TASK of lane B: not run in 30 s");
+                return -1;
+            }
+        }
+        __atomic_store_n(&gg_lb_state, 0, __ATOMIC_RELAXED);
+        if (st < 0) {
+            snprintf(gg_error, sizeof(gg_error), "the CPU program of a GP_CPU_TASK of lane B failed");
+            return -1;
+        }
+    } else if (gg_cpu_run == NULL || gg_cpu_run((const int64_t *)(intptr_t)r->v[0], -1) != 0) {
         snprintf(gg_error, sizeof(gg_error), "the CPU program of a GP_CPU_TASK failed");
         return -1;
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
     *fout = v;
-    double t2 = gg_clock();
-    gg_ts_wait += t1 - t0;
-    gg_ts_cpu += t2 - t1;
-    ++gg_ts_n;
+    if (!gg_lane_b) {           /* (the measures: the model thread's tasks) */
+        double t2 = gg_clock();
+        gg_ts_wait += t1 - t0;
+        gg_ts_cpu += t2 - t1;
+        ++gg_ts_n;
+    }
     return 0;
 }
 
@@ -210,14 +343,45 @@ static const int64_t *gg_hjob;
 static int gg_hbusy, gg_hfail, gg_hon;
 static double gg_hlast;       /* the time of the last program, in s */
 
+/* The helper keeps the team of OpenMP threads of its programs while they
+ * come one after the other (the layers of a prompt group); after this long
+ * with no program it lets them go (gg_cpu_run of a null program). The
+ * threads of a team stay with the thread that opened it, and while the
+ * process has more of them than CPUs, libgomp spins only briefly before a
+ * thread sleeps: a team of 25 kept by the helper after a prompt put the 35
+ * threads of the parts (GP_CPU_TASK, every layer of a decode step) to sleep
+ * between the layers, to be woken at each. */
+#define GG_HELPER_IDLE_NS 20000000L
+
 static void *gg_helper(void *arg)
 {
     (void)arg;
+    cudaSetDevice(gg_device);
+    int team = 0;       /* the helper has kept a team since its last program */
     for (;;) {
         pthread_mutex_lock(&gg_hmu);
         while (gg_hjob == NULL) {
-            pthread_cond_wait(&gg_hcv, &gg_hmu);
+            if (!team) {
+                pthread_cond_wait(&gg_hcv, &gg_hmu);
+                continue;
+            }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += GG_HELPER_IDLE_NS;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            if (pthread_cond_timedwait(&gg_hcv, &gg_hmu, &ts) != 0 && gg_hjob == NULL) {
+                pthread_mutex_unlock(&gg_hmu);
+                if (gg_cpu_run != NULL) {
+                    gg_cpu_run(NULL, -1);
+                }
+                team = 0;
+                pthread_mutex_lock(&gg_hmu);
+            }
         }
+        team = 1;
         const int64_t *prog = gg_hjob;
         pthread_mutex_unlock(&gg_hmu);
         double t0 = gg_clock();

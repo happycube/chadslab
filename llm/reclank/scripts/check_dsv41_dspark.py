@@ -35,7 +35,9 @@ def main():
                     help="the GPU memory of the hot experts (default 10: 2 GB less with DSpark)")
     ap.add_argument("--max-len", type=int, default=None, help="the most positions (default the model's, 1M)")
     ap.add_argument("--fixed", type=int, help="always this many drafts (else chosen by the confidence)")
-    ap.add_argument("--where", choices=("cpu1", "gpu"), default="cpu1", help="the DSpark experts")
+    ap.add_argument("--stop", type=float, default=None,
+                    help="the cutoff of the verify length (default dspark.STOP or RECLANK_MTP_STOP; 0: by the rates)")
+    ap.add_argument("--where", choices=("cpu", "cpu1", "gpu"), default="cpu", help="the DSpark experts")
     ap.add_argument("--mode", default="auto", help="auto (a draft while it pays) or always")
     ap.add_argument("--full-prefill", action="store_true",
                     help="every layer on every token of the prompt (not the decoder's bounded replay)")
@@ -44,9 +46,9 @@ def main():
     t0 = time.time()
     m = DSV41CPU(a.ckpt, exact=False, max_len=a.max_len)
     g = DSV41GPU(m, keep_layers=False, hot_gb=a.hot_gb, replay=not a.full_prefill)
-    ds = DSpark(g, where=a.where)
-    print("loaded in %.1f s (hot experts: %d slots a layer; the DSpark experts on %s)" % (
-        time.time() - t0, g.n_slots, a.where))
+    ds = DSpark(g, where=a.where, stop=a.stop)
+    print("loaded in %.1f s (hot experts: %d slots a layer; the DSpark experts on %s; stop %g)" % (
+        time.time() - t0, g.n_slots, a.where, ds.stop))
     bad = 0
     for path in a.ref:
         r = np.load(path)

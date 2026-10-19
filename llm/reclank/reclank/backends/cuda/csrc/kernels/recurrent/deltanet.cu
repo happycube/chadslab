@@ -16,7 +16,13 @@
  *   k_gdn_out       the norm of the output and the gate.
  *
  * The sums of a column go in GS parts, so the bits differ a little from those
- * of the steps. A group with a log (the MTP verify) keeps k_gdn_heads. */
+ * of the steps. A group with a log (the MTP verify) keeps k_gdn_heads.
+ *
+ * Flag 4 (KDA, GLM-5.3): a decay for each channel of the keys, not each
+ * head. Operand 5 is [t, vh KD] (f_b f_a x), dt_bias [vh KD], and the decay
+ * exp(-5 sigmoid(exp(A_log[h]) (a + dt_bias))) scales row d of the state of
+ * head h (k_gdn_scan<.., CH>: the decays of a step in shared memory too, in
+ * steps of 16 tokens). */
 __global__ void k_gdn_conv_par(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -54,7 +60,23 @@ __global__ void __launch_bounds__(KD) k_gdn_prep(const gp_rec *r, const int64_t 
         row[x * KD + c] = qv * (1.f / sqrtf(nq + 1e-6f) / sqrtf((float)KD));
         row[kd + x * KD + c] = kv * (1.f / sqrtf(nk + 1e-6f));
     } else if (x == kh) {
-        if (i >= t || c >= vh) {
+        if (i >= t) {
+            return;
+        }
+        if (DI(20) & 4) {
+            /* KDA: the decay of each channel */
+            float *a = DP(float, 5) + (size_t)i * vh * KD;
+            for (int ch = c; ch < vh * KD; ch += KD) {
+                float g = expf(DP(const float, 7)[ch / KD]) * (a[ch] + DP(const float, 8)[ch]);
+                a[ch] = expf(-5.f / (1.f + expf(-g)));
+            }
+            if (c < vh) {
+                float *b = DP(float, 6) + (size_t)i * vh + c;
+                *b = 1.f / (1.f + expf(-*b));
+            }
+            return;
+        }
+        if (c >= vh) {
             return;
         }
         float Aexp = expf(DP(const float, 7)[c]);
@@ -79,13 +101,13 @@ __global__ void __launch_bounds__(KD) k_gdn_prep(const gp_rec *r, const int64_t 
 }
 
 #define GDN_TC 32
-template <int KD, int GS>
+template <int KD, int GS, bool CH = false, int TC = GDN_TC>
 __global__ void __launch_bounds__(128) k_gdn_scan(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     constexpr int NV = KD / GS, CB = 128 / GS;     /* values of a thread, columns of a block */
-    __shared__ __align__(16) float qs[GDN_TC][KD], ks[GDN_TC][KD];
-    __shared__ float dec[GDN_TC], bet[GDN_TC];
+    __shared__ __align__(16) float qs[TC][KD], ks[TC][KD], dch[CH ? TC : 1][KD];
+    __shared__ float dec[TC], bet[TC];
     int kh = DI(14), vh = DI(15), t = gdn_nreal(r, e), tiled = DI(20) & 1;
     int kd = kh * KD, vd = vh * KD, cd = 2 * kd + vd;
     int hv = blockIdx.x, part = threadIdx.x % GS;
@@ -100,17 +122,22 @@ __global__ void __launch_bounds__(128) k_gdn_scan(const gp_rec *r, const int64_t
     for (int u = 0; u < NV; ++u) {
         S[u] = Sh[(size_t)(4 * GS * (u / 4) + 4 * part + u % 4) * KD + col];
     }
-    for (int i0 = 0; i0 < t; i0 += GDN_TC) {
-        int n = min(GDN_TC, t - i0);
+    for (int i0 = 0; i0 < t; i0 += TC) {
+        int n = min(TC, t - i0);
         __syncthreads();
         for (int z = threadIdx.x; z < n * KD / 4; z += 128) {
             int ii = z / (KD / 4), d4 = (z % (KD / 4)) * 4;
             const float *row = cv + (size_t)(i0 + ii) * cd;
             *(float4 *)&qs[ii][d4] = *(const float4 *)(row + hk * KD + d4);
             *(float4 *)&ks[ii][d4] = *(const float4 *)(row + kd + hk * KD + d4);
+            if (CH) {
+                *(float4 *)&dch[ii][d4] = *(const float4 *)(da + (size_t)(i0 + ii) * vd + hv * KD + d4);
+            }
+        }
+        if (threadIdx.x < n && !CH) {
+            dec[threadIdx.x] = da[(size_t)(i0 + threadIdx.x) * vh + hv];
         }
         if (threadIdx.x < n) {
-            dec[threadIdx.x] = da[(size_t)(i0 + threadIdx.x) * vh + hv];
             bet[threadIdx.x] = db[(size_t)(i0 + threadIdx.x) * vh + hv];
         }
         __syncthreads();
@@ -121,10 +148,12 @@ __global__ void __launch_bounds__(128) k_gdn_scan(const gp_rec *r, const int64_t
             #pragma unroll
             for (int u4 = 0; u4 < NV / 4; ++u4) {
                 float4 k4 = *(const float4 *)&ks[ii][4 * GS * u4 + 4 * part];
-                S[4 * u4 + 0] = __fmul_rn(S[4 * u4 + 0], decay);
-                S[4 * u4 + 1] = __fmul_rn(S[4 * u4 + 1], decay);
-                S[4 * u4 + 2] = __fmul_rn(S[4 * u4 + 2], decay);
-                S[4 * u4 + 3] = __fmul_rn(S[4 * u4 + 3], decay);
+                float4 d4 = CH ? *(const float4 *)&dch[ii][4 * GS * u4 + 4 * part]
+                               : make_float4(decay, decay, decay, decay);
+                S[4 * u4 + 0] = __fmul_rn(S[4 * u4 + 0], d4.x);
+                S[4 * u4 + 1] = __fmul_rn(S[4 * u4 + 1], d4.y);
+                S[4 * u4 + 2] = __fmul_rn(S[4 * u4 + 2], d4.z);
+                S[4 * u4 + 3] = __fmul_rn(S[4 * u4 + 3], d4.w);
                 s0 += k4.x * S[4 * u4 + 0] + k4.y * S[4 * u4 + 1];
                 s1 += k4.z * S[4 * u4 + 2] + k4.w * S[4 * u4 + 3];
             }
@@ -221,7 +250,7 @@ __global__ void k_gdn_commit_conv(float *conv, const float *log, int n, int kern
 
 template <int KD>
 __global__ void __launch_bounds__(KD) k_gdn_commit_heads(float *S, const float *log, int n,
-                                                         int cd, size_t lrow)
+                                                         int cd, size_t lrow, int ch)
 {
     int hv = blockIdx.x, c = threadIdx.x;
     float *Sh = S + (size_t)hv * KD * KD;
@@ -231,11 +260,12 @@ __global__ void __launch_bounds__(KD) k_gdn_commit_heads(float *S, const float *
         st[d] = Sh[(size_t)d * KD + c];
     }
     for (int i = 0; i < n; ++i) {
-        const float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (2 * KD + 1);
-        float decay = lg[2 * KD], delta = lg[KD + c];
+        /* a head: k, delta, then its decay (or with ch, the decay of each row) */
+        const float *lg = log + (size_t)i * lrow + cd + (size_t)hv * (ch ? 3 * KD : 2 * KD + 1);
+        float delta = lg[KD + c];
         #pragma unroll
         for (int d = 0; d < KD; ++d) {
-            st[d] = __fmul_rn(st[d], decay);
+            st[d] = __fmul_rn(st[d], lg[2 * KD + (ch ? d : 0)]);
         }
         #pragma unroll
         for (int d = 0; d < KD; ++d) {
@@ -362,7 +392,8 @@ __device__ __forceinline__ const uint8_t *kqh_wslot(const gp_rec *r, const int64
 __device__ __forceinline__ int kqh_slot(const gp_rec *r, const int64_t *e, int j)
 {
     int tk = DI(16) * DI(11);
-    return j >= tk ? 0 : DP(const int, 3)[DP(const int, 2)[j]];
+    /* the shared expert: none when its gate matrix (operand 17) is null (LFM2) */
+    return j >= tk ? (DP(const uint8_t, 17) != NULL ? 0 : -1) : DP(const int, 3)[DP(const int, 2)[j]];
 }
 
 /* Operands 22 and 23 (or none): zc (the flags of the pairs that read the
@@ -419,18 +450,75 @@ __global__ void k_kqh_gu(const gp_rec *r, const int64_t *e, int jofs = 0)
     }
 }
 
-/* RQ8_0 experts (gguf.RQ8_0, Qwen4GPU): the MoE kernels rotate the act of
- * each pair before the down product, as kquants.c kq_moe_rot (the program
- * rotates their x). A state of the process. */
+/* The act of the MoE kernels (k_kqh_act, k_qmoe_act), bits of a state of
+ * the process: 1, RQ8_0 experts (gguf.RQ8_0, Qwen4GPU): the act of each pair
+ * rotated before the down product, as kquants.c kq_moe_rot (the program
+ * rotates their x); 2, GLM-5.3: the SwiGLU clamped, silu(min(g, 10))
+ * clamp(u, -10, 10), as act bit 512 of the CPU (the experts and the shared
+ * expert). */
 static int gg_moe_rot = 0;
 
 extern "C" void rc_gpu_set_moe_rot(int on)
 {
-    gg_moe_rot = on;
+    gg_moe_rot = (gg_moe_rot & ~1) | (on ? 1 : 0);
 }
 
-/* rot: the RQ8_0 experts (gg_moe_rot): the act rotated in each 32 values
- * (a warp a group; inner and blockDim are multiples of 32) */
+extern "C" void rc_gpu_set_moe_clamp(int on)
+{
+    gg_moe_rot = (gg_moe_rot & ~2) | (on ? 2 : 0);
+}
+
+/* 4: the contract of FP4-Local (docs/FP4LOCAL_PLAN.md, b12x's W4A16): the KQ_NVX hot experts on
+ * float32 x (bfloat16 values: BF16_ROUND before the MoE), the act kq_b12x_act, each pair's down
+ * row y = bf16(bf16(D2) bf16(w g)) (k_kqh_nvx), and the combine of the rows as they are, bf16(sum),
+ * the shared expert bf16(bf16(sigmoid(bf16(gate))) bf16(s)), out = bf16(routed + shared) */
+extern "C" void rc_gpu_set_moe_contract(int on)
+{
+    /* on: bit 0 the A16 contract of steps and verify groups (4), bit 1 the A4 contract of the prompt
+     * groups (8: GP_KQ_GROUP_MOE, kernels/moe/b12x.cu) */
+    gg_moe_rot = (gg_moe_rot & ~12) | ((on & 1) ? 4 : 0) | ((on & 2) ? 8 : 0);
+}
+
+__device__ __forceinline__ float rc_bf16r(float v)
+{
+    unsigned u = __float_as_uint(v);
+    return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+__device__ __forceinline__ float moe_b12x_act(float g, float u)
+{
+    g = rc_bf16r(g);
+    u = rc_bf16r(u);
+    /* the operations of kq_b12x_act of the CPU (rc_dexp, IEEE products): the same bits */
+    return rc_bf16r(__fmul_rn(rc_bf16r(__fmul_rn(g, __frcp_rn(__fadd_rn(1.f, rc_dexp(-g))))), u));
+}
+
+/* the contract's MoE output from the routed sum acc (of the y rows) and the shared expert's down
+ * row s with its gate logit sl (has: there is one) */
+__device__ __forceinline__ float moe_b12x_out(float acc, int has, float sl, float s)
+{
+    float routed = rc_bf16r(acc);
+    if (!has) {
+        return routed;
+    }
+    float sg = rc_bf16r(__frcp_rn(1.f + expf(-rc_bf16r(sl))));
+    return rc_bf16r(routed + rc_bf16r(sg * rc_bf16r(s)));
+}
+
+__device__ __forceinline__ float moe_act(float g, float u, int act)
+{
+    if (act & 4) {
+        return moe_b12x_act(g, u);
+    }
+    if (act & 2) {
+        g = fminf(g, 10.f);
+        u = fminf(fmaxf(u, -10.f), 10.f);
+    }
+    return qw_silu(g) * u;
+}
+
+/* rot: the bits of gg_moe_rot: 1, the act rotated in each 32 values (a warp
+ * a group; inner and blockDim are multiples of 32); 2, clamped */
 __global__ void k_kqh_act(const gp_rec *r, const int64_t *e, int rot)
 {
     PDL_START();
@@ -441,8 +529,8 @@ __global__ void k_kqh_act(const gp_rec *r, const int64_t *e, int rot)
     int inner = DI(12);
     const float *g = DP(const float, 7) + (size_t)j * 2 * inner;
     for (int i = threadIdx.x; i < inner; i += blockDim.x) {
-        float v = qw_silu(g[i]) * g[inner + i];
-        if (rot) {
+        float v = moe_act(g[i], g[inner + i], rot);
+        if (rot & 1) {
             v = tq6_rot_warp(v, i % 32, false);
         }
         DP(float, 8)[(size_t)j * inner + i] = v;
@@ -485,6 +573,131 @@ __global__ void k_kqh_dn(const gp_rec *r, const int64_t *e, int jofs = 0)
     }
 }
 
+/* The routed pairs (j < t top_k) of GP_KQ_HOT_MOE with Q4_K or Q5_K experts
+ * of NB blocks a row (gate and up: blockIdx.z; DN: down): a warp does
+ * KQH_K_R rows of the expert with x of each lane in registers (the 8 values
+ * of each block it reads in kq_row_part, and their sums), loaded once, in
+ * place of a warp a row that reads all of x for each row (8 KB of x for the
+ * 1.15 KB of a Q4_K row of 2048). STAGE: the rows of the warp first go to
+ * shared memory with 16-byte loads (when they are 16-byte aligned). Each
+ * row has the operations of kq_row (the same bits). Qwen3.6 on the GTX 1070,
+ * 12 pairs a layer: gate or up 125 -> 86 us, down (STAGE) 158 -> 64 us. */
+#define KQH_K_R 4
+template <int FIVE, int NB, int DN, int STAGE>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) k_kqh_k(const gp_rec *r, const int64_t *e)
+{
+    constexpr int BS = FIVE ? 176 : 144, RB = NB * BS, NV = KQH_K_R * RB / 16;
+    constexpr int PER = STAGE ? (NV + 31) / 32 : 1;
+    __shared__ __align__(16) uint8_t sm[STAGE ? ROWS_PER_BLOCK : 1][STAGE ? KQH_K_R * RB : 16];
+    PDL_START();
+    int j = blockIdx.y, up = DN ? 2 : blockIdx.z, slot = kqh_slot(r, e, j);
+    int inner = DI(12), hidden = DI(13), k = DI(11);
+    int rows = DN ? hidden : inner;
+    int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * KQH_K_R;
+    if (slot < 0 || row0 >= rows) {
+        return;
+    }
+    int l = threadIdx.x % 32, c = l / 8, sub = l % 8;
+    const uint8_t *wr = kqh_wslot(r, e, slot, up, (size_t)rows * RB) + (size_t)row0 * RB;
+    int nr = min(KQH_K_R, rows - row0);
+    const int st = STAGE && ((uintptr_t)wr & 15) == 0;     /* (else the direct loads) */
+    if (st) {
+        uint8_t *buf = sm[threadIdx.x / 32];
+        const uint4 *src = (const uint4 *)wr;
+        int nv = nr * RB / 16;
+        #pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            int i = l + 32 * p;
+            if (i < nv) {
+                ((uint4 *)buf)[i] = __ldg(src + i);
+            }
+        }
+        wr = buf;
+    }
+    const float *xt = DN ? DP(const float, 8) + (size_t)j * inner : DP(const float, 0) + (size_t)(j / k) * hidden;
+    float4 xl[NB], xh[NB];
+    float sl[NB], sh[NB];
+    #pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float *xb = xt + b * 256 + 64 * c + 4 * sub;
+        xl[b] = *(const float4 *)xb;
+        xh[b] = *(const float4 *)(xb + 32);
+        sl[b] = xl[b].x + xl[b].y + xl[b].z + xl[b].w;
+        sh[b] = xh[b].x + xh[b].y + xh[b].z + xh[b].w;
+    }
+    if (st) {
+        __syncwarp();
+    }
+    float *out = DN ? DP(float, 9) + (size_t)j * hidden : DP(float, 7) + (size_t)j * 2 * inner + up * inner;
+    #pragma unroll
+    for (int rr = 0; rr < KQH_K_R; ++rr) {
+        if (rr >= nr) {
+            break;
+        }
+        const uint8_t *w = wr + (size_t)rr * RB;
+        float sum = 0.f;
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const uint8_t *blk = w + b * BS;
+            const uint8_t *qs = blk + (FIVE ? 48 : 16);
+            uint32_t q = *(const uint32_t *)(qs + 32 * c + 4 * sub);
+            uint32_t lo = q & 0x0f0f0f0fu, hi = (q >> 4) & 0x0f0f0f0fu;
+            if (FIVE) {
+                uint32_t h = *(const uint32_t *)(blk + 16 + 4 * sub);
+                lo |= ((h >> (2 * c)) & 0x01010101u) << 4;
+                hi |= ((h >> (2 * c + 1)) & 0x01010101u) << 4;
+            }
+            int s0, m0, s1, m1;
+            kq_scale_min(blk + 4, 2 * c, &s0, &m0);
+            kq_scale_min(blk + 4, 2 * c + 1, &s1, &m1);
+            float d = kq_half(blk), dm = kq_half(blk + 2);
+            sum += d * ((float)s0 * kq_dot4(lo, xl[b]) + (float)s1 * kq_dot4(hi, xh[b])) -
+                   dm * ((float)m0 * sl[b] + (float)m1 * sh[b]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            sum += __shfl_xor_sync(RC_FULL_MASK, sum, o);
+        }
+        if (l == 0) {
+            out[row0 + rr] = sum;
+        }
+    }
+}
+
+/* RECLANK_GPU_KQH_K (1): k_kqh_k for the routed pairs of Q4_K and Q5_K experts
+ * whose rows are 2, 4, 8, or 16 blocks; 0 keeps k_kqh_gu and k_kqh_dn (a test). */
+static int kqh_k_ok(int type, int cols)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_KQH_K");
+        on = v == NULL || atoi(v) != 0;
+    }
+    int nb = cols / 256;
+    return on && (type == KQ_Q4_K || type == KQ_Q5_K) && cols % 256 == 0 &&
+           (nb == 2 || nb == 4 || nb == 8 || nb == 16);
+}
+
+/* k_kqh_k for the tk routed pairs: gate and up (dn 0, rows inner, cols
+ * hidden) or down (dn 1, rows hidden, cols inner; staged: its rows are short) */
+static void kqh_k_launch(const gp_rec *dr, const int64_t *denv, int type, int cols, int dn, unsigned tk,
+                         int64_t rows, cudaStream_t s)
+{
+    dim3 grid((unsigned)((rows + ROWS_PER_BLOCK * KQH_K_R - 1) / (ROWS_PER_BLOCK * KQH_K_R)), tk, dn ? 1 : 2);
+    const int five = type == KQ_Q5_K, nb = cols / 256, W = 32 * ROWS_PER_BLOCK;
+#define KQH_K(F, N) \
+    if (five == F && nb == N) { \
+        if (dn) { \
+            k_kqh_k<F, N, 1, (N <= 4)><<<grid, W, 0, s>>>(dr, denv); \
+        } else { \
+            k_kqh_k<F, N, 0, 0><<<grid, W, 0, s>>>(dr, denv); \
+        } \
+        return; \
+    }
+    KQH_K(0, 2) KQH_K(0, 4) KQH_K(0, 8) KQH_K(0, 16)
+    KQH_K(1, 2) KQH_K(1, 4) KQH_K(1, 8) KQH_K(1, 16)
+#undef KQH_K
+}
+
 /* The KQ_NVX experts of GP_KQ_HOT_MOE (the pairs j < t top_k): a block of KS
  * warps for each group of 16 rows (blockIdx.x), pair (blockIdx.y), and
  * matrix (blockIdx.z: gate or up; down with dn). Warp w takes the blocks
@@ -493,7 +706,7 @@ __global__ void k_kqh_dn(const gp_rec *r, const int64_t *e, int jofs = 0)
  * for each whole group (k_kqh_gu) a step had about 250 KB of loads in
  * flight: 166 GB/s, 72 us for the gate and up of a layer. */
 template <int KS>
-__global__ void __launch_bounds__(32 * KS) k_kqh_nvx(const gp_rec *r, const int64_t *e, int dn)
+__global__ void __launch_bounds__(32 * KS) k_kqh_nvx(const gp_rec *r, const int64_t *e, int dn, int ct = 0)
 {
     PDL_START();
     __shared__ float red[KS][16];
@@ -552,11 +765,100 @@ __global__ void __launch_bounds__(32 * KS) k_kqh_nvx(const gp_rec *r, const int6
         for (int i = 0; i < KS; ++i) {
             sm += red[i][threadIdx.x];
         }
-        sm *= 128.f * *(const float *)wg;            /* 0.5 g, and the 2^8 of kq_e4m3s */
+        if (ct && dn) {
+            /* the contract (gg_moe_rot 4): y = bf16(bf16(D2) bf16(w g)) of the pair */
+            float d2 = sm * 128.f, wg_ = rc_bf16r(DP(const float, 1)[j] * *(const float *)wg);
+            sm = rc_bf16r(rc_bf16r(d2) * wg_);
+        } else {
+            sm *= 128.f * *(const float *)wg;        /* 0.5 g, and the 2^8 of kq_e4m3s */
+        }
         if (dn) {
             DP(float, 9)[(size_t)j * hidden + 16 * grp + threadIdx.x] = sm;
         } else {
             DP(float, 7)[(size_t)j * 2 * inner + up * inner + 16 * grp + threadIdx.x] = sm;
+        }
+    }
+}
+
+/* The KQ_NVX experts of GP_KQ_HOT_MOE with FP4-Local's A16 contract (gg_moe_rot 4), with the operations
+ * of the CPU's kq_nvx_rows_f in their order, so a hot and a cold expert give the same bits: for each
+ * row and half block of 16 columns four float32 sums a_u (fma over the 4 steps, w = the E2M1 value),
+ * t = (a0 + a1) + (a2 + a3) (the threads, into shared memory), then a thread for each row f = fma(t,
+ * s 2^-8, f) over the halves in order, f 256 g (gate, up) or the pair's y = bf16(bf16(f 256) bf16(w g))
+ * (down). x: the float rows (bfloat16 values). */
+#define KQH_CT_NH 320       /* the most halves of a row (5120 columns) */
+#define KQH_CT_T 256        /* (the threads of a block: the loads of more tasks in flight) */
+__global__ void __launch_bounds__(KQH_CT_T) k_kqh_nvx_ct(const gp_rec *r, const int64_t *e, int dn)
+{
+    PDL_START();
+    __shared__ float th[16][KQH_CT_NH + 1];
+    __shared__ uint8_t scb[16][KQH_CT_NH + 4];     /* (the scale byte of each row and half: the serial sums
+                                                     * below read shared memory, not a global load a step) */
+    int grp = blockIdx.x, j = blockIdx.y, up = blockIdx.z;
+    int slot = kqh_slot(r, e, j), zc = slot < 0 && kqh_zc(r, e, j);
+    if (slot < 0 && !zc) {
+        return;
+    }
+    int inner = DI(12), hidden = DI(13), k = DI(11);
+    int cols = dn ? inner : hidden, nh = cols / 16;
+    size_t rb = kq_row_bytes(KQ_NVX, cols);
+    const uint8_t *w;
+    if (zc) {
+        size_t ex = (size_t)DP(const int, 2)[j];
+        const int64_t *zt = DP(const int64_t, 23);
+        w = dn ? (const uint8_t *)(intptr_t)zt[2] + ex * hidden * rb
+               : (const uint8_t *)(intptr_t)zt[up ? 1 : 0] + ex * inner * rb;
+    } else {
+        w = dn ? kqh_wslot(r, e, slot, 2, (size_t)hidden * rb)
+               : kqh_wslot(r, e, slot, up, (size_t)inner * rb);
+    }
+    const uint8_t *wg = w + (size_t)16 * grp * rb;
+    const float *x = dn ? DP(const float, 8) + (size_t)j * inner : DP(const float, 0) + (size_t)(j / k) * hidden;
+    /* the E2M1 values of the 16 codes (sign bit 8), in shared memory (an array of the thread indexed
+     * by the code lands in local memory) */
+    __shared__ float e2s[16];
+    if (threadIdx.x < 16) {
+        const int c = threadIdx.x & 7, m = c & 1, ex = c >> 1;
+        const float v = ex == 0 ? 0.5f * (float)m : ldexpf(1.f + 0.5f * (float)m, ex - 1);
+        e2s[threadIdx.x] = threadIdx.x & 8 ? -v : v;
+    }
+    __syncthreads();
+#pragma unroll 2
+    for (int q = threadIdx.x; q < 16 * nh; q += blockDim.x) {
+        int row = q % 16, h = q / 16, b = h / 2;
+        const uint8_t *blk = wg + 16 + (size_t)b * KQ_NVX_BB;
+        int sh = row < 8 ? 0 : 4, r8 = row % 8, k0 = 4 * (h % 2);
+        float a[4] = {0.f, 0.f, 0.f, 0.f};
+        /* (the 4 codes of a step in one word, the 4 values of x in one float4: the loads of the
+         * step; the products and sums in the order of the CPU's kq_nvx_rows_f) */
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int kk = k0 + i;
+            const uint32_t cw = *(const uint32_t *)(blk + 32 * kk + 4 * r8);
+            const float4 xv = *(const float4 *)(x + 32 * b + 4 * kk);
+            const float xs4[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                a[u] = fmaf(e2s[(cw >> (8 * u + sh)) & 15], xs4[u], a[u]);
+            }
+        }
+        th[row][h] = __fadd_rn(__fadd_rn(a[0], a[1]), __fadd_rn(a[2], a[3]));
+        scb[row][h] = blk[256 + 16 * (h % 2) + row];
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        int row = threadIdx.x;
+        float f = 0.f;
+#pragma unroll 8
+        for (int h = 0; h < nh; ++h) {
+            f = fmaf(th[row][h], kq_e4m3s(scb[row][h]), f);
+        }
+        float g = *(const float *)wg;
+        if (dn) {
+            float wq = rc_bf16r(__fmul_rn(DP(const float, 1)[j], g));
+            DP(float, 9)[(size_t)j * hidden + 16 * grp + row] = rc_bf16r(__fmul_rn(rc_bf16r(__fmul_rn(f, 256.f)), wq));
+        } else {
+            DP(float, 7)[(size_t)j * 2 * inner + up * inner + 16 * grp + row] = __fmul_rn(f, __fmul_rn(256.f, g));
         }
     }
 }
@@ -612,13 +914,13 @@ __global__ void __launch_bounds__(32 * KS) k_kqh_nvx_q(const gp_rec *r, const in
         int a[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            a[i] = __dp4a(wv[i], xv, 0);
+            a[i] = rc_dp4a(wv[i], xv, 0);
         }
         if (X2) {
             int xlv = *(const int *)(xl + x0 + 32 * b + 4 * st);
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                a[i] = 128 * a[i] + __dp4a(wv[i], xlv, 0);
+                a[i] = 128 * a[i] + rc_dp4a(wv[i], xlv, 0);
             }
         }
         /* the 4 steps of each half (lane bits 2 and 3), then the other half */
@@ -664,7 +966,7 @@ static int kqh_nvx_on(void)
     return on;
 }
 
-__global__ void k_kqh_sum(const gp_rec *r, const int64_t *e)
+__global__ void k_kqh_sum(const gp_rec *r, const int64_t *e, int ct = 0)
 {
     PDL_START();
     int c = blockIdx.x * blockDim.x + threadIdx.x, tok = blockIdx.y;
@@ -677,11 +979,19 @@ __global__ void k_kqh_sum(const gp_rec *r, const int64_t *e)
     for (int s2 = 0; s2 < k; ++s2) {
         int j = tok * k + s2;
         if (kqh_on(r, e, j)) {
-            acc += val[j] * de[(size_t)j * hidden + c];
+            acc += ct ? de[(size_t)j * hidden + c] : val[j] * de[(size_t)j * hidden + c];
         }
     }
-    float sw = 1.f / (1.f + expf(-DP(const float, 21)[tok]));
-    acc += sw * de[(size_t)(tk + tok) * hidden + c];
+    if (ct) {
+        int has = DP(const uint8_t, 17) != NULL;
+        DP(float, 10)[(size_t)tok * hidden + c] = moe_b12x_out(
+            acc, has, has ? DP(const float, 21)[tok] : 0.f, has ? de[(size_t)(tk + tok) * hidden + c] : 0.f);
+        return;
+    }
+    if (DP(const uint8_t, 17) != NULL) {
+        float sw = 1.f / (1.f + expf(-DP(const float, 21)[tok]));
+        acc += sw * de[(size_t)(tk + tok) * hidden + c];
+    }
     DP(float, 10)[(size_t)tok * hidden + c] = acc;
 }
 
@@ -698,7 +1008,7 @@ __global__ void k_kqh_sum(const gp_rec *r, const int64_t *e)
  * times sigmoid(slog[j]), as k_kqh_sum. So a token has the same bits
  * whichever experts the GPU holds (the hot and the cold experts give the
  * same bits: scripts/check_nvx_hot.py). */
-__global__ void k_moe_combine(const gp_rec *r, const int64_t *e)
+__global__ void k_moe_combine(const gp_rec *r, const int64_t *e, int ct)
 {
     PDL_START();
     int c = blockIdx.x * blockDim.x + threadIdx.x, tok = blockIdx.y;
@@ -724,11 +1034,23 @@ __global__ void k_moe_combine(const gp_rec *r, const int64_t *e)
         }
     }
     float acc = 0.f;
+    if (ct) {
+        /* the contract: the rows are the y of each pair (weighted, rounded) */
+        for (int s = 0; s < k; ++s) {
+            acc += v[s];
+        }
+        int has = r->tag[10] != GP_T_NONE && DP(const float, 10) != NULL;
+        DP(float, 6)[(size_t)tok * hidden + c] = moe_b12x_out(
+            acc, has, has ? DP(const float, 10)[tok] : 0.f, has ? de[(size_t)(t * k + tok) * hidden + c] : 0.f);
+        return;
+    }
     for (int s = 0; s < k; ++s) {
         acc += val[tok * k + s] * v[s];
     }
-    float sw = 1.f / (1.f + expf(-DP(const float, 10)[tok]));
-    acc += sw * de[(size_t)(t * k + tok) * hidden + c];
+    if (r->tag[10] != GP_T_NONE && DP(const float, 10) != NULL) {     /* (no shared expert: LFM2) */
+        float sw = 1.f / (1.f + expf(-DP(const float, 10)[tok]));
+        acc += sw * de[(size_t)(t * k + tok) * hidden + c];
+    }
     DP(float, 6)[(size_t)tok * hidden + c] = acc;
 }
 

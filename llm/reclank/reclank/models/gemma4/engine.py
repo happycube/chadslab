@@ -62,9 +62,12 @@ def tool_done(text):
 
 class GemmaEngine(Engine):
     family = FAMILY
+    # generate takes the conversation id of the client (server/backend.py
+    # session_of): the name of its context on disk (--context-dir)
+    session_ids = True
 
     def __init__(self, model, tokenizer, cfg, drafter=None, n_draft=2, empty_thought_block=True,
-                 max_context=None):
+                 max_context=None, contexts=4, store=None):
         self.model = model
         self.tokenizer = tokenizer
         self.cfg = cfg
@@ -74,7 +77,11 @@ class GemmaEngine(Engine):
         # False for the E2B and E4B models (Tokenizer.apply_chat_template).
         self.empty_thought_block = empty_thought_block
         self.max_context = max_context
-        self.pool = SessionPool(lambda max_len: self._session(max_len))
+        # the conversations kept (core/session.py): each session has its cache
+        # in host memory; the model puts the one in use on the GPU
+        # in host memory; the model puts the one in use on the GPU; store
+        # (core/session.py ContextDir, --context-dir): on disk too
+        self.pool = SessionPool(lambda max_len: self._session(max_len), contexts, store=store)
         # the thought channel: the ids of its markers and the words of the
         # budget and of the wrap-up (load); None: no guard
         self.think_tokens = None
@@ -225,10 +232,13 @@ class GemmaEngine(Engine):
                           wrap_think=tt["wrap_think"], wrap_answer=tt["wrap_answer"],
                           tool=(tt["tool_open"], tt["tool_close"]), open_id=tt["open"])
 
-    def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
-        """Yield one token id at a time for a prompt."""
-        session, shared = self.pool.pick(prompt_ids, max_tokens)
-        print('[reclank] reuse=%d new=%d' % (shared, len(prompt_ids) - shared),
+    def generate(self, prompt_ids, max_tokens, sampler, eos_ids, session=None):
+        """Yield one token id at a time for a prompt. session: the
+        conversation id of the client, or None (core/session.py ContextDir)."""
+        sid = session
+        session, shared = self.pool.pick(prompt_ids, max_tokens, sid=sid)
+        print('[reclank] reuse=%d new=%d; %s' % (shared, len(prompt_ids) - shared,
+                                                 self.pool.note(len(prompt_ids), shared)),
               file=sys.stderr, flush=True)
         guard = self.think_guard(prompt_ids, max_tokens, eos_ids)
         sampler.guard = guard
@@ -255,6 +265,7 @@ class GemmaEngine(Engine):
             # also when the caller stops at a stop token and closes the
             # generator
             sampler.guard = None
+            self.pool.done(session, sid=sid)    # a long prompt to disk (--context-dir)
             if guard is not None and guard.fixes:
                 print("[reclank] the model ended the turn inside the thought channel: <channel|> "
                       "in its place", file=sys.stderr, flush=True)
@@ -281,6 +292,17 @@ SMALL_ROOM = 1.5e9
 # size) under which MTP is off by default: a card of less than 8 GB (one of
 # 8 GB has about 8.0e9 bytes free, one of 6 GB at most 6.4e9).
 SMALL_CARD = 7.5e9
+# The default context (--ctx) of the 26B on a card of less than 12 GB: the
+# cache, the programs of the prompt (groups of 2048 tokens on 8 GB:
+# gpu.chunk_for) and the output head (0.61 GB, on the GPU at the first
+# prompt) must fit beside the hot experts, which give way. The GTX 1070
+# (8.5 GB): a cache of 163840 tokens and a prompt of 8192 fit (the cache
+# grows by 11.6 KB a token: the 5 global layers; the sliding ones keep their
+# window). With 4 GB of it held (4.4 GB free, a small card: groups of 1024
+# tokens): a prompt of 40000 tokens in a cache of 40960 fits with 0.07 GB to
+# spare, 48K does not (the head finds no 0.61 GB); 32768 leaves 0.33 GB.
+CTX_8GB = 163840
+CTX_SMALL = 32768
 
 
 def load(opts, meta=None):
@@ -300,7 +322,8 @@ def load(opts, meta=None):
     os.environ["RECLANK_ATTN"] = "0" if kv == "float" else "1"
     if kv in ("int8", "k16v8", "rq8", "k16vr8"):
         model_mod.KV_FORM = kv
-    g = GGUF(opts.model)
+    from reclank.models.qwen.keep import gguf_or_kept
+    g = gguf_or_kept(opts.model)        # (the weightkeeper's tensors when one holds the file)
     tok = Tokenizer(opts.tokenizer) if opts.tokenizer else Tokenizer.from_gguf(g)
     tc = g.text_config()
     e4b = bool(tc.get("hidden_size_per_layer_input"))
@@ -329,6 +352,11 @@ def load(opts, meta=None):
         model = model_mod.Model(g, cfg).load_all(dtype=opts.dtype or "int4")
     if gpu_on:
         from reclank.models.gemma4 import gpu
+        if not e4b:
+            # an expert device (RECLANK_EXPERT_GPUS) copies its experts while the
+            # weights go to this GPU
+            from reclank.backends.cuda.devices import start_expert_device
+            start_expert_device(model)
         print("copying the weights to the GPU ...", flush=True)
         dev = gpu.offload(model, 0.0 if opts.gpu_dense else opts.hot_gb,
                           resident=getattr(opts, "resident", False))
@@ -388,13 +416,29 @@ def load(opts, meta=None):
         print("MTP: %d drafts a step%s" % (n_draft, ", they end where the product of their "
                                            "probabilities falls under %g" % stop if stop > 0 else ""),
               flush=True)
+    ctx = opts.ctx
+    if ctx is None and gpu_on and getattr(cfg, "enable_moe_block", False) and min(free0, total0) < 12e9:
+        ctx = CTX_SMALL if small_card else CTX_8GB
+        print("context: %d tokens by default on a card of %.1f GB (--ctx sets it)" % (ctx, total0 / 1e9),
+              flush=True)
     thinking = opts.thinking or "auto"
     defaults["thinking"] = thinking in ("on", "low", "medium", "high", "xhigh") or (
-        thinking == "auto" and (opts.ctx is None or opts.ctx >= THINK_MIN_CONTEXT))
+        thinking == "auto" and (ctx is None or ctx >= THINK_MIN_CONTEXT))
     print("thinking %s by default (--thinking %s)" % ("on" if defaults["thinking"] else "off", thinking),
           flush=True)
+    store = None
+    cdir = getattr(opts, "context_dir", None) or os.environ.get("RECLANK_CONTEXT_DIR")
+    if cdir and not e4b:
+        from reclank.core.session import ContextDir
+        # the tag: the model file and the form of the host cache (a file of
+        # another one is never loaded)
+        tag = "%s:%d:%s" % (os.path.basename(opts.model), os.path.getsize(opts.model), model_mod.KV_FORM)
+        store = ContextDir(cdir, tag, max_bytes=getattr(opts, "context_dir_gb", 64.0) * 1e9,
+                           min_tokens=int(os.environ.get("RECLANK_CONTEXT_SAVE_MIN", "4096")))
+        print("contexts on disk: %s (at most %.0f GB; prompts of %d tokens or more)" % (
+            cdir, store.max_bytes / 1e9, store.min_tokens), flush=True)
     eng = GemmaEngine(model, tok, cfg, drafter=drafter, n_draft=n_draft, empty_thought_block=not e4b,
-                      max_context=opts.ctx)
+                      max_context=ctx, contexts=getattr(opts, "contexts", 4), store=store)
     # the thought channel of Gemma 4 (<|channel>thought ... <channel|>): the
     # budget of a think part and the words to wrap up (core/think_guard.py)
     one = lambda t: tok.encode(t)[0] if len(tok.encode(t)) == 1 else None  # noqa: E731

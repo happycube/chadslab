@@ -14,12 +14,23 @@
  *     KQ_Q5_K 13   Q4_K with a fifth bit (32 more bytes, qh).
  *     KQ_Q5_1  7   blocks of 32 (24 bytes): d, m (fp16), 32 fifth bits,
  *                  16 bytes of 4-bit values. w = d * q + m.
+ *     KQ_Q4_0  2   blocks of 32 (18 bytes): d (fp16), 16 bytes of 4-bit
+ *                  values (value j the low 4 bits of byte j, value j + 16
+ *                  the high 4). w = d * (q - 8): the products as Q5_1 with
+ *                  m = -8 d (LFM2.5's QAD Q4_0 file).
  *     KQ_IQ4_NL 20 blocks of 32 (18 bytes): d, 16 bytes of 4-bit codes into
  *                  a table of 16 values (only rc_kq_rows: the n-gram table).
  *     KQ_Q6_K 14   blocks of 256 (210 bytes): 128 bytes of the low 4 bits,
  *                  64 bytes of the high 2 bits, 16 int8 scales (one for
  *                  each 16 values), d. w = d * sc * (q - 32).
  *     KQ_BF16 30   bfloat16 rows (the safetensors checkpoints).
+ *     KQ_IQ2_XXS 16 blocks of 256 (66 bytes): ggml's 2.06-bit i-quant (iq2.c; the
+ *                  experts of Nemotron 3.5 Bolt). 8 parts of 32: int8 grid values with
+ *                  signs times d (2s + 1) / 8.
+ *     KQ_IQ2R 67   IQ2_XXS in rows for this runtime (reclank/formats/iq2.py to_rows):
+ *                  the 8-byte parts of the blocks (block b, part j at 64 b + 8 j),
+ *                  then the fp16 d of each block (at cols / 4 + 2 b), zeros to a
+ *                  multiple of 8 bytes: the same bytes, a part one aligned load.
  *     KQ_Q8X16 60  Q8_0 in groups of 16 rows (this runtime; rc_kq_pack_q8x16 makes
  *                  it from Q8_0 for the CPU): for each group and each block
  *                  of 32 columns, 576 bytes: the 16 fp16 scales of the rows,
@@ -90,7 +101,10 @@
 #define KQ_Q5_K 13
 #define KQ_Q6_K 14
 #define KQ_Q5_1 7
+#define KQ_Q4_0 2
 #define KQ_IQ4_NL 20
+#define KQ_IQ2_XXS 16
+#define KQ_IQ2R 67
 #define KQ_BF16 30
 #define KQ_NV4 51
 #define KQ_Q8X16 60
@@ -117,4 +131,7 @@
  * columns); KQ_FP8B32, FP8 rows with E8M0 scales of 32 x 32 blocks. */
 #define KQ_MXX 64
 #define KQ_FP8B32 65
+/* KQ_MXF8 (FP4-Local, docs/FP4LOCAL_PLAN.md): an MXFP8 row, its cols E4M3 codes, then the E8M0
+ * scale of each 32 (value = e4m3 2^(s - 127)), zeros to a multiple of 16 bytes. */
+#define KQ_MXF8 66
 #define KQ_MXX_BB 272

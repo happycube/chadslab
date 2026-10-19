@@ -17,7 +17,7 @@ from reclank.backends.cuda.gpumm import Buffer, DeviceCache, ProgramLRU, mem, me
 from reclank.models.gemma4.model import KV_KEEP
 from reclank.backends.cuda.runtime import (  # noqa: F401
     GPUCache, GPUProgram, HotCache, MT_CPU, PoolCompiler, WarmPool, _argmax_rows,
-    _check, _topk_rows, expert_host, fill_tables, has_tc, int8_tiles, lib)
+    _check, _topk_rows, expert_host, fill_chunks, fill_tables, has_tc, int8_tiles, lib, stage_room)
 
 
 _HERE = Path(__file__).resolve().parent
@@ -472,6 +472,10 @@ class SplitCompiler(PoolCompiler):
         self.mix = False
         self.gslots_of = {}
         self.mix_bufs = None
+        # Chunked staging (moe_group_chunks): the pieces of each layer, and
+        # layer -> (tgu, tdn, ranges, gslots, fetch) of each piece.
+        self.chunks = 1
+        self.chunks_of = {}
         # The flag form of the handoff to the CPU (a step): no boundary
         # record, so the step is one graph (to_cpu, join).
         self.flags = False
@@ -649,6 +653,8 @@ class SplitCompiler(PoolCompiler):
     def moe(self, h, val, idx, layer):
         if h.shape[0] > 1 and self.stage is not None and self.mix:
             return self.moe_group_mix(h, val, idx, layer)
+        if h.shape[0] > 1 and self.stage is not None and self.chunks > 1:
+            return self.moe_group_chunks(h, val, idx, layer)
         if h.shape[0] > 1 and self.stage is not None:
             return self.moe_group_gpu(h, val, idx, layer)
         if h.shape[0] > 1 and layer in self.hot_host:
@@ -685,8 +691,11 @@ class SplitCompiler(PoolCompiler):
             ranges = np.zeros((2 * n, 3), dtype=np.int64)
             self.tables_of[layer] = (tgu, tdn, ranges)
             self.gslots_of[layer] = np.full(n, -1, dtype=np.int32)
+            # (a mixed group: no cold expert yet; plan_mix fills them before
+            # each run, at most stage_room of them)
             fill_tables(self.model, layer, self.hot_stores.get(layer), self.stage, tgu, tdn,
-                        ranges, self.gslots_of[layer], pool=self.warm_pool)
+                        ranges, self.gslots_of[layer], pre=set() if self.mix else None,
+                        pool=self.warm_pool)
         return self.tables_of[layer]
 
     def fetch(self, layer):
@@ -721,6 +730,65 @@ class SplitCompiler(PoolCompiler):
             self.fetch(layer + 2)
         return out
 
+    def chunk_tables(self, layer):
+        """The tables of the pieces of a layer (chunked staging): a list of
+        (tgu, tdn, ranges, gslots, k) for each piece, k its fetch (layer
+        times the pieces, plus the piece). fill_chunks fills them, and
+        again when the hot experts change."""
+        if layer not in self.chunks_of:
+            n = self.model._layers[layer]["experts.gate_up_proj"][0].shape[0]
+            self.chunks_of[layer] = [
+                (np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64),
+                 np.zeros((2 * n, 3), dtype=np.int64), np.full(n, -1, dtype=np.int32),
+                 layer * self.chunks + c) for c in range(self.chunks)]
+            fill_chunks(self.model, layer, self.hot_stores.get(layer), self.stage,
+                        self.chunks_of[layer], pool=self.warm_pool)
+        return self.chunks_of[layer]
+
+    def fetch_chunk(self, k):
+        """Emit the copy of piece k % chunks of layer k // chunks to buffer
+        k % 2 (fetch k)."""
+        _tgu, _tdn, ranges, _gslots, _k = self.chunk_tables(k // self.chunks)[k % self.chunks]
+        self.p.emit(P.FETCH, ranges, len(ranges), k, k % 2)
+
+    def moe_group_chunks(self, h, val, idx, layer):
+        """The experts of a large group on the GPU when the buffers hold
+        fewer experts than a layer has (chunked staging): the cold experts
+        of the layer come in pieces (chunk_tables), one buffer each in turn.
+        For each piece GP_HOT_SPLIT_MT gives GP_MOE_GPU the pairs of its
+        experts (-1 for the others; the hot experts go with piece 0), and
+        the outputs of the pieces add up. The copy of piece k + 2 starts when
+        piece k is done with its buffer, so each cold expert crosses the bus
+        once for the group, as with buffers of all of them, in a fraction of
+        their memory (the 26B on a card of 4096 MiB)."""
+        w = self.model._layers[layer]
+        gu_q, dn_q = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
+        inner = self.cfg.moe_intermediate_size
+        t, top_k = idx.shape
+        pairs = t * top_k
+        hidden = h.shape[1]
+        i32 = lambda n: self.buffer((n,), np.int32)  # noqa: E731
+        q4x = 1 if expert_host(self.model, layer)[2] else 0
+        total = self.cfg.num_hidden_layers * self.chunks
+        out, part = self.buffer(h.shape), self.buffer(h.shape)
+        cold, cold_val, gidx = i32(pairs), self.buffer((pairs,)), i32(pairs)
+        for c, (tgu, tdn, _ranges, gslots, k) in enumerate(self.chunk_tables(layer)):
+            self.p.emit(P.HOT_SPLIT_MT, idx, val, gslots, cold, cold_val, pairs,
+                        self.p.slot("nreal"), top_k, gidx)
+            self.p.emit(P.FETCH_WAIT, k)
+            dst = out if c == 0 else part
+            self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, q4x, 0, gu_q.shape[1], hidden,
+                        dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
+                        i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
+                        self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), dst,
+                        tgu, tdn)
+            self.p.emit(P.FETCH_DONE, k % 2)
+            if k + 2 < total:
+                self.fetch_chunk(k + 2)
+            if c > 0:
+                self.p.emit(P.ADD, out, part, out, out.size)
+        return out
+
     def moe_group_mix(self, h, val, idx, layer):
         """The experts of a large group, split between the GPU and the CPU
         (a mixed group). GP_FETCH copies only some cold experts: the ones
@@ -729,8 +797,10 @@ class SplitCompiler(PoolCompiler):
         GP_HOT_SPLIT_MT gives the pairs of the other experts to the CPU, and
         the rest to GP_MOE_GPU (-1 for a pair of the CPU). The CPU computes
         its pairs (KQ_MOE of the KQ_Q4X experts, int8 activations, as the
-        prompt of the CPU) while the GPU computes its pairs. The output is
-        the sum of the two parts, at the first reader (join)."""
+        prompt of the CPU; without those copies, an AVX-512 CPU with no VNNI
+        or the plain C build, MOE_MT of the int4 experts) while the GPU
+        computes its pairs. The output is the sum of the two parts, at the
+        first reader (join)."""
         w = self.model._layers[layer]
         gu_q, dn_q = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
         inner = self.cfg.moe_intermediate_size
@@ -741,13 +811,17 @@ class SplitCompiler(PoolCompiler):
         tgu, tdn, _ranges = self.tables(layer)
         gslots = self.gslots_of[layer]
         i32 = lambda n: self.buffer((n,), np.int32)  # noqa: E731
+        q4x = P.ops._Q4X_MOE.get(gu_q.ctypes.data)
         if self.mix_bufs is None:
-            from reclank.backends.cpu import cops
             self.mix_bufs = dict(
                 hp=pinned((t, hidden)), vp=pinned((t, top_k)), ip=pinned((t, top_k), np.int32),
-                xq=np.zeros((t, hidden), np.int8), xs=np.zeros((t, hidden // 32), np.float32),
-                xm=np.zeros((t, hidden // 16), np.float32), out=pinned((t, hidden)),
-                scratch=cops.kq_moe_scratch(t, top_k, E, hidden, inner))
+                out=pinned((t, hidden)))
+            if q4x is not None:
+                from reclank.backends.cpu import cops
+                self.mix_bufs.update(
+                    xq=np.zeros((t, hidden), np.int8), xs=np.zeros((t, hidden // 32), np.float32),
+                    xm=np.zeros((t, hidden // 16), np.float32),
+                    scratch=cops.kq_moe_scratch(t, top_k, E, hidden, inner))
         b = self.mix_bufs
         cold, cold_val, gidx = i32(pairs), self.buffer((pairs,)), i32(pairs)
         # The split and the copy to the host do not need the copies of the
@@ -760,17 +834,22 @@ class SplitCompiler(PoolCompiler):
                     cold, b["ip"], b["ip"].nbytes, ev)
         # The CPU part, on the helper thread (GP_CPU_START).
         cc = P.Compiler(self.model)
-        mats = P.ops.q4x_moe_mats(P.ops._Q4X_MOE[gu_q.ctypes.data])
-        cc.p.keep.append(mats)
-        cc.p.emit(P.KQ_QUANT, b["hp"], t, hidden, b["xq"], b["xs"], b["xm"], b["ip"], top_k)
-        cc.p.emit(P.KQ_MOE, b["xq"], b["xs"], b["xm"], b["ip"], b["vp"], t, top_k, E, mats, None,
-                  hidden, inner, b["scratch"], b["out"], None, 1, None)
+        if q4x is not None:
+            mats = P.ops.q4x_moe_mats(q4x)
+            cc.p.keep.append(mats)
+            cc.p.emit(P.KQ_QUANT, b["hp"], t, hidden, b["xq"], b["xs"], b["xm"], b["ip"], top_k)
+            cc.p.emit(P.KQ_MOE, b["xq"], b["xs"], b["xm"], b["ip"], b["vp"], t, top_k, E, mats, None,
+                      hidden, inner, b["scratch"], b["out"], None, 1, None)
+        else:
+            # the int4 experts (MOE_MT skips the pairs of the GPU: -1 in ip)
+            host_out = P.k_moe(cc, b["hp"], b["vp"], b["ip"], layer)
+            cc.p.emit(P.COPY, host_out, b["out"], b["out"].nbytes)
         cpu = cc.p.finish()
         self.cpu_progs.append(cpu)
         self.p.emit(P.CPU_START, cpu.buf, ev)
         self.p.emit(P.FETCH_WAIT, layer)
         gpu_part = self.buffer(h.shape)
-        self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, 1, 0, gu_q.shape[1], hidden,
+        self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, 1 if q4x is not None else 0, 0, gu_q.shape[1], hidden,
                     dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
                     i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
                     self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), gpu_part,
@@ -818,7 +897,18 @@ class SplitCompiler(PoolCompiler):
                     self.buffer((pairs, hidden)), gpu_part, top_k, 2 * inner, hidden,
                     dn_rows, inner, t, q4x)
         cc = P.Compiler(self.model)
+        # An expert device: the cold pairs of its experts to it (GP_NM_REMOTE_POST: a group), the others
+        # to the CPU (its list in place of ip), and REMOTE_JOIN adds its rows to the CPU's.
+        from reclank.backends.cuda.devices import expert_device
+        xdev = expert_device(self.model)
+        if xdev is not None:
+            lcold, posted = np.zeros((t, top_k), dtype=np.int32), np.zeros(1, dtype=np.int64)
+            cc.p.keep += [lcold, posted]
+            cc.p.emit(P.NM_REMOTE_POST, hp, ip, vp, pairs, xdev.ctx_bytes, layer, lcold, posted, top_k)
+            ip = lcold
         host_out = P.k_moe(cc, hp, vp, ip, layer)
+        if xdev is not None:
+            cc.p.emit(P.REMOTE_JOIN, xdev.ctx_bytes, posted, host_out)
         cpu = cc.p.finish()
         self.cpu_progs.append(cpu)
         out = self.buffer(h.shape)
@@ -895,6 +985,19 @@ class SplitCompiler(PoolCompiler):
                     dn_q.shape[1], inner, 1, 1 if q4x else 0)
         cc = P.Compiler(self.model)
         host_out = pinned(h.shape) if self.flags else np.zeros(h.shape, dtype=np.float32)
+        # An expert device (backends/cuda/devices.py: a second GPU of this
+        # process with experts this one lacks): the cold experts it holds go
+        # to it, the others to the CPU below (its lists in place of ip and
+        # vp), and REMOTE_JOIN adds its sum to the CPU's.
+        from reclank.backends.cuda.devices import expert_device
+        xdev = expert_device(self.model)
+        if xdev is not None:
+            lidx = np.zeros(2 * top_k + 1, dtype=np.int32)
+            lval = np.zeros(top_k, dtype=np.float32)
+            posted = np.zeros(1, dtype=np.int64)
+            cc.p.emit(P.REMOTE_POST, hp, vp, ip, ip[top_k:top_k + 1], xdev.ctx_bytes, layer, hidden,
+                      lidx, lval, lidx[top_k:top_k + 1], posted)
+            ip, vp = lidx, lval
         q4x = P.ops._Q4X_MOE.get(gu_q.ctypes.data)
         if q4x is not None:
             # The cold experts in groups of 16 rows (KQ_Q4X), float32
@@ -913,6 +1016,8 @@ class SplitCompiler(PoolCompiler):
                       hidden, dn_q.shape[1], inner, np.zeros(top_k, dtype=np.int32),
                       np.zeros((top_k, 2 * inner), np.float32), np.zeros((top_k, inner), np.float32),
                       np.zeros((top_k, dn_q.shape[1]), np.float32), host_out)
+        if xdev is not None:
+            cc.p.emit(P.REMOTE_JOIN, xdev.ctx_bytes, posted, host_out)
         cpu = cc.p.finish()
         self.cpu_progs.append(cpu)
         out = self.buffer(h.shape)
@@ -982,11 +1087,14 @@ def hot_counts(model):
 # 1024 the wait is 32% of a group at 2 GB. On a GPU with less than SMALL_GPU
 # bytes free when the model loads the default is SMALL_CHUNK: its programs
 # take half the memory, for the cache (the 26B with 4 GB: prompts of 96K
-# tokens in place of 64K; 120.2 tok/s in place of 123.2 at 64K).
+# tokens in place of 64K; 120.2 tok/s in place of 123.2 at 64K). An 8 GB
+# card (8.3 GB free at the load) takes CHUNK: the 26B on the GTX 1070, a
+# prompt of 8192 tokens, 1024 375 tok/s, 2048 412, 4096 431; the cache then
+# still fits 160K tokens (engine.py: the default context of such a card).
 # RECLANK_GPU_CHUNK sets it for every GPU.
 _CHUNK_ENV = os.environ.get("RECLANK_GPU_CHUNK")
 CHUNK = int(_CHUNK_ENV or "2048")
-SMALL_GPU = 12e9
+SMALL_GPU = 7e9
 SMALL_CHUNK = 1024
 
 
@@ -1021,6 +1129,15 @@ PREFILL_MIN = int(os.environ.get("RECLANK_GPU_PREFILL_MIN", "128"))
 # the count of copied experts of each layer (-1: all); the default (auto)
 # takes the count of the least time in the model of ModelGPU.plan_mix.
 MIX = os.environ.get("RECLANK_GPU_MIX", "1") != "0"   # (the Qwen models read a size)
+# RECLANK_GPU_STAGE_MIN (8): the fewest cold experts a layer that the buffers
+# of a mixed group hold (ModelGPU._stage) before the large groups go without
+# them (all their cold experts on the CPU).
+STAGE_MIN = int(os.environ.get("RECLANK_GPU_STAGE_MIN", "8"))
+# RECLANK_GPU_CHUNK_MAX (8): the most pieces of a layer in chunked staging
+# (SplitCompiler.moe_group_chunks: the cold experts of a layer in buffers
+# that hold fewer, one piece after another), before the mixed groups take the
+# rest to the CPU. 30 layers of 8 pieces stay under GG_FETCH_MAX (256).
+CHUNK_MAX = int(os.environ.get("RECLANK_GPU_CHUNK_MAX", "8"))
 
 # The handoff to the CPU of a decode step inside its graph (SplitCompiler.
 # to_cpu and join, GP_SIGNAL and GP_AWAIT): the step is one graph, and the
@@ -1061,6 +1178,14 @@ WARM = os.environ.get("RECLANK_GPU_WARM", "free")
 # after a prompt of 64K tokens.
 WARM_KEEP = float(os.environ.get("RECLANK_GPU_WARM_KEEP", "0.3e9"))
 WARM_MIN = float(os.environ.get("RECLANK_GPU_WARM_MIN", "1e9"))
+# RECLANK_GPU_WARM_SHORT (1): the programs of the large groups and the
+# buffers of the cold experts go also at the first decode step after a
+# prompt when the pool has less room than the experts the GPU does not hold
+# (WarmPool.warm_short). The 26B on the GTX 1070 after a prompt of 8192
+# tokens: 1424 experts in the pool against 1016, decode 36.4 tok/s against
+# 34.7; the next prompt makes the programs again (a prompt of 8192 tokens
+# took as long, one of 300 tokens 0.07 s more).
+WARM_SHORT = os.environ.get("RECLANK_GPU_WARM_SHORT", "1") == "1"
 
 # The fused forms of the step of the 26B (program.layer_form, fused): the
 # norms and the adds of the end of the attention and of the end of each
@@ -1104,7 +1229,7 @@ MIX_LOG = os.environ.get("RECLANK_GPU_MIX_LOG", "0") == "1"
 
 def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=None,
                         hot_host=None, counts=None, mix=False, resident=False, pool=None,
-                        arena=None):
+                        arena=None, chunks=1):
     """Compile a step of t tokens for the GPU: a chunk of a prompt, or the
     group of an MTP verify step. The form is the group form of the layers.
 
@@ -1133,9 +1258,8 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     c.counts = counts
     c.resident = resident
     c.warm_pool = pool
-    c.mix = mix and gpu_experts and all(
-        P.ops._Q4X_MOE.get(model._layers[i]["experts.gate_up_proj"][0].ctypes.data) is not None
-        for i in range(model.cfg.num_hidden_layers))
+    c.mix = mix and gpu_experts
+    c.chunks = chunks if gpu_experts and not c.mix else 1
     c.env["x"] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
     # The last key of each query less pos (the attention records): row j sees
     # up to its position unless it is in an image (ModelGPU.group). A group of
@@ -1145,7 +1269,10 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     if t > MT_CPU:
         c.env["lim"] = np.arange(t, dtype=np.int32)
     c.p.slot("pos")
-    if gpu_experts:
+    if gpu_experts and c.chunks > 1:
+        c.fetch_chunk(0)
+        c.fetch_chunk(1)
+    elif gpu_experts:
         c.fetch(0)
         c.fetch(1)
     mode = {"int8": "q8", "k16v8": "qv"}.get(kv, "qc")
@@ -1157,6 +1284,7 @@ def compile_split_group(model, t, hot=None, kv="int16", stage=None, hot_stores=N
     c.p.cpu_progs = c.cpu_progs
     c.p.tables_of = c.tables_of
     c.p.gslots_of = c.gslots_of
+    c.p.chunks_of = c.chunks_of
     c.p.mix = c.mix
     prog = _fuse_kq(c.p.finish()) if c.q4_kq else c.p.finish()
     alloc.pack(prog, arena=arena)   # the temporaries by liveness (ir/alloc.py)
@@ -1316,7 +1444,8 @@ class GPUKV(DeviceCache):
         else the new buffers go and MemoryError comes up."""
         new = {}
         if self.bufs[i]:
-            self.unshare()      # the old buffers go: the memory they lent first
+            # the old buffers go: the memory they lent first
+            self.unshare(getattr(self, "share_before", None))
         try:
             for name in self._names(i):
                 rb = self._row(i, name)
@@ -1349,7 +1478,10 @@ class GPUKV(DeviceCache):
                 "vq": cache.vq[i][:rows], "vs": cache.vs[i][:rows]}
 
     def attach(self, cache, max_len):
-        self.unshare()          # the rows of this cache go where the last lent memory
+        # the rows of this cache go where the last lent memory; the copies of
+        # HotCache into blocks there land first (share_before: else a block
+        # they lock fails the take back, a session from disk after another)
+        self.unshare(getattr(self, "share_before", None))
         for i in range(self.cfg.num_hidden_layers):
             rows = cache.end[i] - cache.base[i]
             plan = self.cfg.plan[i]
@@ -1553,6 +1685,7 @@ class ModelGPU(WarmPool, ProgramLRU):
     warm_mode = WARM        # WarmPool (RECLANK_GPU_WARM, _WARM_KEEP, _WARM_MIN)
     warm_keep = WARM_KEEP
     warm_min = WARM_MIN
+    warm_short = WARM_SHORT
     warm_regrow = True
     hot_run = True          # HotCache: the uses of the conversation decide the copies
 
@@ -1611,6 +1744,7 @@ class ModelGPU(WarmPool, ProgramLRU):
         if konly:
             ko_table(model.cfg)
         self.kv = GPUKV(model.cfg, kv, max_chunk=self.chunk, konly=konly)
+        self.kv.share_before = self._share_before
         self.groups = {}      # t -> (Program, GPUProgram) of a group of t tokens
         self._lru_init()
         self.kv.oom = self._evict
@@ -1626,6 +1760,12 @@ class ModelGPU(WarmPool, ProgramLRU):
         if (self.prog.hot_stores and not self.resident and
                 os.environ.get("RECLANK_GPU_HOT_DYN", "1") != "0"):
             self.hot_cache = HotCache(self)
+            from reclank.backends.cuda.devices import expert_device
+            xdev = expert_device(self.model)
+            if xdev is not None:
+                # exclusive caching: the slots do not take the expert device's experts
+                self.hot_cache.exclude = np.stack([xdev.held[e["layer"]].astype(bool)
+                                                   for e in self.hot_cache.layers])
         if self.pooled and self.hot_cache is not None:
             self._pool_first(hot_init)
         self._mm_freeze()       # GpuMem: the weights, the stores, the step stay
@@ -1725,27 +1865,39 @@ class ModelGPU(WarmPool, ProgramLRU):
             out[layer] = (slots, self.g.mirror.buffer_of(gu).ptr, self.g.mirror.buffer_of(dn).ptr)
         return out
 
-    def _stage(self):
+    def _stage(self, cap=None, floor=None):
         """Return the two device buffers for the weights of the cold experts
         of a layer, for a large group. The GPU holds the hot experts already,
-        so a buffer holds only the cold experts of the layer with the most."""
+        so a buffer holds only the cold experts of the layer with the most,
+        or cap of them. floor (or None: all or nothing): with too little
+        memory, buffers for fewer (halves, down to floor) - the pieces of
+        chunked staging or the places of a mixed group (whose CPU takes the
+        cold experts the buffers do not hold).
+        Where all or nothing gave the 26B on a card of 4096 MiB the CPU
+        experts alone for a prompt of 48K tokens: 51 tok/s."""
         if getattr(self, "stage", None) is None:
             w = self.model._layers[0]
             gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
             n = gu.shape[0]
             cold = max(n - len(self.hot.get(i, ())) for i in range(self.model.cfg.num_hidden_layers))
             cold = max(cold, 1)     # (resident: no cold expert, the buffers stay unused)
-            made = []
-            try:
-                for _ in range(2):
-                    made.append(Buffer(cold * gu.nbytes // n))
-                    made.append(Buffer(cold * dn.nbytes // n))
-            except MemoryError:
-                # GpuMem keeps a block until it is freed: the buffers made
-                # so far go too
-                for b in made:
-                    b.free()
-                raise
+            if cap is not None:
+                cold = min(cold, cap)
+            while True:
+                made = []
+                try:
+                    for _ in range(2):
+                        made.append(Buffer(cold * gu.nbytes // n))
+                        made.append(Buffer(cold * dn.nbytes // n))
+                    break
+                except MemoryError:
+                    # GpuMem keeps a block until it is freed: the buffers made
+                    # so far go too
+                    for b in made:
+                        b.free()
+                    if floor is None or cold <= floor:
+                        raise
+                    cold = max(floor, cold // 2)
             self.stage = [(made[0], made[1]), (made[2], made[3])]
         return self.stage
 
@@ -1757,23 +1909,56 @@ class ModelGPU(WarmPool, ProgramLRU):
             # form of a small one (the hot experts on the GPU, the cold ones on
             # the CPU).
             stage = None
-            if (t > MT_CPU and self.model.cfg.enable_moe_block and int8_tiles()
+            # The mixed groups: with the KQ_Q4X copies (VNNI or AVX2) always;
+            # without them (an AVX-512 CPU with no VNNI, the plain C build)
+            # only when the buffers of all the cold experts or the program
+            # beside them do not fit (mix_short: then the buffers shrink and
+            # the CPU takes the cold experts they do not hold). The plain
+            # large group with all of them is 4% faster there (370 against
+            # 385 tok/s for 8K tokens on the GTX 1070).
+            can_mix = MIX and not self.resident
+            mix = can_mix and (expert_host(self.model, 0)[2] or getattr(self, "mix_short", False))
+            n = self.model._layers[0]["experts.gate_up_proj"][0].shape[0]
+            least = -(-n // CHUNK_MAX)      # the fewest places of chunked staging
+            cap = getattr(self, "stage_cap", None)
+            chunks = 1
+            # GP_MOE_GPU takes the int4 experts in float32 too (k_moe_gemm):
+            # without the int8 products (Maxwell) the buffers come all the same
+            if (t > MT_CPU and self.model.cfg.enable_moe_block
+                    and (int8_tiles() or not expert_host(self.model, 0)[2])
                     and not getattr(self, "stage_off", False)):
                 try:
-                    stage = self._stage()
+                    if mix:
+                        stage = self._stage(cap=cap, floor=STAGE_MIN)
+                    else:
+                        # all the cold experts at once, or else (stage_cap set)
+                        # chunked staging, down to CHUNK_MAX pieces
+                        stage = self._stage(cap=cap, floor=least if cap is not None else None)
                 except MemoryError:
+                    if not mix and cap is None:
+                        self.stage_cap = n // 2
+                        return self._group(t)
+                    if can_mix and not mix:
+                        self.mix_short = True
+                        return self._group(t)
                     # Little memory (the 26B on a card of 4 GB with a long
                     # cache): no buffers for the cold experts; the large
                     # groups take the form of a small one, their cold
                     # experts on the CPU (and no new try, which would
                     # first free the programs and the hot experts).
                     self.stage_off = True
+                if stage is not None and not mix:
+                    room = stage_room(self.model, stage)
+                    if room < n - min(len(self.hot.get(i, ())) for i in range(self.model.cfg.num_hidden_layers)):
+                        # fewer places than cold experts: pieces (every expert
+                        # of a layer may be cold when HotCache moves them)
+                        chunks = -(-n // room)
             prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
                                        hot_stores=self._hot_devices() if stage else None,
                                        hot_host=self.prog.hot_stores,
                                        counts=self.hot_cache.counts if self.hot_cache else None,
-                                       mix=MIX and not self.resident, resident=self.resident,
-                                       pool=self.pool, arena=self.arenas.arena_for(t))
+                                       mix=mix, resident=self.resident,
+                                       pool=self.pool, arena=self.arenas.arena_for(t), chunks=chunks)
             self.arenas.keep(t, prog)
             # The tensor cores round the input of a product to float16. The
             # router of the experts then selects another expert more often:
@@ -1804,6 +1989,20 @@ class ModelGPU(WarmPool, ProgramLRU):
             except MemoryError:
                 if stage is None:
                     raise
+                room = stage_room(self.model, stage)
+                if not mix and room > least:
+                    # the buffers fit, but then the program did not: smaller
+                    # buffers in more pieces (stage_cap), and a new try
+                    self._warm_programs()
+                    self.stage_cap = max(least, room // 2)
+                    return self._group(t)
+                if can_mix and (room > STAGE_MIN or not mix):
+                    # no more pieces: a mixed group (its CPU takes what the
+                    # buffers do not hold)
+                    self._warm_programs()
+                    self.mix_short = True
+                    self.stage_cap = max(STAGE_MIN, room // 2)
+                    return self._group(t)
                 # the buffers of the cold experts fit, but then the program
                 # did not (the 26B on 4 GB in Pascal mode, the cache of keys
                 # only: 32K tokens): the large groups without them
@@ -1824,6 +2023,17 @@ class ModelGPU(WarmPool, ProgramLRU):
             for b in pair:
                 b.free()
         self.stage = None
+        if getattr(self, "head_cpu", False) and self.head is None:
+            # the head on the CPU (_run_head): the memory of the prompt goes
+            # to it first, then to the pool
+            try:
+                self._load_head()
+                self.head_cpu = False
+            except MemoryError:
+                pass
+
+    def _warm_prompt_held(self):
+        return any(t > MT_CPU for t in self.groups) or getattr(self, "stage", None) is not None
 
     def _stage_drop(self):
         """Free the buffers of the cold experts (_stage) and the programs of
@@ -1877,16 +2087,19 @@ class ModelGPU(WarmPool, ProgramLRU):
             g.upload("lim")
         if not on_gpu:
             g.upload("x")
-        # The tables of a large group last: the cache, the head and the
-        # program above may take blocks of the pool (their warm experts go
-        # cold, and a block may move).
+        # The tables of a large group last: the cache, the head, the program
+        # above and its binding may take blocks of the pool (their warm experts
+        # go cold, and a block may move). bind came after the tables: its
+        # arrays (the scores grow with pos) took memory from the pool, so a
+        # table kept the address of a freed segment (the 26B with a cache of
+        # 131072 tokens on the GTX 1070: an illegal address in the experts).
+        g.bind(kw)
         if self.hot_cache is not None and size > MT_CPU and not mixed:
             self.hot_cache.refresh(prog, g)
         if mixed:
             self.plan_mix(prog, g)
             if MIX_CAL:
                 _check(lib().rc_gpu_mix_stats_on(1))
-        g.bind(kw)
         t0 = time.perf_counter()
         g.run()
         g.download("xn")
@@ -1933,6 +2146,12 @@ class ModelGPU(WarmPool, ProgramLRU):
             cold = [int(x) for x in order if slots[x] < 0]
             if MIX_PRE != "auto":
                 m = len(cold) if int(MIX_PRE) < 0 else int(MIX_PRE)
+            elif not expert_host(self.model, layer)[2]:
+                # the int4 experts on the CPU (no KQ_Q4X copies: MOE_MT) are
+                # slow next to the copies: the CPU takes only the cold experts
+                # that the buffers do not hold (the GTX 1070 with all of them on
+                # the GPU: 8K tokens at 385 tok/s, with the model's split 299)
+                m = len(cold)
             else:
                 # The time of the layer for m copied experts: the copies go on
                 # during the work of the layers before, and the CPU part runs
@@ -1952,6 +2171,8 @@ class ModelGPU(WarmPool, ProgramLRU):
                 # most copies leave the CPU the least work: a margin for the
                 # errors of the prediction and for other load on the CPU.
                 m = int(ms[tm <= tm.min() + 0.25].max())
+            # at most the places of the buffers (fill_tables): the most used of the cold experts
+            m = min(m, stage_room(self.model, self.stage))
             self.mix_plan.append(m)
             pre = set(cold[:m])
             gslots = prog.gslots_of[layer]
@@ -2121,6 +2342,7 @@ class ModelGPU(WarmPool, ProgramLRU):
             # the head (_load_head_low) makes them only once
             self.out = Buffer(4 * vocab * MT_CPU, "weights")
             self.host_logits = pinned((MT_CPU, vocab))     # a faster copy from the GPU
+        self.head_bytes = w.nbytes
         head = Buffer(w.nbytes, "weights")
         head.upload(w)
         self.head = head
@@ -2169,21 +2391,54 @@ class ModelGPU(WarmPool, ProgramLRU):
 
     def _run_head(self, rows):
         """Run the head on the last rows into self.out. The first call copies
-        the head to the GPU. Return the vocabulary size."""
+        the head to the GPU; when it does not fit even after the programs
+        went (_load_head_low: the 26B on a card of 4 GB after a prompt of
+        48K tokens, where the copy needs 0.61 GB in one block), the CPU runs
+        it (_cpu_head) until the GPU has room. Return the vocabulary size."""
         model, cfg = self.model, self.model.cfg
-        if self.head is None:
+        assert 1 <= rows <= min(self.rows, MT_CPU)
+        if self.head is None and not getattr(self, "head_cpu", False):
+            try:
+                try:
+                    self._load_head()
+                except MemoryError:
+                    self._load_head_low(rows)
+            except MemoryError:
+                if getattr(self, "out", None) is None:
+                    raise
+                self.head_cpu = True
+        elif self.head is None and mem().room() >= self.head_bytes:
+            # the CPU head, and the GPU has room again (a smaller cache): a
+            # try with no program let go
             try:
                 self._load_head()
+                self.head_cpu = False
             except MemoryError:
-                self._load_head_low(rows)
-        assert 1 <= rows <= min(self.rows, MT_CPU)
-        vocab = self.host_logits.shape[1]
-        cap = float(cfg.final_logit_softcapping or 0.0)
-        step = cfg.hidden_size * 4
-        _check(self.head_fn(self.head.ptr, self.last - (rows - 1) * step, self.out.ptr,
-                            vocab, cfg.hidden_size, cap, rows))
+                pass
+        if self.head is None:
+            vocab = self._cpu_head(rows)
+        else:
+            vocab = self.host_logits.shape[1]
+            cap = float(cfg.final_logit_softcapping or 0.0)
+            step = cfg.hidden_size * 4
+            _check(self.head_fn(self.head.ptr, self.last - (rows - 1) * step, self.out.ptr,
+                                vocab, cfg.hidden_size, cap, rows))
         if self.hot_cache is not None and self.hot_cache.due:
             self.hot_cache.observe()
+        return vocab
+
+    def _cpu_head(self, rows):
+        """The head on the CPU (Model.logits of the rows of the hidden state,
+        with the soft cap) into self.out, so that argmax and topk read it
+        there as from the GPU head. Return the vocabulary size."""
+        cfg = self.model.cfg
+        step = cfg.hidden_size * 4
+        x = np.empty((rows, cfg.hidden_size), np.float32)
+        _check(lib().rc_gpu_d2h(x.ctypes.data, self.last - (rows - 1) * step, rows * step))
+        lg = np.ascontiguousarray(self.model.logits(x), np.float32)
+        vocab = lg.shape[1]
+        self.host_logits[:rows] = lg
+        _check(lib().rc_gpu_h2d(self.out.ptr, self.host_logits.ctypes.data, rows * vocab * 4))
         return vocab
 
 

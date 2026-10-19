@@ -1,3 +1,16 @@
+/* The scratch of kq_e3_moe_body (kernels/kq/exl3_moe.c) for t tokens of k
+ * experts and a shared expert, with the low planes of x16: the same takes,
+ * each rounded up by ma_take. */
+static size_t kq_e3_moe_bytes(int t, int k, int experts, int hidden, int inner)
+{
+    size_t P0 = (size_t)t * (k + 1), ne = (size_t)experts + 1;
+    size_t nh = hidden / 128, ni = inner / 128;
+    size_t n = (ne + 1) * 4 * 3 + P0 * 4 * 3 + 64 + 16 * 64;
+    n += 2 * (P0 * (2 * hidden + inner) + P0 * (2 * nh + ni) * 8);
+    n += P0 * (4 * inner + 2 * hidden) * 4 + P0 * (2 * inner + hidden) * 4;
+    return n + 64 * 48;
+}
+
 /* The size of the scratch of kq_moe_body, in bytes. */
 size_t rc_kq_moe_scratch(int t, int k, int experts, int hidden, int inner)
 {
@@ -24,7 +37,10 @@ size_t rc_kq_moe_scratch(int t, int k, int experts, int hidden, int inner)
     /* the planes of the int16 rows (AVX2, kq_q4x_rows_p16) */
     n += P * 2 * (hidden + inner) + P * ((hidden + inner) / 32) * 4 + 64 * 6;
 #endif
-    return n + 64 * 20;
+    n += 64 * 20;
+    /* the MUL1 experts (kq_e3_moe_body) take the same scratch */
+    size_t e3 = kq_e3_moe_bytes(t, k, experts, hidden, inner);
+    return n > e3 ? n : e3;
 }
 
 /* x16 (act bit 5 of kq_moe_body): x as int16 in each 32 values, v =

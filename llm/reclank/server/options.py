@@ -19,7 +19,7 @@ def parser():
     g = ap.add_argument_group("the model")
     g.add_argument("--model", "-m", "--gguf", dest="model", required=True,
                    help="the GGUF file of the model, or a checkpoint directory (DeepSeek V4.1)")
-    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41"), default="auto")
+    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41", "nemotron"), default="auto")
     g.add_argument("--tokenizer", "--tok", dest="tokenizer", default=None,
                    help="tokenizer.json (Gemma: the GGUF data by default; Qwen: next to the model)")
     g.add_argument("--template", default=None,
@@ -51,6 +51,22 @@ def parser():
     g.add_argument("--ctx", "--max-context", dest="ctx", type=int, default=None,
                    help="the tokens of the context (Qwen: the cache, default 98304; Gemma: the "
                         "most tokens of a request, default no limit)")
+    g.add_argument("--lanes", type=int, default=1,
+                   help="Qwen3.8-Flash-Next on the GPU: 2 serves two requests at once, each with a "
+                        "cache of --ctx tokens (docs/LANES_PLAN.md); default 1")
+    g.add_argument("--contexts", type=int, default=4,
+                   help="the conversations the cache keeps (every family): the one in use on the "
+                        "device, the others in host memory; a request that goes on from one brings "
+                        "it back")
+    g.add_argument("--context-dir", default=None,
+                   help="Gemma: keep the contexts on disk there too (RECLANK_CONTEXT_DIR): a prompt of "
+                        "4096 new tokens or more (RECLANK_CONTEXT_SAVE_MIN) is saved after it, and a "
+                        "later request with its start (also after a restart) reads only the rest")
+    g.add_argument("--context-dir-gb", type=float, default=64.0,
+                   help="the most disk space of --context-dir (the oldest files go first)")
+    g.add_argument("--contexts-gb", type=float, default=16.0,
+                   help="Qwen, DeepSeek V4.1: the most host memory of the contexts that are not on "
+                        "the device (their rows and points); the least recently used goes first")
     g = ap.add_argument_group("the answer")
     g.add_argument("--max-tokens", type=int, default=None, help="the default of a request")
     g.add_argument("--max-tokens-floor", type=int, default=0,

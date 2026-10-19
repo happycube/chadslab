@@ -10,6 +10,8 @@
  *     Q8_R   the rows of the GPU (int8 values, then float16 scales): mn = 0
  *     Q8_0   blocks of 34 bytes: mn = 0
  *     Q5_1   w = d q + m (q of 5 bits): mn = m
+ *     Q4_0   blocks of 18 bytes, w = d (q - 8): the int8 values q - 8, mn = 0 (one convention for
+ *            the tensor cores, the dp4a tiles and k_moe_gemm_q40_dp4a)
  *     Q4_K   w = d sc q - dmin mb (sub-blocks of 32 of a block of 256)
  *
  * A tile is BM rows of x (tokens or pairs) by 128 rows of w, with 8 warps;
@@ -19,7 +21,8 @@
 #define KT_BN 128
 #define KT_K 128
 #define KT_RB 144                           /* the bytes of a row of w in a step (136 used) */
-enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4, KT_NVX = 5, KT_Q4X = 6, KT_Q6K = 7 };
+enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4, KT_NVX = 5, KT_Q4X = 6, KT_Q6K = 7,
+       KT_Q40 = 9 };           /* (8: KD_Q5K of the dp4a tiles) */
 /* KT_Q6K (the RQ6_K experts, RQ6_MIX_PLAN.md): a step of 128 columns is half
  * a Q6_K block; a row of a step holds its 64 bytes of low 4 bits, 32 of high
  * 2 bits, 8 int8 scales, and d (106 bytes). Block bk of the step: the
@@ -49,7 +52,7 @@ __device__ __forceinline__ void mma16816s8(int *c, uint32_t a0, uint32_t a1, uin
 
 __host__ __device__ __forceinline__ int kt_format(int type)
 {
-    return type == KQ_Q8_R ? KT_Q8R : type == KQ_Q8_0 ? KT_Q80 : type == KQ_Q5_1 ? KT_Q51 :
+    return type == KQ_Q8_R ? KT_Q8R : type == KQ_Q8_0 ? KT_Q80 : type == KQ_Q5_1 ? KT_Q51 : type == KQ_Q4_0 ? KT_Q40 :
            type == KQ_Q4_K ? KT_Q4K : type == KQ_NV4 ? KT_NV4 : type == KQ_NVX ? KT_NVX :
            type == KQ_Q6_K ? KT_Q6K : -1;
 }
@@ -83,6 +86,11 @@ __device__ __forceinline__ void kt_load_w(uint8_t *dst, const uint8_t *wrow, int
     } else if (F == KT_Q51) {
         if (lane < 6) {
             cp_async16(dst + 16 * lane, wrow + (size_t)(k0 / 32) * 24 + 16 * lane);
+        }
+    } else if (F == KT_Q40) {
+        /* 4 blocks of 18 bytes (8-aligned: the rows are 72 bytes a step) */
+        if (lane < 9) {
+            cp_async8(dst + 8 * lane, wrow + (size_t)(k0 / 32) * 18 + 8 * lane);
         }
     } else if (F == KT_Q6K) {
         /* 53 halfwords: ql (32), qh (16), the 8 scales (4), d (1) */
@@ -126,6 +134,13 @@ __device__ __forceinline__ void kt_frag(const uint8_t *rp, int bk, int c, uint32
     if (F == KT_Q8R) {
         b[0] = *(const uint32_t *)(rp + bk * 32 + 4 * c);
         b[1] = *(const uint32_t *)(rp + bk * 32 + 16 + 4 * c);
+    } else if (F == KT_Q40) {
+        /* Q4_0: 18 bytes a block (the scale, 16 bytes: value i the low 4 bits of
+         * byte i, value i + 16 the high), each nibble minus 8 */
+        const uint8_t *q = rp + bk * 18 + 2;
+        uint32_t u = (uint32_t)*(const uint16_t *)(q + 4 * c) | ((uint32_t)*(const uint16_t *)(q + 4 * c + 2) << 16);
+        b[0] = __vsub4(u & 0x0f0f0f0fu, 0x08080808u);
+        b[1] = __vsub4((u >> 4) & 0x0f0f0f0fu, 0x08080808u);
     } else if (F == KT_Q80) {
         const uint8_t *q = rp + bk * 34 + 2;
         b[0] = (uint32_t)*(const uint16_t *)(q + 4 * c) | ((uint32_t)*(const uint16_t *)(q + 4 * c + 2) << 16);
@@ -155,6 +170,9 @@ __device__ __forceinline__ void kt_scale(const uint8_t *rp, int bk, int k0, floa
     } else if (F == KT_Q80) {
         *d = kq_half(rp + bk * 34);
         *mn = 0.f;
+    } else if (F == KT_Q40) {
+        *d = kq_half(rp + bk * 18);
+        *mn = 0.f;
     } else if (F == KT_Q51) {
         *d = kq_half(rp + bk * 24);
         *mn = kq_half(rp + bk * 24 + 2);
@@ -170,7 +188,10 @@ __device__ __forceinline__ void kt_scale(const uint8_t *rp, int bk, int k0, floa
  * and n0 <= n < n0 + 128 (n < rows) of w (rb bytes each). */
 /* X2 (KT_Q4X only): the int16 form of x (k_quant_x2), xl its lo plane with
  * the rows of xq; a row of a step holds the hi values, then the lo values. */
-template <int F, int BM, int NS, int X2 = 0>
+/* A4 (FP4-Local's prompt rows, kernels/moe/b12x.cu; KT_NVX only): x the codes of NVFP4 (twice the E2M1
+ * values), xs the scale of the first 16 of each block of 32 and xsum that of the second: each half's
+ * sum times its own scale. */
+template <int F, int BM, int NS, int X2 = 0, int A4 = 0>
 __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
                         const int8_t *xq, const float *xs, const float *xsum, const int *xmap,
                         int mcount, float *out, size_t ostride, uint8_t *sm,
@@ -399,6 +420,20 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
                     a[2] = *(const uint32_t *)&as_[b][r0 + g][kk + 4 * c + 16];
                     a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 4 * c + 16];
                     float s0 = ss[b][r0 + g][bk], s1 = ss[b][r0 + g + 8][bk];
+                    if (A4) {
+                        float s0h = ss[b][r0 + g][4 + bk], s1h = ss[b][r0 + g + 8][4 + bk];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            int cl[4] = {0, 0, 0, 0}, ch[4] = {0, 0, 0, 0};
+                            mma16816s8(cl, a[0], a[1], bf[j][0]);
+                            mma16816s8(ch, a[2], a[3], bf[j][1]);
+                            acc[i][j][0] += s0 * i2f_exact(cl[0]) * dl[j][0] + s0h * i2f_exact(ch[0]) * dh[j][0];
+                            acc[i][j][1] += s0 * i2f_exact(cl[1]) * dl[j][1] + s0h * i2f_exact(ch[1]) * dh[j][1];
+                            acc[i][j][2] += s1 * i2f_exact(cl[2]) * dl[j][0] + s1h * i2f_exact(ch[2]) * dh[j][0];
+                            acc[i][j][3] += s1 * i2f_exact(cl[3]) * dl[j][1] + s1h * i2f_exact(ch[3]) * dh[j][1];
+                        }
+                        continue;
+                    }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         int cl[4] = {0, 0, 0, 0}, ch[4] = {0, 0, 0, 0};
@@ -683,8 +718,8 @@ __global__ void k_qmoe_act(const gp_rec *r, const int64_t *e, int rot)
     }
     int64_t p = i / inner, c = i % inner;
     const float *a = DP(const float, 19) + p * 2 * inner;
-    float v = qw_silu(a[c]) * a[inner + c];
-    if (rot) {
+    float v = moe_act(a[c], a[inner + c], rot);
+    if (rot & 1) {
         v = tq6_rot_warp(v, (int)(c % 32), false);
     }
     DP(float, 20)[i] = v;
@@ -742,7 +777,7 @@ __global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
  * KG_B pairs of one expert), 128 rows of w for each block. xq, xs, xsum:
  * the int8 rows of h (gate and up) or of act2 (down). The shared expert
  * (x == E) has the Q8_R rows of the GPU. */
-template <int KFG>
+template <int KFG, int A4 = 0>
 __global__ void __launch_bounds__(256) k_qmoe_gu_tc(const gp_rec *r, const int64_t *e,
                                                     const int8_t *xq, const float *xs,
                                                     const float *xsum, int skip_shared = 0)
@@ -763,8 +798,8 @@ __global__ void __launch_bounds__(256) k_qmoe_gu_tc(const gp_rec *r, const int64
     float *out = DP(float, 19) + (size_t)p0 * 2 * inner + (up ? inner : 0);
     if (x < E) {
         const uint8_t *W = (const uint8_t *)(intptr_t)DP(const int64_t, up ? 9 : 8)[x];
-        kt_tile<KFG, 64, 3>(W, kq_row_bytes(DI(11), hidden), inner, row0 - (up ? inner : 0), hidden,
-                           xq, xs, xsum, w.ptok + p0, n, out, (size_t)2 * inner, ktsm);
+        kt_tile<KFG, 64, 3, 0, A4>(W, kq_row_bytes(DI(11), hidden), inner, row0 - (up ? inner : 0), hidden,
+                                   xq, xs, xsum, w.ptok + p0, n, out, (size_t)2 * inner, ktsm);
     } else {
         kt_tile<KT_Q8R, 64, 3>(DP(const uint8_t, up ? 14 : 13), kq_row_bytes(KQ_Q8_R, hidden), inner,
                                row0 - (up ? inner : 0), hidden, xq, xs, xsum, w.ptok + p0, n, out,
@@ -772,7 +807,7 @@ __global__ void __launch_bounds__(256) k_qmoe_gu_tc(const gp_rec *r, const int64
     }
 }
 
-template <int KFD>
+template <int KFD, int A4 = 0>
 __global__ void __launch_bounds__(256) k_qmoe_dn_tc(const gp_rec *r, const int64_t *e,
                                                     const int8_t *xq, const float *xs,
                                                     const float *xsum, int skip_shared = 0)
@@ -794,8 +829,8 @@ __global__ void __launch_bounds__(256) k_qmoe_dn_tc(const gp_rec *r, const int64
     const float *sr = xs + (size_t)p0 * (inner / 32), *ur = xsum + (size_t)p0 * (inner / 32);
     if (x < E) {
         const uint8_t *W = (const uint8_t *)(intptr_t)DP(const int64_t, 10)[x];
-        kt_tile<KFD, 64, 3>(W, kq_row_bytes(DI(12), inner), hidden, blockIdx.x * KT_BN, inner, xr, sr,
-                           ur, NULL, n, out, (size_t)hidden, ktsm);
+        kt_tile<KFD, 64, 3, 0, A4>(W, kq_row_bytes(DI(12), inner), hidden, blockIdx.x * KT_BN, inner, xr, sr,
+                                   ur, NULL, n, out, (size_t)hidden, ktsm);
     } else {
         kt_tile<KT_Q8R, 64, 3>(DP(const uint8_t, 15), kq_row_bytes(KQ_Q8_R, inner), hidden,
                                blockIdx.x * KT_BN, inner, xr, sr, ur, NULL, n, out, (size_t)hidden,

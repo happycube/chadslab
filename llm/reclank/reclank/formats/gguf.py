@@ -63,7 +63,11 @@ ROT_BASE = {RQ8_0: 8, RQ6_K: 14, RQ4_K: 12, RQ5_K: 13}
 # the group (4 bits), and that largest exponent (a byte); the row padded to
 # 16 bytes. Sign 1, gap 15, mantissa 0 is the zero code. cops.kq_bf16_to_bf12.
 BF12 = 57
+# MXF8 (FP4-Local, docs/FP4LOCAL_PLAN.md): an MXFP8 row, its E4M3 codes, then an E8M0 scale for
+# each 32 (e4m3 2^(s - 127)), zeros to 16 bytes (backends/cpu/csrc/kernels/kq KQ_MXF8)
+MXF8 = 66
 _ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
+              MXF8: lambda cols: (cols + cols // 32 + 15) // 16 * 16,
               E4M3_ROWS: lambda cols: cols,
               NVX: lambda cols: cols // 32 * 18 + 1,
               BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16}
@@ -976,6 +980,38 @@ class GGUF:
         }
 
 
+# The pre-tokenizers of byte-level BPE files (tokenizer.ggml.pre) that bpe_tokenizer_data knows: the
+# pattern of the Split step of their tokenizer.json, and ignore_merges.
+_BPE_PRE = {
+    "lfm2": (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|"
+             r"\s*[\r\n]+|\s+(?!\S)|\s+", True),
+}
+
+
+def bpe_tokenizer_data(g):
+    """The tokenizer.json data (dict) of a byte-level BPE GGUF file (tokenizer.ggml.model gpt2) with a
+    known pre-tokenizer (_BPE_PRE), for QwenTokenizer; None for another file. The control and user
+    tokens (token types 3, 4) are the added tokens; bos_token the text of the bos id."""
+    m = g.meta
+    pre = _BPE_PRE.get(m.get("tokenizer.ggml.pre"))
+    if m.get("tokenizer.ggml.model") != "gpt2" or pre is None:
+        return None
+    tokens = g.meta_strings("tokenizer.ggml.tokens")
+    types = np.asarray(m["tokenizer.ggml.token_type"])
+    bos = m.get("tokenizer.ggml.bos_token_id")
+    return {
+        "model": {"type": "BPE", "vocab": {t: i for i, t in enumerate(tokens)},
+                  "merges": g.meta_strings("tokenizer.ggml.merges"), "ignore_merges": pre[1]},
+        "added_tokens": [{"content": t, "id": i, "special": True} for i, t in enumerate(tokens)
+                         if i < types.size and int(types[i]) in (3, 4)],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": pre[0]}, "behavior": "Isolated", "invert": False},
+            {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]},
+        "bos_token": tokens[int(bos)] if bos is not None else "",
+    }
+
+
 class GGUFSplit(GGUF):
     """A model in split GGUF files (name-00001-of-0000N.gguf, as llama.cpp
     gguf-split writes them). The first file has the metadata; each file has
@@ -1086,6 +1122,48 @@ class GGUFOverlay(GGUF):
             p.close()
 
 
+class GGUFAttached:
+    """A model's tensors (a GGUF, or the weightkeeper's view: keep.KeptGGUF)
+    with the new tensors of other files beside them: the MTP layer of
+    Qwen3.6 in a file of its own (its tensors are cut from unsloth's MTP
+    GGUF). The tensors of the files take raw, dequant and advise_random;
+    the rest is the model's."""
+
+    def __init__(self, base, paths):
+        self.base = base
+        self.attached = [GGUF(p, stage=False) for p in paths]
+        self.tensors = dict(base.tensors)
+        self._order = list(base._order)
+        self._where = {}
+        for p in self.attached:
+            for name in p._order:
+                if name in self.tensors:
+                    raise ValueError("%s has the tensor %s of the model" % (p.path, name))
+                self.tensors[name] = p.tensors[name]
+                self._where[name] = p
+                self._order.append(name)
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def raw(self, gname):
+        p = self._where.get(gname)
+        return p.raw(gname) if p is not None else self.base.raw(gname)
+
+    def dequant(self, gname, rows=None):
+        p = self._where.get(gname)
+        return p.dequant(gname, rows) if p is not None else self.base.dequant(gname, rows)
+
+    def advise_random(self, gname):
+        p = self._where.get(gname)
+        return p.advise_random(gname) if p is not None else self.base.advise_random(gname)
+
+    def close(self):
+        for p in self.attached:
+            p.close()
+        self.base.close()
+
+
 def open_gguf(path):
     """A GGUF file, or the first file of a split model (GGUFSplit)."""
     if re.search(r"-\d{5}-of-\d{5}\.gguf$", path):
@@ -1152,6 +1230,11 @@ def meta_get(meta, key, default=None):
 
 def tensor_bytes(dims, t):
     """The bytes of a tensor of dims (ggml order) and type t."""
+    if 70 < t <= 78:
+        # an EXL3 MUL1 matrix (KQ_E3_BASE + K, formats/exl3.py): the trellis
+        # (K bits a weight), suh and svh, for each matrix of a stack
+        k, n = int(dims[0]), int(dims[1])
+        return (k * n * (t - 70) // 8 + 2 * (k + n)) * int(np.prod(dims[2:]))
     if t in _ROW_BYTES:
         return _ROW_BYTES[t](int(dims[0])) * int(np.prod(dims[1:]))
     bv, bb = _BLOCK[t]

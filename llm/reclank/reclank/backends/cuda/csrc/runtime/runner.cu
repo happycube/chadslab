@@ -6,11 +6,27 @@
     case KT_Q8R: K<KT_Q8R, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     case KT_Q80: K<KT_Q80, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     case KT_Q51: K<KT_Q51, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
+    case KT_Q40: K<KT_Q40, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     case KT_NV4: K<KT_NV4, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     case KT_NVX: K<KT_NVX, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     case KT_Q6K: K<KT_Q6K, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break; \
     default: K<KT_Q4K, X2><<<grid, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, a, xl); break;     \
     }
+
+/* RECLANK_DS_ROUTE_FUSE=0: GP_DS_ROUTER, GP_HOT_SPLIT and GP_SIGNAL of a step as three kernels. */
+static int ds_route_fuse_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("RECLANK_DS_ROUTE_FUSE");
+        v = s ? atoi(s) != 0 : 1;
+    }
+    return v;
+}
+
+/* an expert device's copy (expert_dev.cu, Nemotron) with RECLANK_EX_HG=0: its groups by the rows
+ * kernels, not k_nm_hg_* (a test) */
+static int gg_nm_hg_off;
 
 static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const int64_t *denv)
 {
@@ -24,8 +40,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     const float *qx_src = gg_qx_src;
     size_t qx_n = gg_qx_n;
     gg_qx_src = NULL;
-    if (r == gg_skip) {
-        gg_skip = NULL;
+    if (gg_skip != NULL && r <= gg_skip && r > gg_skip - 4) {
+        /* (the records up to gg_skip, which a kernel before ran) */
+        if (r == gg_skip) {
+            gg_skip = NULL;
+        }
         return 0;
     }
     gg_skip = NULL;
@@ -207,6 +226,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         return 0;
     case GP_RMS_NORM:
         k_rms_norm<<<(unsigned)hlit(r, 3, &bad), T, 0, s>>>(dr, denv, 0, 1, 2, 4, 5);
+        break;
+    case GP_MX8_ACT:
+        k_mx8_act<<<(unsigned)cdiv(hlit(r, 1, &bad) / 32, 8), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_B12X_GLU:
+        k_b12x_glu<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
+        break;
+    case GP_MOE_B12X_OUT:
+        k_moe_b12x_out<<<dim3((unsigned)cdiv(hlit(r, 6, &bad), T), (unsigned)hlit(r, 5, &bad)), T, 0, s>>>(dr, denv);
+        break;
+    case GP_BF16_ROUND:
+        k_bf16_round<<<(unsigned)cdiv(hlit(r, 1, &bad), T), T, 0, s>>>(dr, denv);
         break;
     case GP_ADD:
         k_add<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
@@ -445,9 +476,21 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         unsigned k = (unsigned)hlit(r, 10, &bad) * t;
         /* KQ_Q4X (operand 16): a block for each group of 16 rows */
         int per = hlit(r, 16, &bad) == 1 ? 16 : ROWS_PER_BLOCK;
-        k_hot_gu<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), per), k), W, 0, s>>>(dr, denv);
+        /* int4 rows: x in shared memory, HOT_XR rows a warp (k_hot_gu_xr) */
+        const int xr = hlit(r, 16, &bad) != 1 && hot_xr_on();
+        if (xr) {
+            k_hot_gu_xr<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), ROWS_PER_BLOCK * HOT_XR), k), W,
+                          (size_t)hlit(r, 12, &bad) * 4, s>>>(dr, denv);
+        } else {
+            k_hot_gu<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), per), k), W, 0, s>>>(dr, denv);
+        }
         k_hot_gelu<<<k, T, 0, s>>>(dr, denv);
-        k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), per), k), W, 0, s>>>(dr, denv);
+        if (xr) {
+            k_hot_dn_xr<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), ROWS_PER_BLOCK * HOT_XR), k), W,
+                          (size_t)hlit(r, 14, &bad) * 4, s>>>(dr, denv);
+        } else {
+            k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), per), k), W, 0, s>>>(dr, denv);
+        }
         k_hot_sum<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), T), t), T, 0, s>>>(dr, denv);
         break;
     }
@@ -648,6 +691,47 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_to_half<<<(unsigned)cdiv((int64_t)n2 / 4 + 1, 256), 256, 0, s>>>(act2, g->xh, n2);
             k_moe_gemm_tc<<<dim3((unsigned)cdiv(dn_rows, TN), max_tiles), 128, 0, s>>>(
                 dr, denv, g->xh, 0, dn, dn_rows, inner, de);
+        } else if (!kt_on() && kt_dp4a_on() && moe_q40_mode() > 0 && cols % 32 == 0 && inner % 32 == 0 &&
+                   (size_t)t * cols <= g->kqx_n && (size_t)pairs * inner <= g->kqx_n &&
+                   (moe_q40_mode() == 1 || g->kqx_lo)) {
+            /* Pascal: the int4 experts on dp4a (k_moe_gemm_q40_dp4a), x in the
+             * int16 form (x2) or int8 */
+            float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+            const int x2 = moe_q40_mode() == 2;
+            dim3 ggu((unsigned)cdiv(gu_rows, KT_BN), max_tiles), gdn((unsigned)cdiv(dn_rows, KT_BN), max_tiles);
+            if (x2 && q40_tile_on()) {
+                /* the tile of its own (k_moe_q40_x2): the bits of kt_tile_dp4a */
+                kt_quant_x2(g, h, (size_t)(t * cols));
+                k_moe_q40_x2<<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, 1, gu, gu_rows, cols, act, kt_lo(g));
+            } else if (x2) {
+                kt_quant_x2(g, h, (size_t)(t * cols));
+                k_moe_gemm_q40_dp4a<1><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, act,
+                                                           kt_lo(g));
+            } else {
+                kt_quant(g, h, (size_t)(t * cols));
+                k_moe_gemm_q40_dp4a<0><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, act,
+                                                           NULL);
+            }
+            k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+            if (x2 && q40_tile_on()) {
+                kt_quant_x2(g, act2, (size_t)(pairs * inner));
+                k_moe_q40_x2<<<gdn, 256, 0, s>>>(dr, denv, g->kqx, xs, 0, dn, dn_rows, inner, de, kt_lo(g));
+            } else if (x2) {
+                kt_quant_x2(g, act2, (size_t)(pairs * inner));
+                k_moe_gemm_q40_dp4a<1><<<gdn, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 0, dn, dn_rows, inner, de,
+                                                           kt_lo(g));
+            } else {
+                kt_quant(g, act2, (size_t)(pairs * inner));
+                k_moe_gemm_q40_dp4a<0><<<gdn, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 0, dn, dn_rows, inner, de,
+                                                           NULL);
+            }
+        } else if (gemm8_on() && cols % 32 == 0 && inner % 32 == 0) {
+            /* no int8 products (Maxwell): the float tile of k_gemm8 */
+            k_moe_gemm8<<<dim3((unsigned)cdiv(gu_rows, G8_B), max_tiles), 256, 0, s>>>(
+                dr, denv, h, 1, gu, gu_rows, cols, act);
+            k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+            k_moe_gemm8<<<dim3((unsigned)cdiv(dn_rows, G8_B), max_tiles), 256, 0, s>>>(
+                dr, denv, act2, 0, dn, dn_rows, inner, de);
         } else {
             k_moe_gemm<<<dim3((unsigned)cdiv(gu_rows, GN), max_tiles), 256, 0, s>>>(
                 dr, denv, h, 1, gu, gu_rows, cols, act);
@@ -668,6 +752,24 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         /* The GPU products read the float rows (operand 3 of GP_KQ_LINEAR). */
         return 0;
     case GP_KQ_LINEAR:
+        if (hlit(r, 5, &bad) == KQ_MXF8) {
+            /* an MXFP8 matrix of FP4-Local (kernels/quant/mxf8.cu): x in bfloat16, out rounded */
+            if (bad || mxf8_linear_launch((const float *)(intptr_t)hi(r, g->henv, 3),
+                                          (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (int)hlit(r, 6, &bad),
+                                          (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
+                                          (float *)(intptr_t)hi(r, g->henv, 9), g->w16, g->w16_n,
+                                          (uint16_t *)g->xh, g->xh_n, s) != 0) {
+                bad = 1;
+            }
+            break;
+        }
+        if (hlit(r, 5, &bad) == KQ_NV4 && !bad &&
+            nv4_linear_launch((const float *)(intptr_t)hi(r, g->henv, 3), (const uint8_t *)(intptr_t)hi(r, g->henv, 4),
+                              (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
+                              (float *)(intptr_t)hi(r, g->henv, 9), s) == 0) {
+            /* NVFP4 rows of a step or a few tokens (kernels/quant/nv4.cu: FP4-Local's MTP head) */
+            break;
+        }
         if (kq_e3_k((int)hlit(r, 5, &bad))) {
             /* an EXL3 MUL1 matrix (kernels/quant/exl3.cu): x is operand 3 */
             int64_t t = hlit(r, 8, &bad), cols = hlit(r, 7, &bad), rows = hlit(r, 6, &bad);
@@ -675,7 +777,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                                         kq_e3_k((int)hlit(r, 5, &bad)), (int)rows, (int)cols,
                                         (const float *)(intptr_t)hi(r, g->henv, 3), (size_t)cols, t,
                                         (float *)(intptr_t)hi(r, g->henv, 9), (size_t)rows, g->e3, g->e3_n,
-                                        0.f, s) != 0) {
+                                        0.f, s, g->tc) != 0) {
                 bad = 1;
             }
             break;
@@ -781,7 +883,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 k_kq_linear_i8<0><<<gr, 32 * KQ_RPB, 0, s>>>(dr, denv, g->kqx, xs);
             }
         } else if (bt_on() && hlit(r, 8, &bad) <= 8 &&
-                   bt_shape((int)hlit(r, 5, &bad), (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad))) {
+                   bt_shape((int)hlit(r, 5, &bad), (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad)) &&
+                   !(hlit(r, 7, &bad) >= 4096 && hlit(r, 6, &bad) >= 16384 && hlit(r, 5, &bad) == KQ_BF12 &&
+                     bf16_nt_on() && !(kq_split_on() && hlit(r, 7, &bad) >= 8192) && hlit(r, 7, &bad) % 32 == 0)) {
+            /* (long rows, many of them, as DeepSeek V4.1's head of 129280 x 5120: the CUDA-core kernels
+             * below for 1 to 8 tokens, 1.26 ms against 1.81 on the tensor cores for one, 1.39 against
+             * 1.80 for two, 2.61 against 1.90 for eight; and a token in a verify group gets the bits
+             * of a token alone, which the tensor cores' order does not give) */
             /* KQ_BF12 rows of a step or a small group on the tensor cores */
             int rows = (int)hlit(r, 6, &bad);
             bt_launch(dr, denv, 0, bt_cls(rows, (int)hlit(r, 7, &bad)), cdiv(rows, 16), g->btp, g->btc, s);
@@ -791,7 +899,20 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
              * rows keep the split kernels (k_kq_linear_split, _split_bf16) */
             int64_t t = hlit(r, 8, &bad), rows = hlit(r, 6, &bad);
             unsigned gb = (unsigned)cdiv(rows, KQ_RPB);
-            if (t <= 1) {
+            if (t >= 2 && rows >= 16384) {
+                /* many rows (a head): 4 rows a warp, x once for them (k_kq_linear_bf12_r; R = 2: 3.27
+                 * ms for 8 tokens, 4: 2.61) */
+                unsigned gr = (unsigned)cdiv(rows, KQ_RPB * 4);
+#define BF12_R(NN) k_kq_linear_bf12_r<NN, 4><<<gr, 32 * KQ_RPB, 0, s>>>(dr, denv)
+                if (t <= 2) {
+                    BF12_R(2);
+                } else if (t <= 4) {
+                    BF12_R(4);
+                } else {
+                    BF12_R(8);
+                }
+#undef BF12_R
+            } else if (t <= 1) {
                 k_kq_linear_bf12<1><<<gb, 32 * KQ_RPB, 0, s>>>(dr, denv);
             } else if (t <= 2) {
                 k_kq_linear_bf12<2><<<gb, 32 * KQ_RPB, 0, s>>>(dr, denv);
@@ -800,10 +921,10 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             } else {
                 k_kq_linear_bf12<8><<<gb, 32 * KQ_RPB, 0, s>>>(dr, denv);
             }
-        } else if (kq_bf_type((int)hlit(r, 5, &bad)) && hlit(r, 8, &bad) >= 2 && hlit(r, 8, &bad) <= 8 &&
-                   bf16_nt_on() && hlit(r, 7, &bad) % 16 == 0) {
-            /* bfloat16 rows of a small group: the weights once for all the
-             * tokens (k_kq_linear_bf16), as the split of a step */
+        } else if ((kq_bf_type((int)hlit(r, 5, &bad)) || hlit(r, 5, &bad) == KQ_F32) && hlit(r, 8, &bad) >= 2 &&
+                   hlit(r, 8, &bad) <= 8 && bf16_nt_on() && hlit(r, 7, &bad) % 16 == 0) {
+            /* bfloat16 (or float32) rows of a small group: the weights once for all
+             * the tokens (k_kq_linear_bf16), as the split of a step */
             int64_t t = hlit(r, 8, &bad), rows = hlit(r, 6, &bad);
             int split = kq_split_on() && hlit(r, 7, &bad) >= 8192;
             if (split && t <= 4) {
@@ -945,6 +1066,30 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         } else {
             k_qmoe_sort<<<1, 32, 0, s>>>(dr, denv);
         }
+        if (kq_e3_k((int)hlit(r, 11, &bad)) && kq_e3_k((int)hlit(r, 12, &bad))) {
+            /* MUL1 experts (kernels/quant/exl3.cu): the batches of products on
+             * the rows of the sort, k_qmoe_act between, k_qmoe_sum after */
+            const int has_sh = hi(r, g->henv, 13) != 0;
+            const int Kr = kq_e3_k((int)hlit(r, 11, &bad)), Kd = kq_e3_k((int)hlit(r, 12, &bad));
+            const int Ks = has_sh ? kq_e3_k((int)hlit(r, 16, &bad)) : Kr;
+            const float *hx = (const float *)(intptr_t)hi(r, g->henv, 0);
+            float *act = (float *)(intptr_t)hi(r, g->henv, 19), *de = (float *)(intptr_t)hi(r, g->henv, 21);
+            const float *act2 = (const float *)(intptr_t)hi(r, g->henv, 20);
+            if (bad || !Ks ||
+                e3_group_moe_launch(0, dr, denv, (int)P, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
+                                    g->e3, g->e3_n, s, tiles, g->tc) != 0) {
+                bad = 1;
+                break;
+            }
+            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
+            if (e3_group_moe_launch(1, dr, denv, (int)P, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
+                                    g->e3, g->e3_n, s, tiles, g->tc) != 0) {
+                bad = 1;
+                break;
+            }
+            k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
+            break;
+        }
         /* the shared expert in bfloat16 (RECLANK_DENSE=bf16): the routed
          * experts on the int8 tensor cores, the shared expert in gg_gemm_bf16
          * (its pairs are the rows start[E] .. start[E] + t of act, act2, de) */
@@ -956,8 +1101,26 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                   bf16_tc_on() && hidden % 16 == 0 && inner % 16 == 0 &&
                   2 * (size_t)(t * (hidden > inner ? hidden : inner)) <= g->xh_n;
         const int has_shared = hi(r, g->henv, 13) != 0;
+        if ((gg_moe_rot & 8) && fg == KT_NVX && fd == KT_NVX && !has_shared && g->tc && kt_on() &&
+            hidden % KT_K == 0 && inner % KT_K == 0 && (size_t)(t * hidden) <= g->kqx_n &&
+            (size_t)(P * inner) <= g->kqx_n) {
+            /* FP4-Local's prompt rows (kernels/moe/b12x.cu): b12x's A4 */
+            float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+            size_t sm = KT_SMEM(64, 3);
+            kt_attr();
+            dim3 ggu((unsigned)(2 * inner / KT_BN), tiles), gdn((unsigned)(hidden / KT_BN), tiles);
+            k_a4_quant_h<<<(unsigned)cdiv(t * (hidden / 16), 256), 256, 0, s>>>(dr, denv, g->kqx, xs, xsum);
+            k_qmoe_gu_tc<KT_NVX, 1><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, 0);
+            k_qmoe_act_a4<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv);
+            k_a4_quant_pairs<<<(unsigned)cdiv(P * (inner / 16), 256), 256, 0, s>>>(dr, denv, g->kqx, xs, xsum);
+            k_qmoe_dn_tc<KT_NVX, 1><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, 0);
+            k_qmoe_y_a4<<<(unsigned)cdiv(P * hidden, T), T, 0, s>>>(dr, denv);
+            k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
+            break;
+        }
+        /* (no shared expert, LFM2: the routed experts alone on the tensor cores) */
         if (kt_on() && !moe_f32_on() && g->tc && fg >= 0 && fd >= 0 &&
-            (kt_format((int)hlit(r, 16, &bad)) == KT_Q8R || sbf) &&
+            (kt_format((int)hlit(r, 16, &bad)) == KT_Q8R || sbf || !has_shared) &&
             hidden % KT_K == 0 && inner % KT_K == 0 && (size_t)(t * hidden) <= g->kqx_n &&
             (size_t)(P * inner) <= g->kqx_n) {
             const int *sstart = (const int *)(intptr_t)hi(r, g->henv, 18) + 8 + (E + 2) + E;
@@ -971,6 +1134,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             case KT_Q8R: k_qmoe_gu_tc<KT_Q8R><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q80: k_qmoe_gu_tc<KT_Q80><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q51: k_qmoe_gu_tc<KT_Q51><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
+            case KT_Q40: k_qmoe_gu_tc<KT_Q40><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_NV4: k_qmoe_gu_tc<KT_NV4><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_NVX: k_qmoe_gu_tc<KT_NVX><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q6K: k_qmoe_gu_tc<KT_Q6K><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
@@ -992,12 +1156,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                     }
                 }
             }
-            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot);
+            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
             kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 20), (size_t)(P * inner));
             switch (fd) {
             case KT_Q8R: k_qmoe_dn_tc<KT_Q8R><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q80: k_qmoe_dn_tc<KT_Q80><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q51: k_qmoe_dn_tc<KT_Q51><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
+            case KT_Q40: k_qmoe_dn_tc<KT_Q40><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_NV4: k_qmoe_dn_tc<KT_NV4><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_NVX: k_qmoe_dn_tc<KT_NVX><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
             case KT_Q6K: k_qmoe_dn_tc<KT_Q6K><<<gdn, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, sbf); break;
@@ -1047,7 +1212,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                     KD_SWITCH(f, k_qmoe_gu_dp4a, 0, ggu, sh, xl);
                 }
             }
-            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot);
+            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
             if (x2) {
                 kt_quant_x2(g, (const float *)(intptr_t)hi(r, g->henv, 20), (size_t)(P * inner));
             } else {
@@ -1066,7 +1231,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
         } else {
             k_qmoe_gu<<<dim3((unsigned)(2 * inner / KG_B), tiles), 256, 0, s>>>(dr, denv);
-            k_qmoe_act<<<(unsigned)cdiv((t * k + t) * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot);
+            k_qmoe_act<<<(unsigned)cdiv((t * k + t) * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
             k_qmoe_dn<<<dim3((unsigned)(hidden / KG_B), tiles), 256, 0, s>>>(dr, denv);
         }
         k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
@@ -1175,6 +1340,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_SIGMUL:
         k_sigmul<<<(unsigned)cdiv(hlit(r, 3, &bad), T), T, 0, s>>>(dr, denv);
         break;
+    case GP_Q16:
+    case GP_DQ16:
+        if (hlit(r, 2, &bad) % 128 != 0) {
+            bad = 1;
+            break;
+        }
+        if (r->op == GP_Q16) {
+            k_q16<<<(unsigned)cdiv(hlit(r, 2, &bad) / 128, 8), 256, 0, s>>>(dr, denv);
+        } else {
+            k_dq16<<<(unsigned)cdiv(hlit(r, 2, &bad) / 128, 8), 256, 0, s>>>(dr, denv);
+        }
+        break;
     case GP_ROUTER_TOPK:
         if (hlit(r, 2, &bad) > 1024 || hlit(r, 3, &bad) > 256) {
             bad = 1;
@@ -1191,6 +1368,351 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
         }
         k_router_topk<<<(unsigned)hlit(r, 1, &bad), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_SHORT_CONV:
+        if (hlit(r, 6, &bad) > 8) {
+            bad = 1;
+        }
+        if (hlit(r, 4, &bad) == 1) {
+            k_short_conv<<<(unsigned)cdiv(hlit(r, 5, &bad), 128), 128, 0, s>>>(dr, denv);
+        } else {
+            /* a group: every row at once, then the state */
+            k_short_conv_rows<<<dim3((unsigned)cdiv(hlit(r, 5, &bad), 128), (unsigned)hlit(r, 4, &bad)),
+                                128, 0, s>>>(dr, denv);
+            k_short_conv_state<<<(unsigned)cdiv(hlit(r, 5, &bad), 128), 128, 0, s>>>(dr, denv);
+        }
+        break;
+    case GP_NM_MAMBA: {
+        /* (kernels/nemotron/nm.cu) the state rows of 128 values: 4 a lane */
+        int64_t t = hlit(r, 11, &bad), heads = hlit(r, 12, &bad), hdim = hlit(r, 13, &bad);
+        int64_t groups = hlit(r, 14, &bad), nstate = hlit(r, 15, &bad), kern = hlit(r, 16, &bad);
+        if (nstate != 128 || kern > 9 || groups <= 0 || heads % groups != 0) {
+            bad = 1;
+            break;
+        }
+        int64_t conv = heads * hdim + 2 * groups * nstate;
+        if (t == 1 && hdim <= 64 && hdim % 8 == 0 && kern >= 2 && r->tag[23] == GP_T_NONE) {
+            /* a step (nreal 1): the conv and the scan in one kernel, the conv's state rows with the norm */
+            k_nm_mamba1<<<(unsigned)heads, 256, 0, s>>>(dr, denv);
+            k_nm_gnorm<true><<<(unsigned)groups, 256, 0, s>>>(dr, denv);
+            break;
+        }
+        k_nm_conv<<<(unsigned)cdiv(conv, 256), 256, 0, s>>>(dr, denv);
+        k_nm_scan<<<(unsigned)cdiv(heads * hdim, 4), 128, 0, s>>>(dr, denv);
+        k_nm_gnorm<false><<<(unsigned)(t * groups), 256, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_RELU2:
+        k_nm_relu2<<<(unsigned)cdiv(hlit(r, 2, &bad), 256), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_ATTN: {
+        int64_t hd = hlit(r, 6, &bad);
+        if (hd % 32 != 0 || hd > 256) {
+            bad = 1;
+            break;
+        }
+        k_nm_attn<<<(unsigned)cdiv(hlit(r, 7, &bad) * hlit(r, 4, &bad), 4), 128, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_NM_SPLIT:
+        k_nm_split<<<1, 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_HOT_MOE: {
+        int64_t k = hlit(r, 9, &bad), L = hlit(r, 10, &bad), inner = hlit(r, 11, &bad), t = hlit(r, 12, &bad);
+        if (L % 256 != 0 || inner % 256 != 0) {
+            bad = 1;
+            break;
+        }
+        if (r->tag[13] != GP_T_NONE && t >= 2 && t <= NM_HG && t * k <= 128 && nm_hg_on() && !gg_nm_hg_off) {
+            /* a small group by expert (k_nm_hg_*: each expert's rows decoded once for its pairs) */
+            k_nm_hot_qx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+            switch (nm_hg_form()) {
+            case 22: nm_hg_launch<2, 2>(t, k, L, inner, s, dr, denv); break;
+            case 24: nm_hg_launch<2, 4>(t, k, L, inner, s, dr, denv); break;
+            case 44: nm_hg_launch<4, 4>(t, k, L, inner, s, dr, denv); break;
+            case 82: nm_hg_launch<8, 2>(t, k, L, inner, s, dr, denv); break;
+            case 81: nm_hg_launch<8, 1>(t, k, L, inner, s, dr, denv); break;
+            default: nm_hg_launch<4, 2>(t, k, L, inner, s, dr, denv); break;
+            }
+            k_nm_hg_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            break;
+        } else if (r->tag[13] != GP_T_NONE) {
+            /* int8 x and act (dp4a) */
+            k_nm_hot_qx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+            k_nm_hot_up8<<<dim3((unsigned)cdiv(inner, 4 * NM_HR), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
+            k_nm_hot_qa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
+            /* (the sum of the slots in it) */
+            if (k > NM_KMAX || L % NM_HR != 0 || inner % NM_HR != 0) {
+                bad = 1;
+                break;
+            }
+            k_nm_hot_down8<<<dim3((unsigned)(L / NM_HR), (unsigned)t), (unsigned)(32 * k), 0, s>>>(dr, denv);
+        } else {
+            k_nm_hot_up<<<dim3((unsigned)cdiv(inner, 4), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
+            k_nm_hot_down<<<dim3((unsigned)cdiv(L, 4), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
+            k_nm_hot_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+        }
+        if (r->tag[19] == GP_T_SLOT || (r->tag[19] == GP_T_INT && r->v[19] != 0)) {
+            /* (the sums as NM_QX's x too: here a kernel of its own) */
+            k_nm_hot_oq<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+        }
+        break;
+    }
+    case GP_NM_KV:
+        k_nm_kv<<<(unsigned)cdiv(hlit(r, 5, &bad) * hlit(r, 4, &bad), 256), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_ATTN2: {
+        int64_t nq = hlit(r, 4, &bad), nk = hlit(r, 5, &bad), t = hlit(r, 7, &bad);
+        if (hlit(r, 6, &bad) != NM_HD || nq != NM_QH * nk || (t * nm_nch((int)t) > NM_PARTS && t < NM_PARTS)) {
+            bad = 1;
+            break;
+        }
+        k_nm_attn2<<<dim3((unsigned)nm_nch((int)t), (unsigned)nk, (unsigned)t), 256, 0, s>>>(dr, denv);
+        k_nm_attn_merge<<<dim3((unsigned)nq, (unsigned)t), NM_HD, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_NM_GROUP_MOE: {
+        int64_t k = hlit(r, 13, &bad), L = hlit(r, 14, &bad), inner = hlit(r, 15, &bad);
+        int64_t t = hlit(r, 16, &bad), E = hlit(r, 17, &bad);
+        if (L % 256 != 0 || L > 1024 || inner % 256 != 0 || inner > 256 * NM_GMAXB || E > 4096) {
+            bad = 1;
+            break;
+        }
+        k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+        k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+        {
+            /* the tiles (k_nm_gtile): the raw rows of 32 of an expert in shared memory once */
+            const int x2 = r->tag[19] != GP_T_NONE && hlit(r, 19, &bad) != 0;
+            const size_t su = nm_gtile_smem((int)L), sd = nm_gtile_smem((int)inner);
+            dim3 gu((unsigned)E, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)E, (unsigned)cdiv(L, GM_BM));
+            if (nm_tc_on()) {
+                if (x2) {
+                    k_nm_gtile_tc<false, true><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
+                    k_nm_gtile_tc<true, true><<<gd, 256, sd, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile_tc<false, false><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
+                    k_nm_gtile_tc<true, false><<<gd, 256, sd, s>>>(dr, denv);
+                }
+            } else if (x2) {
+                k_nm_gtile<false, true><<<gu, 256, su, s>>>(dr, denv);
+                k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
+                k_nm_gtile<true, true><<<gd, 256, sd, s>>>(dr, denv);
+            } else {
+                k_nm_gtile<false, false><<<gu, 256, su, s>>>(dr, denv);
+                k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
+                k_nm_gtile<true, false><<<gd, 256, sd, s>>>(dr, denv);
+            }
+        }
+        k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_NM_GEMM8: {
+        /* (RECLANK_NM_KS: the column shares of k_nm_gemm8_tc8, a test) */
+        /* q, s, w, type, rows, cols, t, out (kernels/nemotron/nm.cu) */
+        int64_t type = hlit(r, 3, &bad), rows = hlit(r, 4, &bad), cols = hlit(r, 5, &bad), t = hlit(r, 6, &bad);
+        dim3 gr((unsigned)cdiv(rows, G8_BM), (unsigned)cdiv(t, G8_BN));
+        const int x2 = r->tag[8] != GP_T_NONE && hlit(r, 8, &bad) != 0;
+        if (cols % (type == KQ_IQ2R ? 256 : 32) != 0) {
+            bad = 1;
+        } else if (nm_tc_on() && t <= 8 && cols % 128 == 0 && (type == KQ_NV4 || type == KQ_IQ2R || type == KQ_Q8_0)) {
+            /* rows on at most 8 tokens: k_nm_t8v (the weights streamed; the column shares of
+             * nm_t8_ks), else k_nm_t8 */
+            bool done = false;
+            if (nm_t8v_on()) {
+                if (type == KQ_NV4) {
+                    done = x2 ? nm_t8v_launch<KQ_NV4, true>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n)
+                              : nm_t8v_launch<KQ_NV4, false>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n);
+                } else if (type == KQ_IQ2R) {
+                    done = x2 ? nm_t8v_launch<KQ_IQ2R, true>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n)
+                              : nm_t8v_launch<KQ_IQ2R, false>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n);
+                } else {
+                    done = x2 ? nm_t8v_launch<KQ_Q8_0, true>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n)
+                              : nm_t8v_launch<KQ_Q8_0, false>(rows, cols, t, s, dr, denv, g->nv8, g->nv8_n);
+                }
+            }
+            if (done) {
+                break;
+            }
+            const int64_t blocks = cdiv(rows, NV8_BM);
+            int ks = blocks >= 120 ? 1 : blocks >= 60 ? 2 : 4;
+            float *part = g->nv8;
+            if ((size_t)ks * t * rows > g->nv8_n) {
+                ks = 1;
+            }
+            dim3 gv((unsigned)blocks, (unsigned)ks);
+            if (type == KQ_NV4) {
+                if (x2) k_nm_t8<KQ_NV4, true><<<gv, 256, 0, s>>>(dr, denv, part);
+                else k_nm_t8<KQ_NV4, false><<<gv, 256, 0, s>>>(dr, denv, part);
+            } else if (type == KQ_IQ2R) {
+                if (x2) k_nm_t8<KQ_IQ2R, true><<<gv, 256, 0, s>>>(dr, denv, part);
+                else k_nm_t8<KQ_IQ2R, false><<<gv, 256, 0, s>>>(dr, denv, part);
+            } else {
+                if (x2) k_nm_t8<KQ_Q8_0, true><<<gv, 256, 0, s>>>(dr, denv, part);
+                else k_nm_t8<KQ_Q8_0, false><<<gv, 256, 0, s>>>(dr, denv, part);
+            }
+            if (ks > 1) {
+                k_nm_t8_sum<<<(unsigned)cdiv(t * rows, 256), 256, 0, s>>>(dr, denv, part, ks);
+            }
+        } else if (!nm_tc_on() && t <= 8 && nm_t8d_on() && (type != KQ_IQ2R || cols % 256 == 0)) {
+            /* no tensor cores (Pascal): a group of at most 8 tokens with dp4a, the blocks of a lane
+             * decoded once for all the tokens (k_nm_t8d; RECLANK_NM_T8D: the rows of a warp) */
+            const int R8 = nm_t8d_on();
+            const unsigned nbk = (unsigned)cdiv(rows, 8 * R8), cap = (unsigned)(nv4_sms() * 8);
+            const unsigned nb8 = nbk < cap ? nbk : cap;
+            if (type == KQ_NV4) {
+                if (R8 == 1) k_nm_t8d<KQ_NV4, 1><<<nb8, 256, 0, s>>>(dr, denv);
+                else if (R8 == 4) k_nm_t8d<KQ_NV4, 4><<<nb8, 256, 0, s>>>(dr, denv);
+                else k_nm_t8d<KQ_NV4, 2><<<nb8, 256, 0, s>>>(dr, denv);
+            } else if (type == KQ_IQ2R) {
+                if (R8 == 1) k_nm_t8d<KQ_IQ2R, 1><<<nb8, 256, 0, s>>>(dr, denv);
+                else if (R8 == 4) k_nm_t8d<KQ_IQ2R, 4><<<nb8, 256, 0, s>>>(dr, denv);
+                else k_nm_t8d<KQ_IQ2R, 2><<<nb8, 256, 0, s>>>(dr, denv);
+            } else {
+                if (R8 == 1) k_nm_t8d<KQ_Q8_0, 1><<<nb8, 256, 0, s>>>(dr, denv);
+                else if (R8 == 4) k_nm_t8d<KQ_Q8_0, 4><<<nb8, 256, 0, s>>>(dr, denv);
+                else k_nm_t8d<KQ_Q8_0, 2><<<nb8, 256, 0, s>>>(dr, denv);
+            }
+        } else if (nm_tc_on() && t <= 8) {
+            /* a group of at most 8 tokens: one n8 tile */
+            /* the column shares of a row group: 4 warps a group for the narrow matrices */
+            const int64_t groups = cdiv(rows, 16);
+            const int ks = nm_ks_env() > 0 ? nm_ks_env() : groups >= 1024 ? 1 : groups >= 512 ? 2 : 4;
+            dim3 g8((unsigned)cdiv(rows, G8S_BM / ks), (unsigned)ks);
+            if (type == KQ_IQ2R) {
+                if (x2) k_nm_gemm8_tc8<KQ_IQ2R, true><<<g8, 128, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc8<KQ_IQ2R, false><<<g8, 128, 0, s>>>(dr, denv);
+            } else if (type == KQ_NV4) {
+                if (x2) k_nm_gemm8_tc8<KQ_NV4, true><<<g8, 128, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc8<KQ_NV4, false><<<g8, 128, 0, s>>>(dr, denv);
+            } else if (type == KQ_Q8_0) {
+                if (x2) k_nm_gemm8_tc8<KQ_Q8_0, true><<<g8, 128, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc8<KQ_Q8_0, false><<<g8, 128, 0, s>>>(dr, denv);
+            } else {
+                bad = 1;
+            }
+        } else if (nm_tc_on()) {
+            /* the tensor cores (sm_80 up) */
+            if (type == KQ_IQ2R) {
+                if (x2) k_nm_gemm8_tc<KQ_IQ2R, true><<<gr, 256, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc<KQ_IQ2R, false><<<gr, 256, 0, s>>>(dr, denv);
+            } else if (type == KQ_NV4) {
+                if (x2) k_nm_gemm8_tc<KQ_NV4, true><<<gr, 256, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc<KQ_NV4, false><<<gr, 256, 0, s>>>(dr, denv);
+            } else if (type == KQ_Q8_0) {
+                if (x2) k_nm_gemm8_tc<KQ_Q8_0, true><<<gr, 256, 0, s>>>(dr, denv);
+                else k_nm_gemm8_tc<KQ_Q8_0, false><<<gr, 256, 0, s>>>(dr, denv);
+            } else {
+                bad = 1;
+            }
+        } else if (r->tag[8] != GP_T_NONE && hlit(r, 8, &bad) != 0) {
+            /* x as two int8 planes (operand 8: the low one) */
+            if (type == KQ_IQ2R) {
+                k_nm_gemm8k<KQ_IQ2R, true><<<gr, 256, 0, s>>>(dr, denv);
+            } else if (type == KQ_NV4) {
+                k_nm_gemm8k<KQ_NV4, true><<<gr, 256, 0, s>>>(dr, denv);
+            } else if (type == KQ_Q8_0) {
+                k_nm_gemm8k<KQ_Q8_0, true><<<gr, 256, 0, s>>>(dr, denv);
+            } else {
+                bad = 1;
+            }
+        } else if (type == KQ_IQ2R) {
+            k_nm_gemm8k<KQ_IQ2R, false><<<gr, 256, 0, s>>>(dr, denv);
+        } else if (type == KQ_NV4) {
+            k_nm_gemm8k<KQ_NV4, false><<<gr, 256, 0, s>>>(dr, denv);
+        } else if (type == KQ_Q8_0) {
+            k_nm_gemm8k<KQ_Q8_0, false><<<gr, 256, 0, s>>>(dr, denv);
+        } else {
+            bad = 1;
+        }
+        break;
+    }
+    case GP_NM_QX:
+        k_nm_qx<<<(unsigned)cdiv(hlit(r, 1, &bad) * hlit(r, 2, &bad) / 32, 128), 128, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_DPREP: {
+        /* (no q: a null address) */
+        const int64_t nh = (r->tag[0] == GP_T_NONE || hlit(r, 0, &bad) == 0 ? 0 : hlit(r, 9, &bad)) + hlit(r, 10, &bad);
+        const int64_t hd = hlit(r, 11, &bad);
+        if (hd > 512 || hd % 32 != 0) {
+            bad = 1;
+            break;
+        }
+        k_nm_dprep<<<(unsigned)(hlit(r, 8, &bad) * nh), (unsigned)hd, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_NM_DATTN:
+        if (hlit(r, 8, &bad) != 128 || hlit(r, 11, &bad) + hlit(r, 5, &bad) > NM_DWIN) {
+            bad = 1;
+            break;
+        }
+        k_nm_dattn<<<(unsigned)(hlit(r, 5, &bad) * hlit(r, 6, &bad)), 128, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_DCONV:
+        k_nm_dconv<<<(unsigned)cdiv(hlit(r, 4, &bad) * hlit(r, 5, &bad), 256), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_LTOPK:
+        if (hlit(r, 3, &bad) > NM_LK) {
+            bad = 1;
+            break;
+        }
+        k_nm_ltopk<<<(unsigned)hlit(r, 1, &bad), 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_LATT:
+        if (hlit(r, 3, &bad) > NM_LN || hlit(r, 5, &bad) > 128) {
+            bad = 1;
+            break;
+        }
+        k_nm_latt<<<dim3((unsigned)hlit(r, 3, &bad), (unsigned)hlit(r, 4, &bad)), 128, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_LROWS:
+        k_nm_lrows<<<(unsigned)cdiv(hlit(r, 4, &bad) * hlit(r, 5, &bad), 256), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_LCAT:
+        k_nm_lcat<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad), 256), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_LSCORE:
+        if (hlit(r, 5, &bad) > NM_LK) {
+            bad = 1;
+            break;
+        }
+        k_nm_lscore<<<(unsigned)hlit(r, 4, &bad), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_ADDNORM:
+        k_nm_addnorm<<<(unsigned)hlit(r, 5, &bad), 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_IQ2_LIN:
+        if (hlit(r, 4, &bad) % 256 != 0) {
+            bad = 1;
+            break;
+        }
+        if (hlit(r, 5, &bad) > MT_MAX && hlit(r, 4, &bad) <= 256 * NM_LMAXB) {
+            k_nm_iq2_gemm<<<(unsigned)cdiv(hlit(r, 3, &bad), NM_GROWS), 256, 0, s>>>(dr, denv);
+        } else if (nm_q2_form() == 0) {
+            k_nm_iq2_lin<<<(unsigned)cdiv(hlit(r, 3, &bad), 4 * NM_LR), 128, 0, s>>>(dr, denv);
+        } else {
+            /* (RECLANK_NM_Q2 = R U B: the rows of a warp, the chunks in flight, the blocks an SM; a test) */
+            const int f = nm_q2_form() % 1000, R = f / 100, U = (f / 10) % 10, B = f % 10;
+            const bool x2 = r->tag[7] == GP_T_SLOT || (r->tag[7] == GP_T_INT && r->v[7] != 0);    /* (none: T_INT 0) */
+            unsigned nb = (unsigned)cdiv(hlit(r, 3, &bad), 8 * R), cap = (unsigned)(nv4_sms() * B);
+            nb = nb < cap || B == 0 ? nb : cap;
+#define Q2L(RR, UU) else if (R == RR && U == UU) nm_q2_lin_launch<RR, UU>(x2, nb, s, dr, denv)
+            if (0) {}
+            Q2L(1, 1); Q2L(1, 2); Q2L(1, 4); Q2L(2, 1); Q2L(2, 2); Q2L(2, 4); Q2L(4, 1); Q2L(4, 2); Q2L(8, 1);
+            else bad = 1;
+#undef Q2L
+        }
+        break;
+    case GP_ROUTER_SIG:
+        if (hlit(r, 2, &bad) > 1024 || hlit(r, 3, &bad) > 32) {
+            bad = 1;
+        }
+        if (hlit(r, 2, &bad) > 128) {
+            k_router_sig_b<<<(unsigned)hlit(r, 1, &bad), 256, 0, s>>>(dr, denv);
+        } else {
+            k_router_sig<<<(unsigned)hlit(r, 1, &bad), 32, 0, s>>>(dr, denv);
+        }
         break;
     case GP_ATTN_PREP: {
         int64_t hd = hlit(r, 14, &bad);
@@ -1215,7 +1737,14 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             /* a large group with no log: the parallel forms */
             k_gdn_conv_par<<<dim3((unsigned)cdiv(cd, T), (unsigned)t), T, 0, s>>>(dr, denv);
             k_gdn_prep<128><<<dim3((unsigned)t, (unsigned)(kh + 2)), 128, 0, s>>>(dr, denv);
-            if (gs == 4) {
+            if (hlit(r, 20, &bad) & 4) {
+                /* KDA: the decay of each channel */
+                if (gs == 4) {
+                    k_gdn_scan<128, 4, true, 16><<<dim3((unsigned)vh, 4), 128, 0, s>>>(dr, denv);
+                } else {
+                    k_gdn_scan<128, 8, true, 16><<<dim3((unsigned)vh, 8), 128, 0, s>>>(dr, denv);
+                }
+            } else if (gs == 4) {
                 k_gdn_scan<128, 4><<<dim3((unsigned)vh, 4), 128, 0, s>>>(dr, denv);
             } else {
                 k_gdn_scan<128, 8><<<dim3((unsigned)vh, 8), 128, 0, s>>>(dr, denv);
@@ -1254,8 +1783,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     case GP_MOE_COMBINE: {
         /* the routed experts of the GPU (its de) and the rows of the CPU */
+        /* (the contract's combine unless operand 12 says the experts are not its: FP4-Local's MTP
+         * layer from the BF12 file) */
         int64_t t = hlit(r, 9, &bad), hidden = hlit(r, 8, &bad);
-        k_moe_combine<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
+        const int plain = r->tag[12] != GP_T_NONE && hlit(r, 12, &bad) != 0;
+        k_moe_combine<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv,
+                                                                            plain ? 0 : (gg_moe_rot >> 2) & 1);
         break;
     }
     case GP_DS_MXX_LINEAR: {
@@ -1276,6 +1809,70 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             (float *)(intptr_t)hi(r, g->henv, 2), (int)rows);
         break;
     }
+    case GP_F16_GLINEAR: {
+        /* x (t x groups cols), w (float16), out (t x rows), rows, cols, t, groups */
+        int64_t rows = hlit(r, 3, &bad), cols = hlit(r, 4, &bad), t = hlit(r, 5, &bad);
+        int64_t groups = hlit(r, 6, &bad) > 1 ? hlit(r, 6, &bad) : 1;
+        if (bad || cols % F16G_BK != 0 || cols % 8 != 0 || rows % groups != 0 ||
+            (groups > 1 && (rows / groups) % F16G_BM != 0)) {
+            bad = 1;
+            break;
+        }
+        if (t > 8) {
+            k_f16g_tile<<<dim3((unsigned)cdiv(rows, F16G_BM), (unsigned)cdiv(t, F16G_BN)), 256, 0, s>>>(dr, denv);
+        } else if (t > 4) {
+            k_f16g_gemv<8><<<(unsigned)cdiv(rows, 8), 256, 0, s>>>(dr, denv);
+        } else if (t > 1) {
+            k_f16g_gemv<4><<<(unsigned)cdiv(rows, 8), 256, 0, s>>>(dr, denv);
+        } else {
+            k_f16g_gemv<1><<<(unsigned)cdiv(rows, 8), 256, 0, s>>>(dr, denv);
+        }
+        break;
+    }
+    case GP_GLM_POOL: {
+        /* (operand indices of GP_DS_COMPRESS for k_ds_compress_state) */
+        int64_t t = hlit(r, 10, &bad), hd = hlit(r, 8, &bad), ratio = hlit(r, 7, &bad);
+        bad |= hd > 512 || hd % 32 != 0 || ratio > 8 || ratio < 1;
+        if (bad) {
+            break;
+        }
+        k_glm_ln<<<(unsigned)t, (unsigned)hd, 0, s>>>(dr, denv);
+        k_glm_pool<<<(unsigned)(t / ratio + 1), (unsigned)hd, 0, s>>>(dr, denv);
+        k_ds_compress_state<<<1, (unsigned)hd, 0, s>>>(dr, denv);
+        break;
+    }
+    case GP_GLM_HC_MIX:
+        bad |= hlit(r, 8, &bad) % GLM_HC_NCH != 0;
+        k_glm_hc_part<<<dim3(GLM_HC_NCH, (unsigned)hlit(r, 7, &bad)), 256, 0, s>>>(dr, denv);
+        k_glm_hc_coef<<<(unsigned)hlit(r, 7, &bad), 32, 0, s>>>(dr, denv);
+        break;
+    case GP_GLM_HC_POST:
+        k_glm_hc_post<<<dim3((unsigned)cdiv(hlit(r, 5, &bad), 256), (unsigned)hlit(r, 4, &bad)), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_GLM_ROPE:
+        k_glm_rope<<<(unsigned)hlit(r, 2, &bad), 128, 0, s>>>(dr, denv);
+        break;
+    case GP_GLM_RING_PUT:
+        k_glm_ring_put<<<dim3((unsigned)cdiv(hlit(r, 5, &bad), 1024), (unsigned)hlit(r, 3, &bad)), 256, 0, s>>>(dr, denv);
+        break;
+    case GP_GLM_DSP_ATTN:
+        bad |= hlit(r, 9, &bad) != 64 || hlit(r, 7, &bad) + hlit(r, 10, &bad) > GLM_DSP_MAXK;
+        k_glm_dsp_attn<<<dim3((unsigned)hlit(r, 8, &bad), (unsigned)cdiv(hlit(r, 10, &bad), GLM_DSP_QB)), 256, 0, s>>>(
+            dr, denv);
+        break;
+    case GP_GLM_ATTN:
+        /* q, lat (bfloat16), sel, cnt, out, H, hd, scale, maxk, t */
+        bad |= hlit(r, 5, &bad) != 64 || hlit(r, 6, &bad) != 512 || !gg_caps.tc;
+        if (bad) {
+            break;
+        }
+        cudaFuncSetAttribute(k_glm_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GA_SMEM);
+        k_glm_attn_tc<<<(unsigned)hlit(r, 9, &bad), 256, GA_SMEM, s>>>(dr, denv);
+        break;
+    case GP_GLM_EXPAND:
+        bad |= hlit(r, 6, &bad) * hlit(r, 5, &bad) + hlit(r, 5, &bad) - 1 > hlit(r, 7, &bad);
+        k_glm_expand<<<(unsigned)hlit(r, 8, &bad), 256, 0, s>>>(dr, denv);
+        break;
     case GP_DS_FP8_LINEAR: {
         /* x (t x groups cols float32), codes, scales, out (t x rows), rows, cols, t,
          * groups (0 or 1: one) */
@@ -1336,12 +1933,20 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         bad |= hlit(r, 4, &bad) % 4 != 0;
         break;
     case GP_DS_HC_PRE:
-        k_ds_hc_pre<<<(unsigned)hlit(r, 6, &bad), 1024, 0, s>>>(dr, denv);
+        /* (with operand 14, coef: t blocks more for the post's coefficients) */
+        k_ds_hc_pre<<<(unsigned)hlit(r, 6, &bad) * (r->tag[14] != GP_T_NONE && r->v[14] != 0 ? 2 : 1), 1024, 0,
+                      s>>>(dr, denv);
         break;
     case GP_DS_HC_POST:
         k_ds_hc_post<<<dim3((unsigned)cdiv(hlit(r, 8, &bad), 256), (unsigned)hlit(r, 7, &bad)), 256, 0, s>>>(dr,
                                                                                                            denv);
         break;
+    case GP_DS_HC_STEP: {
+        int64_t dim = hlit(r, 19, &bad);
+        bad |= dim % DS_HCS_C != 0 || dim / DS_HCS_C > DS_HCS_NB;
+        k_ds_hc_step<<<dim3((unsigned)(dim / DS_HCS_C), (unsigned)hlit(r, 18, &bad)), DS_HCS_T, 0, s>>>(dr, denv);
+        break;
+    }
     case GP_DS_ROPE:
         k_ds_rope<<<dim3((unsigned)hlit(r, 5, &bad), (unsigned)hlit(r, 4, &bad)), (unsigned)hlit(r, 7, &bad) / 2, 0,
                     s>>>(dr, denv);
@@ -1418,10 +2023,19 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_ds_attn<<<dim3((unsigned)(hlit(r, 9, &bad) / DS_AHB), (unsigned)hlit(r, 14, &bad)), 256, 0, s>>>(dr,
                                                                                                           denv);
         break;
-    case GP_DS_ROUTER:
+    case GP_DS_ROUTER: {
         bad |= hlit(r, 5, &bad) > 512 || hlit(r, 6, &bad) > 16;
+        const gp_rec *n1 = r + 1, *n2 = r + 2;
+        if (hlit(r, 4, &bad) == 1 && n2 < g->hcode + g->n_code && n1->op == GP_HOT_SPLIT &&
+            n2->op == GP_SIGNAL && hi(n1, g->henv, 0) == hi(r, g->henv, 2) && ds_route_fuse_on()) {
+            /* a step: the router, the hot split and the signal in one kernel */
+            k_ds_route_signal<<<1, 256, 0, s>>>(dr, denv, dr + 1, dr + 2);
+            gg_skip = n2;
+            break;
+        }
         k_ds_router<<<(unsigned)hlit(r, 4, &bad), 256, 0, s>>>(dr, denv);
         break;
+    }
     case GP_DS_SWIGLU:
         k_ds_swiglu<<<(unsigned)cdiv(hlit(r, 3, &bad), 256), 256, 0, s>>>(dr, denv);
         break;
@@ -1520,12 +2134,28 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         unsigned pairs = (unsigned)hlit(r, 11, &bad) * t + t;
         int64_t inner = hlit(r, 12, &bad), hidden = hlit(r, 13, &bad);
         unsigned tk = (unsigned)hlit(r, 11, &bad) * t;
+        if (kq_e3_k((int)hlit(r, 14, &bad)) && kq_e3_k((int)hlit(r, 15, &bad))) {
+            /* MUL1 experts (kernels/quant/exl3.cu): batches of products */
+            const int shared = hi(r, g->henv, 17) != 0;
+            const int Ks = shared ? kq_e3_k((int)hlit(r, 20, &bad)) : 1;
+            if (bad || !Ks || r->tag[22] != GP_T_NONE ||
+                e3_hot_moe_launch(dr, denv, (int)t, (int)hlit(r, 11, &bad), (int)hidden, (int)inner,
+                                  kq_e3_k((int)hlit(r, 14, &bad)), kq_e3_k((int)hlit(r, 15, &bad)), Ks, shared,
+                                  (const float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 7),
+                                  (const float *)(intptr_t)hi(r, g->henv, 8), (float *)(intptr_t)hi(r, g->henv, 9),
+                                  hi(r, g->henv, 10) != 0, gg_moe_rot, g->e3, g->e3_n, s) != 0) {
+                bad = 1;
+            }
+            break;
+        }
         if (kqh_nvx_on() && hlit(r, 14, &bad) == KQ_NVX && hlit(r, 15, &bad) == KQ_NVX &&
             inner % 16 == 0 && hidden % 16 == 0) {
             /* the KQ_NVX experts with a block for each group (k_kqh_nvx),
              * the shared expert (pairs tk on) with k_kqh_gu and k_kqh_dn;
              * on int8 or int16 x, the operations of the CPU (k_kqh_nvx_q) */
-            const int nx = kqh_x_mode();
+            /* the contract of FP4-Local (gg_moe_rot 4): float32 x, k_kqh_nvx */
+            const int ct = (gg_moe_rot >> 2) & 1;
+            const int nx = ct ? 0 : kqh_x_mode();
             if (nx > 0 && hidden % 32 == 0 && inner % 32 == 0 && hidden / 32 <= KQH_NVX_NB &&
                 inner / 32 <= KQH_NVX_NB && (size_t)t * hidden <= g->kqx_n &&
                 (size_t)pairs * inner <= g->kqx_n && (nx == 1 || g->kqx_lo)) {
@@ -1561,15 +2191,24 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 }
                 break;
             }
-            k_kqh_nvx<8><<<dim3((unsigned)(inner / 16), tk, 2), 32 * 8, 0, s>>>(dr, denv, 0);
+            if (ct && hidden / 16 <= KQH_CT_NH && inner / 16 <= KQH_CT_NH) {
+                /* the contract with the operations of the CPU (k_kqh_nvx_ct) */
+                k_kqh_nvx_ct<<<dim3((unsigned)(inner / 16), tk, 2), KQH_CT_T, 0, s>>>(dr, denv, 0);
+            } else {
+                k_kqh_nvx<8><<<dim3((unsigned)(inner / 16), tk, 2), 32 * 8, 0, s>>>(dr, denv, 0, ct);
+            }
             k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), t, 2), W, 0, s>>>(dr, denv,
                                                                                  (int)tk);
             k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot);
-            k_kqh_nvx<4><<<dim3((unsigned)(hidden / 16), tk, 1), 32 * 4, 0, s>>>(dr, denv, 1);
+            if (ct && hidden / 16 <= KQH_CT_NH && inner / 16 <= KQH_CT_NH) {
+                k_kqh_nvx_ct<<<dim3((unsigned)(hidden / 16), tk, 1), KQH_CT_T, 0, s>>>(dr, denv, 1);
+            } else {
+                k_kqh_nvx<4><<<dim3((unsigned)(hidden / 16), tk, 1), 32 * 4, 0, s>>>(dr, denv, 1, ct);
+            }
             k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), t), W, 0, s>>>(dr, denv,
                                                                                (int)tk);
             if (hi(r, g->henv, 10) != 0) {      /* (none: GP_MOE_COMBINE sums) */
-                k_kqh_sum<<<dim3((unsigned)cdiv(hidden, T), t), T, 0, s>>>(dr, denv);
+                k_kqh_sum<<<dim3((unsigned)cdiv(hidden, T), t), T, 0, s>>>(dr, denv, ct);
             }
             break;
         }
@@ -1578,7 +2217,8 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (kx > 0 && r->tag[22] == GP_T_NONE && hidden % 32 == 0 && inner % 32 == 0 &&
             (size_t)t * hidden <= g->kqx_n && (size_t)pairs * inner <= g->kqx_n &&
             (kx == 2 ? g->kqx_lo && kq_x2_type(gt) && kq_x2_type(dt)    /* (a shared expert of another type: kq_row on float32 x) */
-                     : i8x_on() && kq_i8_type(gt) && kq_i8_type(dt) && kq_i8_type(st))) {
+                     : i8x_on() && kq_i8_type(gt) && kq_i8_type(dt) &&
+                       (kq_i8_type(st) || hi(r, g->henv, 17) == 0))) {     /* (no shared expert: LFM2) */
             /* int16 x and act as two int8 planes (kq_row_x2), or int8 (kq_rows_i8) */
             const float *xs = (const float *)(g->kqx + g->kqx_n);
             const int8_t *xl = kx == 2 ? kt_lo(g) : NULL;
@@ -1601,7 +2241,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 k_kqh_gu_i8<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), pairs, 2), W, 0, s>>>(
                     dr, denv, g->kqx, xl, xs);
             }
-            k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot);
+            k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot & ~4);     /* (the contract: KQ_NVX only) */
             if (kx == 2) {
                 kt_quant_x2(g, ax, (size_t)pairs * inner);
             } else {
@@ -1621,9 +2261,22 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             break;
         }
-        k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), pairs, 2), W, 0, s>>>(dr, denv);
-        k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot);
-        k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), pairs), W, 0, s>>>(dr, denv);
+        /* the routed pairs of Q4_K and Q5_K experts: k_kqh_k (x in registers, rows a warp);
+         * the shared expert (the pairs from tk) with k_kqh_gu and k_kqh_dn */
+        const int kk = r->tag[22] == GP_T_NONE && kqh_k_ok(gt, (int)hidden) && kqh_k_ok(dt, (int)inner);
+        if (kk) {
+            kqh_k_launch(dr, denv, gt, (int)hidden, 0, tk, inner, s);
+            k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), t, 2), W, 0, s>>>(dr, denv, (int)tk);
+        } else {
+            k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), pairs, 2), W, 0, s>>>(dr, denv);
+        }
+        k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
+        if (kk) {
+            kqh_k_launch(dr, denv, dt, (int)inner, 1, tk, hidden, s);
+            k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), t), W, 0, s>>>(dr, denv, (int)tk);
+        } else {
+            k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), pairs), W, 0, s>>>(dr, denv);
+        }
         if (hi(r, g->henv, 10) != 0) {      /* (none: GP_MOE_COMBINE sums) */
             k_kqh_sum<<<dim3((unsigned)cdiv(hidden, T), t), T, 0, s>>>(dr, denv);
         }

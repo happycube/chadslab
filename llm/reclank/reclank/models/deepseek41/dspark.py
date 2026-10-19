@@ -28,6 +28,7 @@ verify group has the bits of a step).
 """
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -39,13 +40,28 @@ from reclank.ir import program as P
 from reclank.models.deepseek41.gpu import VERIFY_MAX, _placeholder
 
 
+# the cutoff of the verify length (DSpark.choose), as the MTP drafters' RECLANK_MTP_STOP; the first
+# draft under it is verified too when its survival is at least STOP_FLOOR (RECLANK_DSPARK_STOP_FLOOR).
+# The three real prompts, 160 tokens: the rates' choice 1.11x / 0.97x / 1.21x over plain steps; 0.9
+# with the first under it always 1.08 / 0.98 / 1.21, never 1.09 / 1.04 / 1.08 (rounds of no draft:
+# the draft wasted, then plain steps), floor 0.5 1.14 / 1.04 / 1.18, floor 0.3 1.12 / 1.03 / 1.22
+STOP, STOP_FLOOR = 0.9, 0.3
+
+
 class DSpark:
     """See the module text."""
 
-    def __init__(self, g, where="cpu1"):
+    def __init__(self, g, where="cpu", stop=None):
         """where: the routed experts of the blocks on the GPU ("gpu": 7.2 GB of
-        its memory) or in the RAM of node 1, run there by a part of its CPUs
-        ("cpu1": the GPU's memory for more hot experts of the main model)."""
+        its memory), or in the RAM of both nodes, run by the teams of the main
+        model's parts ("cpu": the GPU's memory for more hot experts of the main
+        model; a draft 12.6 -> 9.5 ms against "cpu1", node 1 with its team).
+        stop: the verify length by the cutoff of the other MTP drafters
+        (speculative.mtp_stop, RECLANK_MTP_STOP; default STOP): the drafts while
+        the survival of their prefix (the product of the sigmoids of the
+        confidences) is at least stop, and the first under it when its survival
+        is at least STOP_FLOOR; 0: the length of the most expected tokens a
+        millisecond (choose)."""
         self.g = g
         self.where = where
         m = g.m
@@ -67,6 +83,9 @@ class DSpark:
         g.on_grow.append(self.drop)
         # the times of a draft and of a verify group of t tokens (ms), measured
         # as the loop runs (moving averages); the first guesses from a step
+        from reclank.core.speculative import mtp_stop
+        self.stop = mtp_stop(STOP) if stop is None else float(stop)
+        self.stop_floor = float(os.environ.get("RECLANK_DSPARK_STOP_FLOOR", STOP_FLOOR))
         self.t_draft = 12.0
         self.t_verify = {t: 63.0 + 9.0 * (t - 1) for t in range(1, VERIFY_MAX + 1)}
 
@@ -80,30 +99,47 @@ class DSpark:
 
     def _experts(self):
         """The routed experts of the blocks, whole, in KQ_MXX: on the GPU (a
-        store of E slots for each block, its map the identity), or in the RAM
-        of node 1 with a part of its CPUs (ExpertParts of one part)."""
+        store of E slots for each block, its map the identity), in the RAM of
+        both nodes as the main model's cold experts ("cpu": ExpertParts of a
+        part a node, the rows of gate and up and of down split as the
+        weightkeeper's, the teams of the main parts), or in the RAM of node 1
+        with its team ("cpu1")."""
         g, src = self.g, self.g.w.src
         H, I = src.hidden, src.inner
         self.stores, self.maps = [], []
-        if self.where == "cpu1":
+        if self.where in ("cpu", "cpu1"):
             from reclank.runtime import moe_parts, numa
-            node = moe_parts.nodes()[-1]
-            cpus = [moe_parts.part_cpus()[-1]]
-            desc = {}
+            if self.where == "cpu":
+                nds, cpus = moe_parts.nodes(), moe_parts.part_cpus()
+                nds = nds[:len(cpus)]
+                ix = g.w.z.index if getattr(g.w, "z", None) is not None else {}
+                share = ix.get("share") if len(ix.get("nodes", [])) == len(nds) else None
+                gu = moe_parts.split(I, len(nds), share=share) if len(nds) > 1 else [(0, I)]
+                dn = moe_parts.split(H, len(nds), share=share) if len(nds) > 1 else [(0, H)]
+            else:
+                nds, cpus = moe_parts.nodes()[-1:], [moe_parts.part_cpus()[-1]]
+                gu, dn = [(0, I)], [(0, H)]
+            desc = {b: [] for b in range(self.blocks)}
             self.ram = []
-            for b in range(self.blocks):
-                arr = numa.empty_on((self.E, g.per), np.uint8, node, strict=True)
-                for e in range(self.E):
-                    ex = src.expert(b, e, prefix="mtp")
-                    arr[e, :g.off3] = cops.kq_mxx_pack(*ex["w1"], I, H)[0].reshape(-1)
-                    arr[e, g.off3:g.off2] = cops.kq_mxx_pack(*ex["w3"], I, H)[0].reshape(-1)
-                    arr[e, g.off2:] = cops.kq_mxx_pack(*ex["w2"], H, I)[0].reshape(-1)
-                self.ram.append(arr)
-                base = arr.ctypes.data
-                desc[b] = [[base, cops.KQ_MXX, g.per, 0, base + g.off3, cops.KQ_MXX, g.per, 0,
-                            base + g.off2, cops.KQ_MXX, g.per, 0]]
-            self.parts = moe_parts.ExpertParts.from_desc(desc, [(0, I)], [(0, H)], self.E, H, I, cpus,
-                                                         part_nodes=[node])
+            for p, node in enumerate(nds):
+                (g0, ng), (d0, nd) = gu[p], dn[p]
+                n1, n2 = ng * (H // 32) * 17, nd * (I // 32) * 17       # (KQ_MXX: 17 bytes a 32 values)
+                per = 2 * n1 + n2
+                for b in range(self.blocks):
+                    arr = numa.empty_on((self.E, per), np.uint8, node, strict=True)
+                    for e in range(self.E):
+                        ex = src.expert(b, e, prefix="mtp")
+                        c1, s1 = ex["w1"]
+                        c3, s3 = ex["w3"]
+                        c2, s2 = ex["w2"]
+                        arr[e, :n1] = cops.kq_mxx_pack(c1[g0:g0 + ng], s1[g0:g0 + ng], ng, H)[0].reshape(-1)
+                        arr[e, n1:2 * n1] = cops.kq_mxx_pack(c3[g0:g0 + ng], s3[g0:g0 + ng], ng, H)[0].reshape(-1)
+                        arr[e, 2 * n1:] = cops.kq_mxx_pack(c2[d0:d0 + nd], s2[d0:d0 + nd], nd, I)[0].reshape(-1)
+                    self.ram.append(arr)
+                    base = arr.ctypes.data
+                    desc[b].append([base, cops.KQ_MXX, per, 0, base + n1, cops.KQ_MXX, per, 0,
+                                    base + 2 * n1, cops.KQ_MXX, per, 0])
+            self.parts = moe_parts.ExpertParts.from_desc(desc, gu, dn, self.E, H, I, cpus, part_nodes=nds)
             self.part_bufs = {}
             return
         for b in range(self.blocks):
@@ -224,8 +260,8 @@ class DSpark:
                 prog.emit(P.DS_ROUTER, lr, g.vec(f + "gate.bias"), ids_r, vals_r, bs, self.E, k, float(m.route_scale),
                           None, None)       # (drafts are text: no bias_vl)
                 sx = f + "shared_experts."
-                if self.where == "cpu1":
-                    # the routed experts in the part of node 1 while the GPU does the shared one
+                if self.where in ("cpu", "cpu1"):
+                    # the routed experts in the parts while the GPU does the shared one
                     fl = pinned((2,), np.int64)
                     fl[:] = 0
                     prog.keep.append(fl)
@@ -330,11 +366,19 @@ class DSpark:
 
     # ---- the loop
     def choose(self, conf):
-        """The verify length: the most expected tokens a millisecond, from the
+        """The verify length: with stop, the drafts while the survival of their
+        prefix is at least stop (the rule of the MTP drafters) and the first under
+        it when its survival is at least the floor; else the most expected tokens a millisecond, from the
         survival of each prefix (the product of the sigmoids of the
         confidences) and the measured times."""
         p = 1.0 / (1.0 + np.exp(-conf.astype(np.float64)))
         surv = np.cumprod(p)
+        if self.stop > 0:
+            n = min(len(conf), VERIFY_MAX - 1)
+            L = 0
+            while L < n and surv[L] >= self.stop:
+                L += 1
+            return L + 1 if L < n and surv[L] >= self.stop_floor else L
         best, bl = 1.0 / (self.t_draft + self.t_verify[1]), 0
         for L in range(1, len(conf) + 1):
             if L + 1 > VERIFY_MAX:

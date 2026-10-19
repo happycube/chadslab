@@ -53,10 +53,10 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
             for (int jt = 0; jt < NT; ++jt) {
                 if (jt < t) {
                     uint4 xv = *(const uint4 *)(xq + (size_t)jt * cols + b * 32 + 16 * hf);
-                    int si = __dp4a((int)qw[0], (int)xv.x, 0);
-                    si = __dp4a((int)qw[1], (int)xv.y, si);
-                    si = __dp4a((int)qw[2], (int)xv.z, si);
-                    si = __dp4a((int)qw[3], (int)xv.w, si);
+                    int si = rc_dp4a((int)qw[0], (int)xv.x, 0);
+                    si = rc_dp4a((int)qw[1], (int)xv.y, si);
+                    si = rc_dp4a((int)qw[2], (int)xv.z, si);
+                    si = rc_dp4a((int)qw[3], (int)xv.w, si);
                     sum[jt] += (float)si * (d * xs[jt * np + b]);
                 }
             }
@@ -81,14 +81,14 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
             for (int jt = 0; jt < NT; ++jt) {
                 if (jt < t) {
                     uint4 xv = *(const uint4 *)(xq + (size_t)jt * cols + b * 32 + 16 * hf);
-                    int si = __dp4a((int)qw[0], (int)xv.x, 0);
-                    si = __dp4a((int)qw[1], (int)xv.y, si);
-                    si = __dp4a((int)qw[2], (int)xv.z, si);
-                    si = __dp4a((int)qw[3], (int)xv.w, si);
-                    int sx = __dp4a(0x01010101, (int)xv.x, 0);
-                    sx = __dp4a(0x01010101, (int)xv.y, sx);
-                    sx = __dp4a(0x01010101, (int)xv.z, sx);
-                    sx = __dp4a(0x01010101, (int)xv.w, sx);
+                    int si = rc_dp4a((int)qw[0], (int)xv.x, 0);
+                    si = rc_dp4a((int)qw[1], (int)xv.y, si);
+                    si = rc_dp4a((int)qw[2], (int)xv.z, si);
+                    si = rc_dp4a((int)qw[3], (int)xv.w, si);
+                    int sx = rc_dp4a(0x01010101, (int)xv.x, 0);
+                    sx = rc_dp4a(0x01010101, (int)xv.y, sx);
+                    sx = rc_dp4a(0x01010101, (int)xv.z, sx);
+                    sx = rc_dp4a(0x01010101, (int)xv.w, sx);
                     sum[jt] += (float)(si - 8 * sx) * (d * xs[jt * np + b]);
                 }
             }
@@ -131,22 +131,22 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
                     const int8_t *xj = xq + (size_t)jt * cols;
                     uint4 xl = *(const uint4 *)(xj + base), xh = *(const uint4 *)(xj + base + 32);
                     float sl = xs[jt * np + base / 32], sh = xs[jt * np + base / 32 + 1];
-                    int dl = __dp4a((int)lo[0], (int)xl.x, 0);
-                    dl = __dp4a((int)lo[1], (int)xl.y, dl);
-                    dl = __dp4a((int)lo[2], (int)xl.z, dl);
-                    dl = __dp4a((int)lo[3], (int)xl.w, dl);
-                    int dh = __dp4a((int)hi[0], (int)xh.x, 0);
-                    dh = __dp4a((int)hi[1], (int)xh.y, dh);
-                    dh = __dp4a((int)hi[2], (int)xh.z, dh);
-                    dh = __dp4a((int)hi[3], (int)xh.w, dh);
-                    int nl = __dp4a(0x01010101, (int)xl.x, 0);
-                    nl = __dp4a(0x01010101, (int)xl.y, nl);
-                    nl = __dp4a(0x01010101, (int)xl.z, nl);
-                    nl = __dp4a(0x01010101, (int)xl.w, nl);
-                    int nh = __dp4a(0x01010101, (int)xh.x, 0);
-                    nh = __dp4a(0x01010101, (int)xh.y, nh);
-                    nh = __dp4a(0x01010101, (int)xh.z, nh);
-                    nh = __dp4a(0x01010101, (int)xh.w, nh);
+                    int dl = rc_dp4a((int)lo[0], (int)xl.x, 0);
+                    dl = rc_dp4a((int)lo[1], (int)xl.y, dl);
+                    dl = rc_dp4a((int)lo[2], (int)xl.z, dl);
+                    dl = rc_dp4a((int)lo[3], (int)xl.w, dl);
+                    int dh = rc_dp4a((int)hi[0], (int)xh.x, 0);
+                    dh = rc_dp4a((int)hi[1], (int)xh.y, dh);
+                    dh = rc_dp4a((int)hi[2], (int)xh.z, dh);
+                    dh = rc_dp4a((int)hi[3], (int)xh.w, dh);
+                    int nl = rc_dp4a(0x01010101, (int)xl.x, 0);
+                    nl = rc_dp4a(0x01010101, (int)xl.y, nl);
+                    nl = rc_dp4a(0x01010101, (int)xl.z, nl);
+                    nl = rc_dp4a(0x01010101, (int)xl.w, nl);
+                    int nh = rc_dp4a(0x01010101, (int)xh.x, 0);
+                    nh = rc_dp4a(0x01010101, (int)xh.y, nh);
+                    nh = rc_dp4a(0x01010101, (int)xh.z, nh);
+                    nh = rc_dp4a(0x01010101, (int)xh.w, nh);
                     sum[jt] += d * ((float)(s0 * dl) * sl + (float)(s1 * dh) * sh) -
                                dm * ((float)(m0 * nl) * sl + (float)(m1 * nh) * sh);
                 }
@@ -181,14 +181,14 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
                 if (jt < t) {
                     const int8_t *xj = xq + (size_t)jt * cols;
                     uint4 xl = *(const uint4 *)(xj + base), xh = *(const uint4 *)(xj + base + 64);
-                    int dl = __dp4a((int)cl[0], (int)xl.x, 0);
-                    dl = __dp4a((int)cl[1], (int)xl.y, dl);
-                    dl = __dp4a((int)cl[2], (int)xl.z, dl);
-                    dl = __dp4a((int)cl[3], (int)xl.w, dl);
-                    int dh = __dp4a((int)ch[0], (int)xh.x, 0);
-                    dh = __dp4a((int)ch[1], (int)xh.y, dh);
-                    dh = __dp4a((int)ch[2], (int)xh.z, dh);
-                    dh = __dp4a((int)ch[3], (int)xh.w, dh);
+                    int dl = rc_dp4a((int)cl[0], (int)xl.x, 0);
+                    dl = rc_dp4a((int)cl[1], (int)xl.y, dl);
+                    dl = rc_dp4a((int)cl[2], (int)xl.z, dl);
+                    dl = rc_dp4a((int)cl[3], (int)xl.w, dl);
+                    int dh = rc_dp4a((int)ch[0], (int)xh.x, 0);
+                    dh = rc_dp4a((int)ch[1], (int)xh.y, dh);
+                    dh = rc_dp4a((int)ch[2], (int)xh.z, dh);
+                    dh = rc_dp4a((int)ch[3], (int)xh.w, dh);
                     sum[jt] += fl * xs[jt * np + base / 32] * (float)dl +
                                fh * xs[jt * np + base / 32 + 2] * (float)dh;
                 }
@@ -203,10 +203,10 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
             for (int j = 0; j < NT; ++j) {
                 if (j < t) {
                     uint4 xv = *(const uint4 *)(xq + (size_t)j * cols + c);
-                    int si = __dp4a((int)q.x, (int)xv.x, 0);
-                    si = __dp4a((int)q.y, (int)xv.y, si);
-                    si = __dp4a((int)q.z, (int)xv.z, si);
-                    si = __dp4a((int)q.w, (int)xv.w, si);
+                    int si = rc_dp4a((int)q.x, (int)xv.x, 0);
+                    si = rc_dp4a((int)q.y, (int)xv.y, si);
+                    si = rc_dp4a((int)q.z, (int)xv.z, si);
+                    si = rc_dp4a((int)q.w, (int)xv.w, si);
                     sum[j] += (float)si * (dc * xs[j * np + c / 32]);
                 }
             }
@@ -456,18 +456,18 @@ __device__ void kq_rows2_q40(const uint8_t *w0, const uint8_t *w1, const int8_t 
         #pragma unroll
         for (int jt = 0; jt < NT; ++jt) {
             uint4 xv = *(const uint4 *)(xq + (size_t)jt * cols + b * 32 + 16 * hf);
-            int sa = __dp4a((int)qa[0], (int)xv.x, 0);
-            sa = __dp4a((int)qa[1], (int)xv.y, sa);
-            sa = __dp4a((int)qa[2], (int)xv.z, sa);
-            sa = __dp4a((int)qa[3], (int)xv.w, sa);
-            int sb = __dp4a((int)qb[0], (int)xv.x, 0);
-            sb = __dp4a((int)qb[1], (int)xv.y, sb);
-            sb = __dp4a((int)qb[2], (int)xv.z, sb);
-            sb = __dp4a((int)qb[3], (int)xv.w, sb);
-            int sx = __dp4a(0x01010101, (int)xv.x, 0);
-            sx = __dp4a(0x01010101, (int)xv.y, sx);
-            sx = __dp4a(0x01010101, (int)xv.z, sx);
-            sx = __dp4a(0x01010101, (int)xv.w, sx);
+            int sa = rc_dp4a((int)qa[0], (int)xv.x, 0);
+            sa = rc_dp4a((int)qa[1], (int)xv.y, sa);
+            sa = rc_dp4a((int)qa[2], (int)xv.z, sa);
+            sa = rc_dp4a((int)qa[3], (int)xv.w, sa);
+            int sb = rc_dp4a((int)qb[0], (int)xv.x, 0);
+            sb = rc_dp4a((int)qb[1], (int)xv.y, sb);
+            sb = rc_dp4a((int)qb[2], (int)xv.z, sb);
+            sb = rc_dp4a((int)qb[3], (int)xv.w, sb);
+            int sx = rc_dp4a(0x01010101, (int)xv.x, 0);
+            sx = rc_dp4a(0x01010101, (int)xv.y, sx);
+            sx = rc_dp4a(0x01010101, (int)xv.z, sx);
+            sx = rc_dp4a(0x01010101, (int)xv.w, sx);
             float xsv = xs[jt * np + b];
             s0[jt] += (float)(sa - 8 * sx) * (da * xsv);
             s1[jt] += (float)(sb - 8 * sx) * (db * xsv);
@@ -641,6 +641,22 @@ static int kq_r2(int64_t t, int64_t rows)
 /* 8 values of a row from column c0 (a multiple of 8), as float32. */
 __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float *v)
 {
+    if (type == KQ_IQ2_XXS) {
+        /* the 8 values of one grid index (c0 a multiple of 8; kernels/nemotron/iq2.cuh) */
+        const uint8_t *blk = w + (size_t)(c0 / 256) * 66;
+        const int j = (c0 % 256) / 32, l = (c0 % 32) / 8;
+        const uint8_t *p = blk + 2 + 8 * j;
+        const uint16_t *p16 = (const uint16_t *)p;
+        const uint32_t aux = (uint32_t)p16[2] | ((uint32_t)p16[3] << 16);
+        const uint64_t g = nm_iq2_grid[p[l]];
+        const int s7 = (aux >> (7 * l)) & 127, sg = s7 | ((__popc(s7) & 1) << 7);
+        const float db = __half2float(__ushort_as_half(*(const uint16_t *)blk)) * (float)(2 * (aux >> 28) + 1) * 0.125f;
+        for (int u = 0; u < 8; ++u) {
+            const float q = db * (float)((g >> (8 * u)) & 255);
+            v[u] = ((sg >> u) & 1) ? -q : q;
+        }
+        return;
+    }
     if (type == KQ_F32) {
         float4 a = *(const float4 *)((const float *)w + c0);
         float4 b = *(const float4 *)((const float *)w + c0 + 4);
@@ -686,6 +702,12 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
         const uint8_t *q = w + 16 * b + (j % 16);
         for (int u = 0; u < 8; ++u) {
             v[u] = sc * kq_e2m1x2((q[u] >> (hi ? 4 : 0)) & 15);
+        }
+    } else if (type == KQ_MXF8) {
+        /* FP4-Local's MXFP8 rows (the shared expert of a group with the contract off) */
+        float sc = __int_as_float((int)w[cols + c0 / 32] << 23);
+        for (int u = 0; u < 8; ++u) {
+            v[u] = sc * kq_e4m3(w[c0 + u]);
         }
     } else if (type == KQ_Q5_1) {
         const uint8_t *blk = w + (size_t)(c0 / 32) * 24;
@@ -857,14 +879,14 @@ __device__ float kq_row_x2(int type, const uint8_t *w, const float *x, const int
                 qw[k] = (uint32_t)q[2 * k] | ((uint32_t)q[2 * k + 1] << 16);
             }
             uint4 hv = *(const uint4 *)(xh + b * 32 + 16 * hf), lv = *(const uint4 *)(xl + b * 32 + 16 * hf);
-            int sh = __dp4a((int)qw[0], (int)hv.x, 0);
-            sh = __dp4a((int)qw[1], (int)hv.y, sh);
-            sh = __dp4a((int)qw[2], (int)hv.z, sh);
-            sh = __dp4a((int)qw[3], (int)hv.w, sh);
-            int sl = __dp4a((int)qw[0], (int)lv.x, 0);
-            sl = __dp4a((int)qw[1], (int)lv.y, sl);
-            sl = __dp4a((int)qw[2], (int)lv.z, sl);
-            sl = __dp4a((int)qw[3], (int)lv.w, sl);
+            int sh = rc_dp4a((int)qw[0], (int)hv.x, 0);
+            sh = rc_dp4a((int)qw[1], (int)hv.y, sh);
+            sh = rc_dp4a((int)qw[2], (int)hv.z, sh);
+            sh = rc_dp4a((int)qw[3], (int)hv.w, sh);
+            int sl = rc_dp4a((int)qw[0], (int)lv.x, 0);
+            sl = rc_dp4a((int)qw[1], (int)lv.y, sl);
+            sl = rc_dp4a((int)qw[2], (int)lv.z, sl);
+            sl = rc_dp4a((int)qw[3], (int)lv.w, sl);
             sum += (float)(128 * sh + sl) * (kq_half(blk) * xs[b]);
         }
     } else if (type == KQ_Q8_R) {
@@ -874,14 +896,14 @@ __device__ float kq_row_x2(int type, const uint8_t *w, const float *x, const int
         for (int c = 16 * lane; c < cols; c += 512) {
             uint4 q = *(const uint4 *)(w + c);
             uint4 hv = *(const uint4 *)(xh + c), lv = *(const uint4 *)(xl + c);
-            int sh = __dp4a((int)q.x, (int)hv.x, 0);
-            sh = __dp4a((int)q.y, (int)hv.y, sh);
-            sh = __dp4a((int)q.z, (int)hv.z, sh);
-            sh = __dp4a((int)q.w, (int)hv.w, sh);
-            int sl = __dp4a((int)q.x, (int)lv.x, 0);
-            sl = __dp4a((int)q.y, (int)lv.y, sl);
-            sl = __dp4a((int)q.z, (int)lv.z, sl);
-            sl = __dp4a((int)q.w, (int)lv.w, sl);
+            int sh = rc_dp4a((int)q.x, (int)hv.x, 0);
+            sh = rc_dp4a((int)q.y, (int)hv.y, sh);
+            sh = rc_dp4a((int)q.z, (int)hv.z, sh);
+            sh = rc_dp4a((int)q.w, (int)hv.w, sh);
+            int sl = rc_dp4a((int)q.x, (int)lv.x, 0);
+            sl = rc_dp4a((int)q.y, (int)lv.y, sl);
+            sl = rc_dp4a((int)q.z, (int)lv.z, sl);
+            sl = rc_dp4a((int)q.w, (int)lv.w, sl);
             sum += (float)(128 * sh + sl) * (__half2float(dq[c / 32]) * xs[c / 32]);
         }
     } else {
@@ -905,22 +927,22 @@ __device__ float kq_row_x2(int type, const uint8_t *w, const float *x, const int
             int base = b * 256 + 128 * n + 32 * u + 16 * hf;
             uint4 h0 = *(const uint4 *)(xh + base), h1 = *(const uint4 *)(xh + base + 64);
             uint4 l0 = *(const uint4 *)(xl + base), l1 = *(const uint4 *)(xl + base + 64);
-            int a = __dp4a((int)cl[0], (int)h0.x, 0);
-            a = __dp4a((int)cl[1], (int)h0.y, a);
-            a = __dp4a((int)cl[2], (int)h0.z, a);
-            a = __dp4a((int)cl[3], (int)h0.w, a);
-            int a2 = __dp4a((int)cl[0], (int)l0.x, 0);
-            a2 = __dp4a((int)cl[1], (int)l0.y, a2);
-            a2 = __dp4a((int)cl[2], (int)l0.z, a2);
-            a2 = __dp4a((int)cl[3], (int)l0.w, a2);
-            int c = __dp4a((int)ch[0], (int)h1.x, 0);
-            c = __dp4a((int)ch[1], (int)h1.y, c);
-            c = __dp4a((int)ch[2], (int)h1.z, c);
-            c = __dp4a((int)ch[3], (int)h1.w, c);
-            int c2 = __dp4a((int)ch[0], (int)l1.x, 0);
-            c2 = __dp4a((int)ch[1], (int)l1.y, c2);
-            c2 = __dp4a((int)ch[2], (int)l1.z, c2);
-            c2 = __dp4a((int)ch[3], (int)l1.w, c2);
+            int a = rc_dp4a((int)cl[0], (int)h0.x, 0);
+            a = rc_dp4a((int)cl[1], (int)h0.y, a);
+            a = rc_dp4a((int)cl[2], (int)h0.z, a);
+            a = rc_dp4a((int)cl[3], (int)h0.w, a);
+            int a2 = rc_dp4a((int)cl[0], (int)l0.x, 0);
+            a2 = rc_dp4a((int)cl[1], (int)l0.y, a2);
+            a2 = rc_dp4a((int)cl[2], (int)l0.z, a2);
+            a2 = rc_dp4a((int)cl[3], (int)l0.w, a2);
+            int c = rc_dp4a((int)ch[0], (int)h1.x, 0);
+            c = rc_dp4a((int)ch[1], (int)h1.y, c);
+            c = rc_dp4a((int)ch[2], (int)h1.z, c);
+            c = rc_dp4a((int)ch[3], (int)h1.w, c);
+            int c2 = rc_dp4a((int)ch[0], (int)l1.x, 0);
+            c2 = rc_dp4a((int)ch[1], (int)l1.y, c2);
+            c2 = rc_dp4a((int)ch[2], (int)l1.z, c2);
+            c2 = rc_dp4a((int)ch[3], (int)l1.w, c2);
             sum += fl * xs[base / 32] * (float)(128 * a + a2) + fh * xs[base / 32 + 2] * (float)(128 * c + c2);
         }
     }
@@ -1019,7 +1041,7 @@ __device__ __forceinline__ float kq_row_x2c(int type, const uint8_t *w, const in
             const uint16_t *pw = (const uint16_t *)(blk + 2 + 4 * (L & 7));
             int w4 = (int)((uint32_t)pw[0] | ((uint32_t)pw[1] << 16));
             int h4 = *(const int *)(xh + 64 * q + 4 * L), l4 = *(const int *)(xl + 64 * q + 4 * L);
-            int is = 128 * __dp4a(w4, h4, 0) + __dp4a(w4, l4, 0);
+            int is = 128 * rc_dp4a(w4, h4, 0) + rc_dp4a(w4, l4, 0);
             acc = fmaf((float)is, __fmul_rn(kq_half(blk), xs[b]), acc);
         }
     } else {
@@ -1050,9 +1072,9 @@ __device__ __forceinline__ float kq_row_x2c(int type, const uint8_t *w, const in
                 int a4 = (int)((lw & 0x0f0f0f0fu) | (((hw >> sh) & 0x03030303u) << 4));
                 int b4 = (int)(((lw >> 4) & 0x0f0f0f0fu) | (((hw >> (sh + 4)) & 0x03030303u) << 4));
                 int xo = 256 * b + 128 * h + 4 * L;
-                int ia = 128 * __dp4a(a4, *(const int *)(xh + xo), 0) + __dp4a(a4, *(const int *)(xl + xo), 0);
-                int ib = 128 * __dp4a(b4, *(const int *)(xh + xo + 64), 0) +
-                         __dp4a(b4, *(const int *)(xl + xo + 64), 0);
+                int ia = 128 * rc_dp4a(a4, *(const int *)(xh + xo), 0) + rc_dp4a(a4, *(const int *)(xl + xo), 0);
+                int ib = 128 * rc_dp4a(b4, *(const int *)(xh + xo + 64), 0) +
+                         rc_dp4a(b4, *(const int *)(xl + xo + 64), 0);
                 float xa = xs[8 * b + 4 * h + (L >> 3)], xc = xs[8 * b + 4 * h + 2 + (L >> 3)];
                 acc = fmaf((float)ia, __fmul_rn(__fmul_rn(d, (float)sc[8 * h + L / 4]), xa), acc);
                 acc = fmaf((float)ib, __fmul_rn(__fmul_rn(d, (float)sc[8 * h + 4 + L / 4]), xc), acc);

@@ -104,28 +104,42 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
     float acc[4][4] = {{0.f}};
     int groups = cols / 32;
     for (int g = 0; g < groups; ++g) {
-        for (int x = threadIdx.x; x < GM * 32; x += blockDim.x) {
-            int qq = x / 32, k = x % 32;
+        /* x: a float4 a thread (the 32 values of GM rows); the int4 rows of w:
+         * every thread dequantizes 8 values (4 bytes of a block: the low and
+         * the high 4 bits), as w_block32. A thread for each row of w (64 of
+         * the 256) took 51.7 ms for the gate and up of a group of 1024 tokens of
+         * the 26B on the GTX 1070, 25.9 ms so; the sums are those of before
+         * (the same bits). */
+        for (int x = threadIdx.x; x < GM * 8; x += blockDim.x) {
+            int qq = x / 8, k4 = (x % 8) * 4;
             int q = q0 + qq;
-            float v = 0.f;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (q < qend) {
                 int src = gather ? pair_tok[q] : q;
-                v = a[(size_t)src * cols + (size_t)g * 32 + k];
+                v = *(const float4 *)(a + (size_t)src * cols + (size_t)g * 32 + k4);
             }
-            xs[k][qq] = v;
+            xs[k4][qq] = v.x;
+            xs[k4 + 1][qq] = v.y;
+            xs[k4 + 2][qq] = v.z;
+            xs[k4 + 3][qq] = v.w;
         }
-        if (threadIdx.x < GN) {
-            int n = n0 + threadIdx.x;
-            float v[32];
+        for (int x = threadIdx.x; x < GN * 4; x += blockDim.x) {
+            int rr = x / 4, c = x % 4, n = n0 + rr;
+            float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             if (n < rows) {
-                w_block32<0>(we, n, cols, g, v);
-            } else {
-                for (int k = 0; k < 32; ++k) {
-                    v[k] = 0.f;
+                const uint8_t *blk = we + ((size_t)n * groups + g) * 18;
+                float d = __half2float(__ushort_as_half((uint16_t)(blk[0] | (blk[1] << 8))));
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int bq = blk[2 + 4 * c + i];
+                    v[i] = (float)((bq & 15) - 8) * d;
+                    v[4 + i] = (float)((bq >> 4) - 8) * d;
                 }
             }
-            for (int k = 0; k < 32; ++k) {
-                ws[k][threadIdx.x] = v[k];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                ws[4 * c + i][rr] = v[i];
+                ws[16 + 4 * c + i][rr] = v[4 + i];
             }
         }
         __syncthreads();
@@ -153,6 +167,143 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
             int n = n0 + tx * 4 + v;
             if (n < rows) {
                 out[(size_t)q * rows + n] = acc[u][v];
+            }
+        }
+    }
+}
+
+/* k_moe_gemm without int8 products (Maxwell; MAXWELL_PLAN.md, section 3.4),
+ * as k_gemm8 (gemm/groups.cu): a tile of the GM pairs of k_moe_tiles by 128
+ * rows a block of 256 threads, 4 pairs by 8 rows a thread (rows 4 tx .. and
+ * 64 + 4 tx ..: the lanes of a warp read runs of shared memory), the int4
+ * block of each row decoded once a step by 2 threads (i4m, then the scale:
+ * the values of k_moe_gemm), the loads of the next step in registers while
+ * the tile works. The terms of each value add in the order of k_moe_gemm
+ * with the same FMA: the same bits. */
+__global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int64_t *e, const float *a,
+                                                      int gather, const int64_t *wtab, int rows, int cols,
+                                                      float *out)
+{
+    PDL_START();
+    __shared__ __align__(16) float xs[32][GM + 4];
+    __shared__ __align__(16) float ws[32][G8_LD];
+    const int *tiles = DP(const int, 16);
+    const int *off = DP(const int, 12);
+    const int *pair_tok = DP(const int, 14);
+    const int tile = blockIdx.y;
+    if (tile >= tiles[0]) {
+        return;
+    }
+    const int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile], qend = off[ex + 1];
+    const int n0 = blockIdx.x * G8_B;
+    const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+    const uint8_t *we = (const uint8_t *)(intptr_t)wtab[ex];
+    const int groups = cols / 32;
+    const int wrow = tid / 2, half = tid & 1;
+    const bool wok = n0 + wrow < rows;
+    /* the rows of A of the 2 float4 of a thread (pair x / 8, columns 4 (x % 8)) */
+    int src[2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int q = q0 + (tid + 256 * i) / 8;
+        src[i] = q < qend ? (gather ? pair_tok[q] : q) : -1;
+    }
+    float4 lx[2];
+    uint32_t lw0, lw1;
+    float ld;
+    auto fetch = [&](int g) {
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            lx[i] = src[i] >= 0 ? *(const float4 *)(a + (size_t)src[i] * cols + (size_t)g * 32 + 4 * ((tid + 256 * i) % 8))
+                                : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        if (wok) {
+            const uint8_t *blk = we + ((size_t)(n0 + wrow) * groups + g) * 18;
+            const uint16_t *c = (const uint16_t *)(blk + 2 + 8 * half);
+            lw0 = (uint32_t)c[0] | ((uint32_t)c[1] << 16);
+            lw1 = (uint32_t)c[2] | ((uint32_t)c[3] << 16);
+            ld = __half2float(__ushort_as_half(*(const uint16_t *)blk));
+        } else {
+            lw0 = lw1 = 0x88888888u;
+            ld = 0.f;
+        }
+    };
+    float acc[4][8];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        #pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            acc[u][v] = 0.f;
+        }
+    }
+    fetch(0);
+    for (int g = 0; g < groups; ++g) {
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            int x = tid + 256 * i, qq = x / 8, k = 4 * (x % 8);
+            xs[k][qq] = lx[i].x;
+            xs[k + 1][qq] = lx[i].y;
+            xs[k + 2][qq] = lx[i].z;
+            xs[k + 3][qq] = lx[i].w;
+        }
+        {
+            const int kb = 8 * half;
+            const uint32_t h0 = lw0 >> 12, h1 = lw1 >> 12;
+            ws[kb + 0][wrow] = i4m<0>(lw0) * ld;
+            ws[kb + 1][wrow] = i4m<8>(lw0) * ld;
+            ws[kb + 2][wrow] = i4m<16>(lw0) * ld;
+            ws[kb + 3][wrow] = i4m<12>(h0) * ld;
+            ws[kb + 4][wrow] = i4m<0>(lw1) * ld;
+            ws[kb + 5][wrow] = i4m<8>(lw1) * ld;
+            ws[kb + 6][wrow] = i4m<16>(lw1) * ld;
+            ws[kb + 7][wrow] = i4m<12>(h1) * ld;
+            ws[16 + kb + 0][wrow] = i4m<4>(lw0) * ld;
+            ws[16 + kb + 1][wrow] = i4m<12>(lw0) * ld;
+            ws[16 + kb + 2][wrow] = i4m<8>(h0) * ld;
+            ws[16 + kb + 3][wrow] = i4m<16>(h0) * ld;
+            ws[16 + kb + 4][wrow] = i4m<4>(lw1) * ld;
+            ws[16 + kb + 5][wrow] = i4m<12>(lw1) * ld;
+            ws[16 + kb + 6][wrow] = i4m<8>(h1) * ld;
+            ws[16 + kb + 7][wrow] = i4m<16>(h1) * ld;
+        }
+        __syncthreads();
+        if (g + 1 < groups) {
+            fetch(g + 1);
+        }
+        #pragma unroll 4
+        for (int k = 0; k < 32; ++k) {
+            const float4 a0 = *(const float4 *)&xs[k][4 * ty];
+            const float4 b0 = *(const float4 *)&ws[k][4 * tx], b1 = *(const float4 *)&ws[k][64 + 4 * tx];
+            const float av[4] = {a0.x, a0.y, a0.z, a0.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                #pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    acc[u][v] = fmaf(av[u], bv[v], acc[u][v]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        int q = q0 + 4 * ty + u;
+        if (q >= qend) {
+            continue;
+        }
+        #pragma unroll
+        for (int hv = 0; hv < 2; ++hv) {
+            int n = n0 + 64 * hv + 4 * tx;
+            float *o = out + (size_t)q * rows + n;
+            if (n + 3 < rows && (rows & 3) == 0) {
+                *(float4 *)o = make_float4(acc[u][4 * hv], acc[u][4 * hv + 1], acc[u][4 * hv + 2], acc[u][4 * hv + 3]);
+            } else {
+                for (int v = 0; v < 4; ++v) {
+                    if (n + v < rows) {
+                        o[v] = acc[u][4 * hv + v];
+                    }
+                }
             }
         }
     }

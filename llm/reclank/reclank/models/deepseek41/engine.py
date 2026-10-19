@@ -2,17 +2,19 @@
 Phase 4): DSV41GPU with the routed experts in the parts on the weightkeeper's rows,
 DSpark drafts (sampled or greedy: DSpark.stream), the chat of the model's own
 encoding.py (the checkpoint's encoding/), its tokenizer (DSTokenizer: the BPE of
-QwenTokenizer with the pre-tokenizer of tokenizer.json), and snapshots of the
-state between the turns.
+QwenTokenizer with the pre-tokenizer of tokenizer.json), and the contexts of a
+few conversations between the turns (core/session.py, RowCache).
 
-The snapshots: the window rings (128 positions) overwrite their rows, so the
-state cannot go back to an earlier position; the compressed rows and the
-index keys of the positions before a point stay (no later position writes
-them). A snapshot holds what goes back: the rings of every layer, the
+The points of a context: the window rings (128 positions) overwrite their
+rows, so the state cannot go back to an earlier position; the compressed rows
+and the index keys of the positions before a point stay (no later position
+writes them). A point holds what goes back: the rings of every layer, the
 compressors' open groups, DSpark's rings; it is taken after the last
 <｜Assistant｜> of each prompt, where the next turn's prompt leaves it (the
 earlier answer comes back in another form: its reasoning dropped). A prompt
-starts from the longest snapshot that is a strict start of it.
+starts from the longest point that is a strict start of it; the compressed
+rows and the index keys of a context that another one replaced on the device
+wait in host memory (RowCache) and go back with it.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import uuid
 
 import numpy as np
 
+from reclank.core.session import BufferRows, RowCache
 from reclank.models.base import Engine
 from reclank.models.qwen.tokenizer import QwenTokenizer
 
@@ -193,11 +196,11 @@ def _content(content, images):
 
 
 class DSEngine(Engine):
-    """DSV41GPU, DSpark (or plain steps), the snapshots of the turns."""
+    """DSV41GPU, DSpark (or plain steps), the contexts of the turns."""
 
     family = FAMILY
 
-    def __init__(self, m, g, ds, tok, enc, ctx, vision=None, worker=None):
+    def __init__(self, m, g, ds, tok, enc, ctx, vision=None, worker=None, contexts=4, contexts_gb=16.0):
         self.m, self.g, self.ds = m, g, ds
         self.vision = vision
         self.worker = worker
@@ -207,10 +210,8 @@ class DSEngine(Engine):
         self.tokenizer = tok
         self.enc = enc
         self.max_context = ctx
-        self.snaps = []          # (prompt start ids, the state), the oldest first
-        self.n_snaps = 4
+        self.ctxs = RowCache(self, contexts, contexts_gb * 1e9, "dsv41")
         self.last_cached = 0
-        self.hits = [0, 0, 0]    # requests, prompt tokens, cached tokens
         self.spec = "auto"       # DSpark: "auto", True (a draft every round)
         self.assistant_id = tok.t.special[ASSISTANT]
         self.think_open_id = tok.t.special[THINK_OPEN]
@@ -332,9 +333,26 @@ class DSEngine(Engine):
 
     def _encode(self, data, budget):
         """The encoder on the GPU; its memory freed after (the model's hot
-        experts and programs hold the rest of the GPU)."""
+        experts and programs hold the rest of the GPU). The programs of a long
+        session grow with the context (1.3 GB at 48K tokens), so when the room
+        the encoder needs (VISION_GB for an image of max_tokens) is not free,
+        or the encoder runs out of memory, the model's programs go first (made
+        again at the next run: fit does the same as cap grows)."""
+        from reclank.backends.cuda.gpumm import mem_info
+        need = VISION_GB * 1e9 * max(budget, 256) / self.vision.max_tokens + 0.2e9
+        if mem_info()[0] < need:
+            self.g.free_programs()
         try:
-            return self.vision.image(data, budget)
+            try:
+                return self.vision.image(data, budget)
+            except (RuntimeError, MemoryError) as e:
+                if "memory" not in str(e).lower():
+                    raise
+                print("[dsv41] the image encoder out of GPU memory (%s): the programs freed, again" % e,
+                      file=sys.stderr, flush=True)
+                self.vision.release()
+                self.g.free_programs()
+                return self.vision.image(data, budget)
         finally:
             self.vision.release()
 
@@ -406,7 +424,20 @@ class DSEngine(Engine):
         if any(w.lower() in str(exc).lower() for w in FATAL_WORDS):
             self.fatal = exc
 
-    # ---- the state and the snapshots
+    # ---- the state and the contexts (core/session.py, RowCache)
+
+    def rows(self):
+        """The compressed rows and the index keys of each layer: a row for each
+        block of ratio positions."""
+        g, m = self.g, self.m
+        out = []
+        for d in (g.ckv, g.kcache):
+            for i, a in d.items():
+                out.append(BufferRows(g.mirror.buffer_of(a), m.max_len // a.shape[0], a.nbytes // a.shape[0]))
+        return out
+
+    def reserve(self, n):
+        pass
 
     def _state_arrays(self):
         g = self.g
@@ -416,7 +447,7 @@ class DSEngine(Engine):
         return arrs
 
     def _save(self, ids):
-        """A snapshot at len(ids) (ids: the keys of the positions, _keys): the
+        """A point at len(ids) (ids: the keys of the positions, _keys): the
         state arrays, and the engram hashes' ids of the last positions (the
         look-back of the next tokens: a request between two turns writes
         others there)."""
@@ -427,18 +458,14 @@ class DSEngine(Engine):
             saved.append(a.copy())
         s = len(ids)
         back = self.m.hashes.cache[max(0, s - 8):s].copy()
-        self.snaps = [sn for sn in self.snaps if sn[0] != ids]
-        self.snaps.append((list(ids), saved, back))
-        if len(self.snaps) > self.n_snaps:
-            self.snaps.pop(0)
+        self.ctxs.point(ids, (saved, back))
 
-    def _restore(self, snap):
+    def _restore(self, point, s):
         g = self.g
-        for a, v in zip(self._state_arrays(), snap[1]):
+        for a, v in zip(self._state_arrays(), point[0]):
             a[:] = v
             g.mirror.buffer_of(a).upload(a)
-        s = len(snap[0])
-        self.m.hashes.cache[max(0, s - 8):s] = snap[2]
+        self.m.hashes.cache[max(0, s - 8):s] = point[1]
 
     @staticmethod
     def _keys(ids):
@@ -476,18 +503,14 @@ class DSEngine(Engine):
         if n + 1 > self.max_context:
             raise ValueError("the prompt has %d tokens; the context is %d" % (n, self.max_context))
         max_tokens = min(int(max_tokens), self.max_context - n - 1)
-        best = None
-        for snap in self.snaps:
-            s = len(snap[0])
-            if s < n and keys[:s] == snap[0] and (best is None or s > len(best[0])):
-                best = snap
-        if best is None:
-            self._fresh()
-            k = 0
-        else:
-            self._restore(best)
-            k = len(best[0])
         t0 = time.time()
+        # the longest point that is a strict start of the prompt (its context
+        # brought to the device)
+        k, point = self.ctxs.begin(keys, lambda p: False)
+        if k == 0:
+            self._fresh()
+        else:
+            self._restore(point, k)
         cut = self._answer_cut(ids)
         if k < cut < n:
             self._prefill(ids[k:cut], k, media)
@@ -498,11 +521,8 @@ class DSEngine(Engine):
         lg, main_last = self._prefill(ids[k0:], k0, media)
         dt = time.time() - t0
         self.last_cached = k
-        h = self.hits
-        h[0], h[1], h[2] = h[0] + 1, h[1] + n, h[2] + k
-        print("[dsv41] cache hit %d of %d prompt tokens; new %d in %.1f s (%.0f tok/s); all %d requests: "
-              "%d of %d cached" % (k, n, n - k, dt, (n - k) / max(dt, 1e-9), h[0], h[2], h[1]),
-              file=sys.stderr, flush=True)
+        print("[dsv41] cache hit %d of %d prompt tokens; new %d in %.1f s (%.0f tok/s); %s" % (
+            k, n, n - k, dt, (n - k) / max(dt, 1e-9), self.ctxs.note(n, k)), file=sys.stderr, flush=True)
         sampler.reset(prompt_ids)
         t1, count, stats = time.time(), 0, {}
         try:
@@ -554,7 +574,8 @@ def load(opts, meta, worker=None):
         # the ViT and the aligner are in the checkpoint (--mmproj off: no image input)
         from reclank.models.deepseek41.vision import DSVision
         vision = DSVision(m.w.src, meta)
-    eng = DSEngine(m, g, ds, tok, enc, m.max_len, vision, worker)
+    eng = DSEngine(m, g, ds, tok, enc, m.max_len, vision, worker, contexts=getattr(opts, "contexts", 4),
+                   contexts_gb=getattr(opts, "contexts_gb", 16.0))
     if opts.image_budget:
         eng.image_budget = min(int(opts.image_budget), vision.max_tokens if vision else 1024)
     # the programs of a prompt and of the loop now (the first request does not wait for them)

@@ -18,13 +18,109 @@ import time
 from reclank.core.sampling import Sampler
 from server.media import MediaSource
 
+# The id of a client's session or conversation, for the lanes (--lanes 2): the headers and the
+# fields of the body that the clients send, in this order.
+#   x-session-affinity, session_id: pi-ai (dsh) with compat.sendSessionAffinityHeaders (its
+#     x-client-request-id is the same id, but other clients send a new one with each request)
+#   x-session-id: pi-ai's OpenRouter form, OpenRouter, vLLM's router (--session-key)
+#   x-claude-code-session-id: Claude Code
+#   conversation_id: Codex (older releases)
+#   prompt_cache_key: the OpenAI API (Codex, OpenCode, pi-ai with long cache retention)
+#   metadata.session_id; metadata.user_id with "session_<id>" (the Anthropic form of Claude Code)
+# "user" and a user_id without a session are a user's, not a conversation's: not used.
+SESSION_HEADERS = ("x-session-affinity", "session_id", "session-id", "x-session-id",
+                   "x-claude-code-session-id", "conversation_id", "x-conversation-id")
+SESSION_FIELDS = ("prompt_cache_key", "session_id", "conversation_id")
+# A lane that the client names: llama.cpp's id_slot, or "lane" (body), or the header x-reclank-lane.
+LANE_FIELDS = ("lane", "id_slot")
+
+
+def session_of(req, headers):
+    """The session id of a request (SESSION_HEADERS, SESSION_FIELDS, metadata), or None."""
+    for h in SESSION_HEADERS:
+        v = headers.get(h) if headers is not None else None
+        if v:
+            return "h:" + str(v).strip()[:128]
+    for f in SESSION_FIELDS:
+        v = req.get(f)
+        if isinstance(v, str) and v:
+            return "b:" + v[:128]
+    meta = req.get("metadata")
+    if isinstance(meta, dict):
+        v = meta.get("session_id")
+        if isinstance(v, str) and v:
+            return "b:" + v[:128]
+        u = meta.get("user_id")
+        if isinstance(u, str) and "session_" in u:
+            return "b:" + u[u.index("session_"):][:128]
+    return None
+
+
+def lane_of(req, headers, n):
+    """The lane that a request names (LANE_FIELDS, x-reclank-lane), or None."""
+    vals = [req.get(f) for f in LANE_FIELDS] + [headers.get("x-reclank-lane") if headers is not None else None]
+    for v in vals:
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < n:
+            return i
+    return None
+
+
+# a lane busy with the request's conversation or session wins a wait by this many prompt tokens
+# (a context comes back on the other lane in a copy: 160K positions in about 0.5 s)
+WAIT_MARGIN = 512
+
+
+def choose_lane(hits, live, busy, last_used, sticky, named=None, wait=None):
+    """The lane of a request (--lanes 2). hits[i]: the prompt tokens lane i's cache would give it
+    (a context in host memory counts on every lane: either brings it back in a copy); live[i]:
+    that is the context on lane i's device; busy[i]: lane i runs or has requests waiting;
+    last_used[i]: when lane i's last request ended; sticky: the lane of the request's session
+    before, or None; named: a lane the client named; wait[i]: what a request waits for on lane i
+    (LaneScheduler.wait, prompt tokens), or None. Return (lane, why).
+
+    1. the lane the client named;
+    2. the lane whose device holds the conversation, if it is free (on a busy one it is the
+       request in flight: a title or a request beside it goes to the other lane);
+    3. the lane of the session, if it is free (a conversation whose start changed, compacted or
+       edited, takes the place of its own context there, not another's);
+    4. a free lane: the one whose last request ended first;
+    5. all busy: the lane with the least wait (a decode ends sooner than a long prompt; the
+       conversation's or the session's lane by a margin, its context's copy, else the oldest
+       end); with no waits, the conversation's lane, else the session's, else the oldest end."""
+    n = len(hits)
+    if named is not None:
+        return named, "named"
+    own = [i for i in range(n) if live[i] and hits[i] > 0]
+    for i in own:
+        if not busy[i]:
+            return i, "its context"
+    if sticky is not None and not busy[sticky]:
+        return sticky, "its session"
+    free = [i for i in range(n) if not busy[i]]
+    if free:
+        return min(free, key=lambda i: last_used[i]), "free"
+    if wait is not None:
+        mine = set(own) | ({sticky} if sticky is not None else set())
+        lane = min(range(n), key=lambda i: (wait[i] - (WAIT_MARGIN if i in mine else 0), last_used[i]))
+        return lane, ("its context (waits)" if lane in own else
+                      "its session (waits)" if lane == sticky else "waits")
+    if own:
+        return own[0], "its context (waits)"
+    if sticky is not None:
+        return sticky, "its session (waits)"
+    return min(range(n), key=lambda i: last_used[i]), "waits"
+
 
 class Backend:
     """The model of the server, for the HTTP handler."""
 
     def __init__(self, engine, worker, model_id="reclank", thinking=None, max_tokens=1024,
                  temperature=1.0, top_k=None, top_p=None, mtp_accept="exact", mtp_floor=None,
-                 media_dir=None):
+                 media_dir=None, repetition_penalty=None):
         self.engine = engine
         self.worker = worker
         self.model_id = model_id
@@ -34,6 +130,8 @@ class Backend:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        # the repetition penalty of a request that gives none (LFM2.5: 1.05)
+        self.repetition_penalty = repetition_penalty
         # The rule of the MTP drafts with sampling (Sampler mtp_accept and
         # mtp_floor). A request can give "mtp_accept" and "mtp_floor".
         self.mtp_accept = mtp_accept
@@ -51,6 +149,11 @@ class Backend:
         self.debug = None
         self.turn_n = 0
         self.last_think = None
+        # the lanes (--lanes 2): the engine of each; the lane of each session; the lane of the
+        # request of this thread (usage: its cached tokens)
+        self.engines = list(getattr(engine, "lanes", None) or [engine])
+        self.sessions = {}
+        self._tls = threading.local()
 
     # ---- what the handler reads of the model
 
@@ -64,7 +167,56 @@ class Backend:
 
     @property
     def last_cached(self):
-        return self.engine.last_cached
+        return self.engines[getattr(self._tls, "lane", 0) or 0].last_cached
+
+    # ---- the lanes
+
+    @property
+    def lanes(self):
+        return len(self.engines)
+
+    def guard(self, lane):
+        """What a generation holds: the lock of the model (one lane), or nothing (the lanes:
+        the scheduler queues the requests of each lane)."""
+        import contextlib
+        return self.lock if self.lanes == 1 else contextlib.nullcontext()
+
+    def route(self, req, headers, prompt_ids):
+        """The lane of a request (choose_lane), on the model thread; None with one lane."""
+        if self.lanes == 1 or getattr(self.worker, "lanes", None) is None:
+            return None
+        sid = session_of(req, headers)
+        named = lane_of(req, headers, self.lanes)
+        sch = self.worker.lanes
+
+        def pick():
+            hl = [e.hit(prompt_ids) for e in self.engines]
+            hits, live = [h[0] for h in hl], [h[1] for h in hl]
+            busy = [sch.lane_busy(i) for i in range(self.lanes)]
+            wait = [sch.wait(i) for i in range(self.lanes)]
+            lane, why = choose_lane(hits, live, busy, sch.last_used, self.sessions.get(sid), named,
+                                    wait)
+            new = len(prompt_ids) - hits[lane]
+            sch.reserved[lane] += 1
+            sch.reserved_tokens[lane] += new
+            if sid is not None:
+                self.sessions[sid] = lane
+                while len(self.sessions) > 512:
+                    self.sessions.pop(next(iter(self.sessions)))
+            print("[lanes] lane %s (%s): cached %s of %d tokens, busy %s%s%s" % (
+                "AB"[lane], why, "/".join(str(h) for h in hits), len(prompt_ids),
+                "".join("AB"[i] for i in range(self.lanes) if busy[i]) or "-",
+                " (waits %s)" % "/".join(str(w) for w in wait) if all(busy) else "",
+                ", session %s" % sid[:24] if sid else ""), file=sys.stderr, flush=True)
+            return lane, new
+        lane, new = self.worker.call(pick)
+        self._tls.lane = lane
+        self._tls.new = new
+        return lane
+
+    def route_tokens(self):
+        """The prompt tokens the request that route() placed on this thread reads (not cached)."""
+        return getattr(self._tls, "new", 0)
 
     def model_info(self, name=None):
         """Return one model description."""
@@ -122,7 +274,7 @@ class Backend:
         return Sampler(temperature=pick("temperature", self.temperature),
                        top_k=pick("top_k", self.top_k), top_p=pick("top_p", self.top_p),
                        min_p=req.get("min_p"),
-                       repetition_penalty=req.get("repetition_penalty"),
+                       repetition_penalty=pick("repetition_penalty", self.repetition_penalty),
                        presence_penalty=req.get("presence_penalty"),
                        frequency_penalty=req.get("frequency_penalty"),
                        seed=req.get("seed"),
@@ -133,11 +285,20 @@ class Backend:
         """Return the token ids that end a generation."""
         return self.engine.stop_ids()
 
-    def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
+    # generate takes session (server/http.py passes the client's conversation id)
+    takes_session = True
+
+    def generate(self, prompt_ids, max_tokens, sampler, eos_ids, lane=None, tokens=0, session=None):
         """Yield the tokens of the answer; the engine runs on the model
-        thread."""
-        return self.worker.stream(
-            lambda: self.engine.generate(prompt_ids, max_tokens, sampler, eos_ids))
+        thread (lane: on that lane, beside the other's; tokens: the prompt
+        tokens it reads, route_tokens()). session: the conversation id of the
+        client (session_of), for an engine that takes it (session_ids)."""
+        eng = self.engines[lane] if lane is not None else self.engine
+        kw = {"session": session} if getattr(eng, "session_ids", False) else {}
+        if lane is None:
+            return self.worker.stream(lambda: eng.generate(prompt_ids, max_tokens, sampler, eos_ids, **kw))
+        return self.worker.stream(lambda: eng.generate(prompt_ids, max_tokens, sampler, eos_ids, **kw),
+                                  lane=lane, tokens=tokens)
 
     # ---- the answer
 

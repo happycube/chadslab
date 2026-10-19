@@ -1179,10 +1179,12 @@ void rc_int4_multi4_mt(const uint8_t *w0, const float *s0, float *o0, int rows0,
                               NULL);
 }
 
-/* The selected experts of a small group of tokens. Job j is one expert,
- * ids[j], with the pairs poff[j] to poff[j + 1] - 1. Pair p reads the x row
- * xi[p] (the stride is xstride) and writes the out row p. Each expert is read
- * one time for all of its tokens. */
+/* The selected experts of a group of tokens. Job j is one expert, ids[j],
+ * with the pairs poff[j] to poff[j + 1] - 1. Pair p reads the x row xi[p]
+ * (the stride is xstride) and writes the out row p. Each expert is read one
+ * time for all of its tokens, I4MT_MAX pairs at a time (the cold experts of a
+ * large group of the 26B, when the GPU has no room for their copies, give an
+ * expert hundreds of pairs: more overran xs and outs). */
 static void gemma_int4_moe_gemv_mt_body(const uint8_t *w, const float *scales, const float *x,
                             const int *ids, const int *poff, const int *xi, int jobs,
                             float *out, int rows, int cols, int xstride)
@@ -1202,16 +1204,18 @@ static void gemma_int4_moe_gemv_mt_body(const uint8_t *w, const float *scales, c
         int j = (int)(u / blocks);
         int i = (int)(u % blocks) * 4;
         int e = ids[j];
-        int np = poff[j + 1] - poff[j];
-        const float *xs[I4MT_MAX];
-        float *outs[I4MT_MAX];
-        for (int q = 0; q < np; ++q) {
-            int p = poff[j] + q;
-            xs[q] = x + (size_t)xi[p] * (size_t)xstride;
-            outs[q] = out + (size_t)p * (size_t)rows;
+        for (int p0 = poff[j]; p0 < poff[j + 1]; p0 += I4MT_MAX) {
+            int np = poff[j + 1] - p0 < I4MT_MAX ? poff[j + 1] - p0 : I4MT_MAX;
+            const float *xs[I4MT_MAX];
+            float *outs[I4MT_MAX];
+            for (int q = 0; q < np; ++q) {
+                int p = p0 + q;
+                xs[q] = x + (size_t)xi[p] * (size_t)xstride;
+                outs[q] = out + (size_t)p * (size_t)rows;
+            }
+            i4_rows_mt(w + (size_t)e * expert_bytes, scales + (size_t)e * expert_scales,
+                       rows, cols, i, xs, outs, np);
         }
-        i4_rows_mt(w + (size_t)e * expert_bytes, scales + (size_t)e * expert_scales,
-                   rows, cols, i, xs, outs, np);
     }
 }
 

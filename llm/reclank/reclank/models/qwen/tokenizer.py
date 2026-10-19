@@ -27,6 +27,12 @@ and changes the bytes of a new piece to the characters of BPE with
 str.translate.
 
 scripts/check_qwen_tok.py compares the ids with the tokenizers library.
+
+Another BPE model of the same kind (LFM2: digits in runs of up to 3 and no
+\\p{M} in the pattern, no NFC) takes the pattern and the normalizer of its
+tokenizer.json (QwenTokenizer: split_pattern): the regex module with that
+pattern, and re for a text of ASCII alone (_ASCII_SPLITS). Its BPE has
+ignore_merges: a piece that is in the vocabulary is that one token.
 """
 from __future__ import annotations
 
@@ -154,6 +160,41 @@ def fast_split(text):
     return _ASCII_RE.findall(text) if text.isascii() else _unicode_split()(text)
 
 
+# The pattern of LFM2 (LFM2.5-24B-A2B) and its ASCII form for re.
+LFM2_PATTERN = (r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"""
+                r"""| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+""")
+_ASCII_SPLITS = {
+    PATTERN: _ASCII_RE,
+    LFM2_PATTERN: re.compile(
+        r"'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])|[^\r\nA-Za-z0-9]?[A-Za-z]+|[0-9]{{1,3}}"
+        r"| ?[^{S}A-Za-z0-9]+[\r\n]*|[{S}]*[\r\n]+|[{S}]+(?![^{S}])|[{S}]+".format(S=_S)),
+}
+
+
+def split_pattern(data):
+    """The pattern of the Split step of the pre-tokenizer of a tokenizer.json
+    (dict), or None."""
+    pre = data.get("pre_tokenizer") or {}
+    for p in [pre] + list(pre.get("pretokenizers") or ()):
+        if p.get("type") == "Split" and "Regex" in (p.get("pattern") or {}):
+            return p["pattern"]["Regex"]
+    return None
+
+
+def splitter(pattern):
+    """The split function of a pattern: fast_split for the pattern of Qwen;
+    else re for ASCII text (a known pattern) and the regex module."""
+    if pattern is None or pattern == PATTERN:
+        return fast_split
+    import regex
+    find = regex.compile(pattern).findall
+    asc = _ASCII_SPLITS.get(pattern)
+    if asc is None:
+        return find
+    asc_find = asc.findall
+    return lambda text: asc_find(text) if text.isascii() else find(text)
+
+
 def bytes_to_unicode():
     """Return the byte table of GPT-2: byte value -> a printable character."""
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("\xa1"), ord("\xac") + 1)) + \
@@ -177,7 +218,8 @@ class QwenTokenizer:
     """
 
     def __init__(self, path):
-        data = json.loads(Path(path).read_text())
+        # (path: a tokenizer.json, or its data: formats.gguf.bpe_tokenizer_data of a GGUF file)
+        data = path if isinstance(path, dict) else json.loads(Path(path).read_text())
         m = data["model"]
         if m.get("type") != "BPE":
             raise ValueError("expected a BPE model")
@@ -211,12 +253,22 @@ class QwenTokenizer:
             if self._specials else None
         self.stop_ids = [self.special[s] for s in ("<|im_end|>", "<|endoftext|>")
                          if s in self.special]
+        # the pattern and the normalizer of the file (Qwen: PATTERN, NFC; a
+        # tokenizer.json of a GGUF file has neither: those of Qwen)
+        self._split = splitter(split_pattern(data))
+        norm = data.get("normalizer", {"type": "NFC"})
+        self._nfc = bool(norm) and norm.get("type") == "NFC"
+        # ignore_merges (LFM2): a piece that is a token of the vocabulary is
+        # that token, without the merges
+        self._whole = bool(m.get("ignore_merges"))
 
     def _bpe(self, piece):
         """Return the ids of one piece (a string of byte characters)."""
         ids = self._cache.get(piece)
         if ids is not None:
             return ids
+        if self._whole and piece in self.vocab:
+            return [self.vocab[piece]]
         parts = list(piece)
         ranks = self.ranks
         while len(parts) > 1:
@@ -283,9 +335,9 @@ class QwenTokenizer:
                 continue
             if ESCAPE in part:
                 part = self.unescape(part)
-            if not part.isascii():
+            if self._nfc and not part.isascii():
                 part = unicodedata.normalize("NFC", part)
-            for w in fast_split(part):
+            for w in self._split(part):
                 ids = words.get(w)
                 if ids is None:
                     ids = self._bpe(w.encode("utf-8").decode("latin-1").translate(tr))

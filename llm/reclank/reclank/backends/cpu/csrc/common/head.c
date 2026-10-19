@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <omp.h>
 #include <dlfcn.h>
 #include <pthread.h>

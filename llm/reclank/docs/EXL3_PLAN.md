@@ -234,10 +234,63 @@ CPU and the GPU; on the 3090 a decode of 64 tok/s and a prompt of 270 tok/s
 (2065 tokens: the GEMV, about 2.7 T weight-tokens/s of dp4a); one large
 matrix of one token reads 450 GB/s.
 
-Next: the prompt on the tensor cores (the decoded tiles to float16, or the
-four bytes of the products as int8 MMA); the expert kernels of the GPU and
-the Qwen3.6 path (Phase 3); the bits against ExLlamaV3 (Phase 0: its
-reference needs torch, scripts/exl3_reference.py).
+**Qwen3.8-27B** (turboderp/Qwen3.8-27B-exl3, SC_5.00bpw_H6_V6: MUL1,
+converter 1.4.2; the MLP and q_proj 4 bits, in_proj_qkv, in_proj_z,
+out_proj, and o_proj 5, k_proj, v_proj, and the head 6) runs on the CPU and
+on the GPU (section 6.2):
+
+- QwenEXL3Program (models/qwen/qwen35.py) reads the directory: the MUL1
+  matrices as they are, in_proj_a and in_proj_b (float16) as float32
+  matrices, the norms with their 1 added, the value heads of the DeltaNet
+  in the order of the checkpoint (cfg.v_tiled False), the embeddings
+  bfloat16. QwenGPU takes a model with no experts (_no_experts: every
+  matrix on the GPU, the prompts as groups of the step's records).
+- The reference: scripts/qwen38_27b_reference.py (transformers, float32 on
+  the CPU, the original bfloat16 checkpoint): two prompts (235 and 63
+  tokens of the template, the first 45 a system part the template adds),
+  then 200 and 98 greedy steps. The BF12 GGUF of the original weights
+  (scripts/convert_qwen35_dense_gguf.py, 41.2 GB) matches it: argmax 594 of
+  594 rows, KL mean 5.4e-5 (scripts/check_lfm25_cpu.py --hs-last-normed).
+- The EXL3 file against it: on the GPU, the last prompt row and the steps
+  (check_lfm25_gpu.py), argmax 314 of 314, KL mean 1.7e-3; on the CPU every
+  row (check_lfm25_cpu.py --max-kl 1e-2), argmax 97.6% (the prompt rows;
+  the steps 296 of 296), KL mean 8.9e-3.
+- On the 3090: decode 31 tok/s; a prompt at 700 to 740 tok/s (512 to 4096
+  tokens of real text; 121 with the dp4a GEMV alone). On the CPU (24 cores
+  of one node): 261 ms a step (808 before the CPU work below).
+- **The prompt on the tensor cores** (k_e3_mma, kernels/quant/exl3.cu; a
+  group of 32 rows or more): the integers of the GEMV on mma.sync m16n8k32
+  u8 x s8. The byte sum s (0 to 1020) of a code is l + 256 h, so two MMAs
+  give l q and h q exactly. The 8 codes of a lane fill the A fragment as
+  they are: x goes to shared memory with the inputs of each 16 in the order
+  of the fragment (k_e3_had_in perm). 21 to 28 T weight-rows/s on the 27B's
+  matrices at 256 to 512 rows (3.1 for the GEMV); the decode costs nothing
+  measurable (removing it: 3%), the rest is the loads of x and the latency.
+  scripts/check_exl3.py --gpu: -118 to -136 dB against the CPU.
+- **The CPU** (kernels/kq/exl3.c): the window of the last codes of a tile
+  no longer reads past the tile (one DRAM miss a tile), a prefetch 20 tile
+  rows ahead, one vpermw for the codes, the integers folded once a block
+  and centred on 510 xn (no cancellation in the float sums), and groups of
+  3 to 8 rows decoded once. One row: 5.0 to 5.8 G weights/s a core, 100 to
+  114 on 24 cores (57 to 75 GB/s; still bound by port 0: vpmulld, vpsrlvd,
+  vpdpbusd). Gemma 4 12B EXL3: 41.2 s to 10.1 s for 48 tokens, the same
+  answer.
+- **No drift** in free-running generation (work/drift: 2000 greedy tokens
+  of two prompts, a story and a B-tree with code, on the GPU; the reference
+  teacher-forced on those tokens, scripts/qwen38_27b_reference.py
+  --forced): the KL against the reference stays 2e-3 to 4e-3 in each bucket
+  of 200 steps (2.5e-3 and 2.1e-3 in the second halves against 3.5e-3 and
+  4.4e-3 in the first), argmax 97.1% and 98.3%; the steps against the same
+  tokens through the prompt path, 3e-4 to 6e-4 with no trend (the state of
+  the steps gathers no error).
+- The server: M=q27 work/start_server.sh (the Qwen engine: an EXL3
+  directory of model_type qwen3_5); the contexts give the same greedy
+  answers when they come back from host memory (work/ctx_check.py).
+
+Next: the MTP layer of the 27B (4 bits in the file); turboderp's
+Qwen3.8-Flash-Next 5.05bpw_h6_ng6 (its experts need the MoE kernels); the expert kernels of the GPU and the Qwen3.6 path (Phase 3);
+the bits against ExLlamaV3 (Phase 0: its reference needs torch,
+scripts/exl3_reference.py).
 
 ### Phase 0: a reference
 
@@ -346,8 +399,9 @@ as Qwen3.6). Their EXL3 tensors: in_proj_qkv, in_proj_z, out_proj, q_proj,
 k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, lm_head, and the
 MTP linears; in 16 bits: in_proj_a, in_proj_b, conv1d, A_log, dt_bias, the
 norms, the embeddings, and the vision tower (new converters can make it
-EXL3: vision_bits). They need a dense MLP and a GPU class with no experts
-in this runtime.
+EXL3: vision_bits). The runtime has both now: the dense MLP of every layer
+(cfg.dense_layers, the form of the dense layers of LFM2) and QwenGPU with
+no experts (section 4, Status).
 
 ### 6.3 The CPU: what limits a product
 

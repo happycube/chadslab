@@ -17,6 +17,7 @@ then run many prompts.
 from __future__ import annotations
 
 import os
+import re
 import weakref
 
 import numpy as np
@@ -369,6 +370,38 @@ class KVCache:
                 self.end[i] = n
         return True
 
+    def state(self):
+        """The rows that the cache holds and their positions (base and end of
+        each layer), as arrays by name: kq3, ks3, vq3, vs3 for layer 3, base,
+        end (Session.save)."""
+        if self.split:
+            raise ValueError("a PartKVCache has no state for a file")
+        out = {"base": np.asarray(self.base, np.int64), "end": np.asarray(self.end, np.int64)}
+        for i in range(self.cfg.num_hidden_layers):
+            if self._cap(i) == 0:
+                continue
+            r = self.end[i] - self.base[i]
+            for name, a in zip(("kq", "ks", "vq", "vs"), self._buffers(i)):
+                out["%s%d" % (name, i)] = a[:r]
+        return out
+
+    def load_state(self, st):
+        """Take the rows of state() (an npz file or a dict): the cache then
+        holds what the saved one held."""
+        base, end = np.asarray(st["base"]), np.asarray(st["end"])
+        for i in range(self.cfg.num_hidden_layers):
+            self.base[i], self.end[i] = int(base[i]), int(end[i])
+            key = "kq%d" % i
+            if key not in st:
+                continue
+            r = self.end[i] - self.base[i]
+            plan = self.cfg.plan[i]
+            cap = max(r, 2 * self.window if plan.is_sliding else min(self.max_len, max(r, 1)))
+            self.kq[i] = None
+            self._grow(i, max(cap, 1))
+            for name, a in zip(("kq", "ks", "vq", "vs"), self._buffers(i)):
+                a[:r] = st["%s%d" % (name, i)]
+
     def first_row(self, layer, n):
         """Return the first position that a token at n sees in the layer."""
         if self.cfg.plan[layer].is_sliding and self.window:
@@ -624,6 +657,11 @@ class Model:
             # The int4 matrices in groups of 16 rows too, for the prompt
             # (ops.q4x_pack_model; RECLANK_Q4X=0 turns it off).
             ops.q4x_pack_model(self)
+        if os.environ.get("RECLANK_EXPERT_GPUS") and os.environ.get("RECLANK_GPU") == "1":
+            # a second GPU's experts (backends/cuda/devices.py), from now on in
+            # a thread: not in the first request
+            from reclank.backends.cuda.devices import start_expert_device
+            start_expert_device(self)
         return self
 
     def free_all(self):
@@ -1590,6 +1628,52 @@ class Session:
         # (media.keys). A soft token matches only the same image or clip.
         self.media_keys = {}
         self._x = None
+
+    def save(self, path, tag=""):
+        """Write the conversation (its ids, the rows of its cache, and the
+        window of the start of its last answer: window_snapshot) to the file
+        path (npz): a later Session.load reads only the tokens after it
+        (core/session.py ContextDir: the contexts of the server on disk). The
+        GPU rows go to the host cache first (Model.gpu_sync). tag names the
+        model and the cache form; load refuses another. Return the bytes."""
+        if self.media_keys:
+            raise ValueError("a conversation with media has no file form")
+        sync = getattr(self.model, "gpu_sync", None)
+        if sync is not None:
+            sync(self.cache)
+        st = dict(self.cache.state())
+        st["ids"] = np.asarray(self.ids, np.int32)
+        st["tag"] = np.asarray(tag)
+        snap = getattr(self, "snap", None)
+        if snap is not None:
+            st["snap_n"], st["snap_start"] = np.int64(snap["n"]), np.int64(snap["start"])
+            for i, rows in snap["rows"].items():
+                for name, a in rows.items():
+                    st["snap_%s%d" % (name, i)] = a
+        tmp = path + ".tmp.npz"
+        np.savez(tmp, **st)
+        os.replace(tmp, path)
+        return os.path.getsize(path)
+
+    def load(self, path, tag=""):
+        """Take the conversation of a file of save. Return its token count."""
+        with np.load(path) as st:
+            if str(st["tag"]) != tag:
+                raise ValueError("%s: a cache of %r, not of %r" % (path, str(st["tag"]), tag))
+            ids = st["ids"]
+            if len(ids) > self.max_len:
+                raise ValueError("%s: %d tokens, more than the session holds (%d)" % (path, len(ids), self.max_len))
+            self.reset()
+            self.cache.load_state(st)
+            self.ids = [int(x) for x in ids]
+            if "snap_n" in st.files:
+                rows = {}
+                for name in st.files:
+                    m = re.match(r"snap_(kq|ks|vq|vs)(\d+)$", name)
+                    if m:
+                        rows.setdefault(int(m.group(2)), {})[m.group(1)] = st[name]
+                self.snap = {"n": int(st["snap_n"]), "start": int(st["snap_start"]), "rows": rows}
+        return len(self.ids)
 
     def common(self, ids, media=None):
         """Return the count of the first ids that are already in the cache.

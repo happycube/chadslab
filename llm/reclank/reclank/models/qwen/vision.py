@@ -106,8 +106,36 @@ class _STWeights:
         return np.ascontiguousarray(a, np.float32)
 
     def matrix(self, name):
-        f, full = self.where[self._hf(name)[0]]
+        """The weights of a linear: bfloat16 bits, or (FP4-Local) the exact values of its MXFP8 (as
+        bfloat16) or NVFP4 (float32) weights."""
+        hf = self._hf(name)[0]
+        f, full = self.where[hf]
+        kind = self.act(name)
+        if kind == "mx8":
+            from reclank.formats.fp4local_st import mxfp8_dequant
+            sf, sfull = self.where[hf[:-7] + ".weight_scale"]
+            w = mxfp8_dequant(f.get(full, dtype=None), sf.get(sfull, dtype=None))
+            return np.ascontiguousarray((w.view(np.uint32) >> 16).astype(np.uint16))
+        if kind == "bf16":
+            from reclank.formats.fp4local_st import nvfp4_rows
+            sf, sfull = self.where[hf[:-7] + ".weight_scale"]
+            gf, gfull = self.where[hf[:-7] + ".weight_scale_2"]
+            g = float(np.asarray(gf.get(gfull)).reshape(-1)[0])
+            return np.ascontiguousarray(nvfp4_rows(f.get(full, dtype=None), sf.get(sfull, dtype=None), g))
         return np.ascontiguousarray(f.get_bf16(full))
+
+    def act(self, name):
+        """The form of the input of a linear in FP4-Local (docs/FP4LOCAL_PLAN.md 2.10): "mx8" for the
+        MXFP8 attention (dynamic MXFP8 activations, the card), "bf16" for the NVFP4 MLP and merger
+        (W4A16), else None (a bfloat16 checkpoint)."""
+        hf = self._hf(name)[0]
+        f, full = self.where[hf]
+        dt = f.dtype(full)
+        if dt == "F8_E4M3" and hf[:-7] + ".weight_scale" in self.where:
+            return "mx8"
+        if dt == "U8" and hf[:-7] + ".weight_scale_2" in self.where:
+            return "bf16"
+        return None
 
 
 def vision_weights(path):
@@ -202,6 +230,16 @@ class QwenVision:
         self.post_ln = (W.f32("v.post_ln.weight").reshape(-1), W.f32("v.post_ln.bias").reshape(-1))
         self.mm0 = _Lin(W.matrix("mm.0.weight"), W.f32("mm.0.bias"))
         self.mm2 = _Lin(W.matrix("mm.2.weight"), W.f32("mm.2.bias"))
+        # FP4-Local: the forms of the inputs of the linears (enc_linear rounds them, and the outputs)
+        self.contract = False
+        if hasattr(W, "act"):
+            for i, b in enumerate(self.blk):
+                p = "v.blk.%d." % i
+                for key, nm in (("q", "attn_qkv"), ("k", "attn_qkv"), ("v", "attn_qkv"), ("o", "attn_out"),
+                                ("up", "ffn_up"), ("down", "ffn_down")):
+                    b[key].act = W.act(p + nm + ".weight")
+            self.mm0.act, self.mm2.act = W.act("mm.0.weight"), W.act("mm.2.weight")
+            self.contract = self.mm0.act is not None
         self.hidden = self.mm2.w.shape[0]
         # The rope of each half: hd / 4 frequencies (Qwen3_5MoeVisionRotaryEmbedding,
         # theta 1e4; the frequencies of hd / 2 values).
@@ -527,6 +565,7 @@ class QwenEmbedder:
         self.vision.gpu = gpu
         self.has_audio = False
         self.gpu = gpu
+        q8 = q8 and not self.vision.contract      # (FP4-Local's weights stay as they are)
         self.q8 = q8
         if q8:
             V = self.vision

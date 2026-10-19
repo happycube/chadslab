@@ -51,9 +51,12 @@ def dense_mode(g, dense=None):
     of a file of convert_q8_gguf.py --dense bf12 stay BF12 unless
     RECLANK_DENSE is q8, rq8 or bf16 (Qwen4CPU.K; rq8: rotated Q8_0, the
     other bfloat16 matrices as q8)."""
-    if getattr(g, "kept", False):
-        return "bf16"       # the weightkeeper chose the types (its least ones): as they are
-    dense = dense or os.environ.get("RECLANK_DENSE", "q8")
+    if getattr(g, "kept", False) or getattr(g, "as_stored", False):
+        # the weightkeeper chose the types (its least ones), or a checkpoint whose
+        # types are its contract (FP4-Local, fp4local_st): as they are
+        return "bf16"
+    # an EXL3 directory (exl3_qwen4.EXL3Source): its few bfloat16 matrices as they are
+    dense = dense or os.environ.get("RECLANK_DENSE", "bf16" if getattr(g, "exl3", False) else "q8")
     if dense != "auto":
         return dense
     from reclank.formats.gguf import tensor_bytes
@@ -180,7 +183,7 @@ def default_experts(path):
     "none" keeps the experts of the model file."""
     import glob
     from reclank.formats.nvfp4_st import is_checkpoint
-    if is_checkpoint(path):
+    if is_checkpoint(path) or os.path.isdir(path):
         return None
     d = os.path.dirname(os.path.abspath(path))
     found = [f for f in sorted(glob.glob(os.path.join(d, "*nvfp4-experts*.gguf")))
@@ -221,7 +224,18 @@ class Qwen4(QwenGGUF):
             # e.g. the NVFP4 experts, then the BF12 experts of the MTP layer
             experts = [e for e in experts.split(",") if e]
         from reclank.models.qwen import keep
-        if path.endswith(".gguf") and keep.holds(path):
+        from reclank.formats.exl3_qwen4 import EXL3Source, is_qwen4_exl3
+        from reclank.formats.fp4local_st import FP4LSource, is_fp4local
+        if is_qwen4_exl3(path):
+            # an EXL3 directory of ExLlamaV3 (reclank/formats/exl3_qwen4.py), from
+            # the weightkeeper when it holds it (keep_exl3.KeptEXL3)
+            if keep.holds(path):
+                from reclank.models.qwen.keep_exl3 import KeptEXL3
+                self.g = KeptEXL3(path)
+            else:
+                self.g = EXL3Source(path)
+            self.cfg = cfg or self.g.config()
+        elif path.endswith(".gguf") and keep.holds(path):
             # a GGUF file that the weightkeeper holds: its tensors from there
             self.g = keep.KeptGGUF(path)
             self.cfg = cfg or config_from_gguf(self.g)
@@ -239,6 +253,20 @@ class Qwen4(QwenGGUF):
             if mtp is not None:
                 self.g.attach(mtp)
             self.cfg = cfg or config_from_gguf(self.g)
+        elif is_fp4local(path):
+            # nvidia/Qwen3.8-Flash-Next-FP4-Local (reclank/formats/fp4local_st.py:
+            # the CSF experts, MXFP8, the NVFP4 n-gram table; docs/FP4LOCAL_PLAN.md),
+            # from the weightkeeper when it holds it (keep_fp4l.KeptFP4L)
+            if keep.holds(path):
+                from reclank.models.qwen.keep_fp4l import KeptFP4L
+                self.g = KeptFP4L(path)
+            else:
+                self.g = FP4LSource(path)
+            if os.environ.get("RECLANK_FP4L_MTP"):
+                # another file's MTP layer (the BF12 GGUF's blk.48) as the drafter (plan D8)
+                from reclank.formats.fp4local_st import attach_mtp
+                attach_mtp(self.g, os.environ["RECLANK_FP4L_MTP"])
+            self.cfg = cfg or self.g.config()
         elif is_checkpoint(path):
             # The safetensors checkpoint of ModelOpt (reclank/formats/nvfp4_st.py); it
             # has the MTP layer.
@@ -252,6 +280,11 @@ class Qwen4(QwenGGUF):
             self.cfg = cfg or config_from_gguf(self.g)
         self.n_layers = layers or self.cfg.num_hidden_layers
         self._deq = {}
+        # FP4-Local's FP8 cache: the int8 cache holds E4M3 codes (a state of the process)
+        cops_ = __import__("reclank.backends.cpu.cops", fromlist=["cops"])
+        cops_.set_kv_e4m3(getattr(self.cfg, "kv_form", "") == "e4m3")
+        from reclank.models.qwen.qwen35 import gguf_name
+        self.gname = gguf_name          # (QwenGGUF.W: the DeltaNet of qwen35 reads its matrices by it)
 
     def G(self, gname):
         """A dequantized tensor by its GGUF name, kept after the first use."""
@@ -321,6 +354,9 @@ class Qwen4(QwenGGUF):
         rows = self.ple_ids(ids, cache)                              # (t, 16)
         emb = self.g.dequant("per_layer_token_embd.weight", rows=rows.reshape(-1))
         emb = emb.reshape(t, -1)                                     # (t, 16 x 160)
+        if getattr(cfg, "ple_bf16", False):
+            from reclank.formats.fp4local_st import bf16r
+            emb = bf16r(emb)            # (FP4-Local: the rows rounded to bfloat16, as vLLM)
         p = "blk.%d.ple_" % i
         eps = cfg.rms_norm_eps
         key = grouped_norm(emb @ self.G(p + "key.weight").T, self.G(p + "norm_key.weight"),
@@ -626,7 +662,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         lf = layer_kv_form(getattr(cfg, "kv_form", "int16"), cfg, i)
         if lf in ("rq8", "rk8v8"):
             raise ValueError("the %s cache is of Qwen3.6 (compile_qwen_step) only" % lf)
-        form = {"int16": 0, "int8": 1, "k16v8": 2, "f32": 3, "tq6": 4}[lf]
+        # (e4m3: the int8 form, its bytes E4M3 codes: FP4-Local's FP8 cache)
+        form = {"int16": 0, "int8": 1, "k16v8": 2, "f32": 3, "tq6": 4, "e4m3": 1}[lf]
         if form == 3:
             # ATTN_PREP writes the float rows of the key and the value
             prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(b + "attn_q_norm.weight"),
@@ -722,6 +759,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         lin(b + "eh_proj.weight", H, rows=t * hc)
         layers, head = [L], b + "hc_head"
     layer_begin = getattr(model, "layer_begin", None)
+    # FP4-Local (cfg.b12x): the outputs of the hyper-connection mixes (the inputs of the blocks, the
+    # MoE and the head) in bfloat16, as vLLM's gate_mean
+    b12x = getattr(cfg, "b12x", False)
     for n, i in enumerate(layers):
         b = "blk.%d." % i
         if fresh and n > 0:
@@ -732,6 +772,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         if i in cfg.ple_layers:
             ple_layer(i)
         hc_pre(b + "hc_attn", mixed)
+        if b12x:
+            prog.emit(P.BF16_ROUND, mixed, t * hid)
         quant(mixed, hid)
         if i >= len(cfg.layer_types) or cfg.layer_types[i] == "full_attention":
             attention(i)
@@ -739,6 +781,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
             deltanet(i)
         prog.emit(P.HC_ADD, H, o5, inj, t, hc, hid, 1.0 / hc)
         hc_pre(b + "hc_ffn", mixed)
+        if b12x:
+            prog.emit(P.BF16_ROUND, mixed, t * hid)
         quant(mixed, hid)
         lin(b + "ffn_gate_inp.weight", logits)
         lin(b + "ffn_gate_inp_shexp.weight", slog)
@@ -753,6 +797,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         model.emit_moe4(prog, i, xb, idx, val, slog, scratch, mo)
         prog.emit(P.HC_ADD, H, mo, inj, t, hc, hid, 1.0 / hc)
     hc_pre(head, xn, inject=False)
+    if b12x:
+        prog.emit(P.BF16_ROUND, xn, t * hid)
     prog.keep.append(dense)
     prog.tokens = t
     return prog.finish()
@@ -772,10 +818,10 @@ class Qwen4CPU(Qwen4):
         # the MoE then rotate the act of each pair before the down product
         # (kq_set_moe_rot: a state of the process), and the program rotates
         # the x of the experts (compile_qwen4_step).
-        from reclank.formats.gguf import RQ6_K, RQ8_0
-        kinds = {t in (RQ8_0, RQ6_K) for n, (_d, t, _o) in self.g.tensors.items()
+        from reclank.formats.gguf import ROT_BASE
+        kinds = {t in ROT_BASE for n, (_d, t, _o) in self.g.tensors.items()
                  if "_exps." in n or "_shexp.weight" in n and "gate_inp" not in n}
-        assert len(kinds) <= 1, "RQ8_0 must be all the experts of the file, or none"
+        assert len(kinds) <= 1, "rotated experts (RQ8_0, RQ6_K, RQ4_K, ...) must be all the experts of the file, or none"
         self.rot_experts = kinds == {True}
         from reclank.backends.cpu import cops
         cops.kq_set_moe_rot(self.rot_experts)
@@ -787,7 +833,7 @@ class Qwen4CPU(Qwen4):
         from reclank.models.qwen.qwen35 import KMat
         m = self._k.get(gname)
         if m is None and getattr(self.g, "kept", False) and \
-                self.g.index["tensors"][gname]["place"] == "experts":
+                self.g.index["tensors"].get(gname, {}).get("place") == "experts":
             # a stack of experts split between the nodes by the weightkeeper:
             # data holds those of the first node; kept, all the nodes (the GPU
             # takes them as its split, gpu35.QwenGPU._kept_split)
@@ -807,10 +853,13 @@ class Qwen4CPU(Qwen4):
                 # (rot_experts), not a dense matrix of dense_rot
                 assert self.rot_experts, gname
                 m.rot = False
-            if m.type == 57:
+            if m.type == 57 and "_exps." not in gname and "_shexp." not in gname:
                 # BF12 (the dense matrices of a file of convert_q8_gguf.py
                 # --dense bf12): its kernels, unless RECLANK_DENSE asks for
                 # q8, rq8 or bf16 (the bfloat16 bits, then as those modes).
+                # Not the experts: a stack of routed experts is E matrices
+                # (KMat rows: those of one), and the MoE takes BF12 routed
+                # and shared experts together (the float rows of x).
                 # rq8: Q8_0 of the rows rotated in each 32 values (as RQ8_0),
                 # m.rot; the program rotates the x of their products
                 # (compile_qwen4_step, dense_rot). Not the head, which runs
@@ -829,7 +878,7 @@ class Qwen4CPU(Qwen4):
                         m.rot = True
                     else:
                         m.data, m.type = bits.reshape(-1).view(np.uint8), 30
-            if m.type == 30 and "_shexp." in gname and m.cols % 32 == 0:
+            if m.type == 30 and "_shexp." in gname and m.cols % 32 == 0 and not getattr(self.g, "as_stored", False):
                 # A bfloat16 shared expert (the NVFP4 experts file) to BF12,
                 # not Q8_0: it runs for every token, on the GPU, and its
                 # bytes are few (3 matrices of 2560 x 640 a layer)
@@ -977,10 +1026,18 @@ class Qwen4CPU(Qwen4):
         return out
 
     def ple_rows(self, ids, cache):
-        """The 16 rows of the n-gram table of each token (t x hid)."""
+        """The 16 rows of the n-gram table of each token (t x hid); FP4-Local's
+        (cfg.ple_bf16) rounded to bfloat16, as vLLM (ple_embedding/reference.py)."""
+        out = self._ple_rows(ids, cache)
+        if getattr(self.cfg, "ple_bf16", False):
+            from reclank.formats.fp4local_st import bf16r
+            out = bf16r(out).reshape(out.shape)
+        return out
+
+    def _ple_rows(self, ids, cache):
         from reclank.backends.cpu import cops
         rows = self.ple_ids(ids, cache)
-        if getattr(self.g, "kept", False):
+        if getattr(self.g, "kept", False) and "per_layer_token_embd.weight" in self.g.index["tensors"]:
             # the weightkeeper (keep.KeptGGUF): the rows split between the nodes,
             # read by their addresses (many threads), then decoded
             g, name = self.g, "per_layer_token_embd.weight"

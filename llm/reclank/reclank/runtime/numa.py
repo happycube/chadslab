@@ -119,6 +119,16 @@ def _huge(m):
         pass
 
 
+def empty_huge(nbytes):
+    """An uninitialized uint8 array of nbytes on huge pages (_huge), its pages
+    on the node of the thread that first writes them."""
+    if nbytes == 0:
+        return np.empty(0, np.uint8)
+    m = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    _huge(m)
+    return np.frombuffer(m, dtype=np.uint8, count=nbytes)
+
+
 def empty_interleaved(nbytes):
     """An uninitialized uint8 array of nbytes whose pages go to the nodes in
     turn (MPOL_INTERLEAVE): all the nodes read it at about the same rate. A

@@ -97,6 +97,18 @@ __global__ void k_ffn_out(const gp_rec *r, const int64_t *e)
 }
 
 /* a, b, out, n */
+/* GP_BF16_ROUND: x, n. x rounded to bfloat16 values (to nearest even) in place. */
+__global__ void k_bf16_round(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < DI(1)) {
+        float *x = DP(float, 0);
+        unsigned u = __float_as_uint(x[i]);
+        x[i] = __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+    }
+}
+
 __global__ void k_add(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -389,6 +401,52 @@ __global__ void k_kv_write(const gp_rec *r, const int64_t *e)
 /* k_kv_write for the int8 cache: a scale of max |x| / 127 for each group of
  * 32 values, as gemma_quant_group32_i8 of the CPU. The int8 cache has no
  * float rows. */
+/* FP4-Local's FP8 cache (docs/FP4LOCAL_PLAN.md 2.9, vLLM's --kv-cache-dtype fp8): the bytes of the int8
+ * cache are E4M3 codes and the scales 1 (K8 = e4m3_rne_satfinite(x / 1.0)); a state of the process
+ * (rc_gpu_set_kv_e4m3) that the writes and every reader of the int8 cache take. */
+__device__ int gg_kv_e4m3_d = 0;
+
+extern "C" int rc_gpu_set_kv_e4m3(int on)
+{
+    return cudaMemcpyToSymbol(gg_kv_e4m3_d, &on, sizeof(int)) == cudaSuccess ? 0 : 1;
+}
+
+/* the E4M3 code of x (to nearest even, subnormals, saturating at 448: cvt.rn.satfinite.e4m3) */
+__device__ __forceinline__ uint8_t rc_e4m3_code(float x)
+{
+    uint8_t s = (__float_as_uint(x) >> 24) & 0x80;
+    float a = fabsf(x);
+    if (!(a < 448.f)) {
+        return s | (a == a ? 0x7E : 0x7F);          /* (NaN stays NaN) */
+    }
+    if (a < 0.015625f) {
+        return s | (uint8_t)(int)rintf(a * 512.f);  /* subnormal codes 0-7, 8 = 2^-6 */
+    }
+    int e;
+    float m = frexpf(a, &e);
+    int q = (int)rintf((m * 2.f - 1.f) * 8.f);
+    int E = e - 1 + 7;
+    if (q == 8) {
+        q = 0;
+        ++E;
+    }
+    int c = (E << 3) | q;
+    return s | (uint8_t)(c > 0x7E ? 0x7E : c);
+}
+
+__device__ __forceinline__ float rc_e4m3_val(uint32_t b)
+{
+    int e = (b >> 3) & 15, m = b & 7;
+    float v = e == 0 ? (float)m * (1.f / 512.f) : __uint_as_float(((uint32_t)(e + 120) << 23) | ((uint32_t)m << 20));
+    return (b & 0x80) ? -v : v;
+}
+
+/* a byte of the int8 cache: int8, or E4M3 with the FP8 cache */
+__device__ __forceinline__ float rc_kv8_val(uint32_t b)
+{
+    return gg_kv_e4m3_d ? rc_e4m3_val(b & 0xff) : (float)(int8_t)(b & 0xff);
+}
+
 template <bool K8>
 __global__ void k_kv_write8(const gp_rec *r, const int64_t *e)
 {
@@ -399,6 +457,15 @@ __global__ void k_kv_write8(const gp_rec *r, const int64_t *e)
         return;
     }
     size_t i = (size_t)g * 32 + l;
+    if (gg_kv_e4m3_d) {
+        for (int kv = 0; kv < 2; ++kv) {
+            DP(uint8_t, kv ? 6 : 4)[i] = rc_e4m3_code(DP(const float, kv)[i]);
+            if (l == 0) {
+                DP(float, kv ? 7 : 5)[g] = 1.f;
+            }
+        }
+        return;
+    }
     for (int kv = 0; kv < 2; ++kv) {
         float x = DP(const float, kv)[i];
         float amax = fabsf(x);

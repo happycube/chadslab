@@ -67,6 +67,16 @@ RESIDENT_BIAS = float(os.environ.get("RECLANK_GPU_RESIDENT_BIAS", "0") or 0)
 # choice before the swaps, so what it holds follows the model's routing.
 HOT_SWAP = float(os.environ.get("RECLANK_GPU_HOT_SWAP", "0") or 0)
 
+# The rows of a prompt in the MTP layer (mtp_rows): with RECLANK_GPU_MTP_MIX
+# (e.g. 1024; 0, the default: off) mixed groups of up to that many rows (as
+# the prompt's groups: the experts by expert on the tensor cores, the cold
+# ones on the CPU), else groups of 256 as a step (the MoE a GEMV for each row
+# and expert). EXL3 5.05, a prompt of 16K tokens: the layer's 2.2 s to 1.65 s
+# (1024) or 1.48 s (4096), the drafts accepted as before; at 64K no gain (the
+# dense attention of the layer is most of it), and the verify groups after
+# 16K 35.5 -> 37.2 ms (the memory of the second mixed program, from the pool?).
+MTP_MIX = int(os.environ.get("RECLANK_GPU_MTP_MIX", "0"))
+
 
 class _Emit4:
     """The model as compile_qwen4_step sees it for a GPU program."""
@@ -74,8 +84,9 @@ class _Emit4:
     # compile_qwen4_step: buffers of each layer, for alloc.pack
     pack_temps = alloc.PACK
 
-    def __init__(self, dev, t, verify, fetch, mix=False, bias=False):
+    def __init__(self, dev, t, verify, fetch, mix=False, bias=False, prefetch=True):
         self.dev, self.m, self.t, self.fetch, self.mix = dev, dev.model, t, fetch, mix
+        self.prefetch = prefetch    # a mixed group: the copies of the layer before its plan
         dev._lpool = None
         self.bias = bias        # a step, a verify group, or the MTP layer: RESIDENT_BIAS
         self.colds = {}         # layer -> the cold list of a step whose selection the router writes
@@ -120,7 +131,7 @@ class _Emit4:
             self.dev._moe_fetch(prog, i, xb["src"], idx, val, slog, out)
             return
         if self.mix:
-            self.dev._moe_mix(prog, i, xb["src"], idx, val, slog, out)
+            self.dev._moe_mix(prog, i, xb["src"], idx, val, slog, out, prefetch=self.prefetch)
             return
         # with HOT_SWAP the router wrote the choice for HotCache already
         swapped = HOT_SWAP > 0 and self.bias and i in self.dev.stores
@@ -157,13 +168,6 @@ class _DevCache4(_DevCache):
         super().attach(cache)
         self.add(list(cache.ple_conv.values()) + list(cache.idx_k.values())
                  + list(cache.idx_blk.values()))
-
-    def add(self, arrays, fresh=None):
-        """More arrays (the buffers of attach's pool first; fresh: zero them,
-        else upload; None: as the last attach)."""
-        if fresh is not None:
-            self._fresh = fresh
-        self._put(arrays)
 
     def buffer(self, a):
         return self.bufs[id(a)][1]
@@ -230,26 +234,6 @@ class Qwen4GPU(QwenGPU):
     def _scratch_names(self):
         return ("scores", "qsa_scratch")
 
-    def sel_of(self, t):
-        """The selection of each layer of a group of t rows (layers + 1, t,
-        top_k), for HotCache."""
-        a = self.sel_bufs.get(t)
-        if a is None:
-            a = self.sel_bufs[t] = np.zeros((self.cfg.num_hidden_layers + 1, t, self.cfg.top_k),
-                                            np.int32)
-        return a
-
-    def _score(self, t, rows, layers):
-        """HotCache: score rows rows of the last group of t rows in layers."""
-        hc = self.hot_cache
-        if hc is None or rows == 0:
-            return
-        sel = self.sel_of(t)
-        self.g.mirror.buffer_of(sel).download(sel)
-        idx = [r for r, e in enumerate(hc.layers) if e["layer"] in layers]
-        lay = [hc.layers[r]["layer"] for r in idx]
-        hc.score_group(idx, sel[lay, :rows].transpose(1, 0, 2))
-
     def _dense_bytes(self, bf16_as_q8=None):
         """The bytes of the dense tensors on the GPU (bfloat16 counts as Q8_0
         when the model requantizes them: Qwen4CPU dense; BF12 as the mode of
@@ -281,7 +265,10 @@ class Qwen4GPU(QwenGPU):
                 first.append((P.FETCH, [prog._enc(ranges), prog._enc(len(ranges)),
                                         prog._enc(i), prog._enc(i % 2)]))
             prog.recs[:0] = first
-        return self._pack(_fuse(prog, t))
+        prog = self._pack(_fuse(prog, t))
+        # the routers' choices of a group (sel_of at its compile: lanes.Lane compiles with its own)
+        prog.sel_buf = self.sel_bufs.get(t)
+        return prog
 
     def _params(self, pos, t, nreal):
         cfg = self.cfg
@@ -398,7 +385,10 @@ class Qwen4GPU(QwenGPU):
             ms = self.mix_size
             size = next((sz for sz in (256, 512, 1024, 2048, 4096)
                          if sz <= ms and sz >= min(rem, ms) and sz <= room - pos - c0), 0)
-            if ms > 0 and rem >= MIX_MIN and size:
+            # FP4-Local (b12x): a prompt part of more than 64 tokens in a mixed group (A4), as vLLM's
+            # prefill rows outside its CUDA graphs of 64 tokens (the plan's 2.2); the rest A16
+            mn = 65 if getattr(self, "b12x", False) and "RECLANK_GPU_MIX_MIN" not in os.environ else MIX_MIN
+            if ms > 0 and rem >= mn and size:
                 n = min(rem, size)
                 h = self.mix(ids[c0:c0 + n], pos + c0, size, media)
                 if streams:
@@ -475,6 +465,91 @@ class Qwen4GPU(QwenGPU):
             else:
                 self._score(size, t, (L,))
         self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * cfg.hidden_size * 4
+        self._mtp_last = self.last      # (the head of the drafts: _draft_head)
+        self.rows = t
+        return prog.names["H"][:t].copy()
+
+    def mtp_rows(self, Hs, ids, pos):
+        """The MTP layer on the rows of a prompt (as mtp, any count): mixed
+        groups of up to MTP_MIX rows (the experts on the tensor cores by
+        expert, the cold ones on the CPU, as the prompt's groups) where they
+        fit, the rest in groups of 256. Return the streams of the layer of
+        the last group; logits() then gives the draft of the last row."""
+        hm, c0, n = None, 0, len(ids)
+        mixed = MTP_MIX >= MIX_MIN and self.mix_size > 0
+        while c0 < n:
+            rem = n - c0
+            if mixed and rem >= MIX_MIN:
+                size = next(s for s in (256, 512, 1024, 2048, 4096) if s >= min(rem, MTP_MIX))
+                c1 = c0 + min(rem, size)
+                hm = self.mtp_mix(Hs[c0:c1], ids[c0:c1], pos + c0, size)
+            else:
+                c1 = c0 + min(rem, 256)
+                hm = self.mtp(Hs[c0:c1], ids[c0:c1], pos + c0)
+            c0 = c1
+        return hm
+
+    def _mtp_mix_group(self, t):
+        """The MTP layer as a mixed group of t rows (mix_progs ("mtp", t)),
+        and the room of the pool for its copies (as _mix_group)."""
+        key = ("mtp", t)
+        e = self.mix_progs.get(key)
+        if e is None:
+            self.free_ring()
+            self._ensure_head()
+            self._pool = {}
+            prog = self._pack(_fuse(compile_qwen4_step(_Emit4(self, t, False, False, mix=True, prefetch=False),
+                                                       t, mtp=True), t))
+            e = self.mix_progs[key] = (prog, self._gpu_program(prog, ("mix_progs", key)))
+        self._running = ("mix_progs", key)
+        self._used(key, "mix_progs")
+        self.mix_cap = self._pool_room(("mix_progs", key))
+        return e
+
+    def mtp_mix(self, Hs, ids, pos, size):
+        """mtp for the rows of a prompt as one mixed group of size rows (no
+        prefetch: its plan copies the experts of the layer it gives the
+        GPU). The selections of these rows do not score HotCache (as the
+        prompt's groups)."""
+        cfg = self.cfg
+        t = len(ids)
+        L = cfg.num_hidden_layers
+        try:
+            prog, g = self._mtp_mix_group(size)
+            if self.hot_cache is not None:
+                self.hot_cache.prepare(wait=True)      # the plan reads the slots
+            self._nreal_h[0] = t
+            e, h = prog.names["e"], prog.names["h"]
+            e[:t] = self.model.embed(ids)
+            e[t:] = 0.0
+            h[:t] = Hs.reshape(t, -1)
+            h[t:] = 0.0
+            g.upload("e")
+            g.upload("h")
+            cos, sin = self.model.rope(rope_positions(self.cache, pos, size))
+            self.cache_dev.share_tail(pos + size, self.cache_dev.before)
+            kw = {"pos": pos, "nreal": t, "cos": np.ascontiguousarray(cos, np.float32),
+                  "sin": np.ascontiguousarray(sin, np.float32),
+                  "scores": np.empty(cfg.num_heads * (pos + size) + 64, np.float32)}
+            for nm, a in zip(("kq", "ks", "vq", "vs"), self.mcache.kv[L]):
+                kw["%s.%d" % (nm, L)] = a
+            g.bind(kw, self.cache_dev, scratch=("scores",))
+            # the blocks of the pool for its copies, after every allocation of the run (_mix_run)
+            hc = self._warm_hc()
+            if hc is not None:
+                self.mix_places = hc.pool_reserve(self.mix_cap)
+            else:
+                free = np.flatnonzero(self.pool.owner == -1)[:self.mix_cap]
+                self.pool.owner[free] = -2
+                self.mix_places = free.astype(np.int32)
+            self._warm_desc(self.mix_places)
+            self.last_run = {"kind": "mtp_mix", "pos": int(pos), "rows": int(t), "size": int(size)}
+            g.run()
+            g.download("H")
+        finally:
+            self._running = None
+        self.last = g.mirror.buffer_of(prog.names["xn"]).ptr + (t - 1) * cfg.hidden_size * 4
+        self._mtp_last = self.last
         self.rows = t
         return prog.names["H"][:t].copy()
 
@@ -492,13 +567,12 @@ class Qwen4GPU(QwenGPU):
         return out
 
     def commit(self, n):
-        """Keep the first n tokens of the last verify group: the DeltaNet
-        (QwenGPU.commit), then the state of the n-gram layer from its copy
-        and the first n inputs of its convolution."""
+        """Keep the first n tokens of the last verify group: the DeltaNet and
+        HotCache's scores (QwenGPU.commit), then the state of the n-gram layer
+        from its copy and the first n inputs of its convolution."""
         prog, pos, ids, (ple_ids, ple_conv) = self._pending
         self._pending = (prog, pos)
         super().commit(n)
-        self._score(prog.tokens, n, range(self.cfg.num_hidden_layers))
         cfg = self.cfg
         ctx = cfg.ple_ngram - 1
         self.cache.ple_ids = np.concatenate([ple_ids, np.asarray(ids[:n], np.int64)])[-ctx:].copy()
@@ -509,15 +583,23 @@ class Qwen4GPU(QwenGPU):
             new = np.ascontiguousarray(np.concatenate([old, gn[:n]])[-old.shape[0]:])
             self.cache_dev.buffer(self.cache.ple_conv[i]).upload(new)
 
-    def _head(self, rows, prob=False):
+    def _draft_head(self, x=None):
+        """True when the logits are those of the MTP layer's last run (or of host rows x, its drafts)
+        and the model has a head of its own for them (FP4-Local: mtp_head, NVFP4)."""
+        if "mtp_head.weight" not in self.model.g.tensors or os.environ.get("RECLANK_FP4L_MTP_HEAD", "1") == "0":
+            return False
+        return x is not None or (getattr(self, "_mtp_last", None) is not None and self._mtp_last == self.last)
+
+    def _head(self, rows, prob=False, draft=False):
         """The program of the head for rows rows (made once); prob: with the
-        probability of the best token of each row too."""
-        key = (rows, "p") if prob else rows
+        probability of the best token of each row too; draft: the MTP drafter's head (mtp_head)."""
+        key = (rows, "p" if prob else "", "d" if draft else "")
         e = self.head_progs.get(key)
         if e is None:
             cfg = self.cfg
-            m = self.model.K("output.weight")
-            w, type_ = self.dense("output.weight")
+            name = "mtp_head.weight" if draft else "output.weight"
+            m = self.model.K(name)
+            w, type_ = self.dense(name)
             self._head_w = w        # its device copy stays (_pinned_arrays)
             hp = P.Program()
             # the logits in pinned memory: a row is 1 MB (248320 values), and
@@ -534,6 +616,8 @@ class Qwen4GPU(QwenGPU):
                 p = pinned((rows,), np.float32)
                 hp.names["prob"] = p
             hp.emit(P.KQ_LINEAR, None, None, None, hx, w, type_, m.rows, m.cols, rows, out)
+            if getattr(cfg, "b12x", False):
+                hp.emit(P.BF16_ROUND, out, rows * m.rows)     # (vLLM's heads give bfloat16 logits)
             for j in range(rows):
                 hp.emit(P.ARGMAX, out[j], m.rows, tok[j:j + 1], *((p[j:j + 1],) if prob else ()))
             hp = hp.finish()
@@ -548,7 +632,7 @@ class Qwen4GPU(QwenGPU):
         row) to the host. For greedy MTP. prob: also the softmax probability
         of each (a float32 array): (tokens, probabilities)."""
         cfg = self.cfg
-        hp, hg = self._head(rows, prob)
+        hp, hg = self._head(rows, prob, self._draft_head())
         assert 1 <= rows <= self.rows
         step = cfg.hidden_size * 4
         _check(lib().rc_gpu_d2d(hg.mirror.buffer_of(hp.names["x"]).ptr,
@@ -568,7 +652,7 @@ class Qwen4GPU(QwenGPU):
         cfg = self.cfg
         if x is not None:
             rows = x.shape[0]
-        hp, hg = self._head(rows)
+        hp, hg = self._head(rows, draft=self._draft_head(x))
         if x is not None:
             hp.names["x"][:] = x
             hg.upload("x")

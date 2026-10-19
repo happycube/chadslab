@@ -37,6 +37,7 @@ from __future__ import annotations
 import bisect
 import ctypes
 import os
+import threading
 import weakref
 
 import numpy as np
@@ -58,7 +59,8 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,),
         P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
         P.CPU_TASK: (0, 1, 2), P.MOE_COMBINE: (5,),     # (MOE_COMBINE: the rows of the CPU, pinned)
-        P.DS_COMBINE: (3,), P.DS_EMBED: (0,)}     # (DS_EMBED: the table in pinned host memory)
+        P.DS_COMBINE: (3,), P.DS_EMBED: (0,),     # (DS_EMBED: the table in pinned host memory)
+        P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,)}  # (the CPU's sums of its experts, pinned)
 
 
 def lib():
@@ -70,12 +72,17 @@ def lib():
         raise RuntimeError(_error)
     try:
         from reclank.backends.cuda import build as _cuda_build
+        from reclank.backends.cuda.devices import prebuild
+        prebuild()      # (the expert devices' libraries, beside this build)
         L = ctypes.CDLL(str(_cuda_build.build()))
     except Exception as exc:  # no nvcc, or the build failed
         _error = "the GPU library is not available: %s" % exc
         raise RuntimeError(_error) from exc
     vp, sz, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
     L.rc_gpu_last_error.restype = ctypes.c_char_p
+    L.rc_gpu_lane.argtypes = [i]
+    L.rc_gpu_scratch_own.argtypes = [i]
+    L.rc_gpu_lane_serve.argtypes = [vp]
     L.rc_gpu_where.argtypes = [vp]
     L.rc_gpu_where.restype = vp
     L.rc_gpu_init.argtypes = [i]
@@ -84,6 +91,7 @@ def lib():
     L.rc_gpu_malloc.restype = vp
     L.rc_gpu_free.argtypes = [vp]
     L.rc_gpu_h2d.argtypes = [vp, vp, sz]
+    L.rc_gpu_h2d_rows.argtypes = [i, vp, vp, sz]
     L.rc_gpu_d2h.argtypes = [vp, vp, sz]
     L.rc_gpu_mix_stats_on.argtypes = [i]
     L.rc_gpu_mix_stats.argtypes = [vp, i]
@@ -97,6 +105,7 @@ def lib():
     L.rc_gpu_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
     L.rc_gpu_q4_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
     L.rc_gpu_e3_linear.argtypes = [vp, i, i, i, vp, i, vp, ctypes.c_float]
+    L.rc_gpu_e3_linear_x16.argtypes = [vp, i, i, i, vp, i, vp]
     L.rc_gpu_topk.argtypes = [vp, i, i, i, ctypes.c_float, vp, vp, vp]
     L.rc_gpu_argmax_rows.argtypes = [vp, i, i, vp]
     L.rc_gpu_embed_q4.argtypes = [vp, vp, vp, i, ctypes.c_float]
@@ -105,6 +114,12 @@ def lib():
     L.rc_gpu_host_register_rw.argtypes = [vp, ctypes.c_size_t]
     L.rc_gpu_set_moe_rot.argtypes = [ctypes.c_int]
     L.rc_gpu_set_moe_rot.restype = None
+    L.rc_gpu_set_moe_clamp.argtypes = [ctypes.c_int]
+    L.rc_gpu_set_moe_clamp.restype = None
+    L.rc_gpu_set_moe_contract.argtypes = [ctypes.c_int]
+    L.rc_gpu_set_moe_contract.restype = None
+    L.rc_gpu_set_kv_e4m3.argtypes = [ctypes.c_int]
+    L.rc_gpu_set_kv_e4m3.restype = ctypes.c_int
     L.rc_gpu_set_pool.argtypes = [vp]
     L.rc_gpu_fence.restype = ctypes.c_int64
     L.rc_gpu_fence_done.argtypes = [ctypes.c_int64, i]
@@ -116,7 +131,7 @@ def lib():
     L.rc_gpu_host_register_ro.argtypes = [vp, ctypes.c_size_t]
     L.rc_gpu_host_register_ro.restype = i
     L.rc_gpu_cache_query.argtypes = [i, i]
-    L.rc_gpu_gdn_commit.argtypes = [vp, vp, vp] + [i] * 6
+    L.rc_gpu_gdn_commit.argtypes = [vp, vp, vp] + [i] * 7
     L.rc_gpu_host_alloc.restype = vp
     L.rc_gpu_d2d.argtypes = [vp, vp, sz]
     L.rc_gpu_ko_table.argtypes = [vp, vp, i, i, i]
@@ -148,7 +163,7 @@ def lib():
 
 
 CAPS_FIELDS = ("cc", "tc", "fp8_mma", "fp4_mma", "pdl", "nanosleep", "smem_block_max", "warp",
-               "sm_count", "unified")
+               "sm_count", "unified", "dp4a")
 
 
 def caps():
@@ -177,8 +192,8 @@ def has_tc():
 def int8_tiles():
     """True when the int8 products of large groups have a kernel: the tensor
     cores, or dp4a (sm_61 up, the Pascal kernels; RECLANK_GPU_DP4A=0 turns
-    them off)."""
-    return has_tc() or (caps().get("cc", 0) >= 61 and os.environ.get("RECLANK_GPU_DP4A", "1") != "0")
+    them off; Maxwell, RECLANK_GPU_CC below 61: no dp4a)."""
+    return has_tc() or (bool(caps().get("dp4a", 0)) and os.environ.get("RECLANK_GPU_DP4A", "1") != "0")
 
 
 def _place_threads(L):
@@ -623,6 +638,12 @@ class WarmPool:
     # _warm_programs frees the programs of the prompts first
     warm_keep = None
     warm_min = 0
+    # True: _warm_programs also when the free segments and the free memory
+    # are less than the blocks of the experts the GPU does not hold (the end
+    # of a prompt on a card too small for all of them: the warm experts are
+    # worth more to the decode than the programs to the next prompt, which
+    # makes them again); a card that holds them all keeps the programs
+    warm_short = False
     # True: a decode step adds free segments whenever the memory has room for
     # one (the memory a prompt let go); False: only when the pool has no free
     # segment (they stay until something needs the memory)
@@ -632,16 +653,23 @@ class WarmPool:
         """Free the programs (and buffers) of the prompts for the pool: none
         by default."""
 
-    def _warm_want(self, hc, pool):
-        """The bytes of free segments worth adding with warm_regrow: blocks
-        for the experts the GPU does not hold, less the free blocks (the 26B
-        on the 3090 holds 3766 of its 3840 experts: 421 segments, 11 GB,
-        made at the first decode step for nothing, then freed by the next
-        prompt)."""
-        if not self.warm_regrow:
-            return float("inf")
+    def _warm_prompt_held(self):
+        """True while programs (or buffers) of a prompt that _warm_programs
+        frees are held: none by default."""
+        return False
+
+    def _warm_need(self, hc, pool):
+        """The bytes of segments for the experts the GPU does not hold, less
+        the free blocks (the 26B on the 3090 holds 3766 of its 3840 experts:
+        421 segments, 11 GB, made at the first decode step for nothing, then
+        freed by the next prompt)."""
         need = int((~hc.held[hc.pool_rows]).sum()) - int((pool.owner == -1).sum())
         return max(0, -(-need // pool.K)) * pool.seg_bytes
+
+    def _warm_want(self, hc, pool):
+        """The bytes of free segments worth adding: with warm_regrow those
+        of _warm_need, else all there is."""
+        return self._warm_need(hc, pool) if self.warm_regrow else float("inf")
 
     def _warm_hc(self):
         """The HotCache that uses the pool (the slot tables point into its
@@ -717,6 +745,16 @@ class WarmPool:
         pool = self._ensure_pool()
         hc.pool_unreserve()
         self._grow_shared()
+        if self.warm_mode == "free" and self.warm_short and self._warm_prompt_held() and \
+                pool.count.get("free", 0) * pool.seg_bytes + mem_info()[0] < self._warm_need(hc, pool):
+            # the end of a prompt (warm_short), also when the pool has free
+            # segments (those the mixed groups of the prompt took): their
+            # memory goes to the pool at once
+            self._warm_programs()
+            room = mem().room() if self.warm_keep is None else max(0, mem_info()[0] - self.warm_keep)
+            room = min(room, self._warm_need(hc, pool))
+            if room >= pool.seg_bytes:
+                pool.grow(room, "free")
         if self.warm_mode == "free" and (self.warm_regrow or not pool.has("free")):
             # (the cheap test first: on the 3090 the 26B wants no block in
             # most steps, and the query of the free memory waits for nothing)
@@ -847,17 +885,19 @@ def expert_host(model, layer):
     (experts, bytes). q4x: the KQ_Q4X copies (ops.q4x_pack_model; the bytes
     of an expert are those of the int4 expert, in groups of 16 rows), unless
     RECLANK_GPU_Q4X=0; the GPU kernels then read that layout (GP_HOT_MOE
-    and GP_MOE_GPU with the flag)."""
+    and GP_MOE_GPU with the flag). Without the int8 products (Maxwell: no
+    tensor cores, no dp4a) the GPU takes the int4 layout, whose float
+    kernels it has (int4_row, k_moe_gemm); the CPU keeps its KQ_Q4X copies."""
     w = model._layers[layer]
     gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
     n = gu.shape[0]
     e = P.ops._Q4X_MOE.get(gu.ctypes.data)
-    if e is not None and os.environ.get("RECLANK_GPU_Q4X", "1") != "0":
+    if e is not None and os.environ.get("RECLANK_GPU_Q4X", "1") != "0" and int8_tiles():
         return e[0].reshape(n, -1), e[1].reshape(n, -1), True
     return gu.reshape(n, -1), dn.reshape(n, -1), False
 
 
-def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=None, pool=None):
+def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=None, pool=None, buf=None):
     """Fill the tables of a large group for one layer (SplitCompiler.tables).
 
     hot is (slots, device address of the hot gate and up blocks, of the hot
@@ -872,11 +912,20 @@ def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=Non
     group). The other cold experts get no place: address 0, and -1 in
     gslots. gslots (or None) gets 0 or more for the experts on the GPU. A
     warm expert (slot HotCache.WARM + block) has the address of its block
-    of pool (the tables change when a block moves: table_version)."""
+    of pool (the tables change when a block moves: table_version).
+
+    The buffers hold the cold experts of the layer with the most when they
+    were made (ModelGPU._stage); the copies may not pass their end (a long
+    cache took memory from the hot experts since, so more are cold: the 26B
+    with a cache of 131072 tokens on the GTX 1070 copied past it and read
+    there). A mixed group asks for at most stage_room; a group of all the
+    experts with more cold ones than that raises MemoryError. buf (or None:
+    layer % 2) is the buffer of the copies (a piece of fill_chunks)."""
     gu, dn, _q4x = expert_host(model, layer)
     n = gu.shape[0]
     egu, edn = gu.nbytes // n, dn.nbytes // n
-    dgu, ddn = stage[layer % 2]
+    dgu, ddn = stage[layer % 2 if buf is None else buf]
+    room = min(dgu.nbytes // egu, ddn.nbytes // edn)
     slots, hgu, hdn = hot if hot is not None else (np.full(n, -1), 0, 0)
     runs = []
     rank = 0
@@ -898,6 +947,8 @@ def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=Non
         if pre is not None and x not in pre:
             tgu[x] = tdn[x] = 0
             continue
+        if rank >= room:
+            raise MemoryError("layer %d: more cold experts to copy than the %d places of the buffers" % (layer, room))
         if gslots is not None:
             gslots[x] = rank
         tgu[x] = dgu.ptr + rank * egu
@@ -914,6 +965,34 @@ def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=Non
     for k, r in enumerate(runs):
         ranges[k] = r[0:3]
         ranges[len(runs) + k] = r[4:7]
+
+
+def fill_chunks(model, layer, hot, stage, chunks, pool=None):
+    """Fill the tables of the pieces of a layer of a large group whose
+    buffers hold fewer experts than the layer has (chunked staging,
+    SplitCompiler.moe_group_chunks). chunks is a list of (tgu, tdn, ranges,
+    gslots, k) for each piece: the cold experts of the layer go to the
+    pieces in even runs (each at most stage_room), piece c to buffer k % 2
+    (k: its fetch); the hot and warm experts are those of piece 0. Raise
+    MemoryError when the pieces have too few places."""
+    n = expert_host(model, layer)[0].shape[0]
+    slots = hot[0] if hot is not None else np.full(n, -1)
+    cold = [x for x in range(n) if slots[x] < 0]
+    C = len(chunks)
+    room = stage_room(model, stage)
+    if len(cold) > C * room:
+        raise MemoryError("layer %d: %d cold experts, %d pieces of %d places" % (layer, len(cold), C, room))
+    per = -(-len(cold) // C)
+    for c, (tgu, tdn, ranges, gslots, k) in enumerate(chunks):
+        fill_tables(model, layer, hot if c == 0 else None, stage, tgu, tdn, ranges, gslots,
+                    pre=set(cold[c * per:(c + 1) * per]), pool=pool if c == 0 else None, buf=k % 2)
+
+
+def stage_room(model, stage):
+    """The cold experts that the buffers of a large group hold (fill_tables)."""
+    gu, dn, _q4x = expert_host(model, 0)
+    n = gu.shape[0]
+    return min(min(b[0].nbytes for b in stage) // (gu.nbytes // n), min(b[1].nbytes for b in stage) // (dn.nbytes // n))
 
 
 # The largest group whose experts run on the CPU (GP_MOE_MT of the CPU
@@ -974,6 +1053,177 @@ def _pieces(src, dst, n):
     return [(src + o, dst + o, min(PIECE, n - o)) for o in range(0, n, PIECE)]
 
 
+# The most copy jobs of HotCache on the way (the queue of the GPU holds 64:
+# experts.cu GG_CACHE_JOBS).
+HOT_PENDING_MAX = 48
+
+# RECLANK_GPU_HOT_C (1): HotCache.score_group and the choice of _replace in C
+# (backends/cpu/csrc/common/hotcache.c: the same sums and orders, so the same
+# slots); 0 the NumPy code (a test).
+HOT_C = os.environ.get("RECLANK_GPU_HOT_C", "1") != "0"
+# RECLANK_GPU_H2D_ROWS (1): the slot tables HotCache changes in one copy (rc_gpu_h2d_rows); 0 a copy
+# each (a test).
+H2D_ROWS = os.environ.get("RECLANK_GPU_H2D_ROWS", "1") != "0"
+
+
+def _hot_lib():
+    """The CPU library with the HotCache functions, or None (HOT_C off, or no library)."""
+    if not HOT_C:
+        return None
+    from reclank.backends.cpu import cops
+    lb = cops._lib
+    if lb is None or not hasattr(lb, "rc_hot_score"):
+        return None
+    if lb.rc_hot_score.argtypes is None:
+        vp, i = ctypes.c_void_p, ctypes.c_int
+        lb.rc_hot_score.argtypes = [vp, vp, vp, vp, vp, vp, vp, vp, i, i, i, i, ctypes.c_double, i,
+                                    i, vp, i, vp]
+        lb.rc_hot_replace.argtypes = [vp, vp, vp, vp, vp, ctypes.c_int64, vp, vp, vp, i, i, i, i,
+                                      ctypes.c_int64, vp, vp]
+    return lb
+
+
+class LaneRunner:
+    """The thread of lane B (docs/LANES_PLAN.md): a stream of its own
+    (rc_gpu_lane), and the run of a program there while the model thread runs
+    lane A's (run_pair). Its CPU tasks run on the model thread."""
+
+    def __init__(self, cpus=None):
+        self.cpus = cpus        # its CPUs (not those of the parts' teams, not the model thread's)
+        self.done = np.zeros(1, np.int64)       # set after lane B's run and its stream
+        self.job = self.err = None
+        self.go, self.fin = threading.Event(), threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="lane-b")
+        self.thread.start()
+
+    def _loop(self):
+        if self.cpus:
+            # (a thread starts with the affinity of the one that made it: the model
+            # thread, pinned to one CPU by the parts; two spinning threads on one
+            # CPU took a time slice for each hand-off, 5.5 ms a layer)
+            os.sched_setaffinity(0, self.cpus)
+        lib().rc_gpu_lane(1)
+        while True:
+            self.go.wait()
+            self.go.clear()
+            g = self.job
+            if g is None:
+                return
+            try:
+                if callable(g):
+                    # (a job of Python: run_pair_job)
+                    self.result = g()
+                else:
+                    _check(lib().rc_gpu_run(g.handle, g.env.ctypes.data))
+                _check(lib().rc_gpu_lane_sync())
+            except BaseException as exc:      # (the model thread raises it)
+                self.err = exc
+            self.done[0] = 1
+            self.fin.set()
+
+    def solo(self, g, extra=()):
+        """Run g on lane B's stream with nothing else (its first run records
+        its graphs there; no capture while another stream launches)."""
+        mem().poll()
+        blocks = run_blocks_of(g) + list(extra)
+        mem().lock(blocks)
+        self._start(g)
+        _check(lib().rc_gpu_lane_serve(self.done.ctypes.data))
+        self.fin.wait()
+        g.fence = mem().fence(blocks)
+        if self.err is not None:
+            raise self.err
+
+    def _start(self, g):
+        s = g.prog.by_name.get("seq") if not callable(g) else None
+        if s is not None:
+            g.seq = getattr(g, "seq", 0) + 1
+            g.env[s.index] = g.seq
+        self.result = None
+        self.done[0] = 0
+        self.err = None
+        self.job = g
+        self.fin.clear()
+        self.go.set()
+
+    def close(self):
+        self.job = None
+        self.go.set()
+        self.thread.join(timeout=5)
+
+
+def run_blocks_of(g):
+    """GpuMem: the blocks a run of g uses (its parameters, its model's)."""
+    return list(g.named.values()) + (g.run_blocks() if g.run_blocks is not None else [])
+
+
+def run_pair(ga, gb, runner, locked):
+    """Run ga (lane A) on the model thread and gb (lane B) on runner's thread
+    at once: the GPU work of the two on two streams, their CPU tasks in turn
+    on the model thread (rc_gpu_lane_serve after ga). locked: the blocks of
+    both (run_blocks_of), locked by the caller right after each bind (the
+    parameters of one move if the bind of the other reclaims memory: the
+    run then read the old place, an illegal address); they unlock when the
+    GPU is done. Lane B's stream is done when this returns."""
+    ga._alive()
+    gb._alive()
+    s = ga.prog.by_name.get("seq")
+    if s is not None:
+        ga.seq = getattr(ga, "seq", 0) + 1
+        ga.env[s.index] = ga.seq
+    blocks = locked
+    runner._start(gb)
+    err = None
+    try:
+        _check(lib().rc_gpu_run(ga.handle, ga.env.ctypes.data))
+    except RuntimeError as exc:
+        err = exc
+    try:
+        _check(lib().rc_gpu_lane_serve(runner.done.ctypes.data))
+    except RuntimeError as exc:
+        err = err or exc
+    runner.fin.wait()
+    ga.fence = gb.fence = mem().fence(blocks)
+    if err is not None:
+        raise err
+    if runner.err is not None:
+        raise runner.err
+
+
+def run_pair_job(ga, job, runner, locked):
+    """run_pair with a job of Python on runner's thread in place of a program: job() runs there (its
+    GPU work on lane B's stream, its CPU tasks on the model thread) and returns (the programs it ran
+    whose last run the fence covers, the blocks it locked); ga runs on the model thread at the same
+    time. The job must not allocate, free, or change what the model thread's run reads (HotCache's
+    slots). Return what job returned."""
+    ga._alive()
+    s = ga.prog.by_name.get("seq")
+    if s is not None:
+        ga.seq = getattr(ga, "seq", 0) + 1
+        ga.env[s.index] = ga.seq
+    runner._start(job)
+    err = None
+    try:
+        _check(lib().rc_gpu_run(ga.handle, ga.env.ctypes.data))
+    except RuntimeError as exc:
+        err = exc
+    try:
+        _check(lib().rc_gpu_lane_serve(runner.done.ctypes.data))
+    except RuntimeError as exc:
+        err = err or exc
+    runner.fin.wait()
+    progs, blocks = runner.result if runner.result is not None else ((), [])
+    f = mem().fence(list(locked) + list(blocks))
+    ga.fence = f
+    for g in progs:
+        g.fence = f
+    if err is not None:
+        raise err
+    if runner.err is not None:
+        raise runner.err
+    return runner.result
+
+
 class HotCache:
     """The hot experts of a ModelGPU follow the text.
 
@@ -1008,6 +1258,11 @@ class HotCache:
         # A cold expert goes to the GPU only from its admit-th use while it
         # is cold. Its first uses run on the CPU.
         self.admit = int(os.environ.get("RECLANK_GPU_HOT_ADMIT", "2"))
+        # (rows x experts) bool, or None: experts another GPU holds (an expert
+        # device, devices.py), which the slots do not take: their selections
+        # do not count (exclusive caching: the slots go to experts that would
+        # run on the CPU)
+        self.exclude = None
         self.top_k = top_k or cfg.top_k_experts
         self.layers = layers if layers is not None else []  # the layers with hot experts
         for layer, (_hot, gu_store, dn_store, slots) in (
@@ -1046,6 +1301,7 @@ class HotCache:
         self.seed_ins = int(os.environ.get("RECLANK_GPU_HOT_SEED", "0"))
         self.rows = np.arange(m)[:, None]
         self.pending = []       # (job id, [(row, expert, slot)], ranges, locked segments)
+        self.skipped = 0        # the passes of copies skipped with the queue full (_replace)
         self.due = False        # a step is done, and observe has not run
         self.version = 0        # changes when a slot table changes
         # Counts for a test: the copies, the steps, and the cold experts of
@@ -1184,11 +1440,27 @@ class HotCache:
         return dst + slot * nb
 
     def _upload(self, rows):
+        """The slot tables of rows to the GPU (one call: rc_gpu_h2d_rows)."""
+        if not rows:
+            return
+        dst, src, nb = [], [], None
         for r in rows:
             e = self.layers[r]
-            _check(lib().rc_gpu_h2d(e["dslots"], e["slots"].ctypes.data, e["slots"].nbytes))
-        if rows:
-            self.version += 1
+            a = e["slots"]
+            sp = e.get("_sp")
+            if sp is None or sp[0] is not a:      # (the host address, kept: .ctypes.data costs us)
+                sp = e["_sp"] = (a, a.ctypes.data)
+            dst.append(e["dslots"])
+            src.append(sp[1])
+            nb = a.nbytes if nb is None or nb == a.nbytes else -1
+        if nb > 0 and H2D_ROWS:
+            d, s_ = np.array(dst, np.uint64), np.array(src, np.uint64)
+            _check(lib().rc_gpu_h2d_rows(len(dst), d.ctypes.data, s_.ctypes.data, nb))
+        else:
+            for r in rows:
+                e = self.layers[r]
+                _check(lib().rc_gpu_h2d(e["dslots"], e["slots"].ctypes.data, e["slots"].nbytes))
+        self.version += 1
 
     def prepare(self, wait=False):
         """Before a step or a group: mark the experts of the finished copies
@@ -1263,20 +1535,40 @@ class HotCache:
         n = sels.shape[0]
         if n == 0 or rows.size == 0:
             return
+        if self.exclude is not None:
+            sels = sels.copy()
+            ex = self.exclude[rows]
+            for j in range(n):
+                s = sels[j]
+                s[(s >= 0) & np.take_along_axis(ex, np.maximum(s, 0), axis=1)] = -1
+        lb = _hot_lib()
+        if lb is not None:
+            p = self._cptrs()
+            rows = np.ascontiguousarray(rows, np.int64)
+            sels = np.ascontiguousarray(sels, np.int32)
+            nc = lb.rc_hot_score(p["score"], p["uses"], p["total"], p["run"], p["held"], p["incoming"],
+                                 rows.ctypes.data, sels.ctypes.data, n, rows.size, self.score.shape[1],
+                                 sels.shape[2], self.decay, int(self.run_mode), int(self._pool_free()),
+                                 p["pool_rows"], self.admit, p["cand"])
+            if nc and self._queue_room():
+                self._replace_c(lb, p, rows, self.max_ins * n)
+            return
         score, d = self.score, self.decay
         sub = score[rows]
         sub *= d ** n
-        uses = self.uses[rows]
-        ri = np.broadcast_to(np.arange(rows.size)[:, None], sels.shape[1:])
-        hit = np.zeros(sub.shape, dtype=bool)
+        R, E = sub.shape
+        # (one flat index of each selection: the scores in the order of the tokens, as n calls of
+        # score_rows; the counts of uses at once, a bincount: 2 ms of Python a verify group before)
+        ok = sels >= 0
+        flat = (np.arange(R)[None, :, None] * E + sels)
+        fs = sub.reshape(-1)
         for j in range(n):
-            ok = sels[j] >= 0
-            rr, ss = ri[ok], sels[j][ok]
-            sub[rr, ss] += d ** (n - 1 - j)       # the experts of a row differ
-            uses[rr, ss] += 1
-            self.total[rows[rr], ss] += 1
-            self.run[rows[rr], ss] += 1
-            hit[rr, ss] = True
+            fs[flat[j][ok[j]]] += d ** (n - 1 - j)       # the experts of a row differ
+        cnt = np.bincount(flat[ok], minlength=R * E).reshape(R, E)
+        uses = self.uses[rows] + cnt.astype(self.uses.dtype)
+        self.total[rows] += cnt.astype(self.total.dtype)
+        self.run[rows] += cnt.astype(self.run.dtype)
+        hit = cnt > 0
         held = self.held[rows]
         uses[held] = 0
         score[rows] = sub
@@ -1347,7 +1639,18 @@ class HotCache:
         """Move up to limit experts of the mask cand (rows, experts) to the
         slots of the lowest held experts, best gain first. cand_rows: cand
         holds only those rows, in their order."""
+        if not self._queue_room():
+            return
         score = self._key()
+        lb = _hot_lib()
+        if lb is not None:
+            rows_ = np.arange(self.held.shape[0], dtype=np.int64) if cand_rows is None else \
+                np.ascontiguousarray(cand_rows, np.int64)
+            if np.unique(rows_).size == rows_.size:
+                p = self._cptrs()
+                p["cand_a"][:rows_.size] = cand
+                self._replace_c(lb, p, rows_, limit)
+                return
         if cand_rows is not None and np.any(np.diff(cand_rows) <= 0):
             full = np.zeros_like(self.held)     # (the order of the whole table)
             full[cand_rows] = cand
@@ -1359,11 +1662,20 @@ class HotCache:
             ri = np.asarray(cand_rows)[si]
         if ri.size == 0:
             return
-        # the lowest held score of the rows of the candidates only
-        ur, inv = np.unique(ri, return_inverse=True)
-        low = np.where(self.held[ur], score[ur], np.inf).min(axis=1)
+        # the lowest held score of the rows of the candidates only (ri is sorted, from nonzero:
+        # the unique rows and the inverse of np.unique from where it changes, no sort)
+        step = np.empty(ri.size, dtype=bool)
+        step[0] = True
+        np.not_equal(ri[1:], ri[:-1], out=step[1:])
+        ur, inv = ri[step], np.cumsum(step) - 1
+        hs = np.where(self.held[ur], score[ur], np.inf)
+        low = hs.min(axis=1)
         order = np.argsort(low[inv] - score[ri, xi], kind="stable")
-        items, rows, changed = [], [], set()
+        # the held expert of the lowest score of each of those rows (as the loop's np.where and
+        # argmin for a row whose slots this call has not changed)
+        va = hs.argmin(axis=1)
+        urow = {int(r): k for k, r in enumerate(ur.tolist())}
+        items, changed = [], set()
         pool, E = self.pool, score.shape[1]
         # The free blocks of the pool, and its warm experts by score, once for
         # the call (the scores do not change in it; a block that a copy takes
@@ -1371,30 +1683,43 @@ class HotCache:
         # same choices as a pass over the pool for each candidate, which took
         # 1.7 ms a call (2.9 ms a token of MTP decode with the NVFP4 experts).
         free, pv, pk = [], None, 0
-        if pool is not None and self.pool_rows[ri].any():
-            free = list(np.flatnonzero(pool.owner == -1))
+        use_pool = pool is not None and bool(self.pool_rows[ri].any())
+        if use_pool:
+            # (a copy takes at most one free block: the first limit; the table of the warm experts
+            # only when they run out, pool_scan: the two took 0.4 ms a call, most of _replace)
+            free = np.flatnonzero(pool.owner == -1)[:limit].tolist()
+
+        def pool_scan():
             pb = np.flatnonzero(pool.owner >= 0)
-            if pb.size:
-                pr, px = np.divmod(pool.owner[pb], E)
-                ps = np.where(self.incoming[pr, px], np.inf, score[pr, px])
-                # the walk below takes at most one block a copy (and skips
-                # the blocks this call took): the lowest 2 limit + 8 do
-                pv = [pb, pool.owner[pb].copy(), ps, *self._low_first(ps, 2 * limit + 8)]
+            if not pb.size:
+                return None
+            own = pool.owner[pb]            # (row E + expert: the flat index of the tables)
+            ps = np.where(self.incoming.reshape(-1)[own], np.inf, score.reshape(-1)[own])
+            # the walk below takes at most one block a copy (and skips
+            # the blocks this call took): the lowest 2 limit + 8 do
+            return [pb, own, ps, *self._low_first(ps, 2 * limit + 8)]
+        scanned = not use_pool
         lowest = {}         # row -> its held expert of the lowest score, until one goes
         for o in order[:4 * limit]:
             if len(items) >= limit:
                 break
             r, x = int(ri[o]), int(xi[o])
-            e = self.layers[r]
             if pool is not None and self.pool_rows[r] and free:
                 slot = self.WARM + int(free.pop(0))    # a free block: no victim
             else:
                 if r not in lowest:
-                    held = np.where(self.held[r], score[r], np.inf)
-                    victim = int(held.argmin())
-                    lowest[r] = (victim, held[victim])
+                    k = urow.get(r)
+                    if k is not None and r not in changed:
+                        victim = int(va[k])
+                        lowest[r] = (victim, hs[k, victim])
+                    else:
+                        held = np.where(self.held[r], score[r], np.inf)
+                        victim = int(held.argmin())
+                        lowest[r] = (victim, held[victim])
                 victim, vs = lowest[r]
                 vr = r
+                if pool is not None and self.pool_rows[r] and not scanned:
+                    pv, scanned = pool_scan(), True
                 if pool is not None and self.pool_rows[r] and pv is not None:
                     # or the warm expert of the lowest score of any row (not
                     # one with a copy on the way)
@@ -1423,13 +1748,69 @@ class HotCache:
                 pool.owner[slot - self.WARM] = r * E + x
             self.incoming[r, x] = True
             items.append((r, x, slot))
-            for part, (src, nb, dst) in enumerate(e["parts"]):
+        self._start_copies(items, changed)
+
+    def _queue_room(self):
+        """The copy queue of the GPU holds GG_CACHE_JOBS (64) jobs. Large
+        experts (LFM2.5: 14 MB in BF12, 8 a step) can come faster than PCIe
+        takes them: land the finished ones, and with the queue still near full
+        no new copies this time (the candidates stay candidates)."""
+        if len(self.pending) >= HOT_PENDING_MAX:
+            self._land(False)
+            if len(self.pending) >= HOT_PENDING_MAX:
+                self.skipped += 1
+                return False
+        return True
+
+    def _cptrs(self):
+        """The addresses of the tables for the C functions (_hot_lib) and the
+        buffers of their results, kept while the arrays stay (NumPy's
+        .ctypes.data took several us each, about 0.1 ms a call)."""
+        owner = self.pool.owner if self.pool is not None else None
+        objs = (self.score, self.uses, self.total, self.run, self.held, self.incoming,
+                self.pool_rows, owner) + tuple(e["slots"] for e in self.layers)
+        c = self.__dict__.get("_cp")
+        if c is None or len(c[0]) != len(objs) or any(a is not b for a, b in zip(c[0], objs)):
+            m, E = self.score.shape
+            sp = np.array([e["slots"].ctypes.data for e in self.layers], np.int64)
+            cand, ch = np.empty((m, E), bool), np.zeros(m, np.uint8)
+            p = {nm: getattr(self, nm).ctypes.data for nm in
+                 ("score", "uses", "total", "run", "held", "incoming", "pool_rows")}
+            p.update(owner=owner.ctypes.data if owner is not None else None,
+                     nowner=owner.size if owner is not None else 0, slots=sp.ctypes.data,
+                     cand=cand.ctypes.data, ch=ch.ctypes.data, sp=sp, cand_a=cand, ch_a=ch)
+            c = self._cp = (objs, p)
+        p = c[1]
+        p["key"] = p["run"] if self.run_mode else p["score"]
+        return p
+
+    def _replace_c(self, lb, p, rows, limit):
+        """_replace in C (hotcache.c) of the candidates in p's buffer cand
+        (a row for each of rows, in order)."""
+        m, E = self.held.shape
+        out = self.__dict__.get("_cp_out")
+        if out is None or out.shape[0] < limit:
+            out = self._cp_out = np.empty((max(limit, 64), 3), np.int64)
+            self._cp_outp = out.ctypes.data
+        ni = lb.rc_hot_replace(p["key"], p["held"], p["incoming"], p["slots"], p["owner"],
+                               p["nowner"], p["pool_rows"], p["cand"], rows.ctypes.data, rows.size,
+                               m, E, limit, self.WARM, self._cp_outp, p["ch"])
+        if ni:
+            self._start_copies([tuple(r) for r in out[:ni].tolist()],
+                               set(np.flatnonzero(p["ch_a"]).tolist()))
+
+    def _start_copies(self, items, changed):
+        """The copies of items ((row, expert, slot) of _replace) to their slots,
+        after the slot tables of the rows changed (their old experts cold)."""
+        if not items:
+            return
+        pool, rows = self.pool, []
+        for r, x, slot in items:
+            for part, (src, nb, dst) in enumerate(self.layers[r]["parts"]):
                 # src: the host address of expert 0 (expert x at x nb), or the
                 # address of each expert (an int64 array: QwenGPU._expert_srcs)
                 a = int(src[x]) if isinstance(src, np.ndarray) else src + x * nb
                 rows += _pieces(a, self._slot_addr(part, dst, nb, slot), nb)
-        if not items:
-            return
         # The old experts are cold on the GPU before the copies start.
         self._upload(changed)
         ranges = np.array(rows, dtype=np.int64)
@@ -1458,6 +1839,11 @@ class HotCache:
         if getattr(prog, "hot_version", None) == self.table_version():
             return
         hot = self.dev._hot_devices()
+        for layer, chunks in (getattr(prog, "chunks_of", None) or {}).items():
+            fill_chunks(self.dev.model, layer, hot.get(layer), self.dev.stage, chunks, pool=self.pool)
+            for tgu, tdn, _ranges, gslots, _k in chunks:
+                for a in (tgu, tdn, gslots):
+                    _check(lib().rc_gpu_h2d(g.mirror.buffer_of(a).ptr, a.ctypes.data, a.nbytes))
         for layer, (tgu, tdn, ranges) in prog.tables_of.items():
             fill_tables(self.dev.model, layer, hot.get(layer), self.dev.stage, tgu, tdn, ranges,
                         pool=self.pool)

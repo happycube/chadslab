@@ -168,6 +168,50 @@ enum {
     GP_DS_TOPK_MERGE   = 186,   /* gpu     the k best so far and the scores of a chunk: the k best (DS_TOPK in chunks) */
     GP_ENC_SILU_MUL    = 187,   /* cpu+gpu silu(gate) * up */
     GP_DS_EMBED_ROWS   = 188,   /* gpu     the rows of an image span in place of the embedding, into the streams */
+    GP_ROUTER_SIG      = 189,   /* cpu+gpu the router of LFM2: sigmoid scores, the bias for the choice, the k weights normed */
+    GP_SHORT_CONV      = 190,   /* cpu+gpu the double-gated short convolution of LFM2 (B x, the causal conv, times C) */
+    GP_Q16             = 191,   /* cpu+gpu float32 values as int16, a float32 scale for each 128 (the int16, then the scales) */
+    GP_DQ16            = 192,   /* cpu+gpu the float32 values of Q16 */
+    GP_F16_GLINEAR     = 193,   /* gpu     x times a float16 matrix in groups (block diagonal: GLM's kv_b of each head) */
+    GP_GLM_POOL        = 194,   /* gpu     the index keys normed, the pools of 4 (softmax of gate + ape) into the pooled-key cache */
+    GP_GLM_EXPAND      = 195,   /* gpu     the tokens of the chosen pools and the open tail of each query */
+    GP_GLM_HC_MIX      = 196,   /* gpu     the mixes of the streams over many blocks, then the post and comb coefficients once a token */
+    GP_GLM_HC_POST     = 197,   /* gpu     post y + comb^T res from the coefficients of GLM_HC_MIX */
+    GP_GLM_ROPE        = 198,   /* gpu     the neox RoPE of rows at positions pos + j (the DSpark drafter) */
+    GP_GLM_RING_PUT    = 199,   /* gpu     the real rows (the last W) into the slots (pos + j) % W of a ring */
+    GP_GLM_DSP_ATTN    = 200,   /* gpu     the drafter's attention: its block over the context ring and its own rows */
+    GP_GLM_ATTN        = 201,   /* gpu     the MLA of a prompt group on the tensor cores (64 heads over their selected latents) */
+    GP_BF16_ROUND      = 202,   /* cpu+gpu x (n values) rounded to bfloat16 in place (the activations of vLLM's contract) */
+    GP_B12X_GLU        = 203,   /* gpu     the act of the contract, bf16(bf16(g sigma(g)) u) of g, u in bfloat16 */
+    GP_MOE_B12X_OUT    = 204,   /* gpu     the MoE output of the contract: bf16(bf16(routed + cpu) + the gated shared expert) */
+    GP_MX8_ACT         = 205,   /* cpu+gpu x (n values) as dynamic MXFP8 in place: e4m3(x / 2^e) 2^e, e = ceil(log2(amax / 448)) of each 32 */
+    GP_NM_MAMBA        = 206,   /* cpu+gpu the Mamba-2 mixer: the causal conv, the recurrence of the state, the gated group norm */
+    GP_RELU2           = 207,   /* cpu+gpu relu(x)^2 */
+    GP_NM_MOE          = 208,   /* cpu     the routed experts of the latent: up, relu^2, down, the weighted sum */
+    GP_NM_ATTN         = 209,   /* gpu     the attention of each query over the float rows of the cache up to its position (no RoPE) */
+    GP_NM_SPLIT        = 210,   /* gpu     the pairs of the experts the GPU does not hold (the CPU's), and their count */
+    GP_NM_HOT_MOE      = 211,   /* gpu     the routed experts of the latent the GPU holds: up, relu^2, down, the sum of each token */
+    GP_NM_QX           = 212,   /* gpu     float rows as int8 with a scale of each 32 (the x of the dp4a products) */
+    GP_NM_IQ2_LIN      = 213,   /* gpu     an IQ2_XXS matrix on the int8 rows of NM_QX (dp4a) */
+    GP_NM_KV           = 214,   /* gpu     the keys and values of a run into the bfloat16 rows of the cache */
+    GP_NM_ATTN2        = 215,   /* gpu     the attention in chunks of positions (a KV head and its query heads a block), then the merge */
+    GP_NM_GROUP_MOE    = 216,   /* gpu     the routed experts of a prompt group on the GPU (cold ones read from mapped host memory) */
+    GP_NM_GEMM8        = 217,   /* gpu     an IQ2_XXS, NVFP4 or Q8_0 matrix on the int8 rows of a prompt group (tiles of 64 x 64, dp4a) */
+    GP_NM_QX2          = 218,   /* cpu     float rows as int16 in two int8 planes and a scale of each 32 (kq_quant_part16) */
+    GP_NM_LIN2         = 219,   /* cpu     an IQ2_XXS, NVFP4 or Q8_0 matrix on the two planes of NM_QX2 */
+    GP_NM_ADDNORM      = 220,   /* cpu+gpu the residual sum and the norm of the next block in one pass: h += a (+ b), out = rmsnorm(h) w */
+    GP_NM_DPREP        = 221,   /* cpu+gpu the drafter's q and k norms and NEOX rope; k and v into the ring of the context (LiLiCorr) */
+    GP_NM_DATTN        = 222,   /* cpu+gpu the drafter's attention: a block over the window of the ring and itself, a sink a head */
+    GP_NM_DCONV        = 223,   /* cpu+gpu the drafter's grouped dynamic conv over a block (base kernel + the token's coefficients) */
+    GP_NM_LTOPK        = 224,   /* cpu+gpu the LiLiCorr candidates: the k best of each slot's logits and their features */
+    GP_NM_LATT         = 225,   /* cpu+gpu the LiLiCorr attention over the candidates with the slot biases */
+    GP_NM_LROWS        = 226,   /* cpu+gpu rows plus a bias and rows (repeated), then an activation (none, silu) */
+    GP_NM_LCAT         = 227,   /* cpu+gpu [x, a, x a] of rows and a vector */
+    GP_NM_LSCORE       = 228,   /* cpu+gpu the LiLiCorr lattice scores of the L2-normed out and in vectors */
+    GP_REMOTE_POST     = 229,   /* cpu     the cold experts of a step that an expert device holds to it, the others to a list */
+    GP_REMOTE_JOIN     = 230,   /* cpu     wait for the expert device's job and add its sum */
+    GP_NM_REMOTE_POST  = 231,   /* cpu     the cold pairs of a Nemotron step that an expert device holds to it, the others to a list */
+    GP_DS_HC_STEP      = 232,   /* gpu     a sublayer's post, then the next one's mixes and pre (DeepSeek V4.1) */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -209,7 +253,18 @@ static inline int gp_op_known(int op)
     case GP_DS_HOT_MOE: case GP_DS_COMBINE: case GP_DS_RING_PUT: case GP_DS_RING_RESTORE:
     case GP_DS_STREAM_MEAN: case GP_DS_COMPRESS_FIX: case GP_DS_GATHER: case GP_DS_MARKOV:
     case GP_DS_CONF: case GP_DS_EMBED: case GP_DS_ENGRAM_ROWS: case GP_DS_ROWS_AT:
-    case GP_DS_TOPK_MERGE: case GP_ENC_SILU_MUL: case GP_DS_EMBED_ROWS:
+    case GP_DS_TOPK_MERGE: case GP_ENC_SILU_MUL: case GP_DS_EMBED_ROWS: case GP_ROUTER_SIG:
+    case GP_SHORT_CONV: case GP_Q16: case GP_DQ16: case GP_F16_GLINEAR: case GP_GLM_POOL:
+    case GP_GLM_EXPAND: case GP_GLM_HC_MIX: case GP_GLM_HC_POST: case GP_GLM_ROPE:
+    case GP_GLM_RING_PUT: case GP_GLM_DSP_ATTN: case GP_GLM_ATTN: case GP_BF16_ROUND:
+    case GP_B12X_GLU: case GP_MOE_B12X_OUT: case GP_MX8_ACT: case GP_NM_MAMBA:
+    case GP_RELU2: case GP_NM_MOE: case GP_NM_ATTN: case GP_NM_SPLIT: case GP_NM_HOT_MOE:
+    case GP_NM_QX: case GP_NM_IQ2_LIN: case GP_NM_KV: case GP_NM_ATTN2:
+    case GP_NM_GROUP_MOE: case GP_NM_GEMM8: case GP_NM_QX2: case GP_NM_LIN2:
+    case GP_NM_ADDNORM: case GP_NM_DPREP: case GP_NM_DATTN: case GP_NM_DCONV:
+    case GP_NM_LTOPK: case GP_NM_LATT: case GP_NM_LROWS: case GP_NM_LCAT:
+    case GP_NM_LSCORE: case GP_REMOTE_POST: case GP_REMOTE_JOIN: case GP_NM_REMOTE_POST:
+    case GP_DS_HC_STEP:
         return 1;
     default:
         return 0;

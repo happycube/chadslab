@@ -2,7 +2,10 @@
 loaded once, handed to the rounds. DeepSeek V4.1 Flash (DEEPSEEK_V41_PLAN.md
 4.2: the expert rows of every node) or Qwen3.8-Flash-Next (the original
 bfloat16 checkpoint as the GGUF tensors of the runtime, reclank/models/qwen/keep.py);
-the model comes from the checkpoint's config.json.
+the model comes from the checkpoint's config.json. An EXL3 directory of
+Qwen3.8-Flash-Next (reclank/models/qwen/keep_exl3.py): its MUL1 blocks, the
+experts whole on every node when they fit (--copies), the n-gram table read
+from its file.
 
     python scripts/weightkeeper.py CKPT                 # as the user: pools filled beforehand, else 4 KB
     sudo .venv/bin/python scripts/weightkeeper.py CKPT --lock
@@ -15,7 +18,9 @@ the model comes from the checkpoint's config.json.
 Options: --share (the rows of part 0, default 0.5: balanced channels),
 --layers 0-3 (a test), --dense (the dense tensors in a segment too, on
 --dense-node), --pages 1g|2m|4k (the largest page), --threads, --socket,
---user/--group (the uid to drop to; default SUDO_UID/SUDO_GID). Qwen: the least
+--user/--group (the uid to drop to; default SUDO_UID/SUDO_GID), --seal size|write
+(size, the default: the rounds map the segments writable so CUDA page-locks
+them; write: read-only maps, the copies to the GPU stage). Qwen: the least
 type of each kind of tensor, --dense-type, --experts-type, --ngram-type
 (bf12, the default: the bfloat16 values in 12.25 bits; bf16; q8; rq8 for the
 experts).
@@ -58,6 +63,8 @@ def check_tensors(ckpt, path, n):
         [round(s["bytes"] / 1e9, 1) for s in ix["segments"]], time.time() - t0, ix["locked"], ix["types"]))
     if ix.get("source") == "gguf":
         return check_gguf(g, ckpt, n)
+    if ix.get("source") == "fp4l":
+        return check_fp4l(g, ckpt, n)
     src = OrigSource(ckpt)
     tiled = tiler(src.config())
     rng = random.Random(1)
@@ -112,6 +119,41 @@ def check_tensors(ckpt, path, n):
             bad += 1
             print("MISMATCH %s" % gname)
     print("%d tensors and rows compared: %s" % (done, "all equal" if not bad else "%d differ" % bad))
+    return 1 if bad else 0
+
+
+def check_fp4l(g, path, n):
+    """FP4-Local (keep_fp4l): random experts of a few stacks, n-gram rows of a few shards and
+    node tensors against FP4LSource packing them again (the same bytes)."""
+    from reclank.backends.cpu import cops
+    from reclank.formats.fp4local_st import FP4LSource
+    src = FP4LSource(path)
+    d = g.index["tensors"]
+    rng = random.Random(1)
+    bad = done = 0
+    xs = [x for x in d if d[x]["place"] == "experts"]
+    for name in rng.sample(xs, min(4, len(xs))):
+        ref = src.pack_experts(name, np.empty(d[name]["E"] * d[name]["nb"], np.uint8)).reshape(d[name]["E"], -1)
+        for _ in range(n):
+            e = rng.randrange(d[name]["E"])
+            for _nd, arr, ids in g.experts(name):
+                k = list(ids).index(e) if e in ids else None
+                if k is not None:
+                    done += 1
+                    bad += arr[k].tobytes() != ref[e].tobytes()
+    if "per_layer_token_embd.weight" in d:
+        dp = d["per_layer_token_embd.weight"]
+        for k in sorted(rng.sample(range(len(src._ple_shards)), 3)) + [len(src._ple_shards) - 1]:
+            rows, r0 = src.pack_ple(k)
+            rows = rows.reshape(-1, dp["rb"])
+            pick = np.array(sorted(rng.randrange(rows.shape[0]) for _ in range(100 * n)) + [0, rows.shape[0] - 1])
+            done += 1
+            bad += cops.kq_gather(g.row_addrs("per_layer_token_embd.weight", r0 + pick), dp["rb"]).tobytes() != \
+                rows[pick].tobytes()
+    for name in rng.sample([x for x in d if d[x]["place"] == "node"], min(n, 64)):
+        done += 1
+        bad += np.ascontiguousarray(src.raw(name)[0]).reshape(-1).view(np.uint8).tobytes() != g.w.tensor(name).tobytes()
+    print("%d compared with the checkpoint: %s" % (done, "all equal" if not bad else "%d differ" % bad))
     return 1 if bad else 0
 
 
@@ -225,6 +267,12 @@ def main():
     ap.add_argument("--ngram-type", choices=("bf12", "bf16", "q8"), default="bf12")
     ap.add_argument("--counts", help="Qwen: the counts of the router (layers x experts, .npy): the "
                     "experts of a layer go to the nodes in snake order of their counts (else in turn)")
+    ap.add_argument("--copies", choices=("auto", "split", "both"), default="auto",
+                    help="an EXL3 directory: the experts split between the nodes, or whole on every node "
+                         "(auto: when they fit)")
+    ap.add_argument("--seal", choices=("size", "write"), default="size",
+                    help="the seals of the segments: size (the rounds map them writable, so CUDA page-locks "
+                         "them for DMA) or write (read-only maps; the copies to the GPU stage)")
     ap.add_argument("--socket")
     ap.add_argument("--user", type=int)
     ap.add_argument("--group", type=int)
@@ -254,6 +302,7 @@ def main():
                   lock=a.lock, dense=a.dense, dense_node=a.dense_node,
                   maxpage={"1g": Z.G1, "2m": Z.M2, "4k": Z.K4}[a.pages], layout=a.layout, sock=a.socket,
                   dense_type=a.dense_type, experts_type=a.experts_type, ngram_type=a.ngram_type, counts=a.counts,
+                  copies=a.copies, seal=a.seal,
                   user=a.user, group=a.group)
     return Z.run(o) or 0
 

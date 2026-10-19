@@ -145,6 +145,10 @@ class DSV41GPU:
         # the decoder's first layer: the source of its global KV (CED, V4.1 2.2)
         self.dec0 = m.L // 2
         self.ab = bool(ab)
+        # RECLANK_DS_HC_STEP=0: the posts, mixes and pres as three records each, the CPU's rows of its pairs
+        self.hc_step = int(os.environ.get("RECLANK_DS_HC_STEP", "1"))
+        # RECLANK_DS_VERIFY_MERGE=0: each half of a verify group runs its own hot and shared experts
+        self.verify_merge = os.environ.get("RECLANK_DS_VERIFY_MERGE", "1") != "0"
         self.replay = bool(replay) and max(m.kv_sources) == self.dec0 == m.cand_src
         self.w = m.w
         if self.w.z is None or self.w.z.index["layout"] == "dsv41-expert-planes-v1":
@@ -287,13 +291,19 @@ class DSV41GPU:
         while cap < need:
             cap *= 2
         self.cap = min(cap, m.max_len)
+        self.free_programs(tables=True)
+        self._tables()
+
+    def free_programs(self, tables=False):
+        """Free the GPU memory of the programs (DSpark's too, on_grow) and of their shared scratch:
+        made again when run (fit, as cap grows; the image encoder, when it needs the room: the
+        programs of a long session take more as the context grows)."""
         self.close()
         for f in self.on_grow:
             f()
-        for a in list(self.scratch.values()) + [a for fr in self.tables for a in fr]:
+        for a in list(self.scratch.values()) + ([a for fr in self.tables for a in fr] if tables else []):
             self.mirror.forget(a.ctypes.data)
         self.scratch = {}
-        self._tables()
 
     def score_chunk(self, t, sw):
         """The entries of a chunk of the index scores of a program of t rows
@@ -552,7 +562,10 @@ class DSV41GPU:
         # a verify group of DSpark (t <= VERIFY_MAX): the logits of every row, and
         # the backups that undo the rows of the refused drafts (restore)
         verify = t <= VERIFY_MAX
-        io.logits = zo(t if verify else 1, m.w.src.cfg["vocab_size"])
+        # (pinned: the copy that ends each step does not stage through pageable memory: 0.22 -> 0.11 ms;
+        # a few MB at most stay allocated, the programs being made again only when cap doubles)
+        io.logits = pinned((t if verify else 1, m.w.src.cfg["vocab_size"]))
+        own.append(io.logits)
         tl = list(m.c.get("dspark_target_layer_ids", []))
         # the input of DSpark from its target layers (read just after the run: a
         # group's is shared scratch)
@@ -567,6 +580,21 @@ class DSV41GPU:
         ip = z(*((2 * k + 1,) if t == 1 else (t * k,)), dtype=np.int32, pin=True)
         host_rows = z(t * k, dim, pin=True)
         part = z(t, dim)
+        # hcs (GP_DS_HC_STEP): a sublayer's post with the next one's mixes and pre in one record; the
+        # CPU's sums of its experts (a row a token, pinned: no flag 64), the GPU's hot pairs summed
+        # before the CPU's task ends; the blocks' sums and the counters of the step (own zeros: the
+        # last block of a token puts its counter back to 0)
+        hcs = self.hc_step != 0
+        hfuse = self.hc_step == 1         # (2: the CPU's sums, the three records of before; a check)
+        lay_set = set(lay)
+        host_sum = z(t, dim, dtype=np.float64, pin=True) if hcs else None   # (float64: flag 2048)
+        part_d = z(t, dim, dtype=np.float64) if hcs else None                # (the GPU's pairs, float64)
+        hcs_part = z(t, 128, 26) if hcs else None
+        hcs_cnt = None
+        if hcs:
+            own.append(np.zeros(t, np.int32))
+            hcs_cnt = own[-1]
+        pend_f, pend_a = {}, {}       # lane -> the layer whose FFN / attention post waits for the next record
         hq = dict(qh=z(t, dim, dtype=np.int8), ql=z(t, dim, dtype=np.int8), xs=z(t, dim // 32),
                   act=z(t * k, 2 * I), act2=z(t * k, I), aqh=z(t * k, I, dtype=np.int8),
                   aql=z(t * k, I, dtype=np.int8), axs=z(t * k, I // 32), de=z(t * k, dim))
@@ -628,6 +656,9 @@ class DSV41GPU:
         lpos = [pos] + [prog.slot("pos%d" % j) for j in range(1, len(lanes))]
         raw_as = {i: z(t, 24) for i in lay}
         raw_fs = {i: z(t, 24) for i in lay}
+        # the post's q and comb of each sublayer, made by its GP_DS_HC_PRE (from the sublayer's mixes)
+        coef_as = {i: z(t, 20) for i in lay}
+        coef_fs = {i: z(t, 20) for i in lay}
         # the kv source and the index source of each layer
         kvs, ixs, ks, xs_ = {}, {}, None, None
         for i in range(L):
@@ -682,14 +713,29 @@ class DSV41GPU:
                 e = p + "engram."
                 lin8(S(io.eg[i]), e + "wkv.weight", S(ekv[i]))
                 prog.emit(P.DS_ENGRAM, S(ekv[i]), hl, self.vec(e + "q_weight", e + "k_weight"), n, dim, hc, eps)
-            if i in tl:
-                prog.emit(P.DS_STREAM_MEAN, hl, S(io.main_h), n, dim, io.main_h.shape[1], tl.index(i) * dim, hc)
             fa, sca, ba = self.hcp(p + "hc_attn")
             raw_a = S(raw_as[i])
-            prog.emit(P.DS_HC_MIX, hl, fa, raw_a, n, hc * dim, eps)
-            pm = prev_of(i)
-            prog.emit(P.DS_HC_PRE, hl, None if pm[0] is None else S(pm[0]), pm[1], pm[2],
-                      self.vec(p + "attn_norm.weight"), S(x), n, dim, eps, hc_eps)
+            pi = pend_f.pop(j, None)
+            if pi is not None:
+                # the FFN of layer pi's post, this layer's mixes and pre
+                _ff, scf_p, bf_p = self.hcp("layers.%d.hc_ffn" % pi)
+                cold = colds[pi][0]
+                prog.emit(P.DS_HC_STEP, S(part_d), S(ys), S(host_sum), cold[k:k + 1] if t == 1 else None, hl,
+                          S(coef_fs[pi]), fa, raw_a, S(raw_fs[pi]), scf_p, bf_p, self.vec(p + "attn_norm.weight"),
+                          S(x), sca, ba, S(coef_as[i]), S(hcs_part), S(hcs_cnt), n, dim, eps, hc_eps, iters, 1)
+                if io.layers is not None:
+                    lr = S(io.layers[pi])
+                    prog.emit(P.COPY, hl, lr, lr.nbytes)      # (layer pi's streams after its post)
+                if i in tl:
+                    prog.emit(P.DS_STREAM_MEAN, hl, S(io.main_h), n, dim, io.main_h.shape[1], tl.index(i) * dim, hc)
+            else:
+                if i in tl:
+                    prog.emit(P.DS_STREAM_MEAN, hl, S(io.main_h), n, dim, io.main_h.shape[1], tl.index(i) * dim, hc)
+                prog.emit(P.DS_HC_MIX, hl, fa, raw_a, n, hc * dim, eps)
+                pm = prev_of(i)
+                prog.emit(P.DS_HC_PRE, hl, None if pm[0] is None else S(pm[0]), pm[1], pm[2],
+                          self.vec(p + "attn_norm.weight"), S(x), n, dim, eps, hc_eps, raw_a, sca, ba, iters,
+                          S(coef_as[i]))
             a = p + "attn."
             ratio = m.ratios[i]
             cs = cc if ratio else cw
@@ -743,20 +789,30 @@ class DSV41GPU:
             prog.emit(P.DS_ROPE, S(o), cs[0], cs[1], ps, n, H, hd, rd, 1, 0)
             lin8(S(o), a + "wo_a.weight", S(oa), groups=m.groups)
             lin8(S(oa), a + "wo_b.weight", S(y))
-            prog.emit(P.DS_HC_POST, S(y), None, hl, raw_a, sca, ba, hl, n, dim, hc_eps, iters)
+            if hfuse:
+                pend_a[j] = i           # (the post with the FFN's mixes and pre: ffn_pre)
+            else:
+                prog.emit(P.DS_HC_POST, S(y), None, hl, raw_a, sca, ba, hl, n, dim, hc_eps, iters, S(coef_as[i]))
 
-        def ffn_pre(j, i):
+        def ffn_pre(j, i, local=True):
             """The FFN of layer i up to its CPU task: the router, the input of
             the cold experts to the host (the signal of the task), the hot
-            experts, the shared one; then the task."""
+            experts, the shared one (local; else ffn_local later); then the
+            task."""
             n, ps, S = rows(j)
             hl, p = S(h), "layers.%d." % i
             _fa, sca, ba = self.hcp(p + "hc_attn")
-            ff, _scf, _bf = self.hcp(p + "hc_ffn")
+            ff, scf, bf = self.hcp(p + "hc_ffn")
             raw_f = S(raw_fs[i])
-            prog.emit(P.DS_HC_MIX, hl, ff, raw_f, n, hc * dim, eps)
-            prog.emit(P.DS_HC_PRE, hl, S(raw_as[i]), sca, ba, self.vec(p + "ffn_norm.weight"), S(xa), n, dim, eps,
-                      hc_eps)
+            if pend_a.pop(j, None) is not None:
+                # the attention's post, the FFN's mixes and pre
+                prog.emit(P.DS_HC_STEP, S(y), None, None, None, hl, S(coef_as[i]), ff, raw_f, S(raw_as[i]), sca, ba,
+                          self.vec(p + "ffn_norm.weight"), S(xa), scf, bf, S(coef_fs[i]), S(hcs_part), S(hcs_cnt),
+                          n, dim, eps, hc_eps, iters, 0)
+            else:
+                prog.emit(P.DS_HC_MIX, hl, ff, raw_f, n, hc * dim, eps)
+                prog.emit(P.DS_HC_PRE, hl, S(raw_as[i]), sca, ba, self.vec(p + "ffn_norm.weight"), S(xa), n, dim,
+                          eps, hc_eps, raw_f, scf, bf, iters, S(coef_fs[i]))
             f = p + "ffn."
             ids, vals = S(io.ids[i], k), S(io.vals[i], k)
             lin12(S(xa), f + "gate.weight", S(logits_r))
@@ -777,19 +833,36 @@ class DSV41GPU:
             prog.keep.append(fl)
             hpl, vpl = S(hp), S(vp, k)
             prog.emit(P.SIGNAL, fl[0:1], seq, S(xa), hpl, hpl.nbytes, cold_val, vpl, vpl.nbytes, cold, ipl, ipl.nbytes)
+            if local:
+                ffn_local(j, i)
+            if hcs:
+                # (the CPU's sum of its experts for each token: no flag 64)
+                cpu = self.parts.program(i, n, k, hpl, ipl, vpl, S(host_sum), ip[k:k + 1] if t == 1 else None,
+                                         32 | 128 | 2048 | (256 if x8 else 0), self.part_bufs)
+            else:
+                cpu = self.parts.program(i, n, k, hpl, ipl, vpl, S(host_rows, k), ip[k:k + 1] if t == 1 else None,
+                                         32 | 64 | 128 | (256 if x8 else 0), self.part_bufs)
+            io.cpu.append(cpu)
+            prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
+
+        def ffn_local(j, i):
+            """The hot experts and the shared one of layer i on the rows of lane
+            j (None: all the rows)."""
+            n, _ps, S = rows(j) if j is not None else (t, None, lambda a, per=1: a)
+            f = "layers.%d.ffn." % i
+            ids, vals = S(io.ids[i], k), S(io.vals[i], k)
             prog.emit(P.DS_HOT_MOE, S(xa), ids, vals, self.maps[i], self.stores[i], self.per, self.off3,
                       self.off2, n, k, dim, I, S(hq["qh"]), S(hq["ql"]), S(hq["xs"]), S(hq["act"], k),
                       S(hq["act2"], k), S(hq["aqh"], k), S(hq["aql"], k), S(hq["axs"], k), S(hq["de"], k),
                       self.w.src.E, int(x8))
+            if hcs:
+                # the GPU's pairs summed now, while the CPU's task runs (the CPU sends its own sum)
+                prog.emit(P.DS_COMBINE, ids, self.maps[i], S(hq["de"], k), None, S(part_d), k, dim, n, int(t > 1), 1)
             sx = f + "shared_experts."
             lin8(S(xa), sx + "w1.weight", S(sg))
             lin8(S(xa), sx + "w3.weight", S(su))
             prog.emit(P.DS_SWIGLU, S(sg), S(su), S(sa), n * I, float(m.limit))
             lin8(S(sa), sx + "w2.weight", S(ys))
-            cpu = self.parts.program(i, n, k, hpl, ipl, vpl, S(host_rows, k), ip[k:k + 1] if t == 1 else None,
-                                     32 | 64 | 128 | (256 if x8 else 0), self.part_bufs)
-            io.cpu.append(cpu)
-            prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
 
         def ffn_post(j, i):
             """The rows of the CPU's task back, the sum of the experts into the streams."""
@@ -798,9 +871,20 @@ class DSV41GPU:
             _ff, scf, bf = self.hcp(p + "hc_ffn")
             fl, cold = flags[j, i], colds[i][0]
             prog.emit(P.AWAIT, fl[1:2], seq, None, None, 0, cold[k:k + 1] if t == 1 else None)
+            if hcs:
+                if hfuse and i + 1 in lay_set and i + 1 not in m.engram_layers:
+                    pend_f[j] = i       # (the post with the next layer's mixes and pre: attn)
+                else:
+                    prog.emit(P.DS_HC_POST, S(part_d), S(ys), hl, S(raw_fs[i]), scf, bf, hl, n, dim, hc_eps, iters,
+                              S(coef_fs[i]), S(host_sum), cold[k:k + 1] if t == 1 else None, 1)
+                    if io.layers is not None:
+                        lr = S(io.layers[i])
+                        prog.emit(P.COPY, hl, lr, lr.nbytes)
+                return
             prog.emit(P.DS_COMBINE, S(io.ids[i], k), self.maps[i], S(hq["de"], k), S(host_rows, k), S(part), k, dim, n,
                       int(t > 1))           # (the rows of GP_HOT_SPLIT_MT, also in a lane of one token)
-            prog.emit(P.DS_HC_POST, S(part), S(ys), hl, S(raw_fs[i]), scf, bf, hl, n, dim, hc_eps, iters)
+            prog.emit(P.DS_HC_POST, S(part), S(ys), hl, S(raw_fs[i]), scf, bf, hl, n, dim, hc_eps, iters,
+                      S(coef_fs[i]))
             if io.layers is not None:
                 lr = S(io.layers[i])
                 prog.emit(P.COPY, hl, lr, lr.nbytes)      # (the lane's rows: the other may be a layer behind)
@@ -817,15 +901,24 @@ class DSV41GPU:
                 ffn_pre(0, i)
                 ffn_post(0, i)
         else:
-            # A's task runs on the CPU while the GPU runs B (and the reverse)
+            # A's task runs on the CPU while the GPU runs B (and the reverse).
+            # A verify group of 2: the hot and shared experts of A and B after
+            # B's signal, on both rows at once (A's are read only by its
+            # ffn_post, after them: the weights once, not once a half; the
+            # kernels of t <= 8 give each row the bits of a step): 51.0 -> 49.4
+            # ms, the GPU its bound. Not for more rows: the CPU is the bound and
+            # A's experts filled the GPU's wait for B's task (6 rows 103 -> 106)
+            merge = t == 2 and self.verify_merge
             lay_ = list(lay)
             for n_, i in enumerate(lay_):
                 attn(0, i)
-                ffn_pre(0, i)
+                ffn_pre(0, i, local=not merge)
                 if n_ > 0:
                     ffn_post(1, lay_[n_ - 1])
                 attn(1, i)
-                ffn_pre(1, i)
+                ffn_pre(1, i, local=not merge)
+                if merge:
+                    ffn_local(None, i)
                 ffn_post(0, i)
             ffn_post(1, lay_[-1])
         prev = prev_of(lay[-1] + 1)
@@ -966,13 +1059,32 @@ class DSV41GPU:
             self.hot.land(wait=len(tokens) > VERIFY_MAX)
         self._inputs(r, tokens, pos, rbase, media)
         r.g.run()
+        step = len(tokens) == 1 and part == "full"
+        if self.hot is not None and step:
+            # the choices of the step before: the GPU ends this one meanwhile (rc_gpu_run returns
+            # with the last CPU task, before the head: 1.3 ms), so its plan costs the step nothing;
+            # its copies start a token later
+            self._hot_flush()
         if part != "enc":
             r.g.download("logits")
         self.last = r
         if self.hot is not None:
-            self.hot.observe(self.download(r.ids), len(tokens), r.lay)
-            self.hot.plan(len(tokens))
+            ids = self.download(r.ids)
+            if step:
+                self._hot_seen = (ids.copy(), r.lay)
+            else:
+                self._hot_flush()
+                self.hot.observe(ids, len(tokens), r.lay)
+                self.hot.plan(len(tokens))
         return r.logits[-1].copy() if part != "enc" else None
+
+    def _hot_flush(self):
+        """The observation and the plan of a step left for later (forward), if any."""
+        seen = getattr(self, "_hot_seen", None)
+        if seen is not None:
+            self._hot_seen = None
+            self.hot.observe(seen[0], 1, seen[1])
+            self.hot.plan(1)
 
     def verify(self, tokens, pos):
         """A verify group of DSpark (len(tokens) <= VERIFY_MAX): the logits of
@@ -987,6 +1099,7 @@ class DSV41GPU:
         self.download(r.main_h)
         self.last = r
         if self.hot is not None:
+            self._hot_flush()
             self.hot.observe(self.download(r.ids), len(tokens), r.lay)
             self.hot.plan(len(tokens))
         return r.logits.copy(), r.main_h.copy()
@@ -1139,7 +1252,9 @@ class DSHot:
         import time
         from reclank.backends.cuda.runtime import lib
         z, t0 = self.g.w.z, time.time()
-        self.registered = all(lib().rc_gpu_host_register_ro(b, n) == 0 for b, n in zip(z.base, z.size))
+        # (writable maps, the weightkeeper's seal "size": page-locked as they are)
+        self.registered = all((lib().rc_gpu_host_register_rw(b, n) != 0) if getattr(z, "writable", False)
+                              else lib().rc_gpu_host_register_ro(b, n) == 0 for b, n in zip(z.base, z.size))
         print("the weightkeeper's segments page-locked for the copies: %s (%.1f s)" % (
             "yes" if self.registered else lib().rc_gpu_last_error().decode(), time.time() - t0), file=sys.stderr)
 

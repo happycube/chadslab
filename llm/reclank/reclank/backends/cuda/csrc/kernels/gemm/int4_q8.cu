@@ -582,8 +582,11 @@ __global__ void k_mt_gemv_bf16(const float *x, const uint16_t *w, float *out, in
         for (int j = 0; j < MT_MAX; ++j) {
             if (j < t) {
                 /* The terms of k_bf16_linear, so a token of a group gets
-                 * the bits of a decode step (an MTP verify group). */
-                const float *xi = x + (size_t)j * cols + i * 8;
+                 * the bits of a decode step (an MTP verify group); x in
+                 * two 16-byte loads (rows of cols floats, cols % 8 == 0). */
+                const float4 *x4 = (const float4 *)(x + (size_t)j * cols + i * 8);
+                const float4 a = x4[0], b = x4[1];
+                const float xi[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
                 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
                     sum[j] += wv[2 * k] * xi[2 * k] + wv[2 * k + 1] * xi[2 * k + 1];

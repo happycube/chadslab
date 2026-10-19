@@ -23,6 +23,7 @@ static gg_job gg_jobs[GG_FETCH_MAX];
 static int gg_job_head, gg_job_tail;
 static int gg_recorded[GG_FETCH_MAX];
 static int gg_fetch_error;
+static char gg_fetch_why[160];     /* the CUDA error of the first failed copy */
 static cudaEvent_t gg_ready[GG_FETCH_MAX], gg_freeev[2];
 static cudaStream_t gg_copy;
 static int gg_worker_on;
@@ -277,19 +278,26 @@ static int gg_h2d_staged(gg_stager *sg, void *dst, const void *src, size_t n, cu
     return 0;
 }
 
-/* RECLANK_GPU_FETCH_PULL (16): the copies of a GP_FETCH job from
+/* RECLANK_GPU_FETCH_PULL (8): the copies of a GP_FETCH job from
  * registered host memory as one kernel of that many blocks of 256 threads
  * that reads the host memory (the map of the pinned experts) and writes the
  * buffer, in place of a DMA copy for each range. On the 3090 (PCIe 3.0 x16)
  * the DMA engine moved 8.0 GB/s with copies of 1 MB to 512 MB (more streams
  * did not help); a kernel of 4 to 32 blocks reads 12.3 GB/s. 0: DMA. A job
- * with a range that is not registered or not 16-byte aligned takes DMA. */
+ * with a range that is not registered or not 16-byte aligned takes DMA. In
+ * the mixed groups 8 blocks leave room on the bus and in the SMs for the
+ * copies on the path of each layer (the part of the CPU, TO_DEV): Qwen3.8
+ * EXL3, a prompt of 4096 tokens, 882 tok/s against 792 with 16. A GPU of
+ * fewer than 24 SMs takes DMA by default: there the blocks of the kernel are
+ * a share of the SMs that the experts of the group need. The GTX 1070 (15
+ * SMs), Qwen3.6, a prompt of 4096 tokens: DMA 331 tok/s (the copies at 8.2
+ * GB/s, hidden), 4 blocks 317, 8 blocks 307, 16 blocks 287. */
 static int gg_pull_blocks(void)
 {
     static int n = -1;
     if (n < 0) {
         const char *v = getenv("RECLANK_GPU_FETCH_PULL");
-        n = v ? atoi(v) : 16;
+        n = v ? atoi(v) : gg_caps.sm_count > 0 && gg_caps.sm_count < 24 ? 0 : 8;
     }
     return n;
 }
@@ -345,6 +353,7 @@ static int gg_pull_ranges(const int64_t *ranges, int count, int64_t *rg)
 static void *gg_worker(void *arg)
 {
     (void)arg;
+    cudaSetDevice(gg_device);
     static gg_stager sg;
     static int64_t *prg, *prg_d;
     static int prg_cap;
@@ -393,6 +402,11 @@ static void *gg_worker(void *arg)
         }
         bad = bad || cudaEventRecord(gg_ready[j.f], gg_copy) != cudaSuccess;
         pthread_mutex_lock(&gg_mu);
+        if (bad && !gg_fetch_error) {
+            cudaError_t ce = cudaGetLastError();
+            snprintf(gg_fetch_why, sizeof(gg_fetch_why), "%s (job of %d ranges, buffer %d)",
+                     cudaGetErrorString(ce), j.count, j.b);
+        }
         gg_fetch_error |= bad;
         gg_recorded[j.f] = 1;
         ++gg_job_head;
@@ -437,6 +451,7 @@ static int gg_cworker_on;
 static void *gg_cworker(void *arg)
 {
     (void)arg;
+    cudaSetDevice(gg_device);
     static gg_stager sg;
     gg_worker_bind();
     for (;;) {

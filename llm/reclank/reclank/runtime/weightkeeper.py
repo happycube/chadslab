@@ -24,9 +24,16 @@ socket, so a round starts in seconds:
   LAYOUT_V1 (layout="planes"): the planes w1.weight, w1.scale, ... of the
   part's rows as the shard has them (index["planes"]); a round reads both.
 - **The handoff.** A round connects (attach()), checks the uid of the peer,
-  gets the index (JSON) and the memfds (SCM_RIGHTS), and maps them read-only
-  at one address in the same order; no copy, the pages stay where the weightkeeper
-  put them. Each memfd is sealed (no write, no resize) once it is filled.
+  gets the index (JSON) and the memfds (SCM_RIGHTS), and maps them at one
+  address in the same order; no copy, the pages stay where the weightkeeper
+  put them. Each memfd is sealed once it is filled: no resize, and with
+  seal="write" no write (the rounds map it read-only); with seal="size" (the
+  default) the rounds map it writable (index["writable"]), so CUDA can
+  page-lock it for DMA (cudaHostRegister of a read-only map: "operation not
+  supported" on the 3090; the copies then stage, a prompt of 8192 tokens of
+  the EXL3 Flash-Next 654 tok/s against 871 page-locked). The arrays of a
+  round stay read-only (Weights._arr); the seal is the guard against a
+  stray write of C or of the GPU.
 - **The checkpoint** of the segments: the size and a sha256 of the header of
   each shard in the index (Weights.check against the files of a round).
 - **The dense weights** (18.7 GB: the attention, the shared experts, the
@@ -95,6 +102,7 @@ SEALS = 1 | 2 | 4 | 8           # F_SEAL_SEAL, SHRINK, GROW, WRITE
 # of memfd_wait_for_pins counts a hugetlb folio once in the page cache and
 # compares it with its count of small pages), so it gets this one instead.
 SEALS_FUTURE = 1 | 2 | 4 | 16
+SEALS_SIZE = 1 | 2 | 4          # (seal="size": no resize, writes allowed)
 PR_SET_PDEATHSIG = 1
 
 _libc = ctypes.CDLL(None, use_errno=True)
@@ -167,6 +175,9 @@ def identity(path):
     if path.endswith(".gguf"):
         from reclank.models.qwen.keep import gguf_ident
         return gguf_ident(path)
+    from reclank.models.qwen import keep_exl3
+    if keep_exl3.detect(path):
+        return keep_exl3.ident(path)    # (an EXL3 directory: every safetensors file)
     where = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
     out = {}
     for f in sorted(set(where.values())):
@@ -396,8 +407,10 @@ class Segment:
             raise OSError("%s: node %d: %d pieces not populated (%s at %d)" % (
                 self.name, self.node, len(errs), errs[0][1], errs[0][0]))
 
-    def seal(self):
-        """The seals, then a read-only map in place of the writable one. A
+    def seal(self, write=True):
+        """write=False: the seals of the size alone (the rounds may map the
+        segment writable), then a read-only map of the weightkeeper's own.
+        Else the seals, then a read-only map in place of the writable one. A
         seal of the writes needs no shared map that may write (a read-only
         MAP_SHARED of the fd counts too), so the range holds an empty
         reservation while the seals go on; after the seal a shared map can
@@ -407,6 +420,10 @@ class Segment:
         enforced (empty when all are)."""
         weak = []
         for fd, (pg, n, o) in zip(self.fds, self.chunks):
+            if not write:
+                fcntl.fcntl(fd, F_ADD_SEALS, SEALS_SIZE)
+                _mmap(self.base + o, n, PROT_READ, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd)
+                continue
             _mmap(self.base + o, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED)
             try:
                 fcntl.fcntl(fd, F_ADD_SEALS, SEALS)
@@ -635,6 +652,14 @@ class Options:
     experts_type: str = "bf12"
     ngram_type: str = "bf12"
     counts: str = None          # the counts of the router (layers x experts, .npy): the experts' nodes
+    # an EXL3 directory (reclank/models/qwen/keep_exl3.py): the stacks of
+    # experts "split" between the nodes, "both" (whole on every node), or
+    # "auto" (both when they fit)
+    copies: str = "auto"
+    # the seals of the segments: "size" (no resize: the rounds map them
+    # writable, so CUDA page-locks them) or "write" (no write either: the
+    # rounds map them read-only)
+    seal: str = "size"
     sock: str = None
     user: int = None            # the uid to drop to as root (default SUDO_UID)
     group: int = None
@@ -650,6 +675,14 @@ def plugin(ckpt):
     """The module of a model that the weightkeeper takes in the tensors layout
     (layout(), fill()), or None: DeepSeek V4.1 (this module's layouts)."""
     from reclank.models.qwen import keep as qwen_keep
+    from reclank.models.qwen import keep_exl3, keep_fp4l
+    from reclank.models.nemotron import keep as nemotron_keep
+    if nemotron_keep.detect(ckpt):
+        return nemotron_keep.PLUGIN         # Nemotron 3.5 Bolt (the expert stacks, the KQ_NV4 rows)
+    if keep_exl3.detect(ckpt):
+        return keep_exl3.PLUGIN             # an EXL3 directory of Qwen3.8 (its MUL1 blocks)
+    if keep_fp4l.detect(ckpt):
+        return keep_fp4l.PLUGIN             # nvidia/Qwen3.8-Flash-Next-FP4-Local (KQ_NVX experts)
     if qwen_keep.detect_gguf(ckpt):
         return qwen_keep.GGUF_PLUGIN        # a GGUF file of Qwen3.8 (its tensors as they are)
     cfg = json.load(open(os.path.join(ckpt, "config.json")))
@@ -678,11 +711,11 @@ class Weightkeeper:
                 if len(nodes) > 1 else [1.0]
             ix = self.index = self.plugin.layout(o.ckpt, nodes, share, o)
             ix.update(version=VERSION, checkpoint=self.sh.path, shards=self.sh.ident, dense=None)
-            log("%s: %d files, %s (dense %s, experts %s, n-gram %s), the experts of each layer split "
-                "between nodes %s: %s GB a node (%.1f s)" % (
+            log("%s: %d files, %s (dense %s, experts %s, n-gram %s), the experts of each layer %s "
+                "nodes %s: %s GB a node (%.1f s)" % (
                     o.ckpt, len(self.sh.ident), ix["model"], ix["types"]["dense"], ix["types"]["experts"],
-                    ix["types"]["ngram"], nodes, ["%.1f" % (b / 1e9) for b in ix["part_bytes"]],
-                    time.time() - t0))
+                    ix["types"]["ngram"], "on all the" if ix.get("copies") == "both" else "split between",
+                    nodes, ["%.1f" % (b / 1e9) for b in ix["part_bytes"]], time.time() - t0))
             return
         L = int(self.sh.hf["num_hidden_layers"])
         layers = list(o.layers) if o.layers is not None else list(range(L))
@@ -741,11 +774,13 @@ class Weightkeeper:
             self.plugin.fill(self.sh, ix, self.segs, o.threads, log)
         else:
             fill(self.sh, ix, self.segs, self.dense, o.threads)
+        ix["writable"] = o.seal == "size"
         for s in every:
-            weak = s.seal()
+            weak = s.seal(write=not ix["writable"])
             seals = {fcntl.fcntl(fd, F_GET_SEALS) for fd in s.fds}
             log("%s: sealed (%s)%s" % (
-                s.name, ", ".join("write" if x & 8 else "future write" if x & 16 else "no write seal"
+                s.name, ", ".join("write" if x & 8 else "future write" if x & 16
+                                  else "size: the rounds map it writable" if ix["writable"] else "no write seal"
                                   for x in sorted(seals)),
                 "; WARNING: a writable map still works for the %s chunk" % ", ".join(weak) if weak else ""))
         bad = []
@@ -953,12 +988,37 @@ def request(op, path=None):
     return c
 
 
+def find(ckpt):
+    """(the socket, the status) of the weightkeeper of this user that holds
+    ckpt, or (None, None): the default socket, then those beside it named
+    reclank-weightkeeper-<uid>-<name>.sock (scripts/weightkeeper.py --socket:
+    a keeper for each model, Qwen3.6 and Gemma 26B on one machine)."""
+    import glob
+    d = default_socket()
+    want = os.path.realpath(ckpt)
+    for path in [d] + sorted(glob.glob(d[:-len(".sock")] + "-*.sock")):
+        try:
+            c = request("status", path)
+            with c:
+                st = json.loads(_recv_msg(c))
+        except (OSError, ValueError):
+            continue
+        if os.path.realpath(st.get("checkpoint", "")) == want:
+            return path, st
+    return None, None
+
+
 class Weights:
-    """The segments of a weightkeeper, mapped read-only in this process."""
+    """The segments of a weightkeeper, mapped in this process: read-only, or
+    writable when the weightkeeper sealed only their size (self.writable:
+    CUDA can page-lock them; the arrays stay read-only)."""
 
     def __init__(self, path=None, populate=True, ckpt=None):
-        """ckpt: the checkpoint the round wants; another one raises ValueError
-        before anything is mapped."""
+        """ckpt: the checkpoint the round wants (with no path, the keeper that
+        holds it: find); another one raises ValueError before anything is
+        mapped."""
+        if path is None and ckpt is not None:
+            path = find(ckpt)[0]
         c = request("get", path)
         with c:
             self.index = json.loads(_recv_msg(c))
@@ -976,16 +1036,18 @@ class Weights:
                 os.close(fd)
             raise ValueError("the weightkeeper holds another checkpoint (%s)" % self.index["checkpoint"])
         self.fds = list(fds)
+        self.writable = bool(self.index.get("writable"))
+        prot = PROT_READ | (PROT_WRITE if self.writable else 0)
         self.base, self.size, k = [], [], 0
         for s in self.index["segments"]:
             n = len(s["chunks"])
-            self.base.append(map_chunks(self.fds[k:k + n], s["chunks"], PROT_READ, populate))
+            self.base.append(map_chunks(self.fds[k:k + n], s["chunks"], prot, populate))
             self.size.append(s["bytes"])
             k += n
         self.dense_base = None
         if self.index.get("dense"):
             d = self.index["dense"]
-            self.dense_base = map_chunks(self.fds[k:], d["chunks"], PROT_READ, populate)
+            self.dense_base = map_chunks(self.fds[k:], d["chunks"], prot, populate)
         for fd in self.fds:
             os.close(fd)
 

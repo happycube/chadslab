@@ -86,7 +86,22 @@ WRITES = {
     # x += o then its norm
     P.ATTN_PREP: (18, 19, 20),
     P.SIGMUL: (2,),
+    P.Q16: (1,),
+    P.DQ16: (1,),
     P.GDN: (11, 12),
+    P.F16_GLINEAR: (2,),
+    P.GLM_POOL: (0, 2, 3, 5, 12, 13),
+    P.GLM_EXPAND: (2, 3),
+    P.GLM_HC_MIX: (4, 5, 6),
+    P.GLM_HC_POST: (3,),
+    P.GLM_ROPE: (0,),
+    P.GLM_RING_PUT: (1,),
+    P.GLM_DSP_ATTN: (5,),
+    P.GLM_ATTN: (4,),
+    P.BF16_ROUND: (0,),
+    P.B12X_GLU: (2,),
+    P.MOE_B12X_OUT: (4,),
+    P.MX8_ACT: (0,),
     P.ADD_RMS: (3,),
     P.ROUTER_TOPK: (4, 5),
     # Qwen 3.8: the streams (hyperconn.cu: norm, act, mix, add in place on
@@ -146,7 +161,8 @@ WRITES[P.DS_FP8_LINEAR] = (3,)
 # compressor on the step that ends a group, the scores of the step's
 # entries, the first cnt of sel)
 WRITES[P.DS_HC_MIX] = (2,)
-WRITES[P.DS_HC_PRE] = (5,)
+WRITES[P.DS_HC_PRE] = (5, 14)              # (14: the post's coefficients, when given)
+WRITES[P.DS_HC_STEP] = (7, 12, 15, 16)      # (4, h, in place; 17, the counters, kept at 0)
 WRITES[P.DS_WIN_WRITE] = (3,)
 WRITES[P.DS_ATTN] = (8,)
 WRITES[P.DS_ROUTER] = (2, 3)

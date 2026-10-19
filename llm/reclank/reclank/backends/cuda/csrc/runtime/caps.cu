@@ -6,7 +6,9 @@
  * allows its kernels, as before the caps.
  *
  * RECLANK_GPU_CC=61 makes the GPU act as one of that compute capability
- * (the kernels of a Pascal GPU on a newer one), to test those paths. */
+ * (the kernels of a Pascal GPU on a newer one), to test those paths; 52 the
+ * Maxwell tier (no dp4a either: MAXWELL_PLAN.md). RECLANK_GPU_DP4A_EMU=1 lets
+ * the scalar dp4a of port.cuh run where there is no dp4a (else it traps). */
 typedef struct {
     int cc;              /* the compute capability: 86 for 8.6 (or RECLANK_GPU_CC) */
     int tc;              /* mma.sync (f16, bf16, s8, tf32), ldmatrix, cp.async: sm_80 */
@@ -18,9 +20,10 @@ typedef struct {
     int warp;            /* the threads of a warp */
     int sm_count;
     int unified;         /* the GPU reads host memory as its own (an integrated GPU) */
+    int dp4a;            /* the int8 dot product of 4 lanes (dp4a): sm_61 */
 } rc_caps;
 
-static rc_caps gg_caps = {0, 1, 0, 0, 1, 1, 48 << 10, 32, 0, 0};
+static rc_caps gg_caps = {0, 1, 0, 0, 1, 1, 48 << 10, 32, 0, 0, 1};
 
 static void gg_caps_init(int device)
 {
@@ -50,4 +53,8 @@ static void gg_caps_init(int device)
     gg_caps.warp = warp;
     gg_caps.sm_count = sms;
     gg_caps.unified = integrated;
+    gg_caps.dp4a = cc >= 61;
+    const char *emu = getenv("RECLANK_GPU_DP4A_EMU");
+    int on = emu && emu[0] == '1';
+    cudaMemcpyToSymbol(rc_dp4a_emu_d, &on, sizeof(on));
 }

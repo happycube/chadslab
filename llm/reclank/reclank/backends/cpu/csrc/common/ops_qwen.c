@@ -79,7 +79,129 @@ static void gp_router_topk_body(const float *logits, int t, int experts, int k, 
     }
 }
 
+/* The router of LFM2-MoE: the score of each expert is sigmoid(logit); the
+ * choice takes the k largest of score + bias[x] (bias: the expert bias,
+ * float32, for the choice only), the weights are the k scores divided by
+ * their sum + eps (1e-6; GLM-5.3 1e-20), times scale (transformers
+ * Lfm2MoeTopKRouter with norm_topk_prob, Glm5NextTextTopkRouter). At an
+ * equal value the lower index wins. One token for each thread. */
+static void gp_router_sig_body(const float *logits, int t, int experts, int k, float *val,
+                               int32_t *idx, const float *bias, float scale, float eps)
+{
+    #pragma omp for schedule(static)
+    for (int j = 0; j < t; ++j) {
+        const float *l = logits + (size_t)j * experts;
+        float s[1024], c[1024];
+        for (int x = 0; x < experts; ++x) {
+            s[x] = 1.f / (1.f + expf(-l[x]));
+            c[x] = s[x] + (bias != NULL ? bias[x] : 0.f);
+        }
+        float sum = 0.f;
+        for (int s2 = 0; s2 < k; ++s2) {
+            int b = -1;
+            for (int x = 0; x < experts; ++x) {
+                if (c[x] != -INFINITY && (b < 0 || c[x] > c[b])) {
+                    b = x;
+                }
+            }
+            idx[(size_t)j * k + s2] = b;
+            val[(size_t)j * k + s2] = s[b];
+            sum += s[b];
+            c[b] = -INFINITY;
+        }
+        for (int s2 = 0; s2 < k; ++s2) {
+            val[(size_t)j * k + s2] = val[(size_t)j * k + s2] / (sum + eps) * scale;
+        }
+    }
+}
+
+/* The double-gated short convolution of LFM2 (Lfm2MoeShortConv), for t
+ * tokens: in (t x 3 ch) holds B, C, x of each token (the in_proj output, in
+ * that order); bx = B * x goes through the causal depthwise convolution of
+ * kernel taps w (ch x kernel, the last tap on the newest row) with the last
+ * kernel - 1 rows of bx in state (kernel - 1 x ch, the oldest first), and
+ * out (t x ch) = C * conv. state gets the last kernel - 1 rows of bx of the
+ * first nreal tokens (0: all t; the other rows pad a group of the GPU). One
+ * block of channels for each thread. */
+static void gp_short_conv_body(const float *in, float *state, const float *w, float *out, int t,
+                               int ch, int kernel, int nreal)
+{
+    if (nreal <= 0 || nreal > t) {
+        nreal = t;
+    }
+    #pragma omp for schedule(static)
+    for (int c0 = 0; c0 < ch; c0 += 64) {
+        int c1 = c0 + 64 < ch ? c0 + 64 : ch;
+        for (int c = c0; c < c1; ++c) {
+            float hist[16];
+            for (int q = 0; q < kernel - 1; ++q) {
+                hist[q] = state[(size_t)q * ch + c];
+            }
+            const float *wc = w + (size_t)c * kernel;
+            for (int j = 0; j < t; ++j) {
+                const float *r = in + (size_t)j * 3 * ch;
+                float bx = r[c] * r[2 * ch + c];
+                float y = 0.f;
+                for (int q = 0; q < kernel - 1; ++q) {
+                    y += wc[q] * hist[q];
+                }
+                y += wc[kernel - 1] * bx;
+                for (int q = 0; q + 1 < kernel - 1; ++q) {
+                    hist[q] = hist[q + 1];
+                }
+                if (kernel > 1) {
+                    hist[kernel - 2] = bx;
+                }
+                out[(size_t)j * ch + c] = r[ch + c] * y;
+                if (j == nreal - 1) {
+                    for (int q = 0; q < kernel - 1; ++q) {
+                        state[(size_t)q * ch + c] = hist[q];
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* out = x * sigmoid(g), for n values. */
+/* GP_Q16: n float32 values (n a multiple of 128) as int16 q, then a
+ * float32 scale s for each 128 (out: 2 n bytes of q, then 4 n / 128 of s);
+ * a value is q s, s = max |x| / 32767 of its 128. GP_DQ16 back. The
+ * transfers of the mixed groups of Qwen at half the bytes (gpu35._moe_mix:
+ * 42 MB a layer of a group of 4096 rows each way, the copies to the GPU
+ * at 3 GB/s next to those of the experts). */
+static void gp_q16_body(const float *x, uint8_t *out, int64_t n)
+{
+    int16_t *q = (int16_t *)out;
+    float *sc = (float *)(out + 2 * n);
+    #pragma omp for schedule(static)
+    for (int64_t b = 0; b < n / 128; ++b) {
+        const float *v = x + 128 * b;
+        float m = 0.f;
+        for (int i = 0; i < 128; ++i) {
+            m = fmaxf(m, fabsf(v[i]));
+        }
+        const float inv = m > 0.f ? 32767.f / m : 0.f;
+        for (int i = 0; i < 128; ++i) {
+            q[128 * b + i] = (int16_t)lrintf(v[i] * inv);
+        }
+        sc[b] = m / 32767.f;
+    }
+}
+
+static void gp_dq16_body(const uint8_t *in, float *x, int64_t n)
+{
+    const int16_t *q = (const int16_t *)in;
+    const float *sc = (const float *)(in + 2 * n);
+    #pragma omp for schedule(static)
+    for (int64_t b = 0; b < n / 128; ++b) {
+        const float s = sc[b];
+        for (int i = 0; i < 128; ++i) {
+            x[128 * b + i] = (float)q[128 * b + i] * s;
+        }
+    }
+}
+
 static void gp_sigmul_body(const float *x, const float *g, float *out, int64_t n)
 {
     #pragma omp for schedule(static)
@@ -91,7 +213,8 @@ static void gp_sigmul_body(const float *x, const float *g, float *out, int64_t n
 /* The steps before the attention of a gated attention with partial RoPE
  * (Qwen3.5), for t tokens from pos:
  *
- * - qg (t x nq x 2 hd): the query and the gate of each head;
+ * - qg (t x nq x 2 hd): the query and the gate of each head; with a null
+ *   gate (LFM2, no output gate), qg is t x nq x hd, the query alone;
  * - the query: rms_norm with qn, RoPE on the first rot values, times scale,
  *   into qout (t x nq x hd); the gate into gate (t x nq x hd);
  * - kk, vv (t x nk x hd): the key gets rms_norm with kn and RoPE; the key and
@@ -115,8 +238,12 @@ static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
         float *dst;
         float sc;
         if (h < nq) {
-            src = qg + ((size_t)j * nq + h) * 2 * hd;
-            memcpy(gate + ((size_t)j * nq + h) * hd, src + hd, (size_t)hd * 4);
+            if (gate != NULL) {
+                src = qg + ((size_t)j * nq + h) * 2 * hd;
+                memcpy(gate + ((size_t)j * nq + h) * hd, src + hd, (size_t)hd * 4);
+            } else {
+                src = qg + ((size_t)j * nq + h) * hd;       /* no gate (LFM2): the query alone */
+            }
             dst = qout + ((size_t)j * nq + h) * hd;
             w = qn;
             sc = scale;
@@ -140,10 +267,11 @@ static void gp_attn_prep_body(const float *qg, const float *kk, const float *vv,
         for (int d = 0; d < hd; ++d) {
             ss += src[d] * src[d];
         }
-        float inv = 1.f / sqrtf(ss / (float)hd + eps);
+        /* no norm weights (Nemotron): the rows as they are */
+        float inv = w != NULL ? 1.f / sqrtf(ss / (float)hd + eps) : 1.f;
         float y[1024];
         for (int d = 0; d < hd; ++d) {
-            y[d] = src[d] * inv * w[d];
+            y[d] = w != NULL ? src[d] * inv * w[d] : src[d];
         }
         const float *c = cos + (size_t)j * rot, *sn = sin + (size_t)j * rot;
         for (int d = 0; d < half; ++d) {
@@ -206,6 +334,191 @@ static void gp_add_scaled(float *out, const float *d, float v, int n)
  * of an int32 that holds the count. The GPU writes that count with the list
  * of the experts that it does not hold (reclank/backends/cuda/runtime.py). A count of 0 gives
  * an output of zeros. */
+/* ---------- an expert device (reclank/backends/cuda/devices.py) ----------
+ * A second GPU, driven by a second copy of the CUDA library in this process,
+ * holds experts the GPU of the step does not: the cold experts of a step
+ * that it holds go to it (post: its job on its stream, and back at once),
+ * the others to the CPU (GP_MOE_N), then wait adds its sum. er_ctx is made
+ * by devices.py (the same layout). */
+typedef struct {
+    int (*post)(int layer, int n, const int32_t *ids, const float *w, const float *h);
+    int (*wait)(float *out);
+    const uint8_t *held;         /* [layer][experts] */
+    int64_t experts;
+    int64_t alive;
+    /* a group of t tokens (Nemotron: GP_NM_REMOTE_POST), idx the expert of each of its t k pairs
+     * or -1; or null */
+    int (*post_t)(int layer, int t, int k, const int32_t *idx, const float *w, const float *x);
+} er_ctx;
+#define ER_MAXK 16
+#define ER_MAXP 256
+
+/* REMOTE_POST: h, val, idx, count (an int32 in memory), ctx, layer, hidden
+ * (unused), lidx, lval, lcount, posted. The pairs of the experts the device
+ * holds go to it (posted gets 1); the others to lidx, lval and lcount, for
+ * GP_MOE_N. */
+static void gp_remote_post(const gp_rec *r, const int64_t *e)
+{
+    #pragma omp single
+    {
+        const float *h = GP_P(const float, 0);
+        const float *val = GP_P(const float, 1);
+        const int32_t *idx = GP_P(const int32_t, 2);
+        int cnt = *GP_P(const int32_t, 3);
+        er_ctx *ctx = GP_P(er_ctx, 4);
+        int layer = GP_I(5);
+        int32_t *lidx = GP_P(int32_t, 7);
+        float *lval = GP_P(float, 8);
+        int32_t *lcnt = GP_P(int32_t, 9);
+        int64_t *posted = GP_P(int64_t, 10);
+        const uint8_t *held = ctx->held + (size_t)layer * ctx->experts;
+        int32_t ids[ER_MAXK];
+        float w[ER_MAXK];
+        int n = 0, m = 0;
+        for (int j = 0; j < cnt; ++j) {
+            int x = idx[j];
+            if (ctx->alive && held[x] && n < ER_MAXK) {
+                ids[n] = x;
+                w[n] = val[j];
+                ++n;
+            } else {
+                lidx[m] = x;
+                lval[m] = val[j];
+                ++m;
+            }
+        }
+        *posted = 0;
+        if (n > 0) {
+            if (ctx->post(layer, n, ids, w, h) == 0) {
+                *posted = 1;
+            } else {
+                /* (the device refused: its experts to the CPU) */
+                for (int j = 0; j < n; ++j) {
+                    lidx[m] = ids[j];
+                    lval[m] = w[j];
+                    ++m;
+                }
+            }
+        }
+        *lcnt = m;
+    }
+}
+
+/* NM_REMOTE_POST: x (the latent rows), cold (the expert of each pair, or -1:
+ * GP_NM_SPLIT), val, pairs, ctx, layer, lcold, posted, k. The cold pairs of
+ * the experts the device holds go to it (posted gets 1), lcold is cold
+ * without them, for GP_NM_MOE: one token (pairs = k) by post, a group by
+ * post_t. */
+static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
+{
+    #pragma omp single
+    {
+        const float *x = GP_P(const float, 0);
+        const int32_t *cold = GP_P(const int32_t, 1);
+        const float *val = GP_P(const float, 2);
+        int np = GP_I(3);
+        er_ctx *ctx = GP_P(er_ctx, 4);
+        int layer = GP_I(5);
+        int32_t *lcold = GP_P(int32_t, 6);
+        int64_t *posted = GP_P(int64_t, 7);
+        int k = r->tag[8] == GP_T_NONE ? np : GP_I(8);
+        static int dbg = -1;
+        if (dbg < 0) {
+            const char *v = getenv("RECLANK_EX_DEBUG");
+            dbg = v != NULL && atoi(v) != 0;
+        }
+        const uint8_t *held = ctx->held + (size_t)layer * ctx->experts;
+        *posted = 0;
+        if (np > k && (np > ER_MAXP || ctx->post_t == NULL)) {
+            /* (a group larger than a job of the device: all its pairs to the CPU) */
+            for (int p = 0; p < np; ++p) {
+                lcold[p] = cold[p];
+            }
+            goto done;
+        }
+        if (np > k) {
+            /* a group: its pairs of the device's experts in place, the others -1 */
+            int32_t gidx[ER_MAXP];
+            int n = 0;
+            for (int p = 0; p < np; ++p) {
+                int c = cold[p];
+                lcold[p] = c;
+                gidx[p] = -1;
+                if (c >= 0 && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP && held[c]) {
+                    gidx[p] = c;
+                    lcold[p] = -1;
+                    ++n;
+                }
+            }
+            if (dbg) {
+                fprintf(stderr, "[cpu] post layer %d: %d rows, %d of %d pairs to the device (thread %d)\n",
+                        layer, np / k, n, np, omp_get_thread_num());
+            }
+            if (n > 0) {
+                if (ctx->post_t(layer, np / k, k, gidx, val, x) == 0) {
+                    *posted = 1;
+                } else {
+                    fprintf(stderr, "[reclank] NM_REMOTE_POST layer %d: the expert device refused a group of %d rows\n",
+                            layer, np / k);
+                    for (int p = 0; p < np; ++p) {
+                        lcold[p] = cold[p];
+                    }
+                }
+            }
+            goto done;
+        }
+        int32_t ids[ER_MAXK], at[ER_MAXK];
+        float w[ER_MAXK];
+        int n = 0;
+        for (int p = 0; p < np; ++p) {
+            int c = cold[p];
+            lcold[p] = c;
+            if (c >= 0 && ctx->alive && held[c] && n < ER_MAXK) {
+                ids[n] = c;
+                w[n] = val[p];
+                at[n] = p;
+                lcold[p] = -1;
+                ++n;
+            }
+        }
+        if (n > 0) {
+            if (ctx->post(layer, n, ids, w, x) == 0) {
+                *posted = 1;
+            } else {
+                /* (the device refused: its pairs to the CPU) */
+                for (int j = 0; j < n; ++j) {
+                    lcold[at[j]] = ids[j];
+                }
+            }
+        }
+    done:;
+    }
+}
+
+/* REMOTE_JOIN: ctx, posted, out. After GP_MOE_N wrote the CPU's sum to out:
+ * add the device's sum (wait for its job). */
+static void gp_remote_join(const gp_rec *r, const int64_t *e)
+{
+    #pragma omp single
+    {
+        er_ctx *ctx = GP_P(er_ctx, 0);
+        if (*GP_P(const int64_t, 1)) {
+            static int dbg = -1;
+            if (dbg < 0) {
+                const char *v = getenv("RECLANK_EX_DEBUG");
+                dbg = v != NULL && atoi(v) != 0;
+            }
+            if (dbg) {
+                fprintf(stderr, "[cpu] join (thread %d)\n", omp_get_thread_num());
+            }
+            if (ctx->wait(GP_P(float, 2)) != 0) {
+                fprintf(stderr, "[reclank] the expert device failed: its experts go to the CPU from now on\n");
+                ctx->alive = 0;
+            }
+        }
+    }
+}
+
 static void gp_moe_one(const gp_rec *r, const int64_t *e)
 {
     const float *h = GP_P(const float, 0);
@@ -309,22 +622,39 @@ static void gp_moe_group(const gp_rec *r, const int64_t *e)
     const int pairs = tokens * top_k;
     #pragma omp single
     {
-        /* A stable insertion sort of the flat indices by expert. */
+        /* A stable sort of the flat indices by expert (counting: a group of
+         * a prompt has thousands of pairs, where the insertion sort of a
+         * small group took time of the square of them). A pair with a
+         * negative expert index is not for the CPU: the GPU computes it
+         * (reclank/backends/cuda/runtime.py). The sort puts such pairs
+         * first. */
+        int ne = 0, s0 = 0;
         for (int f = 0; f < pairs; ++f) {
-            int32_t x = f;
-            int k = f - 1;
-            while (k >= 0 && idx[order[k]] > idx[x]) {
-                order[k + 1] = order[k];
-                --k;
+            if (idx[f] < 0) {
+                ++s0;
+            } else if (idx[f] + 1 > ne) {
+                ne = idx[f] + 1;
             }
-            order[k + 1] = x;
         }
-        /* A pair with a negative expert index is not for the CPU: the GPU
-         * computes it (reclank/backends/cuda/runtime.py). The sort puts such pairs first. */
-        int s0 = 0;
-        while (s0 < pairs && idx[order[s0]] < 0) {
-            ++s0;
+        int *at = (int *)calloc((size_t)ne + 1, sizeof(int));
+        for (int f = 0; f < pairs; ++f) {
+            if (idx[f] >= 0) {
+                ++at[idx[f] + 1];
+            }
         }
+        at[0] = s0;
+        for (int x = 0; x < ne; ++x) {
+            at[x + 1] += at[x];
+        }
+        int nn = 0;
+        for (int f = 0; f < pairs; ++f) {
+            if (idx[f] < 0) {
+                order[nn++] = f;
+            } else {
+                order[at[idx[f]]++] = f;
+            }
+        }
+        free(at);
         int jobs = 0;
         for (int p = s0; p < pairs; ++p) {
             int32_t ex = idx[order[p]];

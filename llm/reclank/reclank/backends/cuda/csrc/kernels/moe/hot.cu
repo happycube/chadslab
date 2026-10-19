@@ -81,6 +81,28 @@ __device__ __forceinline__ float q4x_dot4(uint32_t a, float4 x)
            (float)(int8_t)((a >> 16) & 255) * x.z + (float)(int8_t)(a >> 24) * x.w;
 }
 
+/* q4x_dot4 of the codes of c minus 8 (HI 0: the low 4 bits of each byte;
+ * HI 1: the high 4 bits), with the decode of i4m (gemv.cu): no __vsub4 (a
+ * few instructions on Maxwell and Pascal) and no conversions of int8 (a
+ * quarter of the rate); the nibbles of bits 20, 24 and 28 take one shift of
+ * c by 12. The FMAs written out in order, as int4_part. */
+template <int HI>
+__device__ __forceinline__ float q4x_dot4m(uint32_t c, float4 x)
+{
+    const uint32_t h = c >> 12;
+    float s;
+    if (HI) {
+        s = i4m<4>(c) * x.x;
+        s = fmaf(i4m<12>(c), x.y, s);
+        s = fmaf(i4m<8>(h), x.z, s);
+        return fmaf(i4m<16>(h), x.w, s);
+    }
+    s = i4m<0>(c) * x.x;
+    s = fmaf(i4m<8>(c), x.y, s);
+    s = fmaf(i4m<16>(c), x.z, s);
+    return fmaf(i4m<12>(h), x.w, s);
+}
+
 /* The 16 rows of a KQ_Q4X group by the ROWS_PER_BLOCK warps of a block (the
  * hot experts of a step): warp w takes the blocks of 32 columns w, w + 8,
  * ..., and the warps add their sums in shared memory. Then
@@ -97,12 +119,10 @@ __device__ void q4x_group_block(const uint8_t *wg, const float *x, int cols, flo
         uint2 c = *(const uint2 *)(blk + 8 * lane);
         float4 xv = *(const float4 *)(x + 32 * b + 4 * st);
         const __half *d = (const __half *)(blk + 256);
-        acc[0] += __half2float(d[2 * q]) * q4x_dot4(__vsub4(c.x & 0x0f0f0f0fu, 0x08080808u), xv);
-        acc[1] += __half2float(d[2 * q + 1]) * q4x_dot4(__vsub4(c.y & 0x0f0f0f0fu, 0x08080808u), xv);
-        acc[2] += __half2float(d[2 * q + 8]) *
-                  q4x_dot4(__vsub4((c.x >> 4) & 0x0f0f0f0fu, 0x08080808u), xv);
-        acc[3] += __half2float(d[2 * q + 9]) *
-                  q4x_dot4(__vsub4((c.y >> 4) & 0x0f0f0f0fu, 0x08080808u), xv);
+        acc[0] += __half2float(d[2 * q]) * q4x_dot4m<0>(c.x, xv);
+        acc[1] += __half2float(d[2 * q + 1]) * q4x_dot4m<0>(c.y, xv);
+        acc[2] += __half2float(d[2 * q + 8]) * q4x_dot4m<1>(c.x, xv);
+        acc[3] += __half2float(d[2 * q + 9]) * q4x_dot4m<1>(c.y, xv);
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -142,6 +162,72 @@ __device__ __forceinline__ const uint8_t *hot_w(const gp_rec *r, const int64_t *
         return pool_block(slot, part);
     }
     return DP(const uint8_t, 4 + part) + (size_t)slot * per;
+}
+
+/* The int4 rows of GP_HOT_MOE (no KQ_Q4X copies: an AVX-512 CPU without VNNI
+ * keeps the int4 experts) with x in shared memory: the block stages the x of
+ * its pair once, and a warp does HOT_XR rows of int4_row from there (the
+ * same lanes and sums: the same bits). int4_row on x in global memory read
+ * 32 bytes of x a lane for each 4.5 bytes of weights. The 26B on the GTX
+ * 1070, 6 hot pairs: gate and up 187 -> 85 us, down 123 -> 56 us.
+ * RECLANK_GPU_HOT_XR=0 keeps a warp a row on x in global memory. */
+#define HOT_XR 4
+
+static int hot_xr_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_HOT_XR");
+        on = v == NULL || atoi(v) != 0;
+    }
+    return on;
+}
+
+__device__ __forceinline__ void hot_rows_xr(const uint8_t *we, const float *x, int rows, int cols,
+                                            float *out)
+{
+    extern __shared__ float hot_xs[];
+    const float4 *src = (const float4 *)x;
+    for (int i = threadIdx.x; i < cols / 4; i += blockDim.x) {
+        ((float4 *)hot_xs)[i] = src[i];
+    }
+    __syncthreads();
+    size_t rb = (size_t)(cols / 32) * 18;
+    int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * HOT_XR;
+    for (int rr = 0; rr < HOT_XR; ++rr) {
+        int row = row0 + rr;
+        if (row >= rows) {
+            return;
+        }
+        float v = int4_row(we + (size_t)row * rb, hot_xs, cols);
+        if (threadIdx.x % 32 == 0) {
+            out[row] = v;
+        }
+    }
+}
+
+__global__ void k_hot_gu_xr(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int j = blockIdx.y, slot = hot_slot(r, e, j);
+    int rows = DI(11), cols = DI(12);
+    if (slot < 0) {
+        return;
+    }
+    hot_rows_xr(hot_w(r, e, slot, 0, (size_t)rows * (cols / 32) * 18),
+                DP(const float, 0) + (size_t)(j / DI(10)) * cols, rows, cols, DP(float, 6) + (size_t)j * rows);
+}
+
+__global__ void k_hot_dn_xr(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int j = blockIdx.y, slot = hot_slot(r, e, j);
+    int rows = DI(13), inner = DI(14);
+    if (slot < 0) {
+        return;
+    }
+    hot_rows_xr(hot_w(r, e, slot, 1, (size_t)rows * (inner / 32) * 18),
+                DP(const float, 7) + (size_t)j * inner, rows, inner, DP(float, 8) + (size_t)j * rows);
 }
 
 __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)

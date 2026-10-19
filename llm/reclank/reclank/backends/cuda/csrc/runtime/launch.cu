@@ -45,6 +45,24 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
              r->op == GP_ATTN_V8 || r->op == GP_ATTN_TQ) ? 7 : 5;
     /* (the operand of q_heads) */
     int64_t qh = hlit(r, o, bad), kvh = hlit(r, o + 1, bad), hd = hlit(r, o + 2, bad);
+    if (hd == 64 && (((r->op == GP_ATTN_QC || r->op == GP_ATTN_Q8) && r->tag[11] == GP_T_NONE) ||
+                     (r->op == GP_ATTN_F32H && hlit(r, 8, bad) == 1))) {
+        /* LFM2: head_dim 64 (k_attn64, split by keys, and k_attn64_join) */
+        if (qh % kvh != 0 || qh / kvh > A64_REP || (size_t)qh * A64_NB * 66 > GG_PART_FLOATS) {
+            *bad = 1;
+            return 0;
+        }
+        dim3 grid((unsigned)kvh, A64_NB);
+        if (r->op == GP_ATTN_F32H) {
+            k_attn64<2><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
+        } else if (r->op == GP_ATTN_Q8) {
+            k_attn64<1><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
+        } else {
+            k_attn64<0><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
+        }
+        k_attn64_join<<<(unsigned)qh, 64, 0, gg_stream>>>(dr, denv, g->part, r->op == GP_ATTN_F32H ? 4 : 6);
+        return 0;
+    }
     int hg = qh % kvh == 0 ? (int)cdiv(qh / kvh, ATTN_REP) : 1;
     while (qh % kvh == 0 && (qh / kvh) % hg != 0) {
         ++hg;
@@ -55,10 +73,20 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         *bad = 1;
         return 0;
     }
-    if (r->op == GP_ATTN_QC && hd == 256 && qh == 8 * kvh && fd_on() &&
-        (size_t)qh * FD_PARTS * 258 <= GG_PART_FLOATS) {
-        k_attn_fd<<<dim3((unsigned)kvh, FD_BLOCKS), 128, 0, gg_stream>>>(dr, denv, g->part);
-        k_attn_fd_join<<<dim3((unsigned)qh, 2), 128, 0, gg_stream>>>(dr, denv, g->part);
+    if ((r->op == GP_ATTN_QC || r->op == GP_ATTN_Q8 || r->op == GP_ATTN_V8) && r->tag[11] == GP_T_NONE &&
+        hd == 256 && qh == 8 * kvh && fd_on() && (size_t)qh * FD_PARTS * 258 <= GG_PART_FLOATS) {
+        /* Qwen3.5 / 3.6: 8 query heads a key head (k_attn_fdq; the int8
+         * caches too) */
+        dim3 grid((unsigned)kvh, FD_PARTS);
+        if (r->op == GP_ATTN_Q8) {
+            k_attn_fdq<true, true><<<grid, 256, 0, gg_stream>>>(dr, denv, g->part);
+        } else if (r->op == GP_ATTN_V8) {
+            k_attn_fdq<false, true><<<grid, 256, 0, gg_stream>>>(dr, denv, g->part);
+        } else {
+            k_attn_fdq<false, false><<<grid, 256, 0, gg_stream>>>(dr, denv, g->part);
+        }
+        /* its parts: fd_len keys each (GH 8: the length rounds to 4) */
+        k_attn_fdt_join<256, 8, 8><<<dim3((unsigned)qh, 2), 128, 0, gg_stream>>>(dr, denv, g->part);
         return 0;
     }
     /* A global layer of the 26B on the tensor cores (k_attn_fdtc), with the
@@ -119,7 +147,10 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
             } else if (v8) {
                 k_attn_fdt<256, 2, false, true><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
             } else {
-                k_attn_fdt<256, 2><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
+                k_attn_fds<<<dim3((unsigned)kvh, FD_PARTS), 128, 0, gg_stream>>>(dr, denv, g->part);
+                /* its parts: fd_len keys each (GH 8: the length rounds to 4) */
+                k_attn_fdt_join<256, 2, 8><<<jg, 128, 0, gg_stream>>>(dr, denv, g->part);
+                return 0;
             }
             k_attn_fdt_join<256, 2><<<jg, 128, 0, gg_stream>>>(dr, denv, g->part);
         } else {
@@ -128,7 +159,10 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
             } else if (v8) {
                 k_attn_fdt<512, 8, false, true><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
             } else {
-                k_attn_fdt<512, 8><<<grid, 128, 0, gg_stream>>>(dr, denv, g->part);
+                /* the int16 cache: tiles of the keys in shared memory */
+                k_attn_fdg<<<dim3((unsigned)kvh, FD_PARTS), 256, 0, gg_stream>>>(dr, denv, g->part);
+                k_attn_fdt_join<512, 8><<<jg, 128, 0, gg_stream>>>(dr, denv, g->part);
+                return 0;
             }
             k_attn_fdt_join<512, 8><<<jg, 128, 0, gg_stream>>>(dr, denv, g->part);
         }
@@ -374,6 +408,15 @@ static int f32t_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, i
     }
     if (hd == 256) {
         F32T_K(256)
+    } else if (!F32H && !tq && f32w_on()) {
+        /* head_dim 512: k_flash_f32w (W_BQ = 32 queries a block, as F32T_K) */
+        if (kq8) {
+            k_flash_f32w<true, true><<<grid, 256, 0, s>>>(dr, denv);
+        } else if (vq8) {
+            k_flash_f32w<false, true><<<grid, 256, 0, s>>>(dr, denv);
+        } else {
+            k_flash_f32w<false, false><<<grid, 256, 0, s>>>(dr, denv);
+        }
     } else {
         F32T_K(512)
     }
@@ -604,6 +647,10 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
             k_gemm_dp4a<0><<<grid, 256, 0, gg_stream>>>(xq, xs, (const uint8_t *)w, out, t, rows,
                                                        cols, NULL);
         }
+    } else if (gemm8_on() && cols % 32 == 0 && ((uintptr_t)w & 1) == 0 && ((uintptr_t)x & 15) == 0) {
+        /* no int8 products (Maxwell): the float tile of 8 by 8 a thread */
+        k_gemm8<<<dim3((unsigned)cdiv(rows, G8_B), (unsigned)cdiv(t, G8_B)), 256, 0, gg_stream>>>(
+            x, (const uint8_t *)w, out, t, rows, cols);
     } else {
         k_gemm<0><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(
             x, w, out, t, rows, cols);
@@ -621,7 +668,7 @@ static int i8x_on(void)
         const char *v = getenv("RECLANK_GPU_I8X");
         on = !(v && v[0] == '0');
     }
-    return on;
+    return on && gg_caps.dp4a;      /* the i8x kernels are dp4a (Maxwell: the float k_kq_*) */
 }
 
 /* RECLANK_GPU_MOE_F32=1 (RECLANK_MOE_X16): the experts of a group
@@ -660,9 +707,12 @@ static void kt_attr(void)
 #define KT_SET(F) \
     cudaFuncSetAttribute(k_qmoe_gu_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b); \
     cudaFuncSetAttribute(k_qmoe_dn_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
-    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q4K) KT_SET(KT_NV4) KT_SET(KT_NVX)
+    KT_SET(KT_Q8R) KT_SET(KT_Q80) KT_SET(KT_Q51) KT_SET(KT_Q40) KT_SET(KT_Q4K) KT_SET(KT_NV4) KT_SET(KT_NVX)
     KT_SET(KT_Q6K)
 #undef KT_SET
+    /* the A4 tiles of FP4-Local's prompt rows (kernels/moe/b12x.cu) */
+    cudaFuncSetAttribute(k_qmoe_gu_tc<KT_NVX, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+    cudaFuncSetAttribute(k_qmoe_dn_tc<KT_NVX, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
     cudaFuncSetAttribute(k_moe_gemm_q4x<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
     cudaFuncSetAttribute(k_moe_gemm_q4x<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)KT_SMEM_X2(64, 2));

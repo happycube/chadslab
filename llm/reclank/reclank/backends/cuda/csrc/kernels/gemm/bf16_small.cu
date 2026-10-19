@@ -23,6 +23,17 @@ __device__ __forceinline__ void kq_row_bf16_nt(int type, const uint8_t *w, const
     if (type == KQ_BF12) {
         kq_bf12_row<NT>(w, x, cols, t, part, nparts, sum);
     }
+    /* KQ_F32: the order of kq_row_part */
+    for (int k = lane + 32 * part; type == KQ_F32 && k < cols / 4; k += 32 * nparts) {
+        const float4 a = ((const float4 *)w)[k];
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            if (j < t) {
+                const float4 b = ((const float4 *)(x + (size_t)j * cols))[k];
+                sum[j] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    }
     for (int c = 8 * lane + 256 * part; type == KQ_BF16 && c < cols; c += 256 * nparts) {
         uint4 q = *(const uint4 *)(h + c);
         uint32_t qq[4] = {q.x, q.y, q.z, q.w};
@@ -112,7 +123,7 @@ static int bf16_nt_on(void)
     return on;
 }
 
-/* GP_KQ_LINEAR of a KQ_BF16 matrix for 2 to NT tokens (as k_kq_linear). */
+/* GP_KQ_LINEAR of a KQ_BF16, KQ_BF12 or KQ_F32 matrix for 2 to NT tokens (as k_kq_linear). */
 template <int NT>
 __global__ void k_kq_linear_bf16(const gp_rec *r, const int64_t *e)
 {
@@ -198,6 +209,92 @@ __global__ void __launch_bounds__(32 * KQ_RPB, NT == 1 ? BF12_MINB : 1) k_kq_lin
         }
         if (threadIdx.x % 32 == 0 && j < t) {
             DP(float, 9)[(size_t)j * rows + row] = v;
+        }
+    }
+}
+
+/* k_kq_linear_bf12 for 2 to NT tokens on R rows a warp: the words of the R rows decoded, then each
+ * token's 16 values of x loaded once for the R rows (k_kq_linear_bf12<NT> reads x again for each row:
+ * 8 tokens are 160 KB, more than an SM's L1, so every row read them from L2: 0.75 ms more a token on
+ * DeepSeek V4.1's head of 129280 x 5120). Each row and token gets the operations of kq_bf12_row in
+ * its order: the bits of a token alone (k_kq_linear_bf12<1>, a verify group's rows those of a step). */
+template <int NT, int R>
+__global__ void __launch_bounds__(32 * KQ_RPB, 1) k_kq_linear_bf12_r(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int row0 = (blockIdx.x * KQ_RPB + threadIdx.x / 32) * R;
+    int rows = DI(6), cols = DI(7), t = DI(8);
+    if (row0 >= rows) {
+        return;
+    }
+    const size_t rb = kq_row_bytes(KQ_BF12, cols);
+    const uint8_t *w0 = DP(const uint8_t, 4);
+    const float *x = DP(const float, 3);
+    int lane = threadIdx.x % 32, h = lane & 1;
+    float sum[R][NT];
+    #pragma unroll
+    for (int q = 0; q < R; ++q) {
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sum[q][j] = 0.f;
+        }
+    }
+    const uint8_t *wr[R];
+    #pragma unroll
+    for (int q = 0; q < R; ++q) {
+        wr[q] = w0 + (size_t)(row0 + q < rows ? row0 + q : row0) * rb;
+    }
+    for (int c = 16 * lane; c < cols; c += 512) {
+        uint4 L[R], H[R];
+        int E[R];
+        #pragma unroll
+        for (int q = 0; q < R; ++q) {
+            L[q] = *(const uint4 *)(wr[q] + c);
+            H[q] = *(const uint4 *)(wr[q] + cols + 16 * (c >> 5));
+            E[q] = wr[q][cols + cols / 2 + (c >> 5)];
+        }
+        float wv[R][16];
+        #pragma unroll
+        for (int q = 0; q < R; ++q) {
+            uint32_t pw[8];
+            kq_bf12_dec16(L[q], H[q], E[q], h, pw);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                wv[q][2 * i] = __uint_as_float(pw[i] << 16);
+                wv[q][2 * i + 1] = __uint_as_float(pw[i] & 0xffff0000u);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            if (j < t) {
+                const float4 *x4 = (const float4 *)(x + (size_t)j * cols + c);
+                float4 a[4] = {x4[0], x4[1], x4[2], x4[3]};
+                #pragma unroll
+                for (int q = 0; q < R; ++q) {
+                    float sv = sum[q][j];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sv = fmaf(wv[q][4 * i], a[i].x, sv);
+                        sv = fmaf(wv[q][4 * i + 1], a[i].y, sv);
+                        sv = fmaf(wv[q][4 * i + 2], a[i].z, sv);
+                        sv = fmaf(wv[q][4 * i + 3], a[i].w, sv);
+                    }
+                    sum[q][j] = sv;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < R; ++q) {
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            float v = sum[q][j];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+            }
+            if (threadIdx.x % 32 == 0 && j < t && row0 + q < rows) {
+                DP(float, 9)[(size_t)j * rows + row0 + q] = v;
+            }
         }
     }
 }

@@ -273,24 +273,34 @@ __global__ void __launch_bounds__(128) k_attn_qsa_tc(const gp_rec *r, const int6
  * (scripts/bench_attn_fdtc.cu): one query 0.68 ms (int16; int8 0.48,
  * k16v8 0.62), a group of 3 0.82 ms (0.65, 0.72). The 26B at 100K: plain
  * decode 56 -> 87 tok/s, MTP (2 drafts) 121 tok/s, the same tokens. T 4
- * fills the two m16 tiles of T 3 (83 KB of shared memory); a larger group
+ * fills the two m16 tiles of T 3 (98 KB of shared memory); a larger group
  * takes records of at most FT_TMAX queries (gpu.py attn_rows_small).
  *
- * Block (kv, c), 8 warps: chunk c of the keys of key head kv (ft_len), 64
- * keys at a time; the rows of the 8 T heads of the queries (query j: rows
- * 8 j to 8 j + 7) are the rows of the m16 tiles. The rows of the cache go
- * from memory to the registers of the fragments, with the values in a free
- * order (each load whole sectors):
- *   S = Q K^T: warp w the keys 8 w .. 8 w + 7 (n8) over the 512 values;
- *   lane (g, cc) reads values 32 b + 8 cc .. + 7 of key g, the k16 of two
- *   steps (q as two float16 planes in shared memory, in the same order);
- *   the scores to shared memory; each warp the softmax that runs, the same
- *   in all (rows 8 j + g);
+ * Block (kv, c), 8 warps: chunk c of the keys of key head kv (ft_len), 32
+ * keys at a time (FT_TK: the tiles of the 56 blocks of the RTX 3060, 1.8
+ * MB, stay in its L2 of 3 MB until O reads them again; tiles of 64, 3.5 MB,
+ * read most rows from memory twice); the rows of the 8 T heads of the
+ * queries (query j: rows 8 j to 8 j + 7) are the rows of the m16 tiles. The
+ * rows of the cache go from memory to the registers of the fragments, with
+ * the values in a free order (each load whole sectors):
+ *   S = Q K^T: warp w the keys 8 (w & 3) .. + 7 (n8) over half of the 512
+ *   values: 8 blocks of 32 (bt = w >> 2: blocks bt and bt + 8, then 2 .. 7
+ *   or 10 .. 15); lane (g, cc) reads values 32 b + 8 cc .. + 7 of key g, the
+ *   k16 of two steps (q as two float16 planes in shared memory, in the same
+ *   order); the scores of the two halves to shared memory; each warp the
+ *   softmax that runs, the same in all (rows 8 j + g, the sum of the halves);
  *   O^T += V^T P^T: warp w the values 64 w .. 64 w + 63; lane (g, cc) reads
  *   keys 2 cc, 2 cc + 1, 2 cc + 8, 2 cc + 9 of each k16 at values 64 w +
  *   8 g .. + 7 (8 lanes: 128 bytes of a row): value 64 w + 8 g + 2 t is row
  *   g of tile t, + 1 row g + 8; P^T the scores of the lane (n8: the 8 heads
  *   of query j); 4 tiles of 16 values for each query (16 T floats a lane).
+ * A cache of keys only (ko_tab of at most 64 pairs): the turned values (0 ..
+ * 63 and 256 .. 319: warps 0 and 4 in O) turn back in S, where a lane has
+ * both of a pair (blocks bt and bt + 8: each warp one block of pairs), to
+ * shared memory (rot), and warps 0 and 4 read them there. When they turned
+ * in O (16 keys a lane, a partner row read after each key, two tables for
+ * each value) the other 6 warps waited for those two at the barrier: on
+ * the RTX 3060 (100 W) at 128K positions 2.31 ms, now 1.53 ms.
  * The chunks of query j depend on n + j in steps of 4096 keys only (a
  * group across a step: a second pass for the queries past it), and a tile
  * past the keys of a query changes nothing in it (all its scores -inf), so
@@ -300,8 +310,15 @@ __global__ void __launch_bounds__(128) k_attn_qsa_tc(const gp_rec *r, const int6
  * h, chunk stride gridDim.y. */
 #define FT_TMAX 4
 #define FT_KEYS 64
-#define FT_SLD (FT_KEYS + 4)
-#define FT_SMEM(T) ((size_t)(T) * 8 * 512 * 2 * 2 + (size_t)2 * (T) * 8 * FT_SLD * 4)
+#define FT_TK 32
+#define FT_SLD (FT_TK + 4)
+/* q: 2 planes of rows of FT_QLD chunks of 16 bytes (T 1: 1088 bytes, the 8
+ * rows of a load in different banks; else chunk x of a row at x ^ 4 (row &
+ * 1), which takes registers for the addresses but fits T 4 in 99 KB), the
+ * scores (2 tiles of 2 halves), rot (2 tiles; R: int16 keys and values) */
+#define FT_QLD(T) ((T) == 1 ? 64 + 4 : 64)
+#define FT_SMEM(T, R) ((size_t)(T) * 8 * FT_QLD(T) * 16 * 2 + (size_t)4 * (T) * 8 * FT_SLD * 4 + \
+                       ((R) ? (size_t)2 * FT_TK * 256 : 0))
 
 /* The keys of a chunk of nb chunks for nl keys (those of the last query):
  * from nl rounded up to 4096 keys, a multiple of FT_KEYS. */
@@ -337,7 +354,7 @@ __device__ __forceinline__ void ft_h8(uint4 u, float sc, uint32_t *h)
         #pragma unroll
         for (int t = 0; t < 4; ++t) {
             uint32_t w = (t < 2 ? u.x : u.y) >> (16 * (t % 2));
-            h[t] = pack_h2((float)(int8_t)(w & 0xff) * sc, (float)(int8_t)((w >> 8) & 0xff) * sc);
+            h[t] = pack_h2(rc_kv8_val(w & 0xff) * sc, rc_kv8_val((w >> 8) & 0xff) * sc);
         }
     }
 }
@@ -345,17 +362,22 @@ __device__ __forceinline__ void ft_h8(uint4 u, float sc, uint32_t *h)
 /* KB, VB: the bits of the keys and of the values (GP_ATTN_QC 16, 16;
  * GP_ATTN_Q8 8, 8; GP_ATTN_V8 16, 8). The loads of a batch (8 a lane) go
  * out before their use (through attn_kv8, a branch on the form in each,
- * one waited for the other). q: 16 bytes of a row (8 values) at chunk
- * x ^ 4 (row & 1) of the row, for the shared memory banks. */
+ * one waited for the other). q: FT_QLD. */
 template <int T, int KB, int VB>
-__global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_t *e, float *part)
+__global__ void __launch_bounds__(256, T == 1 ? 2 : 1) k_attn_fdtc(const gp_rec *r, const int64_t *e, float *part)
 {
     PDL_START();
     constexpr int MT = (T + 1) / 2;                /* m16 tiles of the 8 T rows */
     extern __shared__ __align__(16) unsigned char ftsm[];
-    uint4 (*qh)[64] = (uint4 (*)[64])ftsm;                         /* [8 T][64] */
-    uint4 (*ql)[64] = (uint4 (*)[64])(ftsm + (size_t)T * 8 * 1024);
-    float (*ss)[T * 8][FT_SLD] = (float (*)[T * 8][FT_SLD])(ftsm + (size_t)T * 8 * 2048);
+    constexpr int QLD = FT_QLD(T);
+    uint4 (*qh)[QLD] = (uint4 (*)[QLD])ftsm;                       /* [8 T][QLD] */
+    uint4 (*ql)[QLD] = qh + T * 8;
+    float (*ss)[2][T * 8][FT_SLD] = (float (*)[2][T * 8][FT_SLD])(ql + T * 8);
+    /* rot[buf][key][i ^ ft_rsw(key)]: block i of the turned values of a key
+     * (8 values: 8 i .. of 0 .. 63, then of 256 .. 319), turned back, as
+     * float16; ft_rsw(key) = 2 ((key >> 1) & 3) ^ 4 (key & 1) puts the 8 lanes
+     * of a store or a load in different banks */
+    uint4 (*rot)[FT_TK][16] = (uint4 (*)[FT_TK][16])(ss + 2);
     attn_d a = attn_get(r, e);
     int kv = blockIdx.x, c = blockIdx.y, nb = gridDim.y;
     int n = a.n;
@@ -376,7 +398,7 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
             hi[t] = pack_h2(__half2float(h0), __half2float(h1));
             lo[t] = pack_h2(f[2 * t] - __half2float(h0), f[2 * t + 1] - __half2float(h1));
         }
-        int ch = (d / 8) ^ (4 * (row & 1));
+        int ch = T == 1 ? d / 8 : (d / 8) ^ (4 * (row & 1));
         uint2 *ph = (uint2 *)&qh[row][ch] + (d % 8) / 4, *pl = (uint2 *)&ql[row][ch] + (d % 8) / 4;
         *ph = make_uint2(hi[0], hi[1]);
         *pl = make_uint2(lo[0], lo[1]);
@@ -384,6 +406,8 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
     __syncthreads();
     const void *kb = a.kq, *vb = a.vq;              /* operands 1, 3 (int16 or int8) */
     const bool kon = KB == 16 && kb == vb && a.vs != a.ks;   /* keys only (ko_tab) */
+    /* rot: the turned pairs in blocks 0, 1, 8 and 9 (values 0 .. 63 and 256 .. 319) */
+    const bool rt = KB == 16 && VB == 16 && kon && g_ko.half == 256 && g_ko.rd <= 64;
     /* query j: chunks of ft_len(n + j); a group across a step of 4096 keys
      * takes a second pass for the queries past it */
     int L0 = ft_len(n, nb), L1 = ft_len(n + T - 1, nb), buf = 0;
@@ -411,77 +435,109 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
                 acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0.f;
             }
         }
-        for (int x0 = j0; x0 < j1; x0 += FT_KEYS, buf ^= 1) {
-            /* S of keys x0 + 8 warp .. + 7; the keys past j1 read key j1 - 1
-             * (their scores: -inf) */
-            size_t ok = (size_t)min(x0 + 8 * warp + g, j1 - 1) * a.rstride + (size_t)kv * a.hstride;
+        for (int x0 = j0; x0 < j1; x0 += FT_TK, buf ^= 1) {
+            /* S of keys x0 + 8 (warp & 3) .. + 7 (key kx of the lane; the keys
+             * past j1 read key j1 - 1, their scores -inf) over the 8 blocks
+             * of 32 values of half bt: blocks bt, bt + 8 (a turned block and
+             * its partner, in the same lane), then 2 .. 7 (bt 0) or 10 .. 15 */
+            int bt = warp >> 2, kr = 8 * (warp & 3) + g, kx = min(x0 + kr, j1 - 1);
+            size_t ok = (size_t)kx * a.rstride + (size_t)kv * a.hstride;
             float s[MT][4];
             #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 s[mt][0] = s[mt][1] = s[mt][2] = s[mt][3] = 0.f;
             }
-            #pragma unroll 1
-            for (int bb = 0; bb < 16; bb += 8) {
-                uint4 rk[8];
-                float ck[8];
+            uint4 rk[8];
+            float ck[8];
+            const float *ksp = a.ks + ok / 32;      /* (rows of 32 scales) */
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                int b = u < 2 ? bt + 8 * u : 8 * bt + u;
+                rk[u] = ft_ld<KB>(kb, ok + 8 * cc + 32 * b);
+                ck[u] = ksp[b];
+            }
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                uint32_t k[4];
+                ft_h8<KB>(rk[u], ck[u], k);
+                int ch = 4 * (u < 2 ? bt + 8 * u : 8 * bt + u) + cc;
                 #pragma unroll
-                for (int u = 0; u < 8; ++u) {
-                    size_t o = ok + 32 * (bb + u) + 8 * cc;
-                    rk[u] = ft_ld<KB>(kb, o);
-                    ck[u] = a.ks[o / 32];
-                }
-                #pragma unroll
-                for (int u = 0; u < 8; ++u) {
-                    uint32_t k[4];
-                    ft_h8<KB>(rk[u], ck[u], k);
-                    int ch = 4 * (bb + u) + cc;
+                for (int mt = 0; mt < MT; ++mt) {
+                    int r0 = 16 * mt + g, r1 = r0 + 8;
+                    bool h1 = r1 < 8 * T;
                     #pragma unroll
-                    for (int mt = 0; mt < MT; ++mt) {
-                        int r0 = 16 * mt + g, r1 = r0 + 8;
-                        bool h1 = r1 < 8 * T;
-                        #pragma unroll
-                        for (int pl = 0; pl < 2; ++pl) {
-                            uint4 (*qp)[64] = pl ? ql : qh;
-                            uint4 q0 = qp[r0][ch ^ (4 * (r0 & 1))];
-                            uint4 q1 = h1 ? qp[r1][ch ^ (4 * (r1 & 1))] : make_uint4(0u, 0u, 0u, 0u);
-                            uint32_t av[4] = {q0.x, q1.x, q0.y, q1.y};
-                            uint32_t b0[2] = {k[0], k[1]};
-                            mma16816(s[mt], av, b0);
-                            av[0] = q0.z; av[1] = q1.z; av[2] = q0.w; av[3] = q1.w;
-                            b0[0] = k[2]; b0[1] = k[3];
-                            mma16816(s[mt], av, b0);
-                        }
+                    for (int pl = 0; pl < 2; ++pl) {
+                        uint4 (*qp)[QLD] = pl ? ql : qh;
+                        uint4 q0 = qp[r0][T == 1 ? ch : ch ^ (4 * (r0 & 1))];
+                        uint4 q1 = h1 ? qp[r1][ch ^ (4 * (r1 & 1))] : make_uint4(0u, 0u, 0u, 0u);
+                        uint32_t av[4] = {q0.x, q1.x, q0.y, q1.y};
+                        uint32_t b0[2] = {k[0], k[1]};
+                        mma16816(s[mt], av, b0);
+                        av[0] = q0.z; av[1] = q1.z; av[2] = q0.w; av[3] = q1.w;
+                        b0[0] = k[2]; b0[1] = k[3];
+                        mma16816(s[mt], av, b0);
                     }
                 }
+            }
+            /* keys only: the values of blocks bt and bt + 8 of key kx (values
+             * i and i + 256 of the lane, turned back) to rot, for warps 0
+             * and 4 */
+            if (rt) {
+                int i = 32 * bt + 8 * cc;
+                float f[8], y[8];
+                ko_i16x8(rk[0], a.vs[ok / 32 + bt], f);
+                ko_i16x8(rk[1], a.vs[ok / 32 + bt + 8], y);
+                if (ko_turned(i)) {
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        float2 cs = ko_cs(kx, i + u);
+                        float v0 = f[u] * cs.x + y[u] * cs.y, v1 = y[u] * cs.x - f[u] * cs.y;
+                        f[u] = v0;
+                        y[u] = v1;
+                    }
+                }
+                uint32_t h0[4], h1[4];
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    h0[t] = pack_h2(f[2 * t], f[2 * t + 1]);
+                    h1[t] = pack_h2(y[2 * t], y[2 * t + 1]);
+                }
+                int sw = 2 * ((g >> 1) & 3) ^ 4 * (g & 1);     /* ft_rsw(kr) */
+                rot[buf][kr][(4 * bt + cc) ^ sw] = make_uint4(h0[0], h0[1], h0[2], h0[3]);
+                rot[buf][kr][(8 + 4 * bt + cc) ^ sw] = make_uint4(h1[0], h1[1], h1[2], h1[3]);
             }
             #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 int r0 = 16 * mt + g, r1 = r0 + 8;
-                *(float2 *)&ss[buf][r0][8 * warp + 2 * cc] = make_float2(s[mt][0], s[mt][1]);
+                *(float2 *)&ss[buf][bt][r0][kr - g + 2 * cc] = make_float2(s[mt][0], s[mt][1]);
                 if (r1 < 8 * T) {
-                    *(float2 *)&ss[buf][r1][8 * warp + 2 * cc] = make_float2(s[mt][2], s[mt][3]);
+                    *(float2 *)&ss[buf][bt][r1][kr - g + 2 * cc] = make_float2(s[mt][2], s[mt][3]);
                 }
             }
-            /* the values of the first two k16 steps, while the scores join */
+            /* the values of the tile, while the scores join (warps 0 and 4
+             * of a cache of keys only: from rot) */
             /* value k: key 16 (k / 4) + 2 cc + (k & 1) + 8 ((k >> 1) & 1) */
+            auto vk = [&](int k) { return 16 * (k / 4) + 2 * cc + (k & 1) + 8 * ((k >> 1) & 1); };
             auto vo = [&](int k) {
-                int x = x0 + 16 * (k / 4) + 2 * cc + (k & 1) + 8 * ((k >> 1) & 1);
-                return (size_t)min(x, j1 - 1) * a.rstride + (size_t)kv * a.hstride + 64 * warp + 8 * g;
+                return (size_t)min(x0 + vk(k), j1 - 1) * a.rstride + (size_t)kv * a.hstride + 64 * warp + 8 * g;
             };
+            const bool vr = rt && (warp & 3) == 0;
             uint4 rv[8];
             float cv[8];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                size_t o = vo(k);
-                rv[k] = ft_ld<VB>(vb, o);
-                cv[k] = a.vs[o / 32];
+            if (!vr) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    size_t o = vo(k);
+                    rv[k] = ft_ld<VB>(vb, o);
+                    cv[k] = a.vs[o / 32];
+                }
             }
-            /* keys only (ko_tab): the values of warps 0 and 4 (the turned
-             * pairs) from their keys and the partners */
+            /* keys only without rot (ko_tab: more than 64 pairs): a turned
+             * block from its key and the partner */
             auto vh8 = [&](int k, uint4 u, float sc, uint32_t *h) {
                 int i = 64 * warp + 8 * g;
-                if (VB == 16 && kon && ko_turned(i)) {
-                    int x = min(x0 + 16 * (k / 4) + 2 * cc + (k & 1) + 8 * ((k >> 1) & 1), j1 - 1);
+                if (ko_turned(i)) {
+                    int x = min(x0 + vk(k), j1 - 1);
                     size_t po = vo(k) - i + ko_partner(i);
                     float f[8], y[8];
                     ko_i16x8(u, sc, f);
@@ -497,25 +553,27 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
             };
             __syncthreads();
             /* the softmax of row 8 j + g: the keys 16 ks + 2 cc + {0, 1, 8, 9} of
-             * the lane; B = P^T of each k16 step (b0 keys 2 cc, 2 cc + 1; b1 + 8) */
-            uint32_t pb[T][4][2];
+             * the lane (the sum of the scores of the two halves); B = P^T of
+             * each k16 step (b0 keys 2 cc, 2 cc + 1; b1 + 8) */
+            uint32_t pb[T][2][2];
             #pragma unroll
             for (int j = 0; j < T; ++j) {
-                int lim = (act >> j) & 1 ? min(j1, n + j) - x0 : -FT_KEYS;  /* its keys here */
-                float sv[16];
+                int lim = (act >> j) & 1 ? min(j1, n + j) - x0 : -FT_TK;  /* its keys here */
+                float sv[8];
                 #pragma unroll
-                for (int ks = 0; ks < 4; ++ks) {
+                for (int ks = 0; ks < 2; ++ks) {
                     #pragma unroll
                     for (int hf = 0; hf < 2; ++hf) {
                         int kk = 16 * ks + 2 * cc + 8 * hf;
-                        float2 v = *(const float2 *)&ss[buf][8 * j + g][kk];
-                        sv[4 * ks + 2 * hf] = kk < lim ? v.x : -INFINITY;
-                        sv[4 * ks + 2 * hf + 1] = kk + 1 < lim ? v.y : -INFINITY;
+                        float2 v = *(const float2 *)&ss[buf][0][8 * j + g][kk];
+                        float2 w = *(const float2 *)&ss[buf][1][8 * j + g][kk];
+                        sv[4 * ks + 2 * hf] = kk < lim ? v.x + w.x : -INFINITY;
+                        sv[4 * ks + 2 * hf + 1] = kk + 1 < lim ? v.y + w.y : -INFINITY;
                     }
                 }
                 float t0 = sv[0];
                 #pragma unroll
-                for (int u = 1; u < 16; ++u) {
+                for (int u = 1; u < 8; ++u) {
                     t0 = fmaxf(t0, sv[u]);
                 }
                 t0 = fmaxf(t0, __shfl_xor_sync(RC_FULL_MASK, t0, 1));
@@ -526,13 +584,13 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
                 m[j] = n0;
                 float ps = 0.f;
                 #pragma unroll
-                for (int u = 0; u < 16; ++u) {
+                for (int u = 0; u < 8; ++u) {
                     sv[u] = n0 == -INFINITY ? 0.f : expf(sv[u] - n0);
                     ps += sv[u];
                 }
                 l[j] = l[j] * a0 + ps;
                 #pragma unroll
-                for (int ks = 0; ks < 4; ++ks) {
+                for (int ks = 0; ks < 2; ++ks) {
                     pb[j][ks][0] = pack_h2(sv[4 * ks], sv[4 * ks + 1]);
                     pb[j][ks][1] = pack_h2(sv[4 * ks + 2], sv[4 * ks + 3]);
                 }
@@ -547,23 +605,14 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
                     acc[mt][j][3] *= al1;
                 }
             }
-            #pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                if (half == 1) {
-                    #pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        size_t o = vo(8 + k);
-                        rv[k] = ft_ld<VB>(vb, o);
-                        cv[k] = a.vs[o / 32];
-                    }
-                }
+            /* O^T += V^T P^T, hk(k, h) the 4 float16 pairs of value k */
+            auto vmma = [&](auto hk) {
                 #pragma unroll
-                for (int kh = 0; kh < 2; ++kh) {
-                    int ks = 2 * half + kh;
+                for (int ks = 0; ks < 2; ++ks) {
                     uint32_t h[4][4];
                     #pragma unroll
                     for (int k = 0; k < 4; ++k) {
-                        vh8(8 * half + 4 * kh + k, rv[4 * kh + k], cv[4 * kh + k], h[k]);
+                        hk(4 * ks + k, h[k]);
                     }
                     /* rows g (values 2 t) and g + 8 (2 t + 1) of tile t: the
                      * pairs of keys 2 cc, 2 cc + 1 and 2 cc + 8, 2 cc + 9 */
@@ -579,6 +628,17 @@ __global__ void __launch_bounds__(256) k_attn_fdtc(const gp_rec *r, const int64_
                         }
                     }
                 }
+            };
+            if (vr) {
+                /* ft_rsw of key vk(k): 2 cc ^ 4 (k & 1) */
+                vmma([&](int k, uint32_t *h) {
+                    uint4 u = rot[buf][vk(k)][(8 * bt + g) ^ (2 * cc) ^ (4 * (k & 1))];
+                    h[0] = u.x; h[1] = u.y; h[2] = u.z; h[3] = u.w;
+                });
+            } else if (VB == 16 && kon && !rt) {
+                vmma([&](int k, uint32_t *h) { vh8(k, rv[k], cv[k], h); });
+            } else {
+                vmma([&](int k, uint32_t *h) { ft_h8<VB>(rv[k], cv[k], h); });
             }
         }
         /* the part of each head: values 64 warp + 8 g + 2 mt (+ 1) of heads 2 cc,
@@ -872,7 +932,7 @@ static int fdtc_chunks(int kvh)
         int dev = 0, sms = 0, occ = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_attn_fdtc<1, 16, 16>, 256, FT_SMEM(1));
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_attn_fdtc<1, 16, 16>, 256, FT_SMEM(1, 1));
         nb = v != NULL ? atoi(v) : sms * (occ > 0 ? occ : 1);
     }
     return max(1, min(ATTN_CHUNKS / 3, nb / max(1, kvh)));
@@ -896,19 +956,19 @@ static void fdtc_run(int op, dim3 grid, const gp_rec *dr, const int64_t *denv, f
     static int attr = 0;
     if (!attr) {
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)FT_SMEM(T));
+                             (int)FT_SMEM(T, 1));
         cudaFuncSetAttribute(k_attn_fdtc<T, 8, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)FT_SMEM(T));
+                             (int)FT_SMEM(T, 0));
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)FT_SMEM(T));
+                             (int)FT_SMEM(T, 0));
         attr = 1;
     }
     if (op == GP_ATTN_QC) {
-        k_attn_fdtc<T, 16, 16><<<grid, 256, FT_SMEM(T), gg_stream>>>(dr, denv, part);
+        k_attn_fdtc<T, 16, 16><<<grid, 256, FT_SMEM(T, 1), gg_stream>>>(dr, denv, part);
     } else if (op == GP_ATTN_Q8) {
-        k_attn_fdtc<T, 8, 8><<<grid, 256, FT_SMEM(T), gg_stream>>>(dr, denv, part);
+        k_attn_fdtc<T, 8, 8><<<grid, 256, FT_SMEM(T, 0), gg_stream>>>(dr, denv, part);
     } else {
-        k_attn_fdtc<T, 16, 8><<<grid, 256, FT_SMEM(T), gg_stream>>>(dr, denv, part);
+        k_attn_fdtc<T, 16, 8><<<grid, 256, FT_SMEM(T, 0), gg_stream>>>(dr, denv, part);
     }
 }
 

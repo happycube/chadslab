@@ -160,6 +160,60 @@ static void gp_step(const gp_rec *r, int64_t *e)
                           gp_f(r, e, 16), gp_f(r, e, 17), GP_P(float, 18), GP_P(float, 19),
                           GP_P(float, 20));
         break;
+    case GP_ROUTER_SIG:
+        /* logits, t, experts, k, val, idx, bias (or null), scale, eps (or none: 1e-6) */
+        gp_router_sig_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_I(3), GP_P(float, 4),
+                           GP_P(int32_t, 5), GP_P(const float, 6), gp_f(r, e, 7),
+                           r->tag[8] == GP_T_NONE ? 1e-6f : gp_f(r, e, 8));
+        break;
+    case GP_SHORT_CONV:
+        /* in (t x 3 ch: B, C, x), state (kernel - 1 x ch), w (ch x kernel), out, t, ch,
+         * kernel, nreal (or none: all) */
+        gp_short_conv_body(GP_P(const float, 0), GP_P(float, 1), GP_P(const float, 2),
+                           GP_P(float, 3), GP_I(4), GP_I(5), GP_I(6),
+                           r->tag[7] == GP_T_NONE ? 0 : GP_I(7));
+        break;
+    case GP_Q16:
+        /* x, out (int16, then the scales), n */
+        gp_q16_body(GP_P(const float, 0), GP_P(uint8_t, 1), gp_i(r, e, 2));
+        break;
+    case GP_DQ16:
+        /* in (of GP_Q16), x, n */
+        gp_dq16_body(GP_P(const uint8_t, 0), GP_P(float, 1), gp_i(r, e, 2));
+        break;
+    case GP_NM_MAMBA:
+        /* zxd, conv state, conv w, conv b, A_log, D, dt_bias, norm w, ssm state, y, scratch,
+         * t, heads, hdim, groups, nstate, kernel, eps, dt_min, nreal (or none: all) */
+        nm_mamba_body(GP_P(const float, 0), GP_P(float, 1), GP_P(const float, 2),
+                      GP_P(const float, 3), GP_P(const float, 4), GP_P(const float, 5),
+                      GP_P(const float, 6), GP_P(const float, 7), GP_P(float, 8), GP_P(float, 9),
+                      GP_P(float, 10), GP_I(11), GP_I(12), GP_I(13), GP_I(14), GP_I(15), GP_I(16),
+                      gp_f(r, e, 17), gp_f(r, e, 18), r->tag[19] == GP_T_NONE ? 0 : GP_I(19));
+        break;
+    case GP_RELU2:
+        /* x, out, n */
+        nm_relu2_body(GP_P(const float, 0), GP_P(float, 1), gp_i(r, e, 2));
+        break;
+    case GP_NM_MOE:
+        /* x (t x L), ids, val, t, k, up, up type, down, down type, L, inner, scratch, out */
+        /* (13, or none: x and the act as int16 in two planes) */
+        nm_moe_body(GP_P(const float, 0), GP_P(const int32_t, 1), GP_P(const float, 2), GP_I(3),
+                    GP_I(4), GP_P(const uint8_t, 5), GP_I(6), GP_P(const uint8_t, 7), GP_I(8),
+                    GP_I(9), GP_I(10), GP_P(uint8_t, 11), GP_P(float, 12),
+                    r->tag[13] == GP_T_NONE ? 0 : GP_I(13));
+        break;
+    case GP_NM_QX2:
+        /* x, t, cols, xh, xl, xs, xm (kq_quant_part16) */
+        kq_quant_x2(GP_P(const float, 0), GP_I(1), GP_I(2), GP_P(int8_t, 3), GP_P(int8_t, 4), GP_P(float, 5),
+                    GP_P(float, 6));
+        break;
+    case GP_NM_LIN2:
+        /* xh, xl, xs, w, type, rows, cols, t, out */
+        /* (9 or none: x as int16 for a prompt group, the tiled form) */
+        nm_lin2_body(GP_P(const int8_t, 0), GP_P(const int8_t, 1), GP_P(const float, 2), GP_P(const uint8_t, 3),
+                     GP_I(4), GP_I(5), GP_I(6), GP_I(7), GP_P(float, 8),
+                     r->tag[9] == GP_T_NONE ? NULL : GP_P(int16_t, 9));
+        break;
     case GP_SIGMUL:
         /* x, g, out, n */
         gp_sigmul_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2),
@@ -197,6 +251,109 @@ static void gp_step(const gp_rec *r, int64_t *e)
         } else {
             /* the rows of a prompt over the team, as rc_rms_norm */
             gemma_rms_norm_body(x, w, out, rows, cols, eps);
+        }
+        break;
+    }
+    case GP_NM_DPREP:
+        /* q (or none), k, v, qn, kn, K, V, qout, t, nq, nk, hd, pos, ring, theta, eps */
+        nm_dprep_body(r->tag[0] == GP_T_NONE ? NULL : GP_P(const float, 0), GP_P(const float, 1),
+                      GP_P(const float, 2), GP_P(const float, 3), GP_P(const float, 4), GP_P(float, 5),
+                      GP_P(float, 6), GP_P(float, 7), GP_I(8), GP_I(9), GP_I(10), GP_I(11), gp_i(r, e, 12),
+                      GP_I(13), gp_f(r, e, 14), gp_f(r, e, 15));
+        break;
+    case GP_NM_DATTN:
+        /* q, K, V, sinks, out, t, nq, nk, hd, pos0, ring, window, scratch (t nq (window + t) floats) */
+        nm_dattn_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2), GP_P(const float, 3),
+                      GP_P(float, 4), GP_I(5), GP_I(6), GP_I(7), GP_I(8), gp_i(r, e, 9), GP_I(10), GP_I(11),
+                      GP_P(float, 12));
+        break;
+    case GP_NM_DCONV:
+        /* h, dyn, base, out, t, cols, kern, group, side */
+        nm_dconv_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2), GP_P(float, 3), GP_I(4),
+                      GP_I(5), GP_I(6), GP_I(7), GP_I(8));
+        break;
+    case GP_NM_LTOPK:
+        /* logits, S, V, k, cand, feat */
+        if (GP_I(3) > 16) {
+            gp_fail = 2;
+            break;
+        }
+        nm_ltopk_body(GP_P(const float, 0), GP_I(1), GP_I(2), GP_I(3), GP_P(int, 4), GP_P(float, 5));
+        break;
+    case GP_NM_LATT:
+        /* qkv, bias, out, n, heads, hd */
+        if (GP_I(3) > 64) {
+            gp_fail = 2;
+            break;
+        }
+        nm_latt_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_I(3), GP_I(4), GP_I(5));
+        break;
+    case GP_NM_LROWS:
+        /* x, b, y, out, rows, cols, rep, act */
+        nm_lrows_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2), GP_P(float, 3), GP_I(4),
+                      GP_I(5), GP_I(6), GP_I(7));
+        break;
+    case GP_NM_LCAT:
+        nm_lcat_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(float, 2), GP_I(3), GP_I(4));
+        break;
+    case GP_NM_LSCORE:
+        /* ov, iv, anc, scores, S, k, D, scale, eps */
+        nm_lscore_body(GP_P(const float, 0), GP_P(const float, 1), GP_P(const float, 2), GP_P(float, 3), GP_I(4),
+                       GP_I(5), GP_I(6), gp_f(r, e, 7), gp_f(r, e, 8));
+        break;
+    case GP_NM_ADDNORM: {
+        /* h, a, b (or none), w, out, rows, cols, eps: h += a + b (the sum of the block's outputs first,
+         * as ADD o, b, o then ADD h, o, h), then out = the norm of h (gemma_rms_norm_row) */
+        float *h = GP_P(float, 0);
+        const float *a = GP_P(const float, 1);
+        const float *b = r->tag[2] == GP_T_NONE ? NULL : GP_P(const float, 2);
+        const float *w = GP_P(const float, 3);
+        float *out = GP_P(float, 4);
+        int rows = GP_I(5), cols = GP_I(6);
+        float eps = gp_f(r, e, 7);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            float *hr = h + (size_t)i * cols;
+            const float *ar = a + (size_t)i * cols, *br = b != NULL ? b + (size_t)i * cols : NULL;
+            for (int c = 0; c < cols; ++c) {
+                hr[c] += br != NULL ? ar[c] + br[c] : ar[c];
+            }
+            gemma_rms_norm_row(hr, w, out + (size_t)i * cols, cols, eps);
+        }
+        break;
+    }
+    case GP_MX8_ACT: {
+        /* x, n: each 32 values as dynamic MXFP8 (FP4-Local's vision attention: b12x's quantized
+         * mode): e = clamp(ceil(log2(amax / 448)), -127, 127), x = e4m3(x / 2^e) 2^e */
+        float *x = GP_P(float, 0);
+        int n = GP_I(1);
+        #pragma omp for schedule(static)
+        for (int g = 0; g < n / 32; ++g) {
+            float *v = x + (size_t)32 * g, amax = 0.f;
+            for (int i = 0; i < 32; ++i) {
+                amax = fmaxf(amax, fabsf(v[i]));
+            }
+            int ex = 0;
+            if (amax > 0.f) {
+                int p;
+                float m = frexpf(amax / 448.f, &p);
+                ex = m == 0.5f ? p - 1 : p;
+                ex = ex < -127 ? -127 : ex > 127 ? 127 : ex;
+            }
+            for (int i = 0; i < 32; ++i) {
+                float q = kq_e4m3_rne(fabsf(ldexpf(v[i], -ex)));
+                v[i] = ldexpf(v[i] < 0.f ? -q : q, ex);
+            }
+        }
+        break;
+    }
+    case GP_BF16_ROUND: {
+        /* x, n: x rounded to bfloat16 values (to nearest even) in place */
+        float *x = GP_P(float, 0);
+        int n = GP_I(1);
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            x[i] = kq_bf16r(x[i]);
         }
         break;
     }
@@ -388,9 +545,18 @@ static void gp_step(const gp_rec *r, int64_t *e)
                 memcpy(kd, k, (size_t)n * sizeof(float));
                 memcpy(vd, v, (size_t)n * sizeof(float));
             }
-            for (int g = 0; g < n / 32; ++g) {
-                ksd[g] = gemma_quant_group32_i8(k + (size_t)g * 32, kqd + (size_t)g * 32);
-                vsd[g] = gemma_quant_group32_i8(v + (size_t)g * 32, vqd + (size_t)g * 32);
+            if (rc_kv_e4m3) {
+                /* the FP8 cache of FP4-Local: E4M3 codes, the scales 1 */
+                rc_kv_e4m3_codes(k, n, (uint8_t *)kqd);
+                rc_kv_e4m3_codes(v, n, (uint8_t *)vqd);
+                for (int g = 0; g < n / 32; ++g) {
+                    ksd[g] = vsd[g] = 1.f;
+                }
+            } else {
+                for (int g = 0; g < n / 32; ++g) {
+                    ksd[g] = gemma_quant_group32_i8(k + (size_t)g * 32, kqd + (size_t)g * 32);
+                    vsd[g] = gemma_quant_group32_i8(v + (size_t)g * 32, vqd + (size_t)g * 32);
+                }
             }
         }
         break;
@@ -688,6 +854,15 @@ static void gp_step(const gp_rec *r, int64_t *e)
     case GP_MOE:
     case GP_MOE_N:
         gp_moe_one(r, e);
+        break;
+    case GP_REMOTE_POST:
+        gp_remote_post(r, e);
+        break;
+    case GP_REMOTE_JOIN:
+        gp_remote_join(r, e);
+        break;
+    case GP_NM_REMOTE_POST:
+        gp_nm_remote_post(r, e);
         break;
     case GP_ROUTER_MT:
         /* Operands: x, scale, proj, per_expert, hidden, experts, top_k, eps,

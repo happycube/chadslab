@@ -7,6 +7,7 @@ template). The server (server/) and the Qwen engine (engine.py) use them.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 
@@ -26,6 +27,23 @@ WRAP_ANSWER = "\n\n(The context is almost full, so I wrap up briefly now.)\n\n"
 
 
 
+def _generation_ext():
+    """The {% generation %} ... {% endgeneration %} tag of the templates of
+    transformers (the mask of the assistant's tokens; LFM2): its body as it
+    is."""
+    from jinja2 import nodes
+    from jinja2.ext import Extension
+
+    class Generation(Extension):
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+            return nodes.Scope(body, lineno=lineno)
+    return Generation
+
+
 class QwenTok:
     """The tokenizer interface of reclank/server.py on QwenTokenizer, with
     the chat template of the model."""
@@ -34,8 +52,16 @@ class QwenTok:
         import jinja2
         self.t = QwenTokenizer(path)
         self.stop_ids = list(self.t.stop_ids)
+        # bos_token of tokenizer_config.json beside the tokenizer (the LFM2
+        # template starts with it; the Qwen templates do not use it)
+        self.bos_token = path.get("bos_token", "") if isinstance(path, dict) else ""
+        cfg = None if isinstance(path, dict) else os.path.join(os.path.dirname(os.path.abspath(path)),
+                                                               "tokenizer_config.json")
+        if cfg is not None and os.path.exists(cfg):
+            b = json.load(open(cfg)).get("bos_token")
+            self.bos_token = (b.get("content", "") if isinstance(b, dict) else b) or ""
         env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
-                                 extensions=["jinja2.ext.loopcontrols"])
+                                 extensions=["jinja2.ext.loopcontrols", _generation_ext()])
         env.filters["tojson"] = lambda x, **kw: json.dumps(x, ensure_ascii=False)
         env.filters["items"] = lambda d: list(d.items()) if isinstance(d, dict) else []
 
@@ -81,7 +107,7 @@ class QwenTok:
             kw["preserve_thinking"] = bool(preserve)
         text = self.template.render(messages=messages, tools=tools or None,
                                     add_generation_prompt=add_generation_prompt,
-                                    enable_thinking=bool(thinking), **kw)
+                                    enable_thinking=bool(thinking), bos_token=self.bos_token, **kw)
         return text
 
 
@@ -197,6 +223,99 @@ def qwen_parse_output(text):
             "tool_calls": _plain(p["tool_calls"]) + calls, "pending": _plain(pending)}
 
 
+
+
+# The tool calls of LFM2: a Python list of calls between two special tokens,
+# <|tool_call_start|>[get_weather(city='Lyon'), search(q="x")]<|tool_call_end|>
+# (or a JSON list when the system prompt asks for JSON).
+LFM_OPEN, LFM_CLOSE = "<|tool_call_start|>", "<|tool_call_end|>"
+LFM_CALL = re.compile(re.escape(LFM_OPEN) + r"(.*?)" + re.escape(LFM_CLOSE), re.S)
+_PY_CONST = {"true": True, "false": False, "null": None}
+
+
+def _py_value(node):
+    """The value of an argument of a Pythonic call: a literal, or a bare
+    true / false / null (JSON words)."""
+    import ast
+    if isinstance(node, ast.Name) and node.id in _PY_CONST:
+        return _PY_CONST[node.id]
+    return ast.literal_eval(node)
+
+
+def _py_name(node):
+    import ast
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _py_name(node.value) + "." + node.attr
+    raise ValueError("not a function name")
+
+
+def lfm_calls(inner):
+    """The calls of the text between <|tool_call_start|> and
+    <|tool_call_end|>: [(name, arguments)], or None when it is not a list of
+    calls. A positional argument takes the name of the parameter of that
+    place (TOOLS)."""
+    import ast
+    s = inner.strip()
+    try:
+        tree = ast.parse(s, mode="eval").body
+        items = tree.elts if isinstance(tree, (ast.List, ast.Tuple)) else [tree]
+        out = []
+        for c in items:
+            if not isinstance(c, ast.Call):
+                raise ValueError("not a call")
+            name = _py_name(c.func)
+            names = list(TOOLS.get(name, {}))
+            args = {}
+            for j, a in enumerate(c.args):
+                args[names[j] if j < len(names) else "arg%d" % j] = _py_value(a)
+            for kw in c.keywords:
+                if kw.arg is None:
+                    raise ValueError("**kwargs")
+                args[kw.arg] = _py_value(kw.value)
+            out.append((name, args))
+        return out
+    except (SyntaxError, ValueError, TypeError):
+        pass
+    try:
+        obj = json.loads(s)
+        out = []
+        for o in obj if isinstance(obj, list) else [obj]:
+            a = o.get("arguments", o.get("parameters", {}))
+            out.append((o["name"], json.loads(a) if isinstance(a, str) else a))
+        return out
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def lfm_parse_output(text):
+    """The tool calls of LFM2 (lfm_calls), then parse_output of
+    reclank/models/gemma4/chat.py on the rest (the reasoning; it drops the
+    special tokens of the text, so the calls come out first). A call that is
+    not complete is pending: a stream holds it."""
+    from reclank.models.gemma4.chat import parse_output as gemma_parse_output
+    calls = []
+
+    def call(m):
+        got = lfm_calls(m.group(1))
+        if got is None:
+            return m.group(1)                       # not calls: the text stays
+        calls.extend(_call(n, a) for n, a in got)
+        return ""
+    body = LFM_CALL.sub(call, str(text))
+    pending = ""
+    i = body.find(LFM_OPEN)
+    if i >= 0:
+        body, pending = body[:i], body[i:]
+    else:
+        for k in range(min(len(body), len(LFM_OPEN) - 1), 0, -1):
+            if LFM_OPEN.startswith(body[-k:]):
+                body, pending = body[:-k], body[-k:]
+                break
+    p = gemma_parse_output(body)
+    return {"reasoning": _plain(p["reasoning"]), "content": _plain(p["content"]),
+            "tool_calls": _plain(p["tool_calls"]) + calls, "pending": _plain(p["pending"] or pending)}
 
 
 def _escaped(x, esc):

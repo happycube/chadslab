@@ -26,16 +26,6 @@
 #define DP_KB 4                    /* the blocks of 32 columns of a step */
 #define DP_WS 12                   /* the words of a row of a block in shared memory (8 and 4 of pad) */
 
-__device__ __forceinline__ int rc_dp4a(int a, int b, int c)
-{
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
-    return __dp4a(a, b, c);
-#else
-    const char4 x = *(const char4 *)&a, y = *(const char4 *)&b;
-    return c + x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
-#endif
-}
-
 template <int X2>
 __global__ void __launch_bounds__(256, 2) k_gemm_dp4a(const int8_t *xq, const float *xs,
                                                       const uint8_t *w, float *out, int t,
@@ -209,5 +199,5 @@ static int dp4a_on(void)
         const char *v = getenv("RECLANK_GPU_DP4A");
         on = !(v && v[0] == '0');
     }
-    return on && gg_caps.cc >= 61;
+    return on && gg_caps.dp4a;
 }

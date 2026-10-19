@@ -19,12 +19,26 @@ static const int8_t kq_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, 
 /* The values of a block of 32 of a type of blocks of 32. */
 static inline int kq_block32(int type)
 {
-    return type == KQ_Q8_0 || type == KQ_Q5_1 || type == KQ_IQ4_NL || type == KQ_BF16 ||
-           type == KQ_NV4;
+    return type == KQ_Q8_0 || type == KQ_Q5_1 || type == KQ_Q4_0 || type == KQ_IQ4_NL || type == KQ_BF16 ||
+           type == KQ_NV4 || type == KQ_MXF8;
 }
 
 static void kq_block_values(int type, const uint8_t *row, int cols, int b, float *out)
 {
+    if (type == KQ_IQ2_XXS || type == KQ_IQ2R) {
+        kq_iq2_values(row, type, cols, b, out);
+        return;
+    }
+    if (type == KQ_MXF8) {
+        /* e4m3 x 2^(s - 127): exact */
+        uint32_t eb = (uint32_t)row[cols + b] << 23;
+        float sc;
+        memcpy(&sc, &eb, 4);
+        for (int i = 0; i < 32; ++i) {
+            out[i] = kq_e4m3_tab[row[32 * b + i]] * sc;
+        }
+        return;
+    }
     if (type == KQ_BF16) {
         const uint16_t *h = (const uint16_t *)row + (size_t)b * 32;
         for (int i = 0; i < 32; ++i) {
@@ -33,10 +47,12 @@ static void kq_block_values(int type, const uint8_t *row, int cols, int b, float
     } else if (type == KQ_NV4) {
         float g = kq_nv4_g(row, cols);
         const uint8_t *q = kq_nv4_codes(row, b), *sc = kq_nv4_scales(row, cols, b);
-        float s0 = 0.5f * g * kq_e4m3(sc[0]), s1 = 0.5f * g * kq_e4m3(sc[1]);
+        /* (E2M1 x e4m3) x g: the product of the codes and the block scale is
+         * exact, so each value is rounded once (the NVFP4 value) */
+        float s0 = 0.5f * kq_e4m3(sc[0]), s1 = 0.5f * kq_e4m3(sc[1]);
         for (int j = 0; j < 16; ++j) {
-            out[j] = s0 * (float)kq_e2m1x2[q[j] & 15];
-            out[j + 16] = s1 * (float)kq_e2m1x2[q[j] >> 4];
+            out[j] = (s0 * (float)kq_e2m1x2[q[j] & 15]) * g;
+            out[j + 16] = (s1 * (float)kq_e2m1x2[q[j] >> 4]) * g;
         }
     } else if (type == KQ_Q5_1) {
         const uint8_t *blk = row + (size_t)b * 24;
@@ -48,6 +64,13 @@ static void kq_block_values(int type, const uint8_t *row, int cols, int b, float
             int hi = (blk[8 + j] >> 4) | (((qh >> (j + 16)) & 1) << 4);
             out[j] = d * (float)lo + m;
             out[j + 16] = d * (float)hi + m;
+        }
+    } else if (type == KQ_Q4_0) {
+        const uint8_t *blk = row + (size_t)b * 18;
+        float d = kq_h(blk);
+        for (int j = 0; j < 16; ++j) {
+            out[j] = d * (float)((blk[2 + j] & 15) - 8);
+            out[j + 16] = d * (float)((blk[2 + j] >> 4) - 8);
         }
     } else if (type == KQ_IQ4_NL) {
         const uint8_t *blk = row + (size_t)b * 18;
@@ -134,6 +157,12 @@ static void kq_row_scales(const uint8_t *w, int type, int cols, float *ds, float
         for (int i = 0; i < cols / 32; ++i) {
             ds[i] = kq_h(w + (size_t)i * 24);
             dm[i] = -kq_h(w + (size_t)i * 24 + 2);
+        }
+    } else if (type == KQ_Q4_0) {
+        /* w = d q - 8 d: Q5_1's terms with m = -8 d */
+        for (int i = 0; i < cols / 32; ++i) {
+            ds[i] = kq_h(w + (size_t)i * 18);
+            dm[i] = 8.f * ds[i];
         }
     } else if (type == KQ_Q6_K) {
         for (int b = 0; b < cols / 256; ++b) {
@@ -259,6 +288,33 @@ static inline __attribute__((always_inline)) __m512i kq_q51_values(const uint8_t
     memcpy(&hb, b1 + 4, 4);
     __mmask64 hi = (__mmask64)ha | ((__mmask64)hb << 32);
     return _mm512_mask_or_epi32(v, 0xffff, v, _mm512_maskz_mov_epi8(hi, _mm512_set1_epi8(16)));
+}
+
+/* The 4-bit values of two Q4_0 blocks (64 values in their order, 0 .. 15: the 8 of q - 8 in the
+ * mins term). */
+static inline __attribute__((always_inline)) __m512i kq_q40_values(const uint8_t *b0,
+                                                                   const uint8_t *b1)
+{
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    __m128i qa = _mm_loadu_si128((const __m128i *)(b0 + 2));
+    __m128i qb = _mm_loadu_si128((const __m128i *)(b1 + 2));
+    __m512i v = _mm512_castsi128_si512(_mm_and_si128(qa, m4));
+    v = _mm512_inserti32x4(v, _mm_and_si128(_mm_srli_epi16(qa, 4), m4), 1);
+    v = _mm512_inserti32x4(v, _mm_and_si128(qb, m4), 2);
+    return _mm512_inserti32x4(v, _mm_and_si128(_mm_srli_epi16(qb, 4), m4), 3);
+}
+
+static float kq_dot_q4_0(const uint8_t *w, int cols, const int8_t *xq, const float *S)
+{
+    __m512 acc = _mm512_setzero_ps();
+    for (int i = 0; i < cols / 32; i += 2) {
+        const uint8_t *b0 = w + (size_t)i * 18;
+        __m512i is = _mm512_dpbusd_epi32(_mm512_setzero_si512(), kq_q40_values(b0, b0 + 18),
+                                         _mm512_loadu_si512((const void *)(xq + (size_t)i * 32)));
+        __m512 sc = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(S[i]), _mm512_set1_ps(S[i + 1]));
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(is), sc, acc);
+    }
+    return _mm512_reduce_add_ps(acc);
 }
 
 /* The products of one row on one token. S and corr come from kq_prep, as
@@ -440,6 +496,23 @@ static void kq_tile4(const uint8_t *const wr[4], float ds[4][KQ_S], float dm[4][
             KQ51_J(2, a02, a12, a22, a32) KQ51_J(3, a03, a13, a23, a33)
 #undef KQ51_J
         }
+    } else if (type == KQ_Q4_0) {
+        for (int q = 0; q < cols / 64; ++q) {
+            int base = (2 * q) & ~15, o = (2 * q) & 15;
+            __m512i idx = _mm512_mask_blend_epi32(0xff00, _mm512_set1_epi32(o),
+                                                  _mm512_set1_epi32(o + 1));
+            __m512i w0 = kq_q40_values(wr[0] + (size_t)q * 36, wr[0] + (size_t)q * 36 + 18);
+            __m512i w1 = kq_q40_values(wr[1] + (size_t)q * 36, wr[1] + (size_t)q * 36 + 18);
+            __m512i w2 = kq_q40_values(wr[2] + (size_t)q * 36, wr[2] + (size_t)q * 36 + 18);
+            __m512i w3 = kq_q40_values(wr[3] + (size_t)q * 36, wr[3] + (size_t)q * 36 + 18);
+#define KQ40_J(J, A0, A1, A2, A3) { \
+        __m512i xv = _mm512_loadu_si512((const void *)(xr[J] + (size_t)q * 64)); \
+        KQ_ACC(A0, 0, J, w0, xv, idx, base); KQ_ACC(A1, 1, J, w1, xv, idx, base); \
+        KQ_ACC(A2, 2, J, w2, xv, idx, base); KQ_ACC(A3, 3, J, w3, xv, idx, base); }
+            KQ40_J(0, a00, a10, a20, a30) KQ40_J(1, a01, a11, a21, a31)
+            KQ40_J(2, a02, a12, a22, a32) KQ40_J(3, a03, a13, a23, a33)
+#undef KQ40_J
+        }
     } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
         int five = type == KQ_Q5_K;
         size_t bs = five ? 176 : 144;
@@ -507,8 +580,8 @@ static void kq_tile4(const uint8_t *const wr[4], float ds[4][KQ_S], float dm[4][
 static inline int kq_tiles(int type, int cols)
 {
     int parts = type == KQ_Q6_K ? cols / 16 : cols / 32;
-    return type != KQ_F32 && type != KQ_IQ4_NL && type != KQ_BF16 && type != KQ_NV4 &&
-           type != KQ_BF12 && parts <= KQ_S - 16 &&
+    return type != KQ_F32 && type != KQ_IQ4_NL && type != KQ_IQ2_XXS && type != KQ_IQ2R && type != KQ_BF16 && type != KQ_NV4 &&
+           type != KQ_BF12 && type != KQ_MXF8 && parts <= KQ_S - 16 &&
            (!kq_block32(type) || cols % 64 == 0);
 }
 #endif
@@ -523,6 +596,7 @@ static float kq_dot_scaled(const uint8_t *w, int type, int cols, const float *ds
     switch (type) {
     case KQ_Q8_0: return kq_dot_q8_0(w, cols, xq, S) - corr;
     case KQ_Q5_1: return kq_dot_q5_1(w, cols, xq, S) - corr;
+    case KQ_Q4_0: return kq_dot_q4_0(w, cols, xq, S) - corr;
     case KQ_Q4_K: return kq_dot_q45k(w, cols, 0, xq, S) - corr;
     case KQ_Q5_K: return kq_dot_q45k(w, cols, 1, xq, S) - corr;
     }
@@ -642,6 +716,11 @@ static float kq_dot_bf12(const uint8_t *w, int cols, const float *x)
 static float kq_dot1(const uint8_t *w, int type, int cols, const int8_t *xq, const float *xs,
                      const float *xm, const float *x)
 {
+#if defined(__AVX2__)
+    if (type == KQ_IQ2_XXS || type == KQ_IQ2R) {
+        return kq_dot_iq2xxs(w, type, cols, xq, xs);
+    }
+#endif
     if (type == KQ_BF12) {
 #if defined(__AVX512F__)
         return kq_dot_bf12(w, cols, x);

@@ -369,6 +369,16 @@ class Buffer:
         assert a.flags.c_contiguous and a.nbytes <= self.nbytes
         _check(_lib().rc_gpu_d2h(a.ctypes.data, self.ptr, a.nbytes))
 
+    def upload_at(self, a, off):
+        """a to the bytes from off on."""
+        assert a.flags.c_contiguous and off + a.nbytes <= self.nbytes
+        _check(_lib().rc_gpu_h2d(self.ptr + off, a.ctypes.data, a.nbytes))
+
+    def download_at(self, a, off):
+        """The bytes from off on to a."""
+        assert a.flags.c_contiguous and off + a.nbytes <= self.nbytes
+        _check(_lib().rc_gpu_d2h(a.ctypes.data, self.ptr + off, a.nbytes))
+
     def zero(self):
         """All the bytes to 0, on the GPU."""
         _check(_lib().rc_gpu_zero(self.ptr, self.nbytes))
