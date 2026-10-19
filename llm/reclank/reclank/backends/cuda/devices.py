@@ -109,7 +109,8 @@ def _lib_copy(arch, primary_path):
 class ErCtx(ctypes.Structure):
     """er_ctx of backends/cpu/csrc/common/ops_qwen.c."""
     _fields_ = [("post", ctypes.c_void_p), ("wait", ctypes.c_void_p), ("held", ctypes.c_void_p),
-                ("experts", ctypes.c_int64), ("alive", ctypes.c_int64), ("post_t", ctypes.c_void_p)]
+                ("experts", ctypes.c_int64), ("alive", ctypes.c_int64), ("post_t", ctypes.c_void_p),
+                ("cpu_max", ctypes.c_int64)]
 
 
 def _put_api(lib):
@@ -467,10 +468,14 @@ class QwenExpertDevice:
         finally:
             os.sched_setaffinity(0, old)
         self.held = held
+        # an MTP verify group's cold pairs stay on the CPU when they are at most cpu_max
+        # (RECLANK_EXPERT_CPU_MAX, 2): the device's group job outlasts the CPU's few K-quant experts
+        # (both cards, 256 tokens: one draft 56.3 -> 63.5 tok/s; a step's still go, 59.6 -> 56.5 if not)
+        self.cpu_max = int(os.environ.get("RECLANK_EXPERT_CPU_MAX", "2"))
         self.ctx = ErCtx(ctypes.cast(lib.rc_gpu_ex_post, ctypes.c_void_p).value,
                          ctypes.cast(lib.rc_gpu_ex_wait, ctypes.c_void_p).value,
                          self.held.ctypes.data, E, 1,
-                         ctypes.cast(lib.rc_gpu_ex_post_t, ctypes.c_void_p).value)
+                         ctypes.cast(lib.rc_gpu_ex_post_t, ctypes.c_void_p).value, self.cpu_max)
         self.ctx_bytes = np.frombuffer(ctypes.string_at(ctypes.addressof(self.ctx), ctypes.sizeof(self.ctx)),
                                        dtype=np.uint8).copy()
         print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB) after the first %d" % (

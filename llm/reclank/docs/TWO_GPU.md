@@ -332,9 +332,24 @@ MTP on the same tree (256 tokens, `RECLANK_MTP_STOP=0.9`, tok/s):
 | Qwen3.6, both cards (its MTP layer) | 59.5 | 56.6 | 63.7 | 64.0 |
 | Qwen3.6, the 3060 alone | 61.7 | 64.7 | 63.3 | 61.7 |
 
-On a short prompt the 1070 costs Qwen a little (plain and one draft): its
-round trip outlasts the CPU's few cold experts; after 4K it gains (57.0
-against 53.5, section 6).
+On a short prompt the 1070 cost Qwen a little (plain and one draft). Two
+changes since (both cards, 256 tokens on a short prompt, tok/s):
+
+| | plain | 1 draft | 2 drafts | 3 drafts | after 4K |
+|---|---|---|---|---|---|
+| before | 59.6 | 56.3 | 63.8 | 64.0 | 57.6 |
+| a group's few cold pairs on the CPU (`RECLANK_EXPERT_CPU_MAX` 2) | 59.5 | 63.5 | 63.6 | 62.5 | 57.1 |
+| + the 3060's pool not exclusive (`RECLANK_EXPERT_EXCLUSIVE` 0) | **62.6** | **65.5** | 63.3 | 61.8 | 57.5 |
+
+- A verify group of at most 2 cold pairs in a layer leaves them all to the
+  CPU (`er_ctx.cpu_max`, GP_NM_REMOTE_POST of more than one token): the
+  1070's group job outlasts the CPU's few K-quant experts. Not a step's:
+  its one-token job is quicker than the CPU (2 for steps too: plain 56.5;
+  4: 55.4).
+- The 3060's HotCache may take the 1070's experts too: the text's experts
+  move to the 3060 at once, the 1070 runs those of its experts the pool
+  lacks. Exclusive caching had kept the conversation's experts that the
+  1070 held off the 3060 for good.
 
 Little for either: their 3060 slots already follow the text step by step
 (HotCache), so the 1070 holds a tail its first set covered about as well,

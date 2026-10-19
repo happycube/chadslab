@@ -622,8 +622,11 @@ class QwenGPU(WarmPool, ProgramLRU):
                            for srcs, nb, dst in st["parts"]],
                     ip=st.get("ip"), step=i < L))
             self.hot_cache = HotCache(self, layers=layers, top_k=cfg.top_k)
-            if self.xdev is not None:
-                # (exclusive: the pool leaves out the experts of the expert device)
+            if self.xdev is not None and os.environ.get("RECLANK_EXPERT_EXCLUSIVE", "0") == "1":
+                # (RECLANK_EXPERT_EXCLUSIVE=1: the pool leaves out the experts of the expert device. Else
+                # the pool takes any expert, and the device runs those of its experts the pool lacks: the
+                # text's experts on the 3060 at once; a short prompt's decode 59.5 -> 62.6 tok/s, the 3060
+                # alone 61.7; after 4K the same, 57.5)
                 self.hot_cache.exclude = self.xdev.held[[e["layer"] for e in layers]].astype(bool)
             self._ensure_pool()
             row_of = {e["layer"]: r for r, e in enumerate(layers)}

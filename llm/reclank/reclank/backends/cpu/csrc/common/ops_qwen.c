@@ -349,6 +349,11 @@ typedef struct {
     /* a group of t tokens (Nemotron: GP_NM_REMOTE_POST), idx the expert of each of its t k pairs
      * or -1; or null */
     int (*post_t)(int layer, int t, int k, const int32_t *idx, const float *w, const float *x);
+    /* a group (GP_NM_REMOTE_POST of more than one token) leaves all its cold pairs, the device's too,
+     * to the CPU when they are at most this many (the device's group job outlasts the CPU's few
+     * K-quant experts: Qwen's MTP verify groups); 0: the device's always go. (A step's do go: one
+     * token's job is quicker than the CPU on them.) */
+    int64_t cpu_max;
 } er_ctx;
 #define ER_MAXK 16
 #define ER_MAXP 256
@@ -394,16 +399,14 @@ static void gp_remote_post(const gp_rec *r, const int64_t *e)
             }
         }
         *posted = 0;
-        if (n > 0) {
-            if (ctx->post(layer, n, ids, w, h) == 0) {
-                *posted = 1;
-            } else {
-                /* (the device refused: its experts to the CPU) */
-                for (int j = 0; j < n; ++j) {
-                    lidx[m] = ids[j];
-                    lval[m] = w[j];
-                    ++m;
-                }
+        if (n > 0 && ctx->post(layer, n, ids, w, h) == 0) {
+            *posted = 1;
+        } else {
+            /* (the device refused: its experts to the CPU) */
+            for (int j = 0; j < n; ++j) {
+                lidx[m] = ids[j];
+                lval[m] = w[j];
+                ++m;
             }
         }
         *lcnt = m;
@@ -435,8 +438,13 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
         }
         const uint8_t *held = ctx->held + (size_t)layer * ctx->experts;
         *posted = 0;
-        if (np > k && (np > ER_MAXP || ctx->post_t == NULL)) {
-            /* (a group larger than a job of the device: all its pairs to the CPU) */
+        int ncold = 0;
+        for (int p = 0; p < np; ++p) {
+            ncold += cold[p] >= 0;
+        }
+        if (np > k && (ncold <= ctx->cpu_max || np > ER_MAXP || ctx->post_t == NULL)) {
+            /* (a group of a few cold pairs in all, or larger than a job of the device: all its pairs
+             * to the CPU) */
             for (int p = 0; p < np; ++p) {
                 lcold[p] = cold[p];
             }
