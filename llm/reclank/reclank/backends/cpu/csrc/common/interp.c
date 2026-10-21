@@ -140,12 +140,15 @@ static void gp_step(const gp_rec *r, int64_t *e)
     case GP_KQ_MOE_PART:
         /* hf, ids, val, t, k, experts, pm (nparts x 12), hidden, inner, gu (nparts x 2:
          * a0, ni), dn (c0, nd), act2, out, nparts, team, kcount (or null), flags, scr
-         * (the scratch of each part): the flat team of GP_RUN_PARTS
-         * (kernels/kq/moe_part.c) */
+         * (the scratch of each part), then with flag 4096 (a prefetch) the next layer's
+         * gate, bias, map, and the flags that stop it (the last task's out, the next's
+         * in): the flat team of GP_RUN_PARTS (kernels/kq/moe_part.c) */
         kq_moe_part_body(GP_P(const float, 0), GP_P(const int32_t, 1), GP_P(const float, 2), GP_I(3),
                          GP_I(4), GP_I(5), GP_P(const int64_t, 6), GP_I(7), GP_I(8),
                          GP_P(const int32_t, 9), GP_P(const int32_t, 10), GP_P(float, 11), GP_P(float, 12),
-                         GP_I(13), GP_I(14), GP_P(const int32_t, 15), GP_I(16), GP_P(const int64_t, 17));
+                         GP_I(13), GP_I(14), GP_P(const int32_t, 15), GP_I(16), GP_P(const int64_t, 17),
+                         GP_P(const uint16_t, 18), GP_P(const float, 19), GP_P(const int32_t, 20),
+                         GP_P(const int64_t, 21), GP_P(const int64_t, 22));
         break;
     case GP_RUN_PARTS:
         /* the first record of a program of rc_run_task (run.c runs it) */
@@ -196,11 +199,13 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     case GP_NM_MOE:
         /* x (t x L), ids, val, t, k, up, up type, down, down type, L, inner, scratch, out */
-        /* (13, or none: x and the act as int16 in two planes) */
+        /* (13, or none: x and the act as int16 in two planes; 14, 15 or none: the stacks' copies on node 1) */
         nm_moe_body(GP_P(const float, 0), GP_P(const int32_t, 1), GP_P(const float, 2), GP_I(3),
                     GP_I(4), GP_P(const uint8_t, 5), GP_I(6), GP_P(const uint8_t, 7), GP_I(8),
                     GP_I(9), GP_I(10), GP_P(uint8_t, 11), GP_P(float, 12),
-                    r->tag[13] == GP_T_NONE ? 0 : GP_I(13));
+                    r->tag[13] == GP_T_NONE ? 0 : GP_I(13),
+                    r->tag[14] != GP_T_NONE ? GP_P(const uint8_t, 14) : NULL,
+                    r->tag[15] != GP_T_NONE ? GP_P(const uint8_t, 15) : NULL);
         break;
     case GP_NM_QX2:
         /* x, t, cols, xh, xl, xs, xm (kq_quant_part16) */
@@ -1363,8 +1368,10 @@ static void gp_exec(const int64_t *prog, int limit)
     int64_t *e = (int64_t *)malloc((size_t)(n_env > 0 ? n_env : 1) * sizeof(int64_t));
     memcpy(e, env0, (size_t)n_env * sizeof(int64_t));
     for (int pc = 0; pc < n_code; ++pc) {
+        nm_last_record = pc == n_code - 1;
         gp_step(code + pc, e);
     }
+    nm_last_record = 0;
     free(e);
 }
 

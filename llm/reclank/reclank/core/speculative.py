@@ -42,8 +42,9 @@ from reclank.core import ops
 
 class DeviceOp:
     """A run that a generation hands to the scheduler of the lanes (server/worker.py): "run" (a
-    step of one token or a verify group of more, tokens at pos, on the lane's cache), or "pause"
-    (a prompt between its parts: the other lane may run)."""
+    step of one token or a verify group of more, tokens at pos, on the lane's cache), "pause"
+    (a prompt between its parts: the other lane may run), or "yield" (a decode between runs of its
+    own: the other lane may run; it goes on at the next tick)."""
 
     __slots__ = ("kind", "tokens", "pos")
 

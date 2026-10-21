@@ -175,7 +175,45 @@ Like Gemma, Qwen's step is the 3060's own work (attention, the DeltaNet
 layers, the shared experts, the head): the CPU part was about 1 ms of 19.
 Qwen's own zero copy (`RECLANK_GPU_ZC`) works only for KQ_NVX experts.
 
-## 6. Bugs found on the way
+## 6. The three models on the merged tree (c5a49e4)
+
+The same scripts after the merge of upstream (the IQ2 kernels on AVX2, the
+signal that waits for the last CPU task, DeepSeek V4.1): decode in windows
+of 32 steps after the prompt, the RTX 3060 at 100 W, a cache of 256K
+positions for Gemma.
+
+Gemma 4 26B (`scratch gemma_decode_after.py`):
+
+| | prompt | steps 0-31 | 32-63 | 64-95 |
+|---|---|---|---|---|
+| 4K, the 3060 alone | (292: the build) | 37.7 | 50.9 | 59.8 |
+| 4K, both | 669 | 43.7 | 64.4 | 70.0 |
+| 32K, the 3060 alone | 663 | 35.0 | 44.2 | 50.4 |
+| 32K, both | 761 | 39.5 | 58.4 | 63.7 |
+
+Qwen3.6 35B-A3B (`scratch qwen_decode_after.py`):
+
+| | prompt | steps 0-31 | 32-63 | 64-95 |
+|---|---|---|---|---|
+| 4K, the 3060 alone | 621 | 49.0 | 52.8 | 53.5 |
+| 4K, both | 625 | 51.1 | 56.0 | 57.0 |
+| 32K, the 3060 alone | 749 | 35.8 | 41.6 | 40.9 |
+| 32K, both | 750 | 39.5 | 45.5 | 45.6 |
+
+Nemotron 3.5 Bolt, before (c1edb6e) and after the merge:
+
+| | before | after |
+|---|---|---|
+| both, plain decode (code prompt, 128 tokens) | 25.8 | 26.7 |
+| both, the LiLiCorr drafter | 39.2 (1.52x) | 48.3 (1.81x) |
+| the 3060 alone, prompt 4K | 276 | 287 |
+| the 3060 alone, decode after 4K | 21.9 | 21.9 |
+
+The drafter's draft program varies from run to run (12 to 32 ms a round,
+on either tree), so its speedup swings with it; the verify group is 75-77
+ms on both.
+
+## 7. Bugs found on the way
 
 - Nemotron ran past its cache with no check: `NM_KV` wrote the rows of a
   run past `max_len` into the next buffers on the GPU, and a later prompt's
@@ -195,13 +233,13 @@ Qwen's own zero copy (`RECLANK_GPU_ZC`) works only for KQ_NVX experts.
   3060's `k_await` waits for a CPU task that waits for the 1070, and traps
   after 60 s.
 
-## 7. Other measurements of this work
+## 8. Other measurements of this work
 
 The 1070 with 4 GB of ballast (a 4 GB card), Gemma 26B in Maxwell mode
 (`RECLANK_GPU_CC=52`): 16K prompt 265 tok/s, decode 23.4; 32K 213 and 21.2
 (regular mode at 32K: 233 and 22.3).
 
-## 8. Open
+## 9. Open
 
 - Gemma and Qwen: the 1070 could take dense work (layers), not only experts.
 - The prompts do not use the 1070 (Gemma stages its cold experts; Nemotron

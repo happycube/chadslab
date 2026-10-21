@@ -347,6 +347,7 @@ try:
         _lib.rc_kq_moe_part_scratch.argtypes = [_int, _int, _int, _int, _int, _int, _int]
         _lib.rc_kq_moe_part_scratch.restype = ctypes.c_size_t
         _lib.rc_part_prof.argtypes = [_void_p, _int]
+        _lib.rc_ds_spec_stats.argtypes = [_void_p, _int]
         _lib.rc_run_parts.restype = _int
         _lib.rc_run_parts_prof.argtypes = [_void_p, _int, _int, _void_p, _void_p, _int]
         _lib.rc_run_parts_prof.restype = _int
@@ -1853,6 +1854,14 @@ def place_cpus():
     out = np.zeros(4096, np.int32)
     n = _lib.rc_place_cpus(out.ctypes.data, out.size)
     return set(out[:n].tolist())
+
+
+def ds_spec_stats(reset=True):
+    """The prefetch of the next layer's cold experts (RECLANK_DS_SPEC, moe_part.c flag 4096): the experts
+    it guessed, the tasks' cold experts, the hits, the tasks; since the last reset."""
+    out = np.zeros(4, np.int64)
+    _lib.rc_ds_spec_stats(out.ctypes.data, int(reset))
+    return out
 
 
 def part_prof(reset=True):

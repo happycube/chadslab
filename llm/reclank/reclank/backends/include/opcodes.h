@@ -212,6 +212,11 @@ enum {
     GP_REMOTE_JOIN     = 230,   /* cpu     wait for the expert device's job and add its sum */
     GP_NM_REMOTE_POST  = 231,   /* cpu     the cold pairs of a Nemotron step that an expert device holds to it, the others to a list */
     GP_DS_HC_STEP      = 232,   /* gpu     a sublayer's post, then the next one's mixes and pre (DeepSeek V4.1) */
+    GP_NM_HOT_NV4      = 233,   /* gpu     NM_HOT_MOE for KQ_NV4 experts (Nemotron Super): float x, a warp a row */
+    GP_NM_PLAN         = 234,   /* gpu     a prompt group's experts: the cold ones of few pairs the CPU's, the rest the GPU's (by their costs) */
+    GP_DS_STAGE_PICK   = 235,   /* gpu     a prompt group's heaviest cold experts of a layer to the GPU's stage slots (DeepSeek V4.1) */
+    GP_DS_STAGE_PULL   = 236,   /* gpu     the experts of DS_STAGE_PICK from the registered host memory into the stage, beside the stream */
+    GP_DS_STAGE_JOIN   = 237,   /* gpu     the stream waits for a DS_STAGE_PULL */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -264,7 +269,8 @@ static inline int gp_op_known(int op)
     case GP_NM_ADDNORM: case GP_NM_DPREP: case GP_NM_DATTN: case GP_NM_DCONV:
     case GP_NM_LTOPK: case GP_NM_LATT: case GP_NM_LROWS: case GP_NM_LCAT:
     case GP_NM_LSCORE: case GP_REMOTE_POST: case GP_REMOTE_JOIN: case GP_NM_REMOTE_POST:
-    case GP_DS_HC_STEP:
+    case GP_DS_HC_STEP: case GP_NM_HOT_NV4: case GP_NM_PLAN: case GP_DS_STAGE_PICK:
+    case GP_DS_STAGE_PULL: case GP_DS_STAGE_JOIN:
         return 1;
     default:
         return 0;

@@ -1,12 +1,16 @@
-"""Nemotron 3.5 Bolt (P6 of docs/NEMOTRON_BOLT_PLAN.md): the routing profile of real text, the
-count of each expert of each layer over prompts of three kinds (code, prose, an agent's turn with
-tools and tool results), with the CPU engine. Writes MODEL/expert_profile.npz (NemotronGPU takes
-its first hot experts from it) and prints the share of the expert reads that a hot set of each
-size covers.
+"""Nemotron 3.5 Bolt (P6 of docs/NEMOTRON_BOLT_PLAN.md) and Super: the routing profile of real text,
+the count of each expert of each layer over prompts of three kinds (code, prose, an agent's turn with
+tools and tool results), with the CPU engine (--gpu: NemotronGPU's prompt groups, Super: the
+choices of its routers on the GPU). Writes MODEL/expert_profile.npz (NemotronGPU takes its first hot
+experts from it) and prints the share of the expert reads that a hot set of each size covers.
 
-    python scripts/nemotron_profile.py MODEL_DIR [tokens of each kind, 8000]
+    python scripts/nemotron_profile.py MODEL_DIR [tokens of each kind, 8000] [--gpu]
 """
 import sys, os, glob, json, time, numpy as np
+GPU = "--gpu" in sys.argv
+if GPU:
+    sys.argv.remove("--gpu")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reclank.models.nemotron.kq import NemotronKQ
 from reclank.models.nemotron.engine import NemotronTok
@@ -17,8 +21,30 @@ m = NemotronKQ(D); m.count_experts = True
 cfg = m.cfg
 counts = {i: np.zeros(E, np.int64) for i, (E, _, _) in cfg.moe.items()}
 by_kind = {}
+per = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+g = None
+if GPU:
+    from reclank.models.nemotron.gpu import GROUPS, NemotronGPU, task_threads
+    os.environ.setdefault("RECLANK_GPU_CPU_THREADS", str(task_threads()))
+    g = NemotronGPU(m, ctx=per + 1024)
+
 
 def run(ids, kind):
+    if g is not None:
+        g.reset()
+        c0 = 0
+        while c0 < len(ids):
+            size = next((s for s in GROUPS[::-1] if s <= len(ids) - c0), 1)
+            chunk = ids[c0:c0 + size]
+            g._run(chunk, c0)
+            prog, gp = g._prog(size)
+            for i in counts:
+                gp.download("idx.%d" % i)
+                a = prog.names["idx.%d" % i][:len(chunk)].reshape(-1)
+                counts[i] += np.bincount(a[a >= 0], minlength=counts[i].size)
+            c0 += size
+        by_kind[kind] = by_kind.get(kind, 0) + len(ids)
+        return
     c = m.cache(len(ids) + 8)
     for c0 in range(0, len(ids), m.CHUNK):
         chunk = ids[c0:c0 + m.CHUNK]
@@ -29,7 +55,6 @@ def run(ids, kind):
             counts[i] += np.bincount(a[a >= 0], minlength=counts[i].size)
     by_kind[kind] = by_kind.get(kind, 0) + len(ids)
 
-per = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
 t0 = time.time()
 # code: reclank's own sources
 code = "".join(open(f).read() for f in sorted(glob.glob(R + "reclank/models/qwen/*.py"))[:6])

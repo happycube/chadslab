@@ -17,19 +17,6 @@
  * The low 4 bits of byte i of a block are value i, and the high 4 bits are
  * value i + 16. Thus b0 comes from the low 4 bits of bytes 4c to 4c + 3.
  * b1 comes from their high 4 bits. __vsub4 subtracts 8 from each byte. */
-__device__ __forceinline__ void mma16832(int *c, const uint32_t *a, const uint32_t *b)
-{
-#if RC_SM80
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#else
-    __trap();
-#endif
-}
-
 /* x (n rows of cols values) to int8, with one scale for each block of 32:
  * q = round(x / s), s = max |x| / 127. Eight threads for each block; each
  * thread reads 4 values as a float4 and writes 4 bytes. */

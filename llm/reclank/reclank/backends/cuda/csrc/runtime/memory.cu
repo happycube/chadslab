@@ -38,6 +38,18 @@ extern "C" int rc_gpu_host_register_ro(void *p, size_t n)
     return 0;
 }
 
+/* The device address of host memory at p that CUDA has page-locked (registered: read by kernels over the
+ * link), or 0. */
+extern "C" int64_t rc_gpu_dev_addr(const void *p)
+{
+    cudaPointerAttributes a;
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return a.type == cudaMemoryTypeHost ? (int64_t)(intptr_t)a.devicePointer : 0;
+}
+
 /* The PCI bus id of the device ("0000:9e:00.0"), for its NUMA node. */
 extern "C" int rc_gpu_pci_bus_id(char *out, int n)
 {

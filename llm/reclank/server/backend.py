@@ -9,12 +9,15 @@ parses the answer, and runs the decode of its family.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
 
+from reclank.core.messages import PromptIds, content_text
 from reclank.core.sampling import Sampler
 from server.media import MediaSource
 
@@ -67,6 +70,23 @@ def lane_of(req, headers, n):
         if 0 <= i < n:
             return i
     return None
+
+
+# A request to go on after an answer that max_tokens cut (finish "length"): its last message is the
+# user's bare "continue" (or these words), after that answer (continuation)
+CONTINUE_RE = re.compile(r"^(please[\s,]+)?(continue|go on|keep going|carry on|resume|proceed|go ahead)"
+                         r"([\s,]+please)?[\s.!]*$", re.I)
+# the cut answers kept for a continue (the latest)
+CUTS_KEPT = 8
+
+
+def conversation_key(messages, tools):
+    """A key of the messages of a chat request and its tools: the roles, the texts of the contents,
+    the tool calls and their ids (the fields a client sends back as it got them; not the media, nor
+    a reasoning_content some clients send and others drop)."""
+    rows = [[m.get("role"), content_text(m.get("content")).strip(), m.get("tool_calls") or None,
+             m.get("tool_call_id")] for m in messages]
+    return hashlib.sha1(json.dumps([rows, tools or None], sort_keys=True, default=str).encode()).hexdigest()
 
 
 # a lane busy with the request's conversation or session wins a wait by this many prompt tokens
@@ -154,6 +174,10 @@ class Backend:
         self.engines = list(getattr(engine, "lanes", None) or [engine])
         self.sessions = {}
         self._tls = threading.local()
+        # the chat answers that max_tokens cut, by the key of their requests' messages
+        # (conversation_key): their prompts and tokens, for a "continue" (continuation)
+        self.cuts = {}
+        self._cuts_lock = threading.Lock()
 
     # ---- what the handler reads of the model
 
@@ -248,6 +272,52 @@ class Backend:
         preserve = (req.get("chat_template_kwargs") or {}).get("preserve_thinking")
         return eng.prompt_ids(req["messages"], level, req.get("tools"), preserve=preserve,
                               source=self.source)
+
+    def remember_cut(self, req, prompt_ids, out, content):
+        """A chat answer that max_tokens cut (finish "length"): the prompt and the answer's tokens,
+        and the content the client got, for a "continue" after it (continuation)."""
+        if not out:
+            return
+        ids = PromptIds(list(prompt_ids) + [int(t) for t in out])
+        ids.spans = getattr(prompt_ids, "spans", ())
+        key = conversation_key(req["messages"], req.get("tools"))
+        with self._cuts_lock:
+            self.cuts.pop(key, None)
+            self.cuts[key] = {"ids": ids, "content": (content or "").strip(), "out": len(out)}
+            while len(self.cuts) > CUTS_KEPT:
+                self.cuts.pop(next(iter(self.cuts)))
+
+    def continuation(self, req):
+        """The prompt of a "continue" after an answer that max_tokens cut, or None: the request's
+        messages are those of the cut answer's request, then that answer (its content as the client
+        got it, no tool calls), then the user's bare "continue" (CONTINUE_RE). The prompt is the cut
+        answer's prompt and all its tokens, so the model goes on where it stopped: in its think part,
+        if that was open (a template drops the reasoning of an earlier turn: a Super answer of 32768
+        tokens of reasoning, cut, and the "continue" started the thinking again from nothing). A
+        continuation that is cut again is kept in its turn (a second "continue" goes on from it)."""
+        msgs = req.get("messages") or []
+        if len(msgs) < 3 or not self.cuts:
+            return None
+        last, prev = msgs[-1], msgs[-2]
+        if (not isinstance(last, dict) or not isinstance(prev, dict) or last.get("role") != "user"
+                or prev.get("role") != "assistant" or prev.get("tool_calls")):
+            return None
+        if not CONTINUE_RE.match(content_text(last.get("content")).strip()):
+            return None
+        with self._cuts_lock:
+            cut = self.cuts.get(conversation_key(msgs[:-2], req.get("tools")))
+        got = content_text(prev.get("content")).strip()
+        # (a client's text of a stream that sent its content again ends in the content sent)
+        if cut is None or not (got == cut["content"] or (cut["content"] and got.endswith(cut["content"]))):
+            print("[reclank] continue: %s; the prompt as the template renders it" % (
+                "no answer that max_tokens cut has these messages" if cut is None else
+                "the answer before it is not the cut one as sent (%d chars, kept %d)" % (
+                    len(got), len(cut["content"]))), file=sys.stderr, flush=True)
+            return None
+        self.last_think = self.engine.think_level(req, self.thinking)
+        print("[reclank] continue: the answer that max_tokens cut goes on (its prompt and its %d tokens)"
+              % cut["out"], file=sys.stderr, flush=True)
+        return cut["ids"]
 
     def completion_ids(self, prompt):
         return self.engine.completion_ids(prompt)

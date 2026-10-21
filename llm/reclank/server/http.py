@@ -373,7 +373,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             # the think setting of the request (and --no-think-below), the
             # template, the media: server/backend.py and the engine
-            prompt_ids = backend.chat_prompt_ids(req)
+            # (a "continue" after an answer that max_tokens cut: that answer goes on)
+            cont = getattr(backend, "continuation", None)
+            prompt_ids = cont(req) if cont is not None else None
+            if prompt_ids is None:
+                prompt_ids = backend.chat_prompt_ids(req)
         except Exception as exc:
             self._error(400, "prompt failed: %s" % exc)
             return
@@ -409,6 +413,12 @@ class _Handler(BaseHTTPRequestHandler):
                   "tool_calls": calls, "unparsed": parsed.get("pending") or ""})
         except Exception as exc:
             print("[reclank] on_turn failed: %s" % exc, file=sys.stderr, flush=True)
+
+    def _cut(self, backend, chat, prompt_ids, out, content, calls, finish):
+        """A chat answer that max_tokens cut: kept for a "continue" (backend.continuation)."""
+        hook = getattr(backend, "remember_cut", None)
+        if chat and hook is not None and finish == "length" and not calls:
+            hook(self._req, prompt_ids, out, content)
 
     def _run(self, req, prompt_ids, chat):
         backend = self.server.backend
@@ -536,6 +546,7 @@ class _Handler(BaseHTTPRequestHandler):
         log_answer(len(parsed["reasoning"]), len(text), len(calls), len(parsed.get("pending") or ""),
                    backend.clean_raw(raw))
         self._turn(backend, prompt_ids, out, raw, parsed, text, calls, finish)
+        self._cut(backend, chat, prompt_ids, out, text, calls, finish)
         if not text and not calls:
             log_empty(len(parsed["reasoning"]), backend.clean_raw(raw))
         if calls:
@@ -732,6 +743,8 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = backend.parse_output(raw)
         self._turn(backend, prompt_ids, out, raw, parsed, sent_content, parsed["tool_calls"],
                    "closed" if closed else finish)
+        if not closed:
+            self._cut(backend, chat, prompt_ids, out, sent_content, calls, finish)
         if empty is not None and not closed:
             log_empty(empty[0], backend.clean_raw(empty[1]))
 

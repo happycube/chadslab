@@ -27,6 +27,8 @@ import uuid
 import numpy as np
 
 from reclank.core.session import BufferRows, RowCache
+from reclank.core.speculative import DeviceOp
+from reclank.core.think_guard import ThinkGuard, newline_test, report, think_budget, wrap_at_of
 from reclank.models.base import Engine
 from reclank.models.qwen.tokenizer import QwenTokenizer
 
@@ -46,6 +48,12 @@ OFF = ("off", "false", "none", "disabled", "0", "no")
 # the bfloat16 weights, 0.93 GB, and the buffers of 8547 patches: 1.78 GB in all);
 # the hot experts leave it free when the server takes images
 VISION_GB = float(os.environ.get("RECLANK_DS_VISION_GB", "1.8"))
+# the encoded rows of the images kept in host memory (a session of screenshots sends every image of
+# its history each turn: a cache of 8 encoded 17 again each turn, ~20 s; an image of 1024 tokens is 21 MB)
+IMAGE_CACHE_GB = float(os.environ.get("RECLANK_DS_IMAGE_CACHE_GB", "4"))
+# the prompt of a lane (--lanes 2) in parts of this many tokens, with a pause after each (the other
+# lane decodes between them: server/worker.py; as the Qwen engine's)
+LANE_PART = int(os.environ.get("RECLANK_LANE_PART", "4096"))
 FATAL_WORDS = ("illegal memory access", "unspecified launch failure", "misaligned address",
                "device-side assert", "context is destroyed", "CUDA_ERROR_LAUNCH_FAILED")
 
@@ -217,6 +225,18 @@ class DSEngine(Engine):
         self.think_open_id = tok.t.special[THINK_OPEN]
         self.think_close_id = tok.t.special[THINK_CLOSE]
         self.last_text = ""
+        # the think budget (--think-budget), the words to wrap up (--wrap-left) and their tokens (load):
+        # the request's ThinkGuard (think_guard)
+        self.think_budget, self.wrap_left = 6000, 500
+        self.think_force = self.wrap_think = self.wrap_answer = ()
+        self.ends_line = None
+        # the lanes (--lanes 2, server/worker.py; lanes.py): coop hands the runs of a generation to
+        # the scheduler (DeviceOp); lane is the DSLane of this engine (None: lane A, the model's own
+        # state); lanes are the engines of all the lanes (this one alone: [self])
+        self.coop = False
+        self.lane = None
+        self.lanes = [self]
+        self.index = 0
 
     # ---- the prompt
 
@@ -327,7 +347,8 @@ class DSEngine(Engine):
                 got[1][0], got[1][1], got[0].shape[0], time.time() - t0), file=sys.stderr, flush=True)
         self._media_rows.pop(key, None)
         self._media_rows[key] = got
-        while len(self._media_rows) > 8:
+        while len(self._media_rows) > 1 and \
+                sum(r.nbytes for r, _g in self._media_rows.values()) > IMAGE_CACHE_GB * 1e9:
             self._media_rows.pop(next(iter(self._media_rows)))
         return got[0], got[1], key
 
@@ -343,16 +364,18 @@ class DSEngine(Engine):
         if mem_info()[0] < need:
             self.g.free_programs()
         try:
-            try:
-                return self.vision.image(data, budget)
-            except (RuntimeError, MemoryError) as e:
-                if "memory" not in str(e).lower():
-                    raise
-                print("[dsv41] the image encoder out of GPU memory (%s): the programs freed, again" % e,
-                      file=sys.stderr, flush=True)
-                self.vision.release()
-                self.g.free_programs()
-                return self.vision.image(data, budget)
+            while True:
+                try:
+                    return self.vision.image(data, budget)
+                except (RuntimeError, MemoryError) as e:
+                    if "memory" not in str(e).lower():
+                        raise
+                    print("[dsv41] the image encoder out of GPU memory (%s): room made, again" % e,
+                          file=sys.stderr, flush=True)
+                    self.vision.release()
+                    # the programs, then (if they went for room just before) a slot of the hot experts
+                    if not self.g.make_room(e):
+                        raise
         finally:
             self.vision.release()
 
@@ -493,7 +516,59 @@ class DSEngine(Engine):
             return self.ds.prefill(ids, pos=pos, media=media)
         return self.g.prefill(ids, pos, media=media), None
 
+    def _prefill_co(self, ids, pos, media=None):
+        """(yield from) _prefill; with coop in parts of LANE_PART tokens, a pause (DeviceOp) after
+        each but the last, so that the other lane runs between them (a prompt in parts gives the
+        bits of one: the cut at the answer does the same)."""
+        if not self.coop or len(ids) <= LANE_PART:
+            return self._prefill(ids, pos, media)
+        out = None
+        for c0 in range(0, len(ids), LANE_PART):
+            if c0:
+                yield DeviceOp("pause")
+            out = self._prefill(ids[c0:c0 + LANE_PART], pos + c0, media)
+        return out
+
+    # ---- the lanes (server/worker.py LaneScheduler)
+
+    def on(self):
+        """The model with this engine's lane in place (DSLane.view; lane A: as it is)."""
+        import contextlib
+        return self.lane.view() if self.lane is not None else contextlib.nullcontext(self.g)
+
+    def pair(self, a, b):
+        """The runs of lane A (this engine: the model's state) and lane B (lanes[1]) at once
+        (lanes.run_both; their outputs are then each lane's g.last): two steps. Not verify
+        groups (False: each alone): a group already overlaps its halves, and two groups bound the
+        CPU (check_dsv41_lanes.py: plain pairs 1.34x the tokens of one after the other, DSpark
+        pairs 0.92x); DSpark's auto then weighs the paired plain steps against its rounds."""
+        if len(a.tokens) != 1 or len(b.tokens) != 1:
+            return False
+        from reclank.models.deepseek41.lanes import run_both
+        run_both(self.g, self.lanes[1].lane, a.tokens, a.pos, b.tokens, b.pos)
+        return True
+
+    def hit(self, prompt_ids):
+        """What this lane's contexts would give a prompt (RowCache.peek): (the tokens they hold,
+        True when that is the context on this lane's device). On the model thread."""
+        return self.ctxs.peek(self._keys(prompt_ids), lambda p: False)
+
     # ---- the generation
+
+    def think_guard(self, prompt_ids, max_tokens, eos_ids):
+        """The ThinkGuard of a request (core/think_guard.py) when the prompt ends inside <think>
+        (open_channel) or the answer may reach the end of the context, else None: the think part
+        closes at think_budget tokens (and at most half of max_tokens), and the words to wrap up go in
+        when fewer than wrap_left positions of the context are left. (No tool markers: a DSML call
+        is not one token.)"""
+        think = bool(self.open_channel(prompt_ids))
+        wrap_at = wrap_at_of(self.wrap_left, self.max_context - len(prompt_ids) - 1, max_tokens)
+        if not think and wrap_at is None:
+            return None
+        force = self.think_force
+        return ThinkGuard(eos_ids, self.think_close_id, think_budget(self.think_budget, max_tokens, len(force)),
+                          force, think=think, wrap_at=wrap_at, wrap_think=self.wrap_think,
+                          wrap_answer=self.wrap_answer, ends_line=self.ends_line)
 
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
         ids = list(prompt_ids)
@@ -504,42 +579,68 @@ class DSEngine(Engine):
             raise ValueError("the prompt has %d tokens; the context is %d" % (n, self.max_context))
         max_tokens = min(int(max_tokens), self.max_context - n - 1)
         t0 = time.time()
+        # after a longer sequence the programs' cap comes back down and the hot experts that
+        # make_room took grow back while the GPU has room (no run is half done here)
+        self.g.relax(n)
         # the longest point that is a strict start of the prompt (its context
         # brought to the device)
         k, point = self.ctxs.begin(keys, lambda p: False)
-        if k == 0:
-            self._fresh()
-        else:
-            self._restore(point, k)
         cut = self._answer_cut(ids)
-        if k < cut < n:
-            self._prefill(ids[k:cut], k, media)
-            self._save(keys[:cut])
-            k0 = cut
-        else:
-            k0 = k
-        lg, main_last = self._prefill(ids[k0:], k0, media)
+
+        def prefill():
+            if k == 0:
+                self._fresh()
+            else:
+                self._restore(point, k)
+            if k < cut < n:
+                yield from self._prefill_co(ids[k:cut], k, media)
+                self._save(keys[:cut])
+                k0 = cut
+            else:
+                k0 = k
+            return (yield from self._prefill_co(ids[k0:], k0, media))
+
+        try:
+            lg, main_last = yield from prefill()
+        except MemoryError as e:
+            # the programs of a long session take more as the context grows (as _encode): a new one
+            # (an image in the window: the vis program) can find the GPU full. The programs go (made
+            # again when run), the context back to the point, and the prompt again.
+            from reclank.backends.cuda.gpumm import mem_info
+            free0 = mem_info()[0]
+            self.g.free_programs()
+            print("[dsv41] %s: the programs freed (GPU %.2f -> %.2f GB free), the prompt again" % (
+                e, free0 / 1e9, mem_info()[0] / 1e9), file=sys.stderr, flush=True)
+            lg, main_last = yield from prefill()
         dt = time.time() - t0
         self.last_cached = k
         print("[dsv41] cache hit %d of %d prompt tokens; new %d in %.1f s (%.0f tok/s); %s" % (
             k, n, n - k, dt, (n - k) / max(dt, 1e-9), self.ctxs.note(n, k)), file=sys.stderr, flush=True)
         sampler.reset(prompt_ids)
+        guard = sampler.guard = self.think_guard(prompt_ids, max_tokens, eos_ids)
         t1, count, stats = time.time(), 0, {}
         try:
             if self.ds is not None:
                 for tok in self.ds.stream(lg, main_last, n, sampler, max_tokens=max_tokens, eos=eos_ids,
-                                          spec=self.spec, stats=stats):
-                    count += 1
+                                          spec=self.spec, stats=stats, coop=self.coop):
+                    if not isinstance(tok, DeviceOp):
+                        count += 1
                     yield tok
             else:
-                pos, y = n, sampler(lg)
+                pos, y = n, sampler.fixed(sampler(lg))
                 while True:
                     count += 1
                     yield y
                     if y in eos_ids or count >= max_tokens:
                         break
-                    y, pos = sampler(self.g.step(y, pos)), pos + 1
+                    if self.coop:
+                        yield DeviceOp("run", [y], pos)
+                        y, pos = sampler.fixed(sampler(self.g.last.logits[0].copy())), pos + 1
+                    else:
+                        y, pos = sampler.fixed(sampler(self.g.step(y, pos))), pos + 1
         finally:
+            sampler.guard = None
+            report(guard, "dsv41", self.wrap_left)
             dt = time.time() - t1
             extra = ""
             if stats.get("rounds"):
@@ -567,7 +668,8 @@ def load(opts, meta, worker=None):
     m = DSV41CPU(path, max_len=opts.ctx or None)
     images = str(opts.mmproj or "").lower() not in ("off", "none", "0")
     hot = opts.hot_gb if opts.hot_gb is not None else (HOT_GB_DSPARK if mtp else HOT_GB) - (VISION_GB if images else 0)
-    g = DSV41GPU(m, keep_layers=False, hot_gb=hot)
+    # (spec: the prefetch of the cold experts, one lane alone: gpu.py SPEC)
+    g = DSV41GPU(m, keep_layers=False, hot_gb=hot, spec=int(getattr(opts, "lanes", 1) or 1) == 1)
     ds = DSpark(g) if mtp else None
     vision = None
     if images:
@@ -578,6 +680,11 @@ def load(opts, meta, worker=None):
                    contexts_gb=getattr(opts, "contexts_gb", 16.0))
     if opts.image_budget:
         eng.image_budget = min(int(opts.image_budget), vision.max_tokens if vision else 1024)
+    from reclank.models.qwen.chat import THINK_CLOSE as CLOSE_WORDS, WRAP_ANSWER, WRAP_THINK
+    eng.think_budget, eng.wrap_left = max(0, opts.think_budget), max(0, opts.wrap_left)
+    eng.think_force, eng.wrap_think, eng.wrap_answer = (tok.encode(CLOSE_WORDS), tok.encode(WRAP_THINK),
+                                                        tok.encode(WRAP_ANSWER))
+    eng.ends_line = newline_test(tok.decode)
     # the programs of a prompt and of the loop now (the first request does not wait for them)
     warm = tok.encode(enc.encode_messages([{"role": "user", "content": "Hello. " * 300}], thinking_mode="chat"))
     eng._fresh()
@@ -587,10 +694,17 @@ def load(opts, meta, worker=None):
     else:
         g.prefill(warm)
     eng._fresh()
+    if int(getattr(opts, "lanes", 1) or 1) > 1:
+        _lanes_up(eng, warm)
+        _lanes_warm(eng, tok, enc)
     from reclank.backends.cpu import cops as _cops
     _cops.team_warn()
     thinking = opts.thinking or "high"
     level = None if thinking == "off" else EFFORT.get(thinking, EFFORT["high"])
+    if os.environ.get("RECLANK_DS_EFFORT"):
+        # a default effort as a number (1 to 100; --thinking takes the names only), as a request's
+        # reasoning_effort may give
+        level = DSEngine._effort(os.environ["RECLANK_DS_EFFORT"], level)
     defaults = {"temperature": 1.0, "top_p": 0.95, "top_k": None, "max_tokens": 65536,
                 "model_id": "deepseek-v4.1-flash", "thinking": level}
     from reclank.backends.cuda.gpumm import mem_info
@@ -600,3 +714,71 @@ def load(opts, meta, worker=None):
               thinking, level, "on (at most %d tokens)" % eng.image_budget if vision else "off",
               mem_info()[0] / 1e9), flush=True)
     return eng, defaults
+
+
+def _lanes_up(eng, warm):
+    """--lanes 2: lane B (lanes.py DSLane: a second sequence of the model, its own state on the
+    GPU, its caches as long as the model's so that the lanes share the contexts in host memory)
+    and its engine; both hand their runs to the scheduler of the server (coop). warm: a prompt for
+    lane B's prompt programs."""
+    import copy
+    from reclank.models.deepseek41.lanes import DSLane
+    t0 = time.time()
+    g, ds = eng.g, eng.ds
+    lane = DSLane(g, ds)
+    eb = copy.copy(eng)             # (the model, the tokenizer, the encoder, the images' rows shared)
+    eb.ctxs = RowCache(eb, eng.ctxs.max_contexts, eng.ctxs.max_bytes, "dsv41 B")
+    eb.ctxs.share_with(eng.ctxs)
+    eb.last_cached, eb.last_text, eb.last_media = 0, "", []
+    eb.lane, eb.index = lane, 1
+    eng.lanes = eb.lanes = [eng, eb]
+    eng.coop = eb.coop = True
+    with eb.on():
+        # its programs of a prompt and of the loop now (as the model's at the load)
+        eb._fresh()
+        if ds is not None:
+            ds.prefill(warm)
+            ds.warm()
+        else:
+            g.prefill(warm)
+        eb._fresh()
+    from reclank.backends.cuda.gpumm import mem_info
+    print("lane B: %d positions, its programs in %.0f s; GPU %.1f GB free" % (
+        lane.state["max_pos"], time.time() - t0, mem_info()[0] / 1e9), flush=True)
+
+
+def _lanes_warm(eng, tok, enc):
+    """Two short answers at once through the scheduler of the lanes (server/worker.py): the first
+    runs of lane B's programs on its stream, and a check of the pairs."""
+    import queue
+    import threading
+    from reclank.core.sampling import Sampler
+    from server.worker import LaneScheduler
+    t0 = time.time()
+    sch = LaneScheduler(eng.lanes)
+    qs = []
+    for i, text in enumerate(("Name three colors.", "Count from one to five.")):
+        e = eng.lanes[i]
+        ids = tok.encode(enc.encode_messages([{"role": "user", "content": text}], thinking_mode="chat"))
+        q = queue.Queue()
+        sch.admit(i, (lambda e=e, ids=ids: e.generate(ids, 32, Sampler(temperature=0.0), e.stop_ids())),
+                  q, threading.Event())
+        qs.append(q)
+    errs = []
+    while sch.busy():
+        sch.tick(errs.append)
+    if errs:
+        raise errs[0]
+    outs = []
+    for q in qs:
+        out = []
+        while not q.empty():
+            kind, v = q.get()
+            if kind == "item":
+                out.append(v)
+        outs.append(tok.decode(out))
+    for e in eng.lanes:
+        with e.on():
+            e._fresh()
+    print("lanes: a warm pair in %.1f s (%d pairs, %d runs alone): %r / %r" % (
+        time.time() - t0, sch.pairs, sch.solos, outs[0][:40], outs[1][:40]), flush=True)

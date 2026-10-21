@@ -225,7 +225,7 @@ int rc_gpu_sync(void)
  * program that holds it (a group of a prompt of each size held its own: tens
  * of MB each). Each program keeps its own sizes (xh_n, kqx_n: the places in
  * it), so a larger scratch is the same to it. */
-enum { GG_SH_XH, GG_SH_W16, GG_SH_BTP, GG_SH_BTC, GG_SH_KQX, GG_SH_E3, GG_SH_NV8, GG_SH_KINDS };
+enum { GG_SH_XH, GG_SH_W16, GG_SH_BTP, GG_SH_BTC, GG_SH_KQX, GG_SH_E3, GG_SH_NV8, GG_SH_HL, GG_SH_KINDS };
 typedef struct gg_shared {
     void *p;
     size_t n;
@@ -339,10 +339,19 @@ void *rc_gpu_load(const int64_t *prog, int use_graph)
      * GG_SEG_FIRST records, the next ones GG_SEG_MAX. The GPU starts a graph
      * only when cudaGraphLaunch returns, about 1.5 us for each kernel. With a
      * small first graph, the GPU starts early, and the launches of the next
-     * graphs run while it works. */
-    int in_seg = 0, run = 0;
+     * graphs run while it works. A GP_DS_STAGE_PULL's branch joins in its
+     * segment: no new one while a pull is open (open_pulls: a bit for each
+     * event with a pull and no GP_DS_STAGE_JOIN yet). */
+    int in_seg = 0, run = 0, open_pulls = 0;
     for (int pc = 0; pc < g->n_code; ++pc) {
         const gp_rec *r = g->hcode + pc;
+        if (r->op == GP_DS_STAGE_PULL && gg_side_init() != 0) {
+            return NULL;
+        }
+        if (is_boundary(r->op) && open_pulls > 0) {
+            snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: a boundary record before a GP_DS_STAGE_JOIN");
+            return NULL;
+        }
         if (is_boundary(r->op)) {
             in_seg = 0;
             run = 0;
@@ -351,8 +360,17 @@ void *rc_gpu_load(const int64_t *prog, int use_graph)
             }
             continue;
         }
-        if (in_seg && pc - g->seg[g->n_seg - 1].start >= (run == 1 ? GG_SEG_FIRST : GG_SEG_MAX)) {
+        if (in_seg && open_pulls == 0 && pc - g->seg[g->n_seg - 1].start >= (run == 1 ? GG_SEG_FIRST : GG_SEG_MAX)) {
             in_seg = 0;
+        }
+        if (r->op == GP_DS_STAGE_PULL || r->op == GP_DS_STAGE_JOIN) {
+            int bad = 0;
+            const int64_t ev = hlit(r, r->op == GP_DS_STAGE_PULL ? 8 : 0, &bad);
+            if (bad || ev < 0 || ev >= GG_SIDE_EV) {
+                snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: a GP_DS_STAGE event out of range");
+                return NULL;
+            }
+            open_pulls = r->op == GP_DS_STAGE_PULL ? open_pulls | 1 << ev : open_pulls & ~(1 << ev);
         }
         if (!in_seg) {
             g->seg[g->n_seg].start = pc;
@@ -528,6 +546,20 @@ void *rc_gpu_load(const int64_t *prog, int use_graph)
         return NULL;
     }
     g->nv8_n = nneed / sizeof(float);
+    /* The lists of the DeepSeek hot experts (ds_hot_tc6): the pairs of each held expert. */
+    size_t hneed = 0;
+    for (int pc = 0; pc < g->n_code; ++pc) {
+        const gp_rec *r = g->hcode + pc;
+        if (r->op == GP_DS_HOT_MOE && r->tag[8] == GP_T_INT && r->tag[9] == GP_T_INT && r->tag[21] == GP_T_INT) {
+            size_t n = ds_hot_hl_ints((size_t)(r->v[8] * r->v[9]), (size_t)r->v[21]);
+            hneed = n > hneed ? n : hneed;
+        }
+    }
+    if (hneed > 0 && (g->hl = (int *)gg_scratch_get(GG_SH_HL, hneed * sizeof(int), 0)) == NULL) {
+        snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: no memory for the lists of the hot experts");
+        return NULL;
+    }
+    g->hl_n = hneed;
     g->ev = (cudaEvent_t *)calloc((size_t)g->n_ev + 1, sizeof(cudaEvent_t));
     for (int k = 0; k < g->n_ev; ++k) {
         if (cudaEventCreateWithFlags(&g->ev[k], cudaEventDisableTiming) != cudaSuccess) {
@@ -800,6 +832,7 @@ int rc_gpu_unload(void *handle)
     gg_scratch_put(g->kqx);
     gg_scratch_put(g->e3);
     gg_scratch_put(g->nv8);
+    gg_scratch_put(g->hl);
     cudaFreeHost(g->henv);
     free(g->hcode);
     free(g);

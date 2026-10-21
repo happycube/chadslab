@@ -249,6 +249,11 @@ TABLE = [
     ("REMOTE_JOIN", 230, C, "wait for the expert device's job and add its sum"),
     ("NM_REMOTE_POST", 231, C, "the cold pairs of a Nemotron step that an expert device holds to it, the others to a list"),
     ("DS_HC_STEP", 232, G, "a sublayer's post, then the next one's mixes and pre (DeepSeek V4.1)"),
+    ("NM_HOT_NV4", 233, G, "NM_HOT_MOE for KQ_NV4 experts (Nemotron Super): float x, a warp a row"),
+    ("NM_PLAN", 234, G, "a prompt group's experts: the cold ones of few pairs the CPU's, the rest the GPU's (by their costs)"),
+    ("DS_STAGE_PICK", 235, G, "a prompt group's heaviest cold experts of a layer to the GPU's stage slots (DeepSeek V4.1)"),
+    ("DS_STAGE_PULL", 236, G, "the experts of DS_STAGE_PICK from the registered host memory into the stage, beside the stream"),
+    ("DS_STAGE_JOIN", 237, G, "the stream waits for a DS_STAGE_PULL"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}

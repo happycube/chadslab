@@ -52,17 +52,6 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b)
  * memory of the warp: S = Q K^T (Q2: q as two float16 planes, hi + lo, so q
  * keeps about 22 bits), a softmax that runs, then O += P V (P float16, V by
  * ldmatrix.trans). The warps join at the end in shared memory. */
-__device__ __forceinline__ void ldsm_x4_trans(uint32_t *d, const void *p)
-{
-#if RC_SM80
-    unsigned a = (unsigned)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a));
-#else
-    __trap();
-#endif
-}
-
 #define QT_LD 264                    /* the row stride (halves) of the tiles */
 #define QT_SMEM ((size_t)(2 * 16 + 4 * 16) * QT_LD * 2)
 template <int Q2>

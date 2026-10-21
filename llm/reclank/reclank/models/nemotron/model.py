@@ -1,7 +1,8 @@
-"""Nemotron 3.5 Bolt 74B-A9B (NemotronH Puzzle) on the CPU in NumPy (P2 of
-docs/NEMOTRON_BOLT_PLAN.md): the forward of the checkpoint's modeling_nemotron_h.py op for op, in
-float32, from the shipped tensors decoded in NumPy (IQ2_XXS: reclank/formats/iq2.py; NVFP4 and
-Q8_0 here). The slow reference of the runtime: the engines' checks compare against it.
+"""Nemotron 3.5 Bolt 74B-A9B (NemotronH Puzzle) and Super 120B-A12B (NemotronH, uniform layers)
+on the CPU in NumPy (P2 of docs/NEMOTRON_BOLT_PLAN.md, S1 of docs/NEMOTRON_SUPER_PLAN.md): the
+forward of the checkpoint's modeling_nemotron_h.py op for op, in float32, from the shipped tensors
+decoded in NumPy (IQ2_XXS: reclank/formats/iq2.py; NVFP4, FP8 with a tensor scale and Q8_0 here).
+The slow reference of the runtime: the engines' checks compare against it.
 
 - each of the 88 blocks: x + mixer(rmsnorm(x));
 - Mamba-2 (40): in_proj -> z, xBC, dt; a causal conv of 4 + bias + silu over xBC; 128 heads of
@@ -34,8 +35,10 @@ BB = LM + "backbone."
 
 
 class NemotronConfig:
-    """The text model's config (config.json llm_config), with the per-block configs of the
-    Puzzle model in kinds[i] ("mamba", "attention", "moe") and moe[i] = (experts, inner, top)."""
+    """The text model's config (config.json llm_config): the kind of each block in kinds[i]
+    ("mamba", "attention", "moe") and moe[i] = (experts, inner, top), from the per-block configs
+    of the Puzzle model (Bolt) or the uniform layers of NemotronH (Super); mtp: the blocks of the
+    MTP layer (Super: attention, moe), else none."""
 
     def __init__(self, path):
         c = json.load(open(os.path.join(path, "config.json")))
@@ -44,16 +47,22 @@ class NemotronConfig:
         self.hidden = t["hidden_size"]
         self.vocab = t["vocab_size"]
         self.eps = t["layer_norm_epsilon"]
-        blocks = t["block_configs"]
-        self.kinds = [b["block_type"] for b in blocks]
-        self.layers = len(blocks)
-        self.moe = {i: (b["n_routed_experts"], b["moe_intermediate_size"], b["num_experts_per_tok"])
-                    for i, b in enumerate(blocks) if b["block_type"] == "moe"}
+        blocks = t.get("block_configs")
+        if blocks:
+            self.kinds = [b["block_type"] for b in blocks]
+            self.moe = {i: (b["n_routed_experts"], b["moe_intermediate_size"], b["num_experts_per_tok"])
+                        for i, b in enumerate(blocks) if b["block_type"] == "moe"}
+        else:
+            self.kinds = list(t["layers_block_type"])
+            self.moe = {i: (t["n_routed_experts"], t["moe_intermediate_size"], t["num_experts_per_tok"])
+                        for i, kind in enumerate(self.kinds) if kind == "moe"}
+        self.layers = len(self.kinds)
+        self.mtp = list(t.get("mtp_layers_block_type") or []) if t.get("num_nextn_predict_layers") else []
         self.latent = t["moe_latent_size"]
         self.shared_inner = t["moe_shared_expert_intermediate_size"]
         self.route_scale = t["routed_scaling_factor"]
         self.norm_topk = t["norm_topk_prob"]
-        assert t["n_group"] == 1 and t["topk_group"] == 1 and t["scoring_func"] == "sigmoid"
+        assert t["n_group"] == 1 and t["topk_group"] == 1 and t.get("scoring_func", "sigmoid") == "sigmoid"
         assert t["mlp_hidden_act"] == "relu2" and not t["mlp_bias"]
         self.heads = t["num_attention_heads"]
         self.kv_heads = t["num_key_value_heads"]
@@ -71,7 +80,6 @@ class NemotronConfig:
         # llama.cpp: KL 0.083 -> 0.069, top-1 90% -> 94% without it)
         self.dt_min = float((t.get("time_step_limit") or [0.0])[0] or 0.0)
         assert t["mamba_hidden_act"] == "silu" and t["use_conv_bias"] and not t["use_bias"]
-        assert not t.get("num_nextn_predict_layers")
         self.eos = [2, 11]
 
 
@@ -116,6 +124,11 @@ def _e4m3():
 
 
 E4M3 = _e4m3()
+
+
+def fp8(w, s):
+    """ModelOpt FP8 (w: E4M3 bytes [rows, cols]; s: the tensor's float32 scale) -> float32."""
+    return E4M3[np.asarray(w)] * np.float32(s)
 
 
 def nvfp4(w, s, g):
@@ -206,7 +219,10 @@ class NemotronCPU:
         if m is not None:
             return m
         ck = self.ck
-        if name + ".weight_scale" in ck.where:
+        if ck.file(name + ".weight").dtype(name + ".weight") == "F8_E4M3":
+            # FP8 with a tensor scale (Super's Mamba, attention, lm_head)
+            m = fp8(ck.raw(name + ".weight"), float(np.asarray(ck.f32(name + ".weight_scale")).reshape(-1)[0]))
+        elif name + ".weight_scale" in ck.where:
             m = nvfp4(ck.raw(name + ".weight"), ck.raw(name + ".weight_scale"),
                       float(np.asarray(ck.f32(name + ".weight_scale_2")).reshape(-1)[0]))
         else:
@@ -269,9 +285,11 @@ class NemotronCPU:
         y = rms_norm(y.reshape(t, c.m_groups, g), self._vec(p + "norm.weight").reshape(c.m_groups, g), c.eps)
         return y.reshape(t, c.m_inner) @ self._mat(p + "out_proj").T
 
-    def attention(self, i, x, cache):
+    def attention(self, i, x, cache, p=None):
+        """p: the prefix of the mixer's tensors (default block i's; the MTP block's for the
+        drafts, its keys and values in cache under i)."""
         c = self.cfg
-        p = BB + "layers.%d.mixer." % i
+        p = p or BB + "layers.%d.mixer." % i
         t = x.shape[0]
         q = (x @ self._mat(p + "q_proj").T).reshape(t, c.heads, c.head_dim)
         k = (x @ self._mat(p + "k_proj").T).reshape(t, c.kv_heads, c.head_dim)
@@ -290,11 +308,11 @@ class NemotronCPU:
         o = np.einsum("htn,nhd->thd", s.astype(np.float32), Vh).reshape(t, -1)
         return o @ self._mat(p + "o_proj").T
 
-    def route(self, i, x):
-        """(ids [t, k], weights [t, k]) of the experts of each token."""
+    def route(self, i, x, p=None):
+        """(ids [t, k], weights [t, k]) of the experts of each token (p: the mixer's prefix)."""
         c = self.cfg
-        p = BB + "layers.%d.mixer.gate." % i
-        E, _, top = c.moe[i]
+        p = (p or BB + "layers.%d.mixer." % i) + "gate."
+        E, _, top = c.moe[i] if i in c.moe else c.moe[min(c.moe)]
         scores = sigmoid(x @ self._vec(p + "weight").T)                 # [t, E]
         choice = scores + self._vec(p + "e_score_correction_bias")
         ids = np.argsort(-choice, axis=-1, kind="stable")[:, :top]
@@ -303,10 +321,10 @@ class NemotronCPU:
             w = w / (w.sum(-1, keepdims=True) + 1e-20)
         return ids, (w * c.route_scale).astype(np.float32)
 
-    def moe(self, i, x):
+    def moe(self, i, x, p=None):
         c = self.cfg
-        p = BB + "layers.%d.mixer." % i
-        ids, w = self.route(i, x)
+        p = p or BB + "layers.%d.mixer." % i
+        ids, w = self.route(i, x, p)
         lat = x @ self._mat(p + "fc1_latent_proj").T                    # [t, 1024]
         out = np.zeros_like(lat)
         for e in np.unique(ids):
@@ -321,11 +339,40 @@ class NemotronCPU:
     def head(self, x):
         """The logits of the rows of x (normed by norm_f), in slices of the lm_head."""
         h = rms_norm(x, self._vec(BB + "norm_f.weight"), self.cfg.eps)
-        w = self.ck.raw(LM + "lm_head.weight")                          # Q8_0 [131072, 128, 34]
+        self.last_hidden = h            # (the rows after norm_f: the input of the MTP block)
+        return self._head_rows(h)
+
+    def _head_rows(self, h):
+        """h (normed) times the lm_head, in slices of its rows: Q8_0 (Bolt) or FP8 (Super)."""
+        ck = self.ck
+        w = ck.raw(LM + "lm_head.weight")
+        f8 = ck.file(LM + "lm_head.weight").dtype(LM + "lm_head.weight") == "F8_E4M3"
+        sc = float(np.asarray(ck.f32(LM + "lm_head.weight_scale")).reshape(-1)[0]) if f8 else None
         out = np.empty((h.shape[0], w.shape[0]), np.float32)
         for r0 in range(0, w.shape[0], 8192):
-            out[:, r0:r0 + 8192] = h @ q8_0(w[r0:r0 + 8192]).T
+            out[:, r0:r0 + 8192] = h @ (fp8(w[r0:r0 + 8192], sc) if f8 else q8_0(w[r0:r0 + 8192])).T
         return out
+
+    def mtp(self, token, h, cache):
+        """One draft of the MTP block (Super; vLLM nemotron_h_mtp.py): token, the token after the
+        target's last position, and h [hidden], the target's hidden there after norm_f (or, for the
+        drafts after the first, the out of the draft before). u = eh_proj(cat(enorm(embed),
+        hnorm(h))); the attention block on its own keys and values (cache under "mtp"); s = a + u;
+        the latent MoE block; out = final_layernorm(m + s); the logits by the lm_head (no norm_f).
+        Return (logits [vocab], out [hidden])."""
+        c = self.cfg
+        p0, p1 = LM + "mtp.layers.0.", LM + "mtp.layers.1."
+        if "mtp" not in cache.k:
+            cache.k["mtp"] = np.zeros((0, c.kv_heads, c.head_dim), np.float32)
+            cache.v["mtp"] = np.zeros((0, c.kv_heads, c.head_dim), np.float32)
+        e = rms_norm(self.embed([token]), self._vec(p0 + "enorm.weight"), c.eps)
+        hh = rms_norm(np.asarray(h, np.float32).reshape(1, -1), self._vec(p0 + "hnorm.weight"), c.eps)
+        u = np.concatenate([e, hh], -1) @ self._mat(p0 + "eh_proj").T
+        a = self.attention("mtp", rms_norm(u, self._vec(p0 + "norm.weight"), c.eps), cache, p0 + "mixer.")
+        s_ = a + u
+        m = self.moe("mtp", rms_norm(s_, self._vec(p1 + "norm.weight"), c.eps), p1 + "mixer.")
+        out = rms_norm(m + s_, self._vec(p1 + "final_layernorm.weight"), c.eps)
+        return self._head_rows(out)[0], out[0]
 
     def forward(self, ids, cache, logits="all"):
         """The logits of each token of ids (logits="last": of the last only), after cache.n
@@ -342,5 +389,9 @@ class NemotronCPU:
                 x = x + self.moe(i, h)
             if self.hook is not None:
                 self.hook(i, x)
+            if not self.keep_dense:
+                # (the maps of the shards closed: the pages read stay out of the process, and the
+                # page cache can let them go; Super reads 65 GB of experts)
+                self.ck.close()
         cache.n += len(ids)
         return self.head(x[-1:] if logits == "last" else x)

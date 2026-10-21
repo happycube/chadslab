@@ -32,6 +32,8 @@ typedef struct {
     int *btc;
     float *nv8;          /* the column shares of k_nm_t8 */
     size_t nv8_n;
+    int *hl;             /* the lists of the DeepSeek hot experts (ds_hot_tc6) */
+    size_t hl_n;         /* (ints) */
     int8_t *kqx;         /* the int8 rows of the products of large groups (k_kq_tc) */
     size_t kqx_n;        /* its values; then xs and xsum, kqx_n / 32 floats each */
     int tc;              /* 1: the tensor cores for a large group */
@@ -145,6 +147,25 @@ __global__ void k_signal(const gp_rec *r, const int64_t *e)
     signal_body(r, e);
 }
 
+/* A Nemotron step's GP_ROUTER_SIG (with its split: k_router_sig_r's operands 10-12) and the GP_SIGNAL after it
+ * in one block (as k_ds_route_signal): the latent rows' copy first (ready before the router: their writes
+ * over PCIe in flight while it sorts), then the router, then the copies of its outputs and the flag. */
+__global__ void __launch_bounds__(512) k_nm_route_signal(const gp_rec *r, const int64_t *e, const gp_rec *rg)
+{
+    PDL_START();
+    signal_wait(rg, e);
+    {
+        const gp_rec *r = rg;
+        if (di(r, e, 2) != 0) {
+            block_copy4(DP(void, 3), DP(const void, 2), (size_t)di(r, e, 4));
+        }
+    }
+    router_sig_r_body(r, e);
+    __threadfence();
+    __syncthreads();
+    signal_body(rg, e, 1);
+}
+
 /* GP_DS_ROUTER of one token, the GP_HOT_SPLIT after it and the GP_SIGNAL after that in one block (a
  * DeepSeek V4.1 step: three kernels of one block each, 7.9 + 4.5 + 10 us and their gaps, on the way
  * to the CPU's task of every layer). The same operations in the same order. */
@@ -173,14 +194,17 @@ __global__ void __launch_bounds__(256) k_ds_route_signal(const gp_rec *r, const 
     signal_body(rg, e, 1);
 }
 
+/* operand 6 (or none): rows the CPU's are added to (dst = add + src: the GP_ADD after it folded in; with
+ * no cold pair add + 0, its bits) */
 __global__ void k_await(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
+    const float *add = r->tag[6] != GP_T_NONE ? DP(const float, 6) : NULL;
     if (di(r, e, 5) != 0 && *DP(const int, 5) == 0) {
         if (di(r, e, 2) != 0) {
             float *d = DP(float, 3);
             for (size_t i = threadIdx.x; i < (size_t)di(r, e, 4) / 4; i += blockDim.x) {
-                d[i] = 0.f;
+                d[i] = add != NULL ? add[i] + 0.f : 0.f;
             }
         }
         return;
@@ -201,7 +225,13 @@ __global__ void k_await(const gp_rec *r, const int64_t *e)
     }
     __syncthreads();
     __threadfence_system();
-    if (di(r, e, 2) != 0) {
+    if (di(r, e, 2) != 0 && add != NULL) {
+        float *d = DP(float, 3);
+        const float *src = DP(const float, 2);
+        for (size_t i = threadIdx.x; i < (size_t)di(r, e, 4) / 4; i += blockDim.x) {
+            d[i] = add[i] + src[i];
+        }
+    } else if (di(r, e, 2) != 0) {
         block_copy4(DP(void, 3), DP(const void, 2), (size_t)di(r, e, 4));
     }
 }
@@ -212,6 +242,10 @@ static int64_t hi(const gp_rec *r, const int64_t *e, int k);
  * the signals, the time of the CPU programs, the count. */
 static double gg_ts_wait, gg_ts_cpu;
 static int64_t gg_ts_n;
+/* rc_gpu_task_log: while on, the clock at each task's wait, start and end (a measure) */
+#define GG_TL_MAX 65536
+static double *gg_tl;
+static int gg_tl_n, gg_tl_on;
 
 /* out gets the wait and CPU seconds and the count of the tasks since the
  * last call; then they start again. */
@@ -223,6 +257,24 @@ extern "C" int rc_gpu_task_stats(double *out)
     gg_ts_wait = gg_ts_cpu = 0.0;
     gg_ts_n = 0;
     return 0;
+}
+
+/* on 1: the log of the tasks cleared and kept from now on (0: stopped). out (or NULL): the log so far,
+ * 3 clocks a task (the wait's start, the program's start and end, seconds), at most max tasks; the count. */
+extern "C" int rc_gpu_task_log(int on, double *out, int max)
+{
+    int n = gg_tl_n < max ? gg_tl_n : max;
+    if (out != NULL && gg_tl != NULL) {
+        memcpy(out, gg_tl, (size_t)n * 3 * sizeof(double));
+    }
+    if (on && gg_tl == NULL) {
+        gg_tl = (double *)malloc((size_t)GG_TL_MAX * 3 * sizeof(double));
+    }
+    if (on) {
+        gg_tl_n = 0;
+    }
+    gg_tl_on = on && gg_tl != NULL;
+    return n;
 }
 
 /* ---------- lane B (docs/LANES_PLAN.md) ----------
@@ -362,6 +414,12 @@ static int gg_cpu_task(const gp_rec *r, const int64_t *henv)
         gg_ts_wait += t1 - t0;
         gg_ts_cpu += t2 - t1;
         ++gg_ts_n;
+        if (gg_tl_on && gg_tl_n < GG_TL_MAX) {
+            gg_tl[3 * gg_tl_n] = t0;
+            gg_tl[3 * gg_tl_n + 1] = t1;
+            gg_tl[3 * gg_tl_n + 2] = t2;
+            ++gg_tl_n;
+        }
     }
     return 0;
 }

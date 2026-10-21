@@ -1,12 +1,16 @@
 """The think part and the end of the context in an answer, token by token
 (Sampler.guard): ThinkGuard closes a think part at a budget (and when the
 model ends the turn inside it), and puts in the words to wrap up when few
-tokens of the context are left. serve_qwen4 (<think> ... </think>) and
-serve.py (Gemma 4: <|channel>thought ... <channel|>) use it.
+tokens of the context are left. Every engine uses it: Qwen, Nemotron and
+DeepSeek (<think> ... </think>), Gemma 4 (<|channel>thought ... <channel|>).
+The engines take each token of the answer through Sampler.fixed, the drafts
+of speculative rounds too: a token the guard puts in a draft's place ends the
+drafts taken there.
 """
 from __future__ import annotations
 
 import os
+import sys
 
 
 def think_left_open(prompt_ids, special):
@@ -33,7 +37,13 @@ class ThinkGuard:
 
     budget (--think-budget): after that many tokens of the think part, the
     tokens of force (THINK_CLOSE) take the place of the picked ones, one a
-    token, up to </think>; the model then writes the answer. A coding
+    token, up to </think>; the model then writes the answer. With ends_line
+    (a test of the tokens whose text ends in a newline: newline_test), they
+    wait for the end of a line, as NVIDIA's budget for Nemotron: the first
+    token from the budget on that ends a line goes in, then force without
+    its leading newlines; no line ended in NL_WAIT tokens (at most a quarter
+    of the budget), force where it is. A close at the budget alone cut
+    "So (8" in the middle. A coding
     agent's client closed six requests at 303 s each (about 9600 tokens of
     the model at 32 tok/s), and a think of 15339 tokens took 632 s.
 
@@ -53,7 +63,7 @@ class ThinkGuard:
     state at the start (a prompt that ends in an open channel)."""
 
     def __init__(self, stop_ids, close_id, budget=0, force=(), think=True, wrap_at=None,
-                 wrap_think=(), wrap_answer=(), tool=(None, None), open_id=None):
+                 wrap_think=(), wrap_answer=(), tool=(None, None), open_id=None, ends_line=None):
         self.stop, self.close, self.open, self.fixes = set(stop_ids), close_id, bool(think), 0
         self.open_id = open_id
         self.budget, self.force, self.n, self.queue, self.budget_hits = budget, list(force), 0, [], 0
@@ -61,6 +71,9 @@ class ThinkGuard:
         self.tool_open, self.tool_close = tool
         self.count, self.in_tool, self.wrapped = 0, False, False
         self.loops = 0
+        self.ends_line = ends_line
+        self.wait = min(NL_WAIT, budget // 4) if ends_line is not None else 0
+        self.waited = 0
 
     def __call__(self, token):
         self.count += 1
@@ -106,6 +119,17 @@ class ThinkGuard:
             return token
         self.n += 1
         if self.budget and self.n >= self.budget and self.force:
+            self.waited = self.n - self.budget
+            if self.waited < self.wait:
+                if not self.ends_line(token):
+                    return token
+                # (the line ends: the token, then force from its first word)
+                self.budget_hits += 1
+                k = 0
+                while k < len(self.force) - 1 and self.ends_line(self.force[k]):
+                    k += 1
+                self.queue = self.force[k:]
+                return token
             self.budget_hits += 1
             self.queue = list(self.force)
             return self.queue.pop(0)
@@ -113,7 +137,7 @@ class ThinkGuard:
 
     @staticmethod
     def of(prompt_ids, special, stop_ids, budget=0, force=(), wrap_at=None, wrap_think=(),
-           wrap_answer=()):
+           wrap_answer=(), ends_line=None):
         """A guard when the last turn of the prompt opens <think> (and does
         not close it), or with wrap_at; else None."""
         cl = special.get("</think>")
@@ -122,7 +146,8 @@ class ThinkGuard:
             return None
         return ThinkGuard(stop_ids, cl, budget, force, think=think, wrap_at=wrap_at,
                           wrap_think=wrap_think if cl is not None else (), wrap_answer=wrap_answer,
-                          tool=(special.get("<tool_call>"), special.get("</tool_call>")))
+                          tool=(special.get("<tool_call>"), special.get("</tool_call>")),
+                          ends_line=ends_line)
 
 
 # The least think part that a request of enough max_tokens gets (the half of
@@ -130,6 +155,9 @@ class ThinkGuard:
 # items), RECLANK_THINK_MIN; ANSWER_ROOM tokens are left for the answer.
 THINK_MIN = int(os.environ.get("RECLANK_THINK_MIN", "6000"))
 ANSWER_ROOM = 1000
+# the most tokens past the budget that a think part goes on to the end of a line (NVIDIA's 500 for
+# Nemotron's budget), RECLANK_THINK_NL_WAIT; 0: the close at the budget
+NL_WAIT = int(os.environ.get("RECLANK_THINK_NL_WAIT", "500"))
 
 
 def think_budget(budget, max_tokens, n_force):
@@ -142,3 +170,42 @@ def think_budget(budget, max_tokens, n_force):
     half = max(1, max_tokens // 2 - n_force)
     cap = max(half, min(THINK_MIN, max_tokens - n_force - ANSWER_ROOM))
     return min(budget, cap) if budget > 0 else cap
+
+
+def newline_test(decode):
+    """ThinkGuard's ends_line from a tokenizer's decode: True for a token whose text ends in a
+    newline (each token decoded once, when the guard first asks)."""
+    seen = {}
+
+    def ends_line(token):
+        r = seen.get(token)
+        if r is None:
+            r = seen[token] = decode([int(token)]).endswith("\n")
+        return r
+    return ends_line
+
+
+def wrap_at_of(wrap_left, room, max_tokens):
+    """The token of the answer from which fewer than wrap_left (--wrap-left)
+    positions of the context are left, room: the positions after the prompt;
+    None when max_tokens does not get there."""
+    if wrap_left > 0 and max_tokens > room - wrap_left:
+        return max(1, room - wrap_left + 1)
+    return None
+
+
+def report(guard, tag, wrap_left):
+    """The lines of the log for what a guard did in an answer (none: None)."""
+    if guard is None:
+        return
+    if guard.fixes:
+        print("[%s] the model ended the turn inside the think part: its close in its place" % tag,
+              file=sys.stderr, flush=True)
+    if guard.wrapped:
+        print("[%s] fewer than %d tokens of the context left at token %d of the answer: the words to "
+              "wrap up" % (tag, wrap_left, guard.wrap_at), file=sys.stderr, flush=True)
+    if guard.budget_hits:
+        at = (" at the end of a line, %d tokens on" % guard.waited if guard.waited < guard.wait else
+              " (no line ended in %d tokens)" % guard.wait if guard.wait else "")
+        print("[%s] the think part reached its budget (%d tokens): closed%s" % (tag, guard.budget, at),
+              file=sys.stderr, flush=True)

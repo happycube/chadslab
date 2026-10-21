@@ -474,6 +474,9 @@ static size_t nm_moe_scratch_bytes(int t, int k, int L, int inner)
  * pass adds the pairs afterwards (the same bits as nm_moe_body for any count of threads, not the
  * same as it). */
 #define NM_FEW 32
+/* the record being run is the last of its program (interp.c gp_exec sets it in each thread): a record may
+ * then end with no barrier of its own, the end of the parallel region being one */
+static __thread int nm_last_record;
 #define NM_MOE_TN 3
 #define NM_DCH 16
 static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int t, int k,
@@ -504,6 +507,149 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
             }
         }
     }
+#if defined(__AVX2__)
+    /* KQ_NV4 experts (Super) on int16 x: the rows 16 at a time by the rows forms of nmx2.c (kq_rows_x2_nv4v
+     * with VNNI, kq_rows_x2_nv4 without: the bits of kq_dot_x2 there); x of each token as int16 once */
+    int16_t xpu[4][1024] __attribute__((aligned(64)));
+    static int rows_on = -1;            /* RECLANK_NM_NV4_ROWS=0: the rows one at a time (a measure) */
+    if (rows_on < 0) {
+        const char *e = getenv("RECLANK_NM_NV4_ROWS");
+        rows_on = e == NULL || atoi(e) != 0;
+    }
+    const int nv4u = rows_on && x16 && up_type == KQ_NV4 && t <= 4 && L % 32 == 0;
+    const int nv4d = rows_on && x16 && down_type == KQ_NV4 && t <= 4 && inner % 32 == 0 && k <= NM_FEW;
+#if defined(NM_X2_VNNI)
+    const int uspan = kq_nv4v_span(L), dspan = kq_nv4v_span(inner);
+    int uok = 1;
+#else
+    const int uspan = 32, dspan = 32;
+    float fdu[4][1024 / 32];
+    int uok = 1;
+#endif
+    if (nv4u) {
+        for (int j = 0; j < t; ++j) {
+            kq_nv4_x16(xq[j], xl[j], L, uspan, xpu[j]);
+#if !defined(NM_X2_VNNI)
+            uok &= kq_nv4_fd(xs[j], L, fdu[j]);
+#endif
+        }
+    }
+    /* the int16 act of each pair (made after the up rows, before the down rows: scratch past the low
+     * planes, the region of the tiles' int16 act) */
+    int16_t *ap = (int16_t *)(al + (size_t)np * inner + (size_t)t * L * 2);
+#if defined(NM_X2_VNNI)
+    static int runs_on = -1;            /* RECLANK_NM_NV4_RUNS=0: the tasks by pair (a measure) */
+    if (runs_on < 0) {
+        const char *e = getenv("RECLANK_NM_NV4_RUNS");
+        runs_on = e == NULL || atoi(e) != 0;
+    }
+    if (runs_on && nv4u && nv4d && inner % CH == 0 && CH % dspan == 0 && np <= 4 * NM_FEW) {
+        /* by expert (a verify group: the tokens share experts): a task reads its rows of an expert once
+         * for all the pairs of the expert (the rows of a block in the L1 for the second token on), the
+         * kernels and the sums as by pair: the same bits. Each thread makes the runs (pairs by expert,
+         * in the order of the pairs) for itself. The up tasks also make the int16 act of their rows
+         * (the 64-spans of kq_nv4_x16 stay inside a task); the down tasks write the row of each pair
+         * (po: the pair rows' region of the scratch), then the slots of each token in their order. */
+        float *po = (float *)(am + (size_t)np * inner / 16);
+        int rex[4 * NM_FEW], rst[4 * NM_FEW + 1], rpr[4 * NM_FEW], nr = 0, n = 0;
+        for (int pr = 0; pr < np; ++pr) {
+            if (ids[pr] >= 0) {
+                rpr[n++] = pr;
+            }
+        }
+        for (int a = 1; a < n; ++a) {          /* insertion sort by expert, stable: np is small */
+            int v = rpr[a], b = a - 1;
+            while (b >= 0 && ids[rpr[b]] > ids[v]) {
+                rpr[b + 1] = rpr[b];
+                --b;
+            }
+            rpr[b + 1] = v;
+        }
+        for (int a = 0; a < n; ++a) {
+            if (a == 0 || ids[rpr[a]] != ids[rpr[a - 1]]) {
+                rex[nr] = ids[rpr[a]];
+                rst[nr++] = a;
+            }
+        }
+        rst[nr] = n;
+        const int uch = inner / CH;
+        #pragma omp single nowait
+        {
+            int *dc = (int *)((float *)(am + (size_t)np * inner / 16) + (size_t)np * L);
+            for (int b = 0; b < L / 32; ++b) {
+                dc[b] = 0;
+            }
+        }
+        #pragma omp for schedule(dynamic, 1)
+        for (int task = 0; task < nr * uch; ++task) {
+            const int ru = task / uch, r0 = (task % uch) * CH;
+            const uint8_t *w = up + (size_t)rex[ru] * inner * urb;
+            for (int r = r0; r < r0 + CH; r += 16) {
+                for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
+                    const int pr = rpr[a], j = pr / k;
+                    kq_rows_x2_nv4v(w + (size_t)r * urb, urb, L, 16, xpu[j], xs[j], 1, act + (size_t)pr * inner + r, 1);
+                }
+            }
+            for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
+                const int pr = rpr[a];
+                float *ar = act + (size_t)pr * inner;
+                for (int r = r0; r < r0 + CH; ++r) {
+                    float v = ar[r] > 0.f ? ar[r] : 0.f;
+                    ar[r] = v * v;
+                }
+                for (int g = r0 / 32; g < (r0 + CH) / 32; ++g) {
+                    kq_quant_part16(ar, g, aq + (size_t)pr * inner, al + (size_t)pr * inner, as + (size_t)pr * (inner / 32),
+                                    am + (size_t)pr * (inner / 16));
+                }
+                kq_nv4_x16(aq + (size_t)pr * inner + r0, al + (size_t)pr * inner + r0, CH, dspan, ap + (size_t)pr * inner + r0);
+            }
+        }
+        /* the sums: the task that finishes the last run of a block of DR rows (dcnt, an atomic count of
+         * each block's runs; zeroed before the barrier after the up tasks) adds that block's rows of
+         * each token over its slots, in their order (no barrier between the down tasks and the sums) */
+        const int DR = 32, dch = L / DR;
+        int *dcnt = (int *)(po + (size_t)np * L);
+        const int last = nm_last_record;
+        #pragma omp for schedule(dynamic, 1) nowait
+        for (int task = 0; task < nr * dch; ++task) {
+            const int ru = task / dch, r0 = (task % dch) * DR;
+            const uint8_t *w = down + ((size_t)rex[ru] * L + r0) * drb;
+            for (int r = 0; r < DR; r += 16) {
+                for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
+                    const int pr = rpr[a];
+                    kq_rows_x2_nv4v(w + (size_t)r * drb, drb, inner, 16, ap + (size_t)pr * inner, as + (size_t)pr * (inner / 32),
+                                    1, po + (size_t)pr * L + r0 + r, 1);
+                }
+            }
+            if (__atomic_add_fetch(&dcnt[r0 / DR], 1, __ATOMIC_ACQ_REL) == nr) {
+                for (int j = 0; j < t; ++j) {
+                    for (int r = r0; r < r0 + DR; ++r) {
+                        float s = 0.f;
+                        for (int q = 0; q < k; ++q) {
+                            const int pr = j * k + q;
+                            if (ids[pr] < 0) {
+                                continue;
+                            }
+                            s += val[pr] * po[(size_t)pr * L + r];
+                        }
+                        out[(size_t)j * L + r] = s;
+                    }
+                }
+            }
+        }
+        if (nr == 0) {
+            #pragma omp for schedule(static) nowait
+            for (int x0 = 0; x0 < t * L; ++x0) {
+                out[x0] = 0.f;
+            }
+        }
+        if (!last) {
+            #pragma omp barrier
+        }
+        return;
+    }
+#endif
+#endif
     const int uch = (inner + CH - 1) / CH;
     #pragma omp for schedule(dynamic, 1)
     for (int task = 0; task < np * uch; ++task) {
@@ -514,7 +660,20 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
         const uint8_t *w = up + (size_t)ids[pr] * inner * urb;
         float *a = act + (size_t)pr * inner;
 #if defined(__AVX2__)
-        if (x16 && (up_type == KQ_IQ2R || up_type == KQ_IQ2_XXS)) {
+        if (nv4u && uok) {
+            for (int r = r0; r < r1; r += 16) {
+                int nr = r1 - r < 16 ? r1 - r : 16;
+#if defined(NM_X2_VNNI)
+                kq_rows_x2_nv4v(w + (size_t)r * urb, urb, L, nr, xpu[j], xs[j], 1, a + r, 1);
+#else
+                kq_rows_x2_nv4(w + (size_t)r * urb, urb, L, nr, xpu[j], fdu[j], 1, a + r, 1);
+#endif
+            }
+            for (int r = r0; r < r1; ++r) {
+                float v = a[r] > 0.f ? a[r] : 0.f;
+                a[r] = v * v;
+            }
+        } else if (x16 && (up_type == KQ_IQ2R || up_type == KQ_IQ2_XXS)) {
             /* (the rows of the task 4 at a time: kq_rows_x2_iq2, the bits of kq_dot_x2) */
             kq_rows_x2_iq2(w + (size_t)r0 * urb, urb, up_type, L, r1 - r0, xq[j], xl[j], xs[j], 1, a + r0, 1, 0);
             for (int r = r0; r < r1; ++r) {
@@ -540,6 +699,54 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
     }
     const int dch = (L + NM_DCH - 1) / NM_DCH;
 #if defined(__AVX2__)
+    if (nv4d) {
+        /* the act of each pair as int16 once, then the rows of each token 16 at a time on each of its
+         * pairs, each row's sum over the slots in their order (the loop below's) */
+        #pragma omp for schedule(static)
+        for (int pr = 0; pr < np; ++pr) {
+            if (ids[pr] >= 0) {
+                kq_nv4_x16(aq + (size_t)pr * inner, al + (size_t)pr * inner, inner, dspan, ap + (size_t)pr * inner);
+            }
+        }
+        #pragma omp for schedule(dynamic, 1)
+        for (int task = 0; task < t * dch; ++task) {
+            int j = task / dch, r0 = (task % dch) * NM_DCH, r1 = r0 + NM_DCH < L ? r0 + NM_DCH : L;
+            float dq[NM_FEW][NM_DCH];
+            for (int q = 0; q < k; ++q) {
+                int pr = j * k + q;
+                if (ids[pr] < 0) {
+                    continue;
+                }
+                const uint8_t *w = down + ((size_t)ids[pr] * L + r0) * drb;
+                const float *asr = as + (size_t)pr * (inner / 32);
+#if defined(NM_X2_VNNI)
+                kq_rows_x2_nv4v(w, drb, inner, r1 - r0, ap + (size_t)pr * inner, asr, 1, dq[q], 1);
+#else
+                float fd[4096 / 32];
+                if (inner <= 4096 && kq_nv4_fd(asr, inner, fd)) {
+                    kq_rows_x2_nv4(w, drb, inner, r1 - r0, ap + (size_t)pr * inner, fd, 1, dq[q], 1);
+                } else {
+                    for (int r = r0; r < r1; ++r) {
+                        dq[q][r - r0] = kq_dot_x2(down + ((size_t)ids[pr] * L + r) * drb, down_type, inner,
+                                                  aq + (size_t)pr * inner, al + (size_t)pr * inner, asr);
+                    }
+                }
+#endif
+            }
+            for (int r = r0; r < r1; ++r) {
+                float s = 0.f;
+                for (int q = 0; q < k; ++q) {
+                    int pr = j * k + q;
+                    if (ids[pr] < 0) {
+                        continue;
+                    }
+                    s += val[pr] * dq[q][r - r0];
+                }
+                out[(size_t)j * L + r] = s;
+            }
+        }
+        return;
+    }
     if (x16 && (down_type == KQ_IQ2R || down_type == KQ_IQ2_XXS) && k <= NM_FEW) {
         /* the rows of each pair 4 at a time (kq_rows_x2_iq2), then each row's sum over the slots in
          * their order: the bits of the loop below */
@@ -592,11 +799,19 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
     }
 }
 
+/* up1, down1 (or NULL): the copies of the stacks on node 1 (the weightkeeper's, the same bytes): the
+ * threads of node 1 read them, those of node 0 up and down (the team pinned by node: run.c), so every
+ * expert comes from the memory of the reading thread's node; the same bits */
 static void nm_moe_body(const float *x, const int32_t *ids, const float *val, int t, int k,
                         const uint8_t *up, int up_type, const uint8_t *down, int down_type, int L,
-                        int inner, uint8_t *scratch, float *out, int x16)
+                        int inner, uint8_t *scratch, float *out, int x16, const uint8_t *up1,
+                        const uint8_t *down1)
 {
     const int np = t * k, CH = 64;
+    if (up1 != NULL && down1 != NULL && kq_my_node() == 1) {
+        up = up1;
+        down = down1;
+    }
     if (t <= 4 && L <= 1024 && inner % 64 == 0) {
         nm_moe_few(x, ids, val, t, k, up, up_type, down, down_type, L, inner, scratch, out, x16);
         return;

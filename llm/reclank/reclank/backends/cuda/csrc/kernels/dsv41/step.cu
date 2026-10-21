@@ -16,99 +16,11 @@
  * kept raw ([t, 24], k_ds_hc_mix), and each record that uses them makes the
  * coefficients it needs (ds_hc_coef: the sigmoids and the Sinkhorn of 4 x 4).
  */
+#include "common.cuh"
+
 #define DS_HC 4
 #define DS_NMIX ((2 + DS_HC) * DS_HC)
 #define DS_NCOEF (DS_HC + DS_HC * DS_HC)      /* the post q and comb of a token (GP_DS_HC_PRE's coef) */
-
-/* The caches (the window rings, the compressed rows, the index keys): a row of
- * hd values in one of these forms. The records take the form of the caches
- * (1 bfloat16, 2 the smallest), each cache its own form of it (ds_cf):
- *   0  float32 (the rows of a group, kvq; not a cache);
- *   1  the bfloat16 bits (the three caches);
- *   2  FP8: hd E4M3 codes, then an E8M0 scale for each 32 (the window rows);
- *   4  FP4: hd / 2 bytes of E2M1 codes (value 2i in the low 4 bits), then an
- *      E4M3 scale for each 16 (the compressed rows: the form of the model);
- *   5  FP4: the same, an E8M0 scale for each 32 (the index keys).
- * Each holds the values the model puts there exactly (E4M3 times a power of
- * two; E2M1 times an E4M3 scale; E2M1 times a power of two; the sign of a
- * zero too), so the bits of the model do not change. */
-#define DS_CW 0                 /* the kinds of cache, for ds_cf */
-#define DS_CC 1
-#define DS_CK 2
-__device__ __forceinline__ int ds_cf(int form, int kind)
-{
-    return form <= 1 ? form : kind == DS_CW ? 2 : kind == DS_CC ? 4 : 5;
-}
-
-__device__ __forceinline__ size_t ds_rb(int hd, int form)
-{
-    switch (form) {
-    case 0: return (size_t)hd * 4;
-    case 1: return (size_t)hd * 2;
-    case 2: return (size_t)hd + hd / 32;
-    case 4: return (size_t)hd / 2 + hd / 16;
-    default: return (size_t)hd / 2 + hd / 32;
-    }
-}
-
-/* The value of an E2M1 code: twice the values 0, 0.5, 1, 1.5, 2, 3, 4, 6 are
- * the nibbles of 0xC8643210 (no table in local memory); the sign of a zero
- * is kept. */
-__device__ __forceinline__ float ds_e2m1f(uint32_t c)
-{
-    float v = (float)((0xC8643210u >> (4 * (c & 7))) & 15u) * 0.5f;
-    return __uint_as_float(__float_as_uint(v) | ((c & 8u) << 28));
-}
-
-/* the scale of value col of a row of FP8 or FP4 */
-__device__ __forceinline__ float ds_bscale(const uint8_t *rw, int hd, int col, int form)
-{
-    if (form == 2) {
-        return __int_as_float((int)rw[hd + col / 32] << 23);
-    }
-    if (form == 4) {
-        return e4m3f(rw[hd / 2 + col / 16]);
-    }
-    return __int_as_float((int)rw[hd / 2 + col / 32] << 23);
-}
-
-/* value col of row of a cache */
-__device__ __forceinline__ float ds_rld(const void *base, size_t row, int col, int hd, int form)
-{
-    if (form == 0) {
-        return ((const float *)base)[row * hd + col];
-    }
-    if (form == 1) {
-        return __uint_as_float((uint32_t)((const uint16_t *)base)[row * hd + col] << 16);
-    }
-    const uint8_t *rw = (const uint8_t *)base + row * ds_rb(hd, form);
-    float q = form == 2 ? e4m3f(rw[col]) : ds_e2m1f(rw[col / 2] >> (4 * (col & 1)));
-    return __fmul_rn(q, ds_bscale(rw, hd, col, form));
-}
-
-/* the 4 values from col (a multiple of 4) */
-__device__ __forceinline__ float4 ds_rld4(const void *base, size_t row, int col, int hd, int form)
-{
-    if (form == 0) {
-        return *(const float4 *)((const float *)base + row * hd + col);
-    }
-    if (form == 1) {
-        uint2 u = *(const uint2 *)((const uint16_t *)base + row * hd + col);
-        return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16),
-                           __uint_as_float(u.y & 0xffff0000u));
-    }
-    const uint8_t *rw = (const uint8_t *)base + row * ds_rb(hd, form);
-    float sc = ds_bscale(rw, hd, col, form);
-    float q0, q1, q2, q3;
-    if (form == 2) {
-        uint32_t q = *(const uint32_t *)(rw + col);
-        q0 = e4m3f(q & 255), q1 = e4m3f((q >> 8) & 255), q2 = e4m3f((q >> 16) & 255), q3 = e4m3f(q >> 24);
-    } else {
-        uint32_t q = *(const uint16_t *)(rw + col / 2);
-        q0 = ds_e2m1f(q), q1 = ds_e2m1f(q >> 4), q2 = ds_e2m1f(q >> 8), q3 = ds_e2m1f(q >> 12);
-    }
-    return make_float4(__fmul_rn(q0, sc), __fmul_rn(q1, sc), __fmul_rn(q2, sc), __fmul_rn(q3, sc));
-}
 
 /* The E4M3 code of x, a value E4M3 holds exactly (the sign of a zero kept). */
 __device__ __forceinline__ uint32_t ds_e4m3_code(float x)
@@ -187,12 +99,6 @@ __device__ __forceinline__ void ds_rcopy(void *dst, size_t drow, const void *src
     if (col % 32 == 0) {
         d[hd + col / 32] = sp[hd + col / 32];
     }
-}
-
-/* the operand k of a record as the form of a cache (none: 0) */
-__device__ __forceinline__ int ds_form(const gp_rec *r, const int64_t *e, int k)
-{
-    return r->tag[k] != GP_T_NONE ? (int)di(r, e, k) : 0;
 }
 
 /* kq_round_e4m3 of the CPU (mxx.c): nearest, ties to even, saturated at 448. */
@@ -1323,26 +1229,6 @@ __global__ void __launch_bounds__(1024) k_ds_topk_merge(const gp_rec *r, const i
  * A block for each DS_AHB heads of a query. */
 #define DS_AHB 4
 #define DS_AMAX (128 + 2048)
-/* Key m of a query: a row of the ring (form) or of the compressed cache (its
- * form), or of the group (kvq, float32): its base, row and form. */
-struct ds_krow {
-    const void *p;
-    size_t row;
-    int form;
-};
-
-__device__ __forceinline__ ds_krow ds_akey(int m, int nr, int ng, int64_t lo, int g0, int win, const void *ring,
-                                          const float *kvq, const void *ckv, const int *sel, int form)
-{
-    if (m < nr) {
-        return {ring, (size_t)((lo + m) % win), ds_cf(form, DS_CW)};
-    }
-    if (m < nr + ng) {
-        return {kvq, (size_t)(g0 + m - nr), 0};
-    }
-    return {ckv, (size_t)sel[m - nr - ng], ds_cf(form, DS_CC)};
-}
-
 /* Operand 15 (or null): the partials of a split over the keys (a step:
  * blockIdx.z of DS_ASPLIT ranges of the keys), [t, H, DS_ASPLIT, hd + 2]
  * (the max, the sum of the exps, the output not yet divided); then
@@ -1621,150 +1507,6 @@ __global__ void __launch_bounds__(256) k_ds_attn_s(const gp_rec *r, const int64_
     }
 }
 
-/* GP_DS_ATTN for a group (t > 8, no split): the operands of k_ds_attn; a
- * block for each DS_GHB heads of a query, one pass over its keys with an
- * online softmax: each chunk of DS_GKC keys decoded once into shared memory
- * (from any form of the caches) for the heads, a warp for each key's
- * scores, then thread h of the first DS_GHB the max and the sum of head h,
- * then every thread its 2 columns of the outputs of the heads. The sink
- * joins the sum at the end (model.py sparse_attn). */
-#define DS_GHB 16
-#define DS_GKC 4
-__global__ void __launch_bounds__(256) k_ds_attn_g(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    int win = DI(3), hd = DI(10), maxk = DI(12), h0 = blockIdx.x * DS_GHB, j = blockIdx.y, H = DI(9);
-    int64_t pos = di(r, e, 2), p = pos + j;
-    int64_t lo = p - win + 1 > 0 ? p - win + 1 : 0;
-    int nr = lo < pos ? (int)(pos - lo) : 0;
-    int g0 = lo > pos ? (int)(lo - pos) : 0, ng = j - g0 + 1;
-    int mode = r->tag[16] != GP_T_NONE ? DI(16) : 0;
-    if (mode & 2) {
-        /* bounded replay (V4.1 3.2.2): the window starts at operand 18 (the
-         * first position of the replay) */
-        int64_t w0 = di(r, e, 18);
-        lo = lo > w0 ? lo : w0;
-        nr = lo < pos ? (int)(pos - lo) : 0;
-        g0 = lo > pos ? (int)(lo - pos) : 0;
-        ng = j - g0 + 1;
-    }
-    if (mode & 1) {
-        nr = (int)(pos < win ? pos : win);
-        lo = pos - nr;
-        g0 = 0;
-        ng = DI(14);
-    }
-    const void *ckv = DP(const void, 4);
-    int form = ds_form(r, e, 17);
-    const int *sel = DP(const int, 5) + (size_t)j * maxk;
-    int nk = nr + ng + (ckv ? DP(const int, 6)[j] : 0);
-    const void *ring = DP(const void, 1);
-    const float *kvq = DP(const float, 13);
-    float scale = df(r, e, 11);
-    __shared__ __align__(16) float qs[DS_GHB][512];
-    __shared__ __align__(16) float ks[DS_GKC][512];
-    __shared__ float ps[DS_GHB][DS_GKC];
-    __shared__ float mrun[DS_GHB], lrun[DS_GHB], corr[DS_GHB];
-    const float *q = DP(const float, 0) + ((size_t)j * H + h0) * hd;
-    for (int i = threadIdx.x; i < DS_GHB * hd; i += blockDim.x) {
-        qs[i / hd][i % hd] = q[i];
-    }
-    if (threadIdx.x < DS_GHB) {
-        mrun[threadIdx.x] = -INFINITY;
-        lrun[threadIdx.x] = 0.f;
-    }
-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    float acc[DS_GHB][2];
-    #pragma unroll
-    for (int h = 0; h < DS_GHB; ++h) {
-        acc[h][0] = acc[h][1] = 0.f;
-    }
-    int nq = hd / 4;
-    for (int m0 = 0; m0 < nk; m0 += DS_GKC) {
-        int nc = nk - m0 < DS_GKC ? nk - m0 : DS_GKC;
-        __syncthreads();
-        for (int idx = threadIdx.x; idx < nc * nq; idx += blockDim.x) {
-            int kk = idx / nq, c4 = 4 * (idx % nq);
-            ds_krow kr = ds_akey(m0 + kk, nr, ng, lo, g0, win, ring, kvq, ckv, sel, form);
-            *(float4 *)&ks[kk][c4] = ds_rld4(kr.p, kr.row, c4, hd, kr.form);
-        }
-        __syncthreads();
-        if (warp < nc) {
-            float d[DS_GHB];
-            #pragma unroll
-            for (int h = 0; h < DS_GHB; ++h) {
-                d[h] = 0.f;
-            }
-            for (int c = 4 * lane; c < hd; c += 128) {
-                float4 k4 = *(const float4 *)&ks[warp][c];
-                #pragma unroll
-                for (int h = 0; h < DS_GHB; ++h) {
-                    float4 q4 = *(const float4 *)&qs[h][c];
-                    d[h] += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
-                }
-            }
-            #pragma unroll
-            for (int h = 0; h < DS_GHB; ++h) {
-                for (int o = 16; o > 0; o >>= 1) {
-                    d[h] += __shfl_xor_sync(RC_FULL_MASK, d[h], o);
-                }
-            }
-            if (lane == 0) {
-                #pragma unroll
-                for (int h = 0; h < DS_GHB; ++h) {
-                    ps[h][warp] = d[h] * scale;
-                }
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x < DS_GHB) {
-            int h = threadIdx.x;
-            float mx = mrun[h];
-            for (int k = 0; k < nc; ++k) {
-                mx = fmaxf(mx, ps[h][k]);
-            }
-            float cr = mrun[h] == -INFINITY ? 0.f : expf(mrun[h] - mx);
-            float l = lrun[h] * cr;
-            for (int k = 0; k < nc; ++k) {
-                float pv = expf(ps[h][k] - mx);
-                ps[h][k] = pv;
-                l += pv;
-            }
-            mrun[h] = mx;
-            lrun[h] = l;
-            corr[h] = cr;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int h = 0; h < DS_GHB; ++h) {
-            #pragma unroll
-            for (int cc = 0; cc < 2; ++cc) {
-                int col = threadIdx.x + 256 * cc;
-                if (col < hd) {
-                    float a = acc[h][cc] * corr[h];
-                    for (int k = 0; k < nc; ++k) {
-                        a += ps[h][k] * ks[k][col];
-                    }
-                    acc[h][cc] = a;
-                }
-            }
-        }
-    }
-    __syncthreads();
-    float *out = DP(float, 8) + ((size_t)j * H + h0) * hd;
-    #pragma unroll
-    for (int h = 0; h < DS_GHB; ++h) {
-        float den = lrun[h] + expf(DP(const float, 7)[h0 + h] - mrun[h]);
-        #pragma unroll
-        for (int cc = 0; cc < 2; ++cc) {
-            int col = threadIdx.x + 256 * cc;
-            if (col < hd) {
-                out[(size_t)h * hd + col] = acc[h][cc] / den;
-            }
-        }
-    }
-}
-
 /* The partials of the split of GP_DS_ATTN: out = sum_z o_z e^(mx_z - M) /
  * (sum_z s_z e^(mx_z - M) + e^(sink - M)). A block for each (head, token). */
 __global__ void __launch_bounds__(512) k_ds_attn_join(const gp_rec *r, const int64_t *e)
@@ -1930,22 +1672,8 @@ __global__ void __launch_bounds__(1024) k_ds_engram(const gp_rec *r, const int64
  * GP_DS_HOT_MOE: x [t, H], idx [t, k], val [t, k], map [E], store, per,
  * off3, off2, t, k, H, I, qh, ql [t, H], xs [t, H / 32], act [t k, 2 I],
  * act2 [t k, I], aqh, aql [t k, I], axs [t k, I / 32], de [t k, H], E (the experts
- * of the layer: the grid of the grouped kernels of a prompt). */
-__global__ void __launch_bounds__(256) k_ds_hot_gu(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    int pq = blockIdx.z, k = DI(9), H = DI(10), I = DI(11);
-    int slot = DP(const int, 3)[DP(const int, 1)[pq]];
-    if (slot < 0) {
-        return;
-    }
-    int j = pq / k, mat = blockIdx.y, grp = blockIdx.x, nb = H / 32;
-    const uint8_t *w = DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5) + (mat ? di(r, e, 6) : 0) +
-                       (size_t)grp * nb * MXX_BB;
-    mxx_group_x2<8>(w, H, DP(const int8_t, 12) + (size_t)j * H, DP(const int8_t, 13) + (size_t)j * H,
-                    DP(const float, 14) + (size_t)j * nb, DP(float, 15) + (size_t)pq * 2 * I + mat * I + 16 * grp);
-}
-
+ * of the layer: the grid of the grouped kernels of a prompt), x8, stage (or none: the slots
+ * DS_STAGE_SLOT0 + s of map are slot s of stage, GP_DS_STAGE_PICK). */
 __global__ void __launch_bounds__(256) k_ds_hot_act(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -1964,184 +1692,98 @@ __global__ void __launch_bounds__(256) k_ds_hot_act(const gp_rec *r, const int64
     o[i] = __fmul_rn(__fmul_rn(sl, u), DP(const float, 2)[pq]);
 }
 
-__global__ void __launch_bounds__(256) k_ds_hot_dn(const gp_rec *r, const int64_t *e)
+/* GP_DS_STAGE_PICK (a group of a prompt; docs/DS_PREFILL_PLAN.md Phase 1): idx [np], map [E] (the slot
+ * of each expert, or -1), smap (out [E]), list (out [N]), np, E, N, minp, s0, omap (out [E]). The pairs
+ * of each expert that map does not hold counted; the N with the most (at least minp each; ties: the
+ * lower id) take the stage slots DS_STAGE_SLOT0 + s0 + s in smap (the others as in map), list[s] their
+ * ids (or -1); omap the stage slots of smap alone (those of map too: half B runs A's; the others -1).
+ * The GPU copies them in (GP_DS_STAGE_PULL) and takes their pairs; GP_HOT_SPLIT_MT on smap leaves the
+ * CPU the rest. One block. */
+#define DS_STAGE_E 1024
+#define DS_STAGE_N 256
+__global__ void __launch_bounds__(1024) k_ds_stage_pick(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
-    int pq = blockIdx.y, H = DI(10), I = DI(11);
-    int slot = DP(const int, 3)[DP(const int, 1)[pq]];
-    if (slot < 0) {
-        return;
+    const int *idx = DP(const int, 0), *map = DP(const int, 1);
+    int *smap = DP(int, 2), *list = DP(int, 3), *omap = r->tag[9] != GP_T_NONE ? DP(int, 9) : NULL;
+    const int np = DI(4), E = DI(5), N = DI(6), minp = DI(7) > 0 ? DI(7) : 1, s0 = DI(8);
+    __shared__ int cnt[DS_STAGE_E], pick[DS_STAGE_N];
+    for (int x = threadIdx.x; x < E; x += blockDim.x) {
+        cnt[x] = 0;
     }
-    int grp = blockIdx.x, nb = I / 32;
-    const uint8_t *w = DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5) + di(r, e, 7) + (size_t)grp * nb * MXX_BB;
-    mxx_group_x2<8>(w, I, DP(const int8_t, 17) + (size_t)pq * I, DP(const int8_t, 18) + (size_t)pq * I,
-                    DP(const float, 19) + (size_t)pq * nb, DP(float, 20) + (size_t)pq * H + 16 * grp);
-}
-
-/* GP_DS_HOT_MOE for a group of a prompt (t > 8): a block for each (group of
- * 16 rows, matrix, expert); the experts the GPU does not hold and the ones no
- * pair takes leave at once; the others take their pairs (the scan of idx)
- * and the same rows of the expert for each of them in turn, so the rows are
- * read once from the memory and then from the cache (k_ds_hot_gu read them
- * again for every pair: 1.9 s of a group of 512 on the real prompt). The
- * operations of a pair are those of k_ds_hot_gu: the same bits. */
-#define DS_HOT_MAXP 3072
-
-/* The pairs of expert ex among the pairs [p0, p0 + DS_HOT_MAXP k) of idx
- * [t k] into pl (an expert at most once a token: at most DS_HOT_MAXP), in any
- * order (each pair's sums are its own); their count. Every thread calls it,
- * for the chunks of the pairs in turn (a group of any size). */
-__device__ int ds_hot_pairs(const int *idx, int ex, int p0, int np, int k, int *pl, int *cnt)
-{
-    __syncthreads();            /* the chunk before is done with pl */
-    if (threadIdx.x == 0) {
-        *cnt = 0;
+    for (int s = threadIdx.x; s < N; s += blockDim.x) {
+        pick[s] = -1;
     }
     __syncthreads();
-    int p1 = p0 + DS_HOT_MAXP * k < np ? p0 + DS_HOT_MAXP * k : np;
-    for (int p = p0 + threadIdx.x; p < p1; p += blockDim.x) {
-        if (idx[p] == ex) {
-            int at = atomicAdd(cnt, 1);
-            if (at < DS_HOT_MAXP) {
-                pl[at] = p;
-            }
+    for (int p = threadIdx.x; p < np; p += blockDim.x) {
+        const int x = idx[p];
+        if (x >= 0 && x < E && map[x] < 0) {
+            atomicAdd(&cnt[x], 1);
         }
     }
     __syncthreads();
-    return *cnt < DS_HOT_MAXP ? *cnt : DS_HOT_MAXP;
-}
-__global__ void __launch_bounds__(256) k_ds_hot_gu_g(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    int ex = blockIdx.z, k = DI(9), H = DI(10), I = DI(11), t = DI(8);
-    int slot = DP(const int, 3)[ex];
-    if (slot < 0) {
-        return;
-    }
-    __shared__ int pl[DS_HOT_MAXP];
-    __shared__ int np_;
-    const int *idx = DP(const int, 1);
-    for (int p0 = 0; p0 < t * k; p0 += DS_HOT_MAXP * k) {
-        int n = ds_hot_pairs(idx, ex, p0, t * k, k, pl, &np_);
-        if (n == 0) {
+    /* the rank of an expert: the experts of more pairs, or as many and a lower id, before it */
+    for (int x = threadIdx.x; x < E; x += blockDim.x) {
+        const int c = cnt[x];
+        smap[x] = map[x];
+        if (omap) {
+            omap[x] = map[x] >= DS_STAGE_SLOT0 ? map[x] : -1;
+        }
+        if (c < minp) {
             continue;
         }
-        int mat = blockIdx.y, grp = blockIdx.x, nb = H / 32;
-        const uint8_t *w = DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5) + (mat ? di(r, e, 6) : 0) +
-                           (size_t)grp * nb * MXX_BB;
-        for (int q = 0; q < n; ++q) {
-            int pq = pl[q], j = pq / k;
-            mxx_group_x2<8>(w, H, DP(const int8_t, 12) + (size_t)j * H, DP(const int8_t, 13) + (size_t)j * H,
-                            DP(const float, 14) + (size_t)j * nb,
-                            DP(float, 15) + (size_t)pq * 2 * I + mat * I + 16 * grp);
-            __syncthreads();
+        int rank = 0;
+        for (int y = 0; y < E && rank < N; ++y) {
+            const int d = cnt[y];
+            rank += d > c || (d == c && y < x);
+        }
+        if (rank < N) {
+            pick[rank] = x;
         }
     }
-}
-
-__global__ void __launch_bounds__(256) k_ds_hot_dn_g(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    int ex = blockIdx.y, k = DI(9), H = DI(10), I = DI(11), t = DI(8);
-    int slot = DP(const int, 3)[ex];
-    if (slot < 0) {
-        return;
-    }
-    __shared__ int pl[DS_HOT_MAXP];
-    __shared__ int np_;
-    const int *idx = DP(const int, 1);
-    for (int p0 = 0; p0 < t * k; p0 += DS_HOT_MAXP * k) {
-        int n = ds_hot_pairs(idx, ex, p0, t * k, k, pl, &np_);
-        if (n == 0) {
-            continue;
-        }
-        int grp = blockIdx.x, nb = I / 32;
-        const uint8_t *w = DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5) + di(r, e, 7) + (size_t)grp * nb * MXX_BB;
-        for (int q = 0; q < n; ++q) {
-            int pq = pl[q];
-            mxx_group_x2<8>(w, I, DP(const int8_t, 17) + (size_t)pq * I, DP(const int8_t, 18) + (size_t)pq * I,
-                            DP(const float, 19) + (size_t)pq * nb, DP(float, 20) + (size_t)pq * H + 16 * grp);
-            __syncthreads();
-        }
-    }
-}
-
-/* The same on the tensor cores (gg_caps.tc): a warp takes 16 rows of the
- * expert for 8 of its pairs at once, mma m16n8k32 on the int8 planes (the
- * weights 2 e2m1 from the KQ_MXX block: the 4 bytes at 32 c + 4 g are rows g
- * (low) and g + 8 (high) of values 4c .. 4c + 3, the A fragments; x the B
- * fragments), so for each block of 32 columns a = 128 sum(hi w) + sum(lo w),
- * exact in int32 as in k_mxx_rows_x2; then p = a 2^(e - 127) and f =
- * fma(p, xs, f) over the blocks in order, 0.5 f: the bits of the CPU. The
- * rows of the expert once for its pairs, 8 pairs a load. */
-template <bool DN>
-__global__ void __launch_bounds__(128) k_ds_hot_tc(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    int ex = DN ? blockIdx.y : blockIdx.z, k = DI(9), H = DI(10), I = DI(11), t = DI(8);
-    int slot = DP(const int, 3)[ex];
-    if (slot < 0) {
-        return;
-    }
-    __shared__ int pl[DS_HOT_MAXP];
-    __shared__ int np_;
-    const int *idx = DP(const int, 1);
-    for (int p0 = 0; p0 < t * k; p0 += DS_HOT_MAXP * k) {
-        int n = ds_hot_pairs(idx, ex, p0, t * k, k, pl, &np_);
-        if (n == 0) {
-            continue;
-        }
-        int cols = DN ? I : H, nb = cols / 32, grp = blockIdx.x, mat = DN ? 0 : blockIdx.y;
-        const uint8_t *wg = DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5) +
-                            (DN ? di(r, e, 7) : (mat ? di(r, e, 6) : 0)) + (size_t)grp * nb * MXX_BB;
-        const int8_t *qh = DP(const int8_t, DN ? 17 : 12), *ql = DP(const int8_t, DN ? 18 : 13);
-        const float *xs = DP(const float, DN ? 19 : 14);
-        float *out = DP(float, DN ? 20 : 15);
-        int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, c = lane % 4;
-        for (int t0 = 8 * warp; t0 < n; t0 += 32) {
-            /* the pair of this lane's B column (g), and of its C columns (2c, 2c + 1) */
-            int pb = t0 + g < n ? pl[t0 + g] : -1;
-            int pc0 = t0 + 2 * c < n ? pl[t0 + 2 * c] : -1, pc1 = t0 + 2 * c + 1 < n ? pl[t0 + 2 * c + 1] : -1;
-            size_t xb = pb < 0 ? 0 : (size_t)(DN ? pb : pb / k) * cols;
-            size_t s0 = pc0 < 0 ? 0 : (size_t)(DN ? pc0 : pc0 / k) * nb;
-            size_t s1 = pc1 < 0 ? 0 : (size_t)(DN ? pc1 : pc1 / k) * nb;
-            float f[4] = {0.f, 0.f, 0.f, 0.f};
-            for (int b = 0; b < nb; ++b) {
-                const uint8_t *blk = wg + (size_t)b * MXX_BB;
-                uint32_t w0 = *(const uint32_t *)(blk + 32 * c + 4 * g);
-                uint32_t w1 = *(const uint32_t *)(blk + 128 + 32 * c + 4 * g);
-                uint32_t a[4] = {kt_e2m1x4(w0), kt_e2m1x4(w0 >> 4), kt_e2m1x4(w1), kt_e2m1x4(w1 >> 4)};
-                uint32_t bh[2] = {0u, 0u}, bl[2] = {0u, 0u};
-                if (pb >= 0) {
-                    bh[0] = *(const uint32_t *)(qh + xb + 32 * b + 4 * c);
-                    bh[1] = *(const uint32_t *)(qh + xb + 32 * b + 16 + 4 * c);
-                    bl[0] = *(const uint32_t *)(ql + xb + 32 * b + 4 * c);
-                    bl[1] = *(const uint32_t *)(ql + xb + 32 * b + 16 + 4 * c);
-                }
-                int ch[4] = {0, 0, 0, 0}, cl[4] = {0, 0, 0, 0};
-                mma16832(ch, a, bh);
-                mma16832(cl, a, bl);
-                float e0 = e8m0f(blk[256 + g]), e1 = e8m0f(blk[256 + g + 8]);
-                float x0 = pc0 >= 0 ? xs[s0 + b] : 0.f, x1 = pc1 >= 0 ? xs[s1 + b] : 0.f;
-                f[0] = fmaf(__fmul_rn((float)(128 * ch[0] + cl[0]), e0), x0, f[0]);
-                f[1] = fmaf(__fmul_rn((float)(128 * ch[1] + cl[1]), e0), x1, f[1]);
-                f[2] = fmaf(__fmul_rn((float)(128 * ch[2] + cl[2]), e1), x0, f[2]);
-                f[3] = fmaf(__fmul_rn((float)(128 * ch[3] + cl[3]), e1), x1, f[3]);
+    __syncthreads();
+    for (int s = threadIdx.x; s < N; s += blockDim.x) {
+        const int x = pick[s];
+        list[s] = x;
+        if (x >= 0) {
+            smap[x] = DS_STAGE_SLOT0 + s0 + s;
+            if (omap) {
+                omap[x] = DS_STAGE_SLOT0 + s0 + s;
             }
-            /* c0, c1: row g, pairs 2c, 2c + 1; c2, c3: row g + 8 */
-            int rows[2] = {16 * grp + g, 16 * grp + g + 8};
-            int pcs[2] = {pc0, pc1};
-            for (int i = 0; i < 4; ++i) {
-                int pq = pcs[i & 1], row = rows[i >> 1];
-                if (pq < 0) {
-                    continue;
-                }
-                float v = __fmul_rn(f[i], 0.5f);
-                if (DN) {
-                    out[(size_t)pq * H + row] = v;
-                } else {
-                    out[(size_t)pq * 2 * I + mat * I + row] = v;
-                }
+        }
+    }
+}
+
+/* GP_DS_STAGE_PULL: list [N], tab [nr, 4] (int64 each range of an expert: the device address of expert
+ * 0's bytes of it in the weightkeeper's registered segments, the bytes from one expert to the next, its
+ * bytes, its offset in a slot; all 16-byte aligned, gpu.py checks), nr, N, stage, per, s0, blocks, ev:
+ * the experts of list into the slots s0 + s of stage, the GPU reading the host memory (k_fetch_pull's
+ * loop: two loads in flight a thread); on the side stream, its event ev (runner.cu, GP_DS_STAGE_JOIN). */
+__global__ void __launch_bounds__(256) k_ds_stage_pull(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    const int *list = DP(const int, 0);
+    const int64_t *tab = DP(const int64_t, 1);
+    const int nr = DI(2), N = DI(3), s0 = DI(6);
+    uint8_t *stage = DP(uint8_t, 4);
+    const size_t per = (size_t)di(r, e, 5), step = (size_t)gridDim.x * blockDim.x;
+    for (int s = 0; s < N; ++s) {
+        const int x = list[s];
+        if (x < 0) {
+            continue;
+        }
+        for (int q = 0; q < nr; ++q) {
+            const int4 *src = (const int4 *)(intptr_t)(tab[4 * q] + (int64_t)x * tab[4 * q + 1]);
+            int4 *dst = (int4 *)(stage + (size_t)(s0 + s) * per + (size_t)tab[4 * q + 3]);
+            const size_t n = (size_t)tab[4 * q + 2] / 16;
+            size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+            for (; i + step < n; i += 2 * step) {
+                int4 a = src[i], b = src[i + step];
+                dst[i] = a;
+                dst[i + step] = b;
+            }
+            if (i < n) {
+                dst[i] = src[i];
             }
         }
     }

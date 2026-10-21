@@ -52,8 +52,8 @@ def parser():
                    help="the tokens of the context (Qwen: the cache, default 98304; Gemma: the "
                         "most tokens of a request, default no limit)")
     g.add_argument("--lanes", type=int, default=1,
-                   help="Qwen3.8-Flash-Next on the GPU: 2 serves two requests at once, each with a "
-                        "cache of --ctx tokens (docs/LANES_PLAN.md); default 1")
+                   help="Qwen3.8-Flash-Next or DeepSeek V4.1 on the GPU: 2 serves two requests at once, "
+                        "each with a cache of --ctx tokens (docs/LANES_PLAN.md, OVERLAP_PLAN.md); default 1")
     g.add_argument("--contexts", type=int, default=4,
                    help="the conversations the cache keeps (every family): the one in use on the "
                         "device, the others in host memory; a request that goes on from one brings "

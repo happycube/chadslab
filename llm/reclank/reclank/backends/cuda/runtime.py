@@ -125,6 +125,9 @@ def lib():
     L.rc_gpu_fence_done.argtypes = [ctypes.c_int64, i]
     L.rc_gpu_pool_dims.argtypes = [vp]
     L.rc_gpu_host_register_rw.restype = ctypes.c_int64
+    L.rc_gpu_dev_addr.argtypes = [vp]
+    L.rc_gpu_dev_addr.restype = ctypes.c_int64
+    L.rc_gpu_task_log.argtypes = [i, vp, i]
     L.rc_gpu_set_tc.argtypes = [i]
     L.rc_gpu_host_alloc.argtypes = [sz]
     L.rc_gpu_cache_copy.argtypes = [vp, i]

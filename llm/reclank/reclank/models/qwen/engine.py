@@ -28,7 +28,7 @@ import numpy as np
 from reclank.core.messages import MEDIA_TYPES, PromptIds
 from reclank.core.speculative import DeviceOp, relay
 from reclank.core.session import RowCache, BufferRows, HostRows
-from reclank.core.think_guard import ThinkGuard, think_budget, think_left_open
+from reclank.core.think_guard import ThinkGuard, newline_test, report, think_budget, think_left_open
 from reclank.encoders import media as MD
 from reclank.models.base import Engine
 from reclank.models.qwen.chat import (THINK_CLOSE, TOOLS, WRAP_ANSWER, WRAP_THINK, QwenTok, _escaped,
@@ -90,6 +90,7 @@ class QwenEngine(Engine):
         self.think_force = ()
         self.wrap_think = ()
         self.wrap_answer = ()
+        self.ends_line = None     # (the think budget's wait for the end of a line: load)
         self.crash_dir = None
         # media input (--mmproj): the embedder, the default budgets, and a
         # cache of soft rows by media key
@@ -539,21 +540,13 @@ class QwenEngine(Engine):
             wrap_at = max(1, room - left + 1)
         guard = ThinkGuard.of(prompt_ids, self.tokenizer.t.special, eos_ids,
                               think_budget(self.think_budget, max_tokens, len(force)),
-                              force, wrap_at, self.wrap_think, self.wrap_answer)
+                              force, wrap_at, self.wrap_think, self.wrap_answer, self.ends_line)
         sampler.guard = guard
         try:
             yield from self._decode(logits, n, max_tokens, sampler, eos_ids)
         finally:
             sampler.guard = None
-            if guard is not None and guard.fixes:
-                print("[qwen4] the model ended the turn inside <think>: </think> in its place",
-                      file=sys.stderr, flush=True)
-            if guard is not None and guard.wrapped:
-                print("[qwen4] fewer than %d tokens of the context left at token %d of the answer: "
-                      "the words to wrap up" % (self.wrap_left, guard.wrap_at), file=sys.stderr, flush=True)
-            if guard is not None and guard.budget_hits:
-                print("[qwen4] the think part reached its budget (%d tokens): closed" % guard.budget,
-                      file=sys.stderr, flush=True)
+            report(guard, "qwen4", self.wrap_left)
 
     def _decode(self, logits, n, max_tokens, sampler, eos_ids):
         pos, count, t0 = n, 0, time.time()
@@ -639,7 +632,7 @@ def _lanes_up(eng, opts):
     eb = QwenEngine(eng.model, eng.dev, eng.tokenizer, eng.ctx, eng.cache_cls,
                     contexts=eng.ctxs.max_contexts, contexts_gb=eng.ctxs.max_bytes / 1e9)
     for k in ("worker", "think_budget", "wrap_left", "crash_dir", "wrap_think", "wrap_answer",
-              "think_force", "mtp", "embedder", "image_budget", "video_budget", "video_frames"):
+              "think_force", "ends_line", "mtp", "embedder", "image_budget", "video_budget", "video_frames"):
         setattr(eb, k, getattr(eng, k))
     eb._media_rows = eng._media_rows
     eb.lane, eb.index = lane, 1
@@ -817,6 +810,7 @@ def load(opts, meta, worker=None):
     eng.wrap_think = tok.encode(WRAP_THINK)
     eng.wrap_answer = tok.encode(WRAP_ANSWER)
     eng.think_force = tok.encode(THINK_CLOSE)
+    eng.ends_line = newline_test(tok.decode)
     # MTP is on by default (3 drafts) with the layer: on the 2-socket Xeon
     # and the 3090 with the RQ8_0 file, 1 draft was best (greedy 27.7 ->
     # 30.4 tok/s; 2 or 3 drafts 29.6 and 29.0); with the MIX-BF12 file, the

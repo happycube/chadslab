@@ -330,6 +330,17 @@ class ExpertParts:
         q.keep += scr
         return q.finish()
 
+    def program_spec(self, i, k, hf, gate, bias, mp, cur=None, nxt=None):
+        """The prefetch of layer i's cold experts (flag 4096 of GP_KQ_MOE_PART, DeepSeek V4.1 steps):
+        layer i's router (gate bf16 [E, hidden], bias) on hf (the layer before's input), the top k that
+        mp (the host copy of the GPU's slots) does not hold, each part's rows of them read until nxt
+        (layer i's task's flag in) reaches cur (the value of the last task's flag out)."""
+        q = P.Program()
+        q.emit(P.RUN_PARTS, self.nparts, self.team, self.cpus_arr)
+        q.emit(P.KQ_MOE_PART, hf, None, None, 1, k, self.E, self.pm[i], self.hidden, self.inner, self.gu_arr,
+               self.dn_arr, None, None, self.nparts, self.team, None, 4096, None, gate, bias, mp, cur, nxt)
+        return q.finish()
+
 
 def _scratch_bytes(t, k, E, hidden, inner, ni, nd):
     from reclank.backends.cpu import cops

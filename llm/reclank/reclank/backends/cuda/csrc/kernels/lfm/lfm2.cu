@@ -228,6 +228,108 @@ __global__ void __launch_bounds__(256) k_router_sig_b(const gp_rec *r, const int
     }
 }
 
+/* k_router_sig_b's choices by a bitonic sort (E <= 1024; N the power of two from E up, N / 2 threads a
+ * block): the experts by score down, the index up on a tie (k_router_sig_b's order of choice: a total
+ * order), so the first k are its slots in its order; then the sum in the order of the slots: the same
+ * choices, sum and weights (k_router_sig_b's 22 rounds took 24 us a token on a 3090, a rank of each
+ * expert 20). Operands past k_router_sig_b's (or none): 9 counts (each choice of the first nreal rows
+ * adds 1: GP_COUNT's), 10 slots, 11 cold, 12 count (GP_NM_SPLIT's: a pair's expert when its slot is
+ * -1, else -1; their count; the grid one block for all the rows), 13 nreal. */
+__device__ void router_sig_r_body(const gp_rec *r, const int64_t *e)
+{
+    __shared__ float s[1024], c[1024];
+    __shared__ int id[1024], ncold;
+    const int t = DI(1), E = DI(2), k = DI(3), tid = threadIdx.x, N = 2 * blockDim.x;
+    const float *bias = r->tag[6] == GP_T_NONE ? NULL : DP(const float, 6);
+    int *counts = r->tag[9] == GP_T_NONE ? NULL : DP(int, 9);
+    const int *slots = r->tag[10] == GP_T_NONE ? NULL : DP(const int, 10);
+    int nreal = r->tag[13] == GP_T_NONE ? t : DI(13);
+    nreal = nreal > 0 && nreal < t ? nreal : t;
+    const float sc = df(r, e, 7), eps = r->tag[8] == GP_T_NONE ? 1e-6f : df(r, e, 8);
+    if (tid == 0) {
+        ncold = 0;
+    }
+    const int j0 = slots != NULL ? 0 : blockIdx.x, j1 = slots != NULL ? t : blockIdx.x + 1;
+    for (int j = j0; j < j1; ++j) {
+        const float *l = DP(const float, 0) + (size_t)j * E;
+        __syncthreads();
+        for (int x = tid; x < N; x += blockDim.x) {
+            if (x < E) {
+                s[x] = 1.f / (1.f + expf(-l[x]));
+                c[x] = s[x] + (bias != NULL ? bias[x] : 0.f);
+            } else {
+                c[x] = -INFINITY;
+            }
+            id[x] = x;
+        }
+        __syncthreads();
+        for (int kk = 2; kk <= N; kk <<= 1) {
+            for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+                const int i = (tid / jj) * 2 * jj + tid % jj, ix = i + jj;
+                const float ca = c[i], cb = c[ix];
+                const int ia = id[i], ib = id[ix];
+                const bool bfirst = cb > ca || (cb == ca && ib < ia);
+                if (bfirst == ((i & kk) == 0)) {
+                    c[i] = cb;
+                    c[ix] = ca;
+                    id[i] = ib;
+                    id[ix] = ia;
+                }
+                __syncthreads();
+            }
+        }
+        float *val = DP(float, 4) + (size_t)j * k;
+        int *idx = DP(int, 5) + (size_t)j * k;
+        if (tid == 0) {
+            float sum = 0.f;
+            for (int q = 0; q < k; ++q) {
+                sum += s[id[q]];
+                idx[q] = id[q];
+                val[q] = s[id[q]];
+            }
+            for (int q = 0; q < k; ++q) {
+                val[q] = val[q] / (sum + eps) * sc;
+            }
+        }
+        if (tid < k) {
+            const int x = id[tid];
+            if (counts != NULL && j < nreal) {
+                atomicAdd(&counts[x], 1);
+            }
+            if (slots != NULL) {
+                const int cx = j < nreal && slots[x] < 0 ? x : -1;
+                DP(int, 11)[(size_t)j * k + tid] = cx;
+                if (cx >= 0) {
+                    atomicAdd(&ncold, 1);
+                }
+            }
+        }
+    }
+    if (slots != NULL) {
+        __syncthreads();
+        if (tid == 0) {
+            *DP(int, 12) = ncold;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(512) k_router_sig_r(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    router_sig_r_body(r, e);
+}
+
+/* RECLANK_GPU_ROUTER_RANK=0: k_router_sig_b (a measure) */
+static int router_rank_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_ROUTER_RANK");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 /* k_attn64: GP_ATTN_QC (int16, MODE 0) or GP_ATTN_Q8 (int8, MODE 1) with
  * head_dim 64: q, kq, ks, vq, vs, scores, out, q_heads, kv_heads, 64, n; or
  * GP_ATTN_F32H of one token (MODE 2, the float32 rows of the first full

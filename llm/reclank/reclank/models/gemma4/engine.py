@@ -14,6 +14,7 @@ import time
 
 from reclank.core.messages import PromptIds, content_text, has_media, message_parts
 from reclank.core.session import SessionPool
+from reclank.core.think_guard import newline_test, report
 from reclank.models.base import Engine
 
 FAMILY = "gemma4"
@@ -193,7 +194,15 @@ class GemmaEngine(Engine):
         tool result when the thought channel is on; the model then writes
         its thought with no opener and closes it with <channel|>."""
         tail = self.tokenizer.decode(list(prompt_ids[-4:]), skip_special_tokens=False)
-        return THOUGHT_OPEN if tail.endswith(THOUGHT_OPEN) else ""
+        if tail.endswith(THOUGHT_OPEN):
+            return THOUGHT_OPEN
+        # a "continue" after an answer that max_tokens cut (server/backend.py continuation): the
+        # prompt ends inside the thought of the model's last turn
+        turn = self.tokenizer.encode("<|turn>")
+        ids = list(prompt_ids)
+        start = next((i for i in range(len(ids) - 1, -1, -1) if ids[i] == turn[0]), -1) if len(turn) == 1 else -1
+        text = self.tokenizer.decode(ids[start + 1:], skip_special_tokens=False)
+        return THOUGHT_OPEN if text.rfind(THOUGHT_OPEN) > text.rfind("<channel|>") else ""
 
     def completion_ids(self, prompt):
         return self.tokenizer.encode(prompt)
@@ -230,7 +239,8 @@ class GemmaEngine(Engine):
                           think_budget(self.think_budget, max_tokens, len(tt["force"])),
                           tt["force"], think=bool(self.open_channel(prompt_ids)), wrap_at=wrap_at,
                           wrap_think=tt["wrap_think"], wrap_answer=tt["wrap_answer"],
-                          tool=(tt["tool_open"], tt["tool_close"]), open_id=tt["open"])
+                          tool=(tt["tool_open"], tt["tool_close"]), open_id=tt["open"],
+                          ends_line=tt.get("ends_line"))
 
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids, session=None):
         """Yield one token id at a time for a prompt. session: the
@@ -266,16 +276,7 @@ class GemmaEngine(Engine):
             # generator
             sampler.guard = None
             self.pool.done(session, sid=sid)    # a long prompt to disk (--context-dir)
-            if guard is not None and guard.fixes:
-                print("[reclank] the model ended the turn inside the thought channel: <channel|> "
-                      "in its place", file=sys.stderr, flush=True)
-            if guard is not None and guard.wrapped:
-                print("[reclank] fewer than %d tokens of the context left at token %d of the answer: "
-                      "the words to wrap up" % (self.wrap_left, guard.wrap_at), file=sys.stderr,
-                      flush=True)
-            if guard is not None and guard.budget_hits:
-                print("[reclank] the think part reached its budget (%d tokens): closed" % guard.budget,
-                      file=sys.stderr, flush=True)
+            report(guard, "reclank", self.wrap_left)
             st = session.mtp_stats
             if self.drafter is not None and st.get("drafts"):
                 print('[reclank] mtp steps=%d drafts=%d accepted=%d (%d%%)' % (
@@ -448,7 +449,8 @@ def load(opts, meta=None):
             "open": one("<|channel>"), "close": one("<channel|>"),
             "force": tok.encode(THINK_CLOSE), "wrap_think": tok.encode(WRAP_THINK),
             "wrap_answer": tok.encode(WRAP_ANSWER),
-            "tool_open": one("<|tool_call>"), "tool_close": one("<tool_call|>")}
+            "tool_open": one("<|tool_call>"), "tool_close": one("<tool_call|>"),
+            "ends_line": newline_test(tok.decode)}
     if opts.mmproj:
         from reclank.models.gemma4.encoders import load_embedder
         # The encoders on the GPU when the model is (RECLANK_MEDIA_GPU=0: CPU).

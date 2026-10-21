@@ -24,9 +24,64 @@ static int ds_route_fuse_on(void)
     return v;
 }
 
+static int ds_attn_g2_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("RECLANK_DS_ATTN_G2");
+        v = s ? atoi(s) != 0 : 1;
+    }
+    return v;
+}
+
+/* RECLANK_DS_HOT_TC6: the hot experts by ds_hot_tc6 (the lists, then the held experts' items) for the
+ * groups of a prompt (bit 0), the steps (bit 1: t 1) and the verify groups (bit 2: t 2 .. 8; a pair of
+ * lanes' steps too); default 5: a step's experts take a pair or two each, and k_ds_hot_gu reads their
+ * weights as fast (34.2 ms a step either way); a verify group of 4 to 8 rows 1-4% faster */
+static int ds_hot_tc6_on(int64_t t)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("RECLANK_DS_HOT_TC6");
+        v = s ? atoi(s) : 5;
+    }
+    return (v >> (t > 8 ? 0 : t == 1 ? 1 : 2)) & 1;
+}
+
+static int ds_attn_tc_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("RECLANK_DS_ATTN_TC");
+        v = s ? atoi(s) != 0 : 0;
+    }
+    return v;
+}
+
 /* an expert device's copy (expert_dev.cu, Nemotron) with RECLANK_EX_HG=0: its groups by the rows
  * kernels, not k_nm_hg_* (a test) */
 static int gg_nm_hg_off;
+
+/* GP_DS_STAGE_PULL beside the program's kernels: the stream's event after the pick, the pull on gg_side
+ * after it, then the pull's event gg_side_ev[ev]; GP_DS_STAGE_JOIN makes the stream wait for that event
+ * (in a graph: a branch, joined in the same segment: rc_gpu_load). Made by a thread when it loads or first runs
+ * such a program. */
+#define GG_SIDE_EV 4
+static __thread cudaStream_t gg_side;            /* (each thread its own: the lanes, rc_gpu_lane) */
+static __thread cudaEvent_t gg_side_fork, gg_side_ev[GG_SIDE_EV];
+
+static int gg_side_init(void)
+{
+    if (gg_side != NULL) {
+        return 0;
+    }
+    CK(cudaStreamCreateWithFlags(&gg_side, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&gg_side_fork, cudaEventDisableTiming));
+    for (int k = 0; k < GG_SIDE_EV; ++k) {
+        CK(cudaEventCreateWithFlags(&gg_side_ev[k], cudaEventDisableTiming));
+    }
+    return 0;
+}
 
 static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const int64_t *denv)
 {
@@ -753,11 +808,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         return 0;
     case GP_KQ_LINEAR:
         if (hlit(r, 5, &bad) == KQ_MXF8) {
-            /* an MXFP8 matrix of FP4-Local (kernels/quant/mxf8.cu): x in bfloat16, out rounded */
+            /* an MXFP8 matrix of FP4-Local (kernels/quant/mxf8.cu): x in bfloat16, out rounded; operand 10 (or
+             * none): a factor of every output (Super's FP8 tensor scale, the GP_MUL after it folded in) */
+            const float sc = r->tag[10] != GP_T_NONE ? hlitf(r, 10, &bad) : 1.f;
             if (bad || mxf8_linear_launch((const float *)(intptr_t)hi(r, g->henv, 3),
                                           (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (int)hlit(r, 6, &bad),
                                           (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
-                                          (float *)(intptr_t)hi(r, g->henv, 9), g->w16, g->w16_n,
+                                          (float *)(intptr_t)hi(r, g->henv, 9), sc, g->w16, g->w16_n,
                                           (uint16_t *)g->xh, g->xh_n, s) != 0) {
                 bad = 1;
             }
@@ -884,6 +941,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
         } else if (bt_on() && hlit(r, 8, &bad) <= 8 &&
                    bt_shape((int)hlit(r, 5, &bad), (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad)) &&
+                   /* (one token on a matrix of at most 4096 x 4096: k_kq_linear_bf12 below, Super's latent
+                    * projections 18.2 -> 13.6 us, its router 11.2 -> 9.3; 4 tokens 18.6 against 25.5 here) */
+                   !(hlit(r, 8, &bad) == 1 && hlit(r, 6, &bad) <= 4096 && hlit(r, 7, &bad) <= 4096) &&
                    !(hlit(r, 7, &bad) >= 4096 && hlit(r, 6, &bad) >= 16384 && hlit(r, 5, &bad) == KQ_BF12 &&
                      bf16_nt_on() && !(kq_split_on() && hlit(r, 7, &bad) >= 8192) && hlit(r, 7, &bad) % 32 == 0)) {
             /* (long rows, many of them, as DeepSeek V4.1's head of 129280 x 5120: the CUDA-core kernels
@@ -1417,6 +1477,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_NM_SPLIT:
         k_nm_split<<<1, 256, 0, s>>>(dr, denv);
         break;
+    case GP_NM_PLAN:
+        if (hlit(r, 8, &bad) > NM_PLAN_E || hlit(r, 5, &bad) / hlit(r, 6, &bad) > NM_PLAN_T) {
+            bad = 1;
+            break;
+        }
+        k_nm_plan<<<1, 1024, 0, s>>>(dr, denv);
+        break;
     case GP_NM_HOT_MOE: {
         int64_t k = hlit(r, 9, &bad), L = hlit(r, 10, &bad), inner = hlit(r, 11, &bad), t = hlit(r, 12, &bad);
         if (L % 256 != 0 || inner % 256 != 0) {
@@ -1458,6 +1525,27 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         break;
     }
+    case GP_NM_HOT_NV4: {
+        /* x, idx, val, slots, up, down, act, de, out, k, L, inner, t (GP_NM_HOT_MOE's); 13, 14 or none:
+         * the device address of each expert's up and down rows (the slots mark the hot ones) */
+        int64_t k = hlit(r, 9, &bad), L = hlit(r, 10, &bad), inner = hlit(r, 11, &bad), t = hlit(r, 12, &bad);
+        if (L % 32 != 0 || inner % 32 != 0) {
+            bad = 1;
+            break;
+        }
+        if (nm_hot_b_on() && L <= 1024 && inner <= 3072) {
+            /* (up: x of L <= 1024 columns, one block a lane; down: the act of inner <= 3072, three) */
+            k_nm_hot_nv4b<false, 8, 1><<<dim3((unsigned)cdiv(inner, 64), (unsigned)(t * k)), 256,
+                                         (size_t)L * 4, s>>>(dr, denv);
+            k_nm_hot_nv4b<true, 4, 3><<<dim3((unsigned)cdiv(L, 32), (unsigned)(t * k)), 256,
+                                        (size_t)inner * 4, s>>>(dr, denv);
+        } else {
+            k_nm_hot_up_nv4<<<dim3((unsigned)cdiv(inner, 8), (unsigned)(t * k)), 256, 0, s>>>(dr, denv);
+            k_nm_hot_down_nv4<<<dim3((unsigned)cdiv(L, 8), (unsigned)(t * k)), 256, 0, s>>>(dr, denv);
+        }
+        k_nm_hot_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+        break;
+    }
     case GP_NM_KV:
         k_nm_kv<<<(unsigned)cdiv(hlit(r, 5, &bad) * hlit(r, 4, &bad), 256), 256, 0, s>>>(dr, denv);
         break;
@@ -1467,6 +1555,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             bad = 1;
             break;
         }
+        if (t >= NM_FA_MIN && nm_fa_on()) {
+            /* a group: the tensor cores (k_nm_fattn: 8 tokens a block, no chunks to merge) */
+            k_nm_fattn<<<dim3((unsigned)cdiv(t, 8), (unsigned)nk), 256, 0, s>>>(dr, denv);
+            break;
+        }
         k_nm_attn2<<<dim3((unsigned)nm_nch((int)t), (unsigned)nk, (unsigned)t), 256, 0, s>>>(dr, denv);
         k_nm_attn_merge<<<dim3((unsigned)nq, (unsigned)t), NM_HD, 0, s>>>(dr, denv);
         break;
@@ -1474,6 +1567,60 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_NM_GROUP_MOE: {
         int64_t k = hlit(r, 13, &bad), L = hlit(r, 14, &bad), inner = hlit(r, 15, &bad);
         int64_t t = hlit(r, 16, &bad), E = hlit(r, 17, &bad);
+        /* operand 21: the type of the experts (none: KQ_IQ2R; KQ_NV4: Super's, k_nm_gtile_nv4) */
+        const int64_t xtype = r->tag[21] != GP_T_NONE ? hlit(r, 21, &bad) : KQ_IQ2R;
+        if (xtype == KQ_NV4) {
+            const int x2 = r->tag[19] != GP_T_NONE && hlit(r, 19, &bad) != 0;
+            if (L % 32 != 0 || L > 1024 || inner % 32 != 0 || E > 4096 || !nm_tc_on()) {
+                bad = 1;
+                break;
+            }
+            const size_t su = nm_gtile_nv4_smem((int)L), sd = nm_gtile_nv4_smem((int)inner);
+            static size_t set_u = 0, set_d = 0;      /* (the opt-in of the dynamic shared memory, once a size) */
+            if (su > 48 * 1024 && su > set_u) {
+                cudaFuncSetAttribute(k_nm_gtile_nv4<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)su);
+                cudaFuncSetAttribute(k_nm_gtile_nv4<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)su);
+                set_u = su;
+            }
+            if (sd > 48 * 1024 && sd > set_d) {
+                cudaFuncSetAttribute(k_nm_gtile_nv4<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sd);
+                cudaFuncSetAttribute(k_nm_gtile_nv4<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sd);
+                set_d = sd;
+            }
+            k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+            k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            dim3 gu((unsigned)E, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)E, (unsigned)cdiv(L, GM_BM));
+            /* (the up tiles quantize the act themselves: operand 7 unused). Operand 22 (or none): the experts in
+             * the GPU's memory (the stage buffers: k_nm_gtile_nv4c, 64 x 64 tiles) */
+            if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) == 2 && L % 64 == 0 && inner % 64 == 0) {
+                /* the experts in NV4T (the stage buffers by k_nm_tile_pull): k_nm_gtile_nv4t */
+                dim3 cu((unsigned)(inner / 64), (unsigned)E), cd((unsigned)(L / 64), (unsigned)E);
+                if (x2) {
+                    k_nm_gtile_nv4t<false, true><<<cu, 256, 0, s>>>(dr, denv);
+                    k_nm_gtile_nv4t<true, true><<<cd, 256, 0, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile_nv4t<false, false><<<cu, 256, 0, s>>>(dr, denv);
+                    k_nm_gtile_nv4t<true, false><<<cd, 256, 0, s>>>(dr, denv);
+                }
+            } else if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) != 0 && L % 64 == 0 && inner % 64 == 0 && nm_gc_on()) {
+                dim3 cu((unsigned)(inner / 64), (unsigned)E), cd((unsigned)(L / 64), (unsigned)E);
+                if (x2) {
+                    k_nm_gtile_nv4c<false, true><<<cu, 256, 0, s>>>(dr, denv);
+                    k_nm_gtile_nv4c<true, true><<<cd, 256, 0, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile_nv4c<false, false><<<cu, 256, 0, s>>>(dr, denv);
+                    k_nm_gtile_nv4c<true, false><<<cd, 256, 0, s>>>(dr, denv);
+                }
+            } else if (x2) {
+                k_nm_gtile_nv4<false, true><<<gu, 256, su, s>>>(dr, denv);
+                k_nm_gtile_nv4<true, true><<<gd, 256, sd, s>>>(dr, denv);
+            } else {
+                k_nm_gtile_nv4<false, false><<<gu, 256, su, s>>>(dr, denv);
+                k_nm_gtile_nv4<true, false><<<gd, 256, sd, s>>>(dr, denv);
+            }
+            k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            break;
+        }
         if (L % 256 != 0 || L > 1024 || inner % 256 != 0 || inner > 256 * NM_GMAXB || E > 4096) {
             bad = 1;
             break;
@@ -1592,6 +1739,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             } else {
                 bad = 1;
             }
+        } else if (nm_tc_on() && type == KQ_NV4 && rows % 64 == 0 && cols % 64 == 0 && nm_gc_on()) {
+            /* KQ_NV4 rows of a group: 64 x 64 tiles (k_nm_gemm8_nv4c) */
+            dim3 gc((unsigned)(rows / 64), (unsigned)cdiv(t, 64));
+            if (x2) k_nm_gemm8_nv4c<true><<<gc, 256, 0, s>>>(dr, denv);
+            else k_nm_gemm8_nv4c<false><<<gc, 256, 0, s>>>(dr, denv);
         } else if (nm_tc_on()) {
             /* the tensor cores (sm_80 up) */
             if (type == KQ_IQ2R) {
@@ -1708,7 +1860,27 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (hlit(r, 2, &bad) > 1024 || hlit(r, 3, &bad) > 32) {
             bad = 1;
         }
-        if (hlit(r, 2, &bad) > 128) {
+        if (hlit(r, 2, &bad) > 128 && router_rank_on()) {
+            /* (operand 10, the split: one block for all the rows) */
+            int n = 64;
+            while (n < hlit(r, 2, &bad)) {
+                n *= 2;
+            }
+            if (r->tag[10] != GP_T_NONE && hlit(r, 1, &bad) > 32) {
+                bad = 1;
+                break;
+            }
+            const gp_rec *n1 = r + 1;
+            if (r->tag[10] != GP_T_NONE && n1 < g->hcode + g->n_code && n1->op == GP_SIGNAL && ds_route_fuse_on()) {
+                /* (a step's router and its split, and the signal after: k_nm_route_signal, one kernel) */
+                k_nm_route_signal<<<1, (unsigned)(n / 2), 0, s>>>(dr, denv, dr + 1);
+                gg_skip = n1;
+                break;
+            }
+            k_router_sig_r<<<r->tag[10] != GP_T_NONE ? 1u : (unsigned)hlit(r, 1, &bad), (unsigned)(n / 2), 0, s>>>(dr, denv);
+        } else if (r->tag[9] != GP_T_NONE || r->tag[10] != GP_T_NONE) {
+            bad = 1;            /* (the fused count and split: k_router_sig_r only) */
+        } else if (hlit(r, 2, &bad) > 128) {
             k_router_sig_b<<<(unsigned)hlit(r, 1, &bad), 256, 0, s>>>(dr, denv);
         } else {
             k_router_sig<<<(unsigned)hlit(r, 1, &bad), 32, 0, s>>>(dr, denv);
@@ -2015,9 +2187,22 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             break;
         }
         if (hlit(r, 14, &bad) > 8 && hlit(r, 9, &bad) % DS_GHB == 0) {
-            /* a group of a prompt: one pass, the keys decoded once for 16 heads */
-            k_ds_attn_g<<<dim3((unsigned)(hlit(r, 9, &bad) / DS_GHB), (unsigned)hlit(r, 14, &bad)), 256, 0, s>>>(
-                dr, denv);
+            /* a group of a prompt: one pass, the keys decoded once for 16 heads (hd 512: in rounds of
+             * DS_G2KC keys, k_ds_attn_g2; RECLANK_DS_ATTN_G2=0: k_ds_attn_g) */
+            if (hlit(r, 10, &bad) == 512 && hlit(r, 9, &bad) % 64 == 0 && ds_attn_tc_on()) {
+                cudaFuncSetAttribute(k_ds_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DS_TSMEM);
+                k_ds_attn_tc<<<dim3((unsigned)(hlit(r, 9, &bad) / 64), (unsigned)hlit(r, 14, &bad)), 256, DS_TSMEM,
+                               s>>>(dr, denv);
+            } else if (hlit(r, 10, &bad) == 512 && ds_attn_g2_on()) {
+                k_ds_attn_g2<<<dim3((unsigned)(hlit(r, 9, &bad) / DS_GHB), (unsigned)hlit(r, 14, &bad)), 256, 0, s>>>(
+                    dr, denv);
+            } else {
+                k_ds_attn_g<<<dim3((unsigned)(hlit(r, 9, &bad) / DS_GHB), (unsigned)hlit(r, 14, &bad)), 256, 0, s>>>(
+                    dr, denv);
+            }
+            if (!bad && ds_dump_attn(g, r) != 0) {
+                return -1;
+            }
             break;
         }
         k_ds_attn<<<dim3((unsigned)(hlit(r, 9, &bad) / DS_AHB), (unsigned)hlit(r, 14, &bad)), 256, 0, s>>>(dr,
@@ -2062,7 +2247,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
          * a verify group: a block for each pair */
         int grouped = t > 8;
         int64_t E = grouped ? hlit(r, 21, &bad) : 0;
-        if (grouped && gg_caps.tc) {
+        int tc6 = gg_caps.tc && ds_hot_tc6_on(t) && r->tag[21] == GP_T_INT &&
+                  ds_hot_tc6_fits(H, I, r->v[21]) && ds_hot_hl_ints((size_t)(t * k), (size_t)r->v[21]) <= g->hl_n;
+        if (tc6) {
+            ds_hot_tc6(0, dr, denv, (const int *)(intptr_t)hi(r, g->henv, 1), (const int *)(intptr_t)hi(r, g->henv, 3),
+                       g->hl, t * k, r->v[21], H, I, s);
+        } else if (grouped && gg_caps.tc) {
             k_ds_hot_tc<false><<<dim3((unsigned)(I / 16), 2, (unsigned)E), 128, 0, s>>>(dr, denv);
         } else if (grouped) {
             k_ds_hot_gu_g<<<dim3((unsigned)(I / 16), 2, (unsigned)E), 256, 0, s>>>(dr, denv);
@@ -2079,13 +2269,47 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 (const float *)(intptr_t)hi(r, g->henv, 16), (int8_t *)(intptr_t)hi(r, g->henv, 17),
                 (int8_t *)(intptr_t)hi(r, g->henv, 18), (float *)(intptr_t)hi(r, g->henv, 19), NULL, ab);
         }
-        if (grouped && gg_caps.tc) {
+        if (tc6) {
+            ds_hot_tc6(1, dr, denv, NULL, NULL, g->hl, t * k, r->v[21], H, I, s);
+        } else if (grouped && gg_caps.tc) {
             k_ds_hot_tc<true><<<dim3((unsigned)(H / 16), (unsigned)E), 128, 0, s>>>(dr, denv);
         } else if (grouped) {
             k_ds_hot_dn_g<<<dim3((unsigned)(H / 16), (unsigned)E), 256, 0, s>>>(dr, denv);
         } else {
             k_ds_hot_dn<<<dim3((unsigned)(H / 16), (unsigned)(t * k)), 256, 0, s>>>(dr, denv);
         }
+        if (ds_dump_hot(g, r) != 0) {
+            return -1;
+        }
+        break;
+    }
+    case GP_DS_STAGE_PICK:
+        if (hlit(r, 5, &bad) > DS_STAGE_E || hlit(r, 6, &bad) > DS_STAGE_N) {
+            bad = 1;
+            break;
+        }
+        k_ds_stage_pick<<<1, 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_DS_STAGE_PULL: {
+        int ev = (int)hlit(r, 8, &bad);
+        if (bad || ev < 0 || ev >= GG_SIDE_EV || gg_side_init() != 0) {
+            bad = 1;
+            break;
+        }
+        CK(cudaEventRecord(gg_side_fork, s));
+        CK(cudaStreamWaitEvent(gg_side, gg_side_fork, 0));
+        k_ds_stage_pull<<<(unsigned)hlit(r, 7, &bad), 256, 0, gg_side>>>(dr, denv);
+        CK(cudaGetLastError());
+        CK(cudaEventRecord(gg_side_ev[ev], gg_side));
+        break;
+    }
+    case GP_DS_STAGE_JOIN: {
+        int ev = (int)hlit(r, 0, &bad);
+        if (bad || ev < 0 || ev >= GG_SIDE_EV || gg_side == NULL) {
+            bad = 1;
+            break;
+        }
+        CK(cudaStreamWaitEvent(s, gg_side_ev[ev], 0));
         break;
     }
     case GP_DS_COMBINE:

@@ -50,8 +50,9 @@ class LaneScheduler:
     """Two generations at once on the model thread (docs/LANES_PLAN.md): the engines of the
     lanes (engines[0] the model's own state, engines[1] lane B: engine.on() puts its state in
     place). A generation is a generator of tokens that hands its runs over as DeviceOps
-    (reclank/core/speculative.py): a step or a verify group ("run"), or a pause between the parts
-    of a prompt. Each tick resumes the lanes that have no run pending, then runs the runs: the two
+    (reclank/core/speculative.py): a step or a verify group ("run"), a pause between the parts
+    of a prompt, or a "yield" (a decode that ran its own work, as Nemotron's MTP rounds: it goes on
+    at the next tick, and counts as decoding for the other lane's pause). Each tick resumes the lanes that have no run pending, then runs the runs: the two
     at once when both lanes decode (engines[0].pair), else each alone. A lane's requests wait in
     its queue (backend.route chose the lane)."""
 
@@ -169,10 +170,12 @@ class LaneScheduler:
                 # the pause holds while another lane decodes: it has a run pending, or it has
                 # none yet (it ran this tick or the last; resumed below, it hands one over). Not
                 # while the other reads a prompt too (paused): then the parts take turns.
-                decodes = any(t is not None and (t.op is None or t.op.kind == "run")
+                decodes = any(t is not None and (t.op is None or t.op.kind in ("run", "yield"))
                               for j, t in enumerate(self.slots) if j != i)
                 if now < s.until and decodes:
                     continue
+                s.op = None
+            if s.op is not None and s.op.kind == "yield":
                 s.op = None
             if s.op is None:
                 self._resume(i, note)

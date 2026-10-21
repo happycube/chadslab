@@ -37,7 +37,7 @@ from reclank.backends.cpu import cops
 from reclank.backends.cuda.gpumm import Buffer, pinned
 from reclank.backends.cuda.runtime import GPUProgram, _check, lib
 from reclank.ir import program as P
-from reclank.models.deepseek41.gpu import VERIFY_MAX, _placeholder
+from reclank.models.deepseek41.gpu import VERIFY_MAX, _placeholder, gpu_oom
 
 
 # the cutoff of the verify length (DSpark.choose), as the MTP drafters' RECLANK_MTP_STOP; the first
@@ -302,7 +302,12 @@ class DSpark:
         prog.keep += self.rings
         prog.finish()
         io.prog = prog
-        io.g = GPUProgram(prog, graph=g.graph, mirror=g.mirror)
+        try:
+            io.g = GPUProgram(prog, graph=g.graph, mirror=g.mirror)
+            io.g.prepare()      # the graphs now: their memory shows in run (DSV41GPU.make_room)
+        except BaseException:
+            g.drop_run(io)
+            raise
         return io
 
     def drop(self):
@@ -326,9 +331,13 @@ class DSpark:
             self.run(t, True).g.prepare()
 
     def run(self, tm, draft):
-        key = (tm, draft)
-        if key not in self.progs:
-            self.progs[key] = self._compile(tm, draft)
+        key = (tm, draft) + ((("lane", self.g.lane_id),) if self.g.lane_id else ())
+        while key not in self.progs:
+            try:
+                self.progs[key] = self._compile(tm, draft)
+            except (MemoryError, RuntimeError) as e:
+                if not gpu_oom(e) or not self.g.make_room(e):
+                    raise
         return self.progs[key]
 
     def reset(self):
@@ -447,8 +456,23 @@ class DSpark:
             probs[hit[0]] = 0.0
         return False, sampler._sample(cand, probs)
 
+    def _run(self, tokens, pos, coop):
+        """(yield from) A step or a verify group of the main model handed to the scheduler of the
+        lanes (server/worker.py: a DeviceOp, alone or beside the other lane's run; its outputs are
+        then g.last's): the coop form of g.verify. Return (logits [t, vocab], main_h)."""
+        assert coop
+        g = self.g
+        from reclank.core.speculative import DeviceOp
+        yield DeviceOp("run", tokens, pos)
+        # the outputs as the run left them in host memory (forward, verify and lanes.run_both
+        # download both): the other lane may have freed the programs since (make_room), so no
+        # device copy is read here
+        r = g.last
+        mh = r.main_h[:len(tokens)].copy() if r.main_h is not None else None
+        return r.logits[:len(tokens)].copy(), mh
+
     def stream(self, lg, main_last, pos, sampler, max_tokens=None, eos=(), spec="auto", fixed=None, probe=8,
-               stats=None):
+               stats=None, coop=False):
         """The tokens after a prompt whose state the main model and the rings
         hold (lg: the logits of its last token, main_last: its input of
         DSpark, pos: its length), as they come (a generator), up to max_tokens
@@ -458,12 +482,16 @@ class DSpark:
         the bits); True: a draft every round; "auto": a draft only while the
         rounds give more tokens a second than plain steps (both rates measured
         as it runs; every probe-th step tries the other). fixed: always that
-        many drafts. stats (a dict): filled as it runs."""
+        many drafts. stats (a dict): filled as it runs. coop: the runs of the main model go to the
+        scheduler of the lanes as DeviceOps (yielded among the tokens: _run). Every token goes through
+        the sampler's guard (Sampler.fixed: the think budget, core/think_guard.py); one it puts in a
+        draft's place ends the drafts taken there."""
         g = self.g
+        fix = sampler.fixed
         if stats is None:
             stats = {}
         stats.update(rounds=0, plain=0, drafted=0, accepted=0, lengths=[], conf=[])
-        y = sampler(lg)
+        y = fix(sampler(lg))
         main_rows, mpos = main_last, pos - 1       # the main rows the rings lack
         rate_spec = rate_plain = None              # tokens a ms (moving averages)
         t_start = time.time()
@@ -486,14 +514,18 @@ class DSpark:
                     if y in eos or (max_tokens is not None and count >= max_tokens):
                         return
                     if spec is False:
-                        y, pos = sampler(g.step(y, pos)), pos + 1
+                        if coop:
+                            logits, _mh = yield from self._run([y], pos, coop)
+                            y, pos = fix(sampler(logits[0])), pos + 1
+                        else:
+                            y, pos = fix(sampler(g.step(y, pos))), pos + 1
                         continue
                     # a plain step that keeps the input of DSpark (the rings stay whole)
-                    logits, main_h = g.verify([y], pos)
+                    logits, main_h = (yield from self._run([y], pos, coop)) if coop else g.verify([y], pos)
                     if main_rows is not None and len(main_rows):
                         self.seed(main_rows, mpos)
                     main_rows, mpos = main_h[:1], pos
-                    y, pos = sampler(logits[0]), pos + 1
+                    y, pos = fix(sampler(logits[0])), pos + 1
                     stats["plain"] += 1
                     dt = (time.time() - t_round) * 1e3
                     rate_plain = 1.0 / dt if rate_plain is None else 0.8 * rate_plain + 0.2 / dt
@@ -503,19 +535,22 @@ class DSpark:
                 self.t_draft = 0.9 * self.t_draft + 0.1 * (time.time() - t0) * 1e3
                 L = self.choose(conf) if fixed is None else fixed
                 t0 = time.time()
-                logits, main_h = g.verify([y] + [int(d) for d in drafts[:L]], pos)
+                vt = [y] + [int(d) for d in drafts[:L]]
+                logits, main_h = (yield from self._run(vt, pos, coop)) if coop else g.verify(vt, pos)
                 t = L + 1
                 self.t_verify[t] = 0.8 * self.t_verify[t] + 0.2 * (time.time() - t0) * 1e3
                 a, nxt, ok = 0, None, []
                 while a < L:
                     taken, tok = self._take(sampler, logits[a], drafts[a])
+                    tok = fix(tok)
+                    taken = taken and tok == int(drafts[a])
                     ok.append(taken)
                     if not taken:
                         nxt = tok
                         break
                     a += 1
                 if nxt is None:
-                    nxt = sampler(logits[a])
+                    nxt = fix(sampler(logits[a]))
                 emitted = [y] + [int(d) for d in drafts[:a]]
                 if a < L:
                     g.restore(t, pos, a + 1)

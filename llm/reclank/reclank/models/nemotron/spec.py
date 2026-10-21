@@ -12,9 +12,14 @@ target's distribution).
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import time
 
 import numpy as np
+
+# the sizes of the MTP block's parts over a prompt (NemotronMTPSpec.flush; RECLANK_NM_MTP_PARTS)
+FLUSH_PARTS = tuple(int(v) for v in os.environ.get("RECLANK_NM_MTP_PARTS", "2048,1024,256,64,16,4").split(","))
 
 from reclank.models.nemotron.kq import BB
 
@@ -85,6 +90,23 @@ class NemotronSpec:
             self.d.inject(None, feats, np.arange(pos, pos + len(chunk)))
         return m.logits(xn[-1:])[0]
 
+    @staticmethod
+    def _take(lg, drafts, sample):
+        """The tokens of a verify group's rows lg after the drafts: each row's pick (sample, None:
+        the argmax) after the sampler's guard (Sampler.fixed: the think budget, core/think_guard.py),
+        the drafts as long as the picks are theirs, then the first other pick. The rows after it are
+        not sampled (their picks would go into the sampler's history)."""
+        fix = getattr(sample, "fixed", None)
+        out = []
+        for j, r in enumerate(lg):
+            t = int(np.argmax(r)) if sample is None else int(sample(r))
+            if fix is not None:
+                t = fix(t)
+            out.append(t)
+            if j >= len(drafts) or t != drafts[j]:
+                break
+        return out
+
     def round(self, last, cache, sample=None):
         """One round after the token last (at position cache.n): the tokens taken (1 .. block)."""
         m, d = self.m, self.d
@@ -97,10 +119,8 @@ class NemotronSpec:
         prog, xn, feats = self._run(ids, cache)
         lg = m.logits(xn)
         t2 = time.time()
-        tt = [int(np.argmax(r)) if sample is None else int(sample(r)) for r in lg]
-        a = 0
-        while a < len(drafts) and drafts[a] == tt[a]:
-            a += 1
+        got = self._take(lg, drafts, sample)
+        a = len(got) - 1
         if a < len(drafts):
             for i, (cv, S) in saved.items():
                 cache.conv[i][:] = cv
@@ -114,7 +134,7 @@ class NemotronSpec:
         cache.n = n + a + 1
         d.inject(None, feats[:a + 1], np.arange(n, n + a + 1))
         self.stats.append((a, t1 - t0, t2 - t1, time.time() - t2))
-        return drafts[:a] + [tt[a]]
+        return got
 
     def generate(self, ids, n_new, cache, sample=None, stop=()):
         out = []
@@ -156,7 +176,8 @@ class NemotronGPUSpec(NemotronSpec):
             prog.names["logits"] = lg
             _to_other(prog)
             prog.finish()
-            self._v = (prog, GPUProgram(prog, graph=g.graph, mirror=g.mirror))
+            with g.lane_scratch(t) if hasattr(g, "lane_scratch") else contextlib.nullcontext():
+                self._v = (prog, GPUProgram(prog, graph=g.graph, mirror=g.mirror))
         return self._v
 
     def _bind_run(self, e, extra=None):
@@ -175,7 +196,9 @@ class NemotronGPUSpec(NemotronSpec):
             vp = self._v[0]
             self.m.programs[self.block] = vp
             prog = self._replay_prog(sd=True)
-            self._replay = (prog, GPUProgram(prog, graph=self.g.graph, mirror=self.g.mirror))
+            g = self.g
+            with g.lane_scratch(self.block) if hasattr(g, "lane_scratch") else contextlib.nullcontext():
+                self._replay = (prog, GPUProgram(prog, graph=g.graph, mirror=g.mirror))
         return self._replay
 
     def prefill(self, ids, cache=None):
@@ -215,10 +238,8 @@ class NemotronGPUSpec(NemotronSpec):
             gp.download("feat.%d" % b)
         lg = prog.names["logits"]
         t2 = time.time()
-        tt = [int(np.argmax(r)) if sample is None else int(sample(r)) for r in lg]
-        a = 0
-        while a < len(drafts) and drafts[a] == tt[a]:
-            a += 1
+        got = self._take(lg, drafts, sample)
+        a = len(got) - 1
         if a < len(drafts):
             # (the replay reads the states the group read, still in use, and writes the other set)
             self._bind_run(self._replay_gpu(), {"nreal": a + 1})
@@ -227,7 +248,7 @@ class NemotronGPUSpec(NemotronSpec):
         feats = np.concatenate([prog.names["feat.%d" % b] for b in d.target_ids], 1)
         d.inject(None, feats[:a + 1], np.arange(n, n + a + 1))
         self.stats.append((a, t1 - t0, t2 - t1, time.time() - t2))
-        return drafts[:a] + [tt[a]]
+        return got
 
     def generate(self, ids, n_new, cache=None, sample=None, stop=()):
         out = []
@@ -241,3 +262,99 @@ class NemotronGPUSpec(NemotronSpec):
             if any(gg in stop for gg in got):
                 break
         return out[:n_new]
+
+
+class _NoDrafter:
+    """The target side of NemotronGPUSpec for the MTP rounds: no captured layers; the verify group
+    of block rows."""
+
+    def __init__(self, block):
+        self.target_ids, self.block = [], block
+
+
+class NemotronMTPSpec(NemotronGPUSpec):
+    """Super's rounds with its MTP block (NemotronGPU.mtp; docs/NEMOTRON_SUPER_PLAN.md S7). The block
+    at position i reads the target's hidden after norm_f there and the token after it. A round after
+    the token last at n: one MTP run over the positions the block has not read with the target's rows
+    (the taken ones of the round before, and n - 1 with last): its last row drafts d1; then d2 .. dk
+    each from the out of the draft before; the verify group [last, d1 .. dk] on the GPU (the Mamba
+    states in two sets, the replay of the taken rows: NemotronGPUSpec's); the taken tokens, and the
+    target's rows of their positions for the next round's first run. sample(row): the target's
+    choice of a row (greedy: argmax); the rows are drawn in order up to the first refusal, so the
+    sampler sees only the tokens it gives."""
+
+    def __init__(self, gdev, drafts=3):
+        # (the verify group keeps each layer's in_proj rows for the replay, with no layer captured)
+        gdev.m.spec_rows = True
+        NemotronGPUSpec.__init__(self, gdev, _NoDrafter(drafts + 1))
+        self.k = drafts
+        self.pend = None                # (first position, the target's rows from there) the block has not read
+        self.stats = []
+
+    def _head_scale(self):
+        head = self.m.M("language_model.lm_head")
+        return np.float32(head.scale) if head.scale is not None else np.float32(1.0)
+
+    def after_prompt(self, pos, rows):
+        """The target read the prompt part at pos..pos + len(rows) - 1 (rows: its hidden after norm_f):
+        the block reads those positions whose next token is known (all but the last, which waits for
+        the token after it)."""
+        if self.pend is not None and self.pend[0] + len(self.pend[1]) == pos:
+            p0, h = self.pend[0], np.concatenate([self.pend[1], rows])
+        else:
+            p0, h = pos, rows
+        self.pend = (p0, h)
+
+    def flush(self, ids):
+        """The block over the pending positions whose next tokens ids gives (ids[p] the token at
+        position p), but the last one; the pending rows are then that last one."""
+        p0, h = self.pend
+        n = len(h) - 1
+        c = 0
+        # (in parts of at most FLUSH_PARTS[0] rows, with no head: their keys and values only; a part reads all the
+        # block's experts once, across the link: 256-row parts gave a prompt of 9387 tokens 3.6 s more)
+        while c < n:
+            size = next((s for s in FLUSH_PARTS if s <= n - c), 1)
+            self.g.mtp([ids[p0 + c + 1 + j] for j in range(size)], h[c:c + size], p0 + c, head=False)
+            c += size
+        self.pend = (p0 + n, h[n:])
+        self.next_tokens = []
+
+    def round(self, last, sample=None):
+        g, k = self.g, self.k
+        n = g.cache.n
+        if n + self.block > g.cache.max_len:
+            raise ValueError("the cache holds %d positions: a verify group of %d at %d" % (
+                g.cache.max_len, self.block, n))
+        t0 = time.time()
+        p0, h = self.pend
+        assert p0 + len(h) == n, (p0, len(h), n)
+        toks = list(self.next_tokens) + [int(last)]
+        lg, out = g.mtp(toks, h, p0)
+        drafts = [int(np.argmax(lg[-1]))]
+        o = out[-1:]
+        for j in range(1, k):
+            lg1, o = g.mtp([drafts[-1]], o, n + j - 1)
+            drafts.append(int(np.argmax(lg1[0])))
+        t1 = time.time()
+        prog, gp = self._vprog()
+        x = prog.names["H"]
+        x[:] = self.m.embed([int(last)] + drafts)
+        gp.upload("H")
+        self._bind_run(self._v)
+        g.after_run(prog, gp, self.block)
+        gp.download("logits")
+        gp.download("xn")
+        lgv = prog.names["logits"] * self._head_scale()
+        t2 = time.time()
+        got = self._take(lgv, drafts, sample)
+        a = len(got) - 1
+        if a < k:
+            self._bind_run(self._replay_gpu(), {"nreal": a + 1})
+        g.swap()
+        g.cache.n = n + a + 1
+        # the target's rows of the taken positions n .. n + a: the next round's first MTP run
+        self.pend = (n, prog.names["xn"][:a + 1].copy())
+        self.next_tokens = drafts[:a]
+        self.stats.append((a, t1 - t0, t2 - t1, time.time() - t2))
+        return got

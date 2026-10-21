@@ -16,6 +16,10 @@ static int gg_boundary(gg_prog *g, const gp_rec *r)
         j.count = (int)r->v[1];
         j.f = (int)r->v[2];
         j.b = (int)r->v[3];
+        /* operands 4-6 (or none): the mode (1: KQ_NV4 rows into NV4T), the columns of the even and odd ranges */
+        j.mode = r->tag[4] != GP_T_NONE ? (int)r->v[4] : 0;
+        j.c0 = r->tag[5] != GP_T_NONE ? (int)r->v[5] : 0;
+        j.c1 = r->tag[6] != GP_T_NONE ? (int)r->v[6] : 0;
         pthread_mutex_lock(&gg_mu);
         gg_recorded[j.f] = 0;
         gg_jobs[gg_job_tail % GG_FETCH_MAX] = j;

@@ -15,47 +15,6 @@
 #define T2N 128
 #define T2RB 40      /* bytes of one row of a step: 2 blocks of 18, and 4 to align */
 
-__device__ __forceinline__ void cp_async4(void *smem, const void *gmem)
-{
-#if RC_SM80
-    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(sa), "l"(gmem));
-#else
-    *(uint32_t *)smem = *(const uint32_t *)gmem;     /* (cp.async: aligned) */
-#endif
-}
-
-__device__ __forceinline__ void cp_async16(void *smem, const void *gmem)
-{
-#if RC_SM80
-    unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(gmem));
-#else
-    *(int4 *)smem = *(const int4 *)gmem;
-#endif
-}
-
-__device__ __forceinline__ void cp_async_commit()
-{
-#if RC_SM80
-    asm volatile("cp.async.commit_group;\n" ::);
-#endif
-}
-
-__device__ __forceinline__ void cp_async_wait1()
-{
-#if RC_SM80
-    asm volatile("cp.async.wait_group 1;\n" ::);
-#endif
-}
-
-__device__ __forceinline__ void cp_async_wait0()
-{
-#if RC_SM80
-    asm volatile("cp.async.wait_group 0;\n" ::);
-#endif
-}
-
 /* Two float16 values n0 - 8 and n1 - 8 from two 4-bit numbers. */
 __device__ __forceinline__ uint32_t nib2(uint32_t n0, uint32_t n1)
 {

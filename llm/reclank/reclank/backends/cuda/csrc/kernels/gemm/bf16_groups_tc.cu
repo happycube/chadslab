@@ -256,9 +256,11 @@ static int bf16_tc_on(void)
  * 0) times the bfloat16 rows of w into out (stride ldo, from row orow0):
  * k_to_bf16 into the scratch xb (and xb + t cols for the lo plane), then
  * k_gemm_bf16_tc. */
+/* x1: x is bfloat16 values already (the low plane would be zeros: one product a fragment, the same sums);
+ * xready: xb holds its bfloat16 rows already (an earlier call on the same x: no k_to_bf16) */
 static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uint16_t *w, float *out,
                          size_t ldo, const int *orow0, int t, int rows, int cols, uint16_t *xb,
-                         cudaStream_t s, int w12 = 0)
+                         cudaStream_t s, int w12 = 0, int x1 = 0, int xready = 0)
 {
     static int attr = 0;
     if (!attr) {
@@ -268,9 +270,11 @@ static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uin
                              (int)BF_SMEM(1));
         attr = 1;
     }
-    int x2 = bf16_tc_on() != 8;
+    int x2 = bf16_tc_on() != 8 && !x1;
     uint16_t *xl = x2 ? xb + (size_t)t * cols : NULL;
-    k_to_bf16<<<(unsigned)(((int64_t)t * cols + 255) / 256), 256, 0, s>>>(x, ldx, xrow0, xb, t, cols, xl);
+    if (!xready) {
+        k_to_bf16<<<(unsigned)(((int64_t)t * cols + 255) / 256), 256, 0, s>>>(x, ldx, xrow0, xb, t, cols, xl);
+    }
     dim3 grid((unsigned)((t + T2M - 1) / T2M), (unsigned)((rows + T2N - 1) / T2N));
     if (x2 && w12) {
         k_gemm_bf16_tc<1, 1><<<grid, 256, BF_SMEM(1), s>>>(xb, w, out, ldo, orow0, t, rows, cols, xl);

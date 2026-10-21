@@ -43,7 +43,7 @@ __device__ __forceinline__ void mxf8_step(const uint32_t *q, const float *s, con
 
 template <int R, int NT>
 __global__ void __launch_bounds__(256) k_mxf8_gemv(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                  float *out)
+                                                  float *out, float sc)
 {
     int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
     if (row0 >= rows) {
@@ -99,7 +99,7 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv(const uint8_t *w, int rows, i
                         v += __shfl_xor_sync(RC_FULL_MASK, v, o);
                     }
                     if (lane == 0 && row0 + r < rows) {
-                        out[(size_t)(j0 + jj) * rows + row0 + r] = rc_bf16r_k(v);
+                        out[(size_t)(j0 + jj) * rows + row0 + r] = rc_bf16r_k(v) * sc;
                     }
                 }
             }
@@ -113,7 +113,7 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv(const uint8_t *w, int rows, i
  * k_mxf8_gemv in the same order (the same bits). */
 template <int R, int NT>
 __global__ void __launch_bounds__(256) k_mxf8_gemv_s(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                    float *out)
+                                                    float *out, float sc)
 {
     __shared__ __align__(16) float xsm[NT][512];
     int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
@@ -196,7 +196,7 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv_s(const uint8_t *w, int rows,
                         v += __shfl_xor_sync(RC_FULL_MASK, v, o);
                     }
                     if (lane == 0 && row0 + r < rows) {
-                        out[(size_t)(j0 + jj) * rows + row0 + r] = rc_bf16r_k(v);
+                        out[(size_t)(j0 + jj) * rows + row0 + r] = rc_bf16r_k(v) * sc;
                     }
                 }
             }
@@ -207,7 +207,7 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv_s(const uint8_t *w, int rows,
 #define MXT_BM 64
 #define MXT_BN 32
 __global__ void __launch_bounds__(128) k_mxf8_tc(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                float *out)
+                                                float *out, float osc)
 {
     __shared__ float tab[256];
     __shared__ float ws[MXT_BM][33];
@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(128) k_mxf8_tc(const uint8_t *w, int rows, int
         for (int i = 0; i < 4; ++i) {
             int rr = row + (i >= 2 ? 8 : 0), tt = tk + (i & 1);
             if (rr < rows && tt < t) {
-                out[(size_t)tt * rows + rr] = rc_bf16r_k(acc[nt][i]);
+                out[(size_t)tt * rows + rr] = rc_bf16r_k(acc[nt][i]) * osc;
             }
         }
     }
@@ -323,13 +323,13 @@ __global__ void k_mxf8_to_bf16(const uint8_t *w, int n, int cols, uint16_t *dst)
     d[1] = make_uint4(o[4], o[5], o[6], o[7]);
 }
 
-/* out (n values) rounded to bfloat16 in place */
-__global__ void k_round_bf16_n(float *out, size_t n)
+/* out (n values) rounded to bfloat16 in place, times sc */
+__global__ void k_round_bf16_n(float *out, size_t n, float sc)
 {
     PDL_START();
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        out[i] = rc_bf16r_k(out[i]);
+        out[i] = rc_bf16r_k(out[i]) * sc;
     }
 }
 
@@ -337,6 +337,17 @@ __global__ void k_round_bf16_n(float *out, size_t n)
  * large group (t > MT_MAX): chunks of rows as bfloat16 in w16 (exact) and the bfloat16 tensor cores
  * of gg_gemm_bf16 (x to bfloat16 in xb), the output rounded; else the kernels above. */
 /* RECLANK_GPU_MXF8_STAGE=0: the groups of 2-8 tokens on k_mxf8_gemv (x read by each warp) */
+/* RECLANK_GPU_MXF8_X1=0: the two planes of x in a group's product (its low plane zeros: a measure) */
+static int mxf8_x1_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_MXF8_X1");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 static int mxf8_stage_on(void)
 {
     static int on = -1;
@@ -347,7 +358,9 @@ static int mxf8_stage_on(void)
     return on;
 }
 
-static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int cols, int t, float *out,
+/* sc: a factor of every output after its rounding (Super's FP8 tensor scale: GP_MUL's product, the same bits;
+ * 1 for FP4-Local's) */
+static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int cols, int t, float *out, float sc,
                               uint16_t *w16, size_t w16_n, uint16_t *xb, size_t xb_n, cudaStream_t s)
 {
     if (cols % 128 != 0) {
@@ -357,7 +370,7 @@ static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int co
         (size_t)t * cols * (bf16_tc_on() != 8 ? 2 : 1) <= xb_n) {
         /* x in bfloat16 values (vLLM's activations; gg_gemm_bf16's low plane then 0) */
         size_t nx = (size_t)t * cols;
-        k_round_bf16_n<<<(unsigned)((nx + 255) / 256), 256, 0, s>>>((float *)x, nx);
+        k_round_bf16_n<<<(unsigned)((nx + 255) / 256), 256, 0, s>>>((float *)x, nx, 1.f);
         int step = (int)(w16_n / (size_t)cols);
         step = step >= T2N ? step / T2N * T2N : step;
         size_t rb = kq_row_bytes(KQ_MXF8, cols);
@@ -365,25 +378,39 @@ static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int co
             int n = rows - r0 < step ? rows - r0 : step;
             k_mxf8_to_bf16<<<(unsigned)(((int64_t)n * (cols / 16) + 255) / 256), 256, 0, s>>>(w + (size_t)r0 * rb, n,
                                                                                             cols, w16);
-            gg_gemm_bf16(x, (size_t)cols, NULL, w16, out + r0, (size_t)rows, NULL, t, n, cols, xb, s);
+            /* (x rounded to bfloat16 above: one plane; its rows converted once, at the first chunk) */
+            gg_gemm_bf16(x, (size_t)cols, NULL, w16, out + r0, (size_t)rows, NULL, t, n, cols, xb, s, 0, mxf8_x1_on(),
+                         r0 > 0 && mxf8_x1_on());
         }
         size_t nv = (size_t)t * rows;
-        k_round_bf16_n<<<(unsigned)((nv + 255) / 256), 256, 0, s>>>(out, nv);
+        k_round_bf16_n<<<(unsigned)((nv + 255) / 256), 256, 0, s>>>(out, nv, sc);
         return 0;
     }
     if (t > 8 && gg_caps.tc) {
         k_mxf8_tc<<<dim3((unsigned)((rows + MXT_BM - 1) / MXT_BM), (unsigned)((t + MXT_BN - 1) / MXT_BN)), 128, 0, s>>>(w, rows, cols, x, t,
-                                                                                              out);
+                                                                                              out, sc);
         return 0;
     }
-    int R = rows >= 32 * 128 ? 4 : rows >= 16 * 128 ? 2 : 1;
+    /* R rows a warp: 2 where each SM still gets 2 blocks (a 3090, a step: Super's in_proj 18560 x 4096
+     * 114 -> 95 us, out_proj 4096 x 8192 67 -> 45 us at R 2; R 4 left out_proj 128 blocks on 82 SMs, R 1
+     * no faster); a row's sums do not depend on R (the same bits). RECLANK_GPU_MXF8_R: R (a measure). */
+    static int rset = -1;
+    if (rset < 0) {
+        const char *v = getenv("RECLANK_GPU_MXF8_R");
+        rset = v ? atoi(v) : 0;
+    }
+    const int nsm = gg_caps.sm_count > 0 ? gg_caps.sm_count : 32;
+    int R = rows >= 16 * 2 * nsm ? 2 : 1;
+    if (rset == 1 || rset == 2 || rset == 4) {
+        R = rset;
+    }
     unsigned nblk = (unsigned)((rows + 8 * R - 1) / (8 * R));
 #define MXF8_GEMV(RR, NN)                                                                          \
     do {                                                                                           \
         if (NN > 1 && mxf8_stage_on()) {                                                           \
-            k_mxf8_gemv_s<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out);                   \
+            k_mxf8_gemv_s<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out, sc);                   \
         } else {                                                                                   \
-            k_mxf8_gemv<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out);                     \
+            k_mxf8_gemv<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out, sc);                     \
         }                                                                                          \
     } while (0)
 #define MXF8_GEMV_T(NN)                                                                            \

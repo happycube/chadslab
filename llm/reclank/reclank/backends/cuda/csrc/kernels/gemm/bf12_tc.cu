@@ -16,18 +16,6 @@
  * the 8 k-steps (k-step q: columns 16c + 2q, 16c + 2q + 1); the thread
  * (g', c) of x takes the same columns of token g'. GP_KQ_LINEAR (m < 0) or
  * the matrices of GP_KQ_MULTI of bt_shape (the blocks one after another). */
-__device__ __forceinline__ void mma1688_tf32(float *c, const uint32_t *a, const uint32_t *b)
-{
-#if RC_SM80
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#else
-    __trap();
-#endif
-}
 
 /* The 16 values of a BF12 row from column c0 (16 | c0) as 8 words of two
  * bfloat16 values (kq_bf12_dec16), or zeros past the row. */

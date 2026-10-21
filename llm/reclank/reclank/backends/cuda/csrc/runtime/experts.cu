@@ -15,6 +15,7 @@ typedef struct {
     const int64_t *ranges;
     int count;
     int f, b;
+    int mode, c0, c1;       /* mode 1: KQ_NV4 rows into NV4T (k_nm_tile_pull; the columns of even / odd ranges) */
 } gg_job;
 
 static pthread_mutex_t gg_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -302,6 +303,18 @@ static int gg_pull_blocks(void)
     return n;
 }
 
+/* RECLANK_GPU_TILE_PULL (16): the blocks of k_nm_tile_pull (the copies of a stage in NV4T) */
+static int gg_tile_blocks(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *v = getenv("RECLANK_GPU_TILE_PULL");
+        n = v ? atoi(v) : 16;
+        n = n > 0 ? n : 16;
+    }
+    return n;
+}
+
 __global__ void k_fetch_pull(const int64_t *__restrict__ rg, int count)
 {
     const size_t step = (size_t)gridDim.x * blockDim.x;
@@ -324,13 +337,19 @@ __global__ void k_fetch_pull(const int64_t *__restrict__ rg, int count)
 
 /* The ranges of a job for k_fetch_pull (the device address of each
  * source), in rg (3 * count values; the ranges of 0 bytes left out); the
- * count, or -1 when the job must take DMA. */
-static int gg_pull_ranges(const int64_t *ranges, int count, int64_t *rg)
+ * count, or -1 when the job must take DMA. dev: a source in the GPU's own
+ * memory too (k_nm_tile_pull: the hot experts' slots); keep: the ranges of 0
+ * bytes kept (their place: the even / odd columns of k_nm_tile_pull). */
+static int gg_pull_ranges(const int64_t *ranges, int count, int64_t *rg, int dev = 0, int keep = 0)
 {
     int m = 0;
     for (int k = 0; k < count; ++k) {
         const int64_t *q = ranges + 3 * k;
         if (q[2] == 0) {
+            if (keep) {
+                rg[3 * m] = rg[3 * m + 1] = rg[3 * m + 2] = 0;
+                ++m;
+            }
             continue;
         }
         cudaPointerAttributes a;
@@ -339,7 +358,12 @@ static int gg_pull_ranges(const int64_t *ranges, int count, int64_t *rg)
             return -1;
         }
         int64_t src = (int64_t)(intptr_t)a.devicePointer;
-        if (a.type != cudaMemoryTypeHost || src == 0 || (src | q[1] | q[2]) % 16 != 0) {
+        if (dev && a.type == cudaMemoryTypeDevice) {
+            src = q[0];
+        } else if (a.type != cudaMemoryTypeHost) {
+            return -1;
+        }
+        if (src == 0 || (src | q[1] | q[2]) % 16 != 0) {
             return -1;
         }
         rg[3 * m] = src;
@@ -368,7 +392,7 @@ static void *gg_worker(void *arg)
         int bad = cudaEventSynchronize(gg_freeev[j.b]) != cudaSuccess;
         double t0 = gg_clock(), nb = 0.0;
         int np_ = -1;
-        if (!bad && gg_pull_blocks() > 0) {
+        if (!bad && (gg_pull_blocks() > 0 || j.mode == 1)) {
             if (j.count > prg_cap) {
                 free(prg);
                 cudaFree(prg_d);
@@ -376,14 +400,27 @@ static void *gg_worker(void *arg)
                 bad = prg == NULL || cudaMalloc((void **)&prg_d, (size_t)j.count * 24) != cudaSuccess;
                 prg_cap = bad ? 0 : j.count;
             }
-            np_ = bad ? -1 : gg_pull_ranges(j.ranges, j.count, prg);
+            np_ = bad ? -1 : gg_pull_ranges(j.ranges, j.count, prg, j.mode == 1, j.mode == 1);
+            if (j.mode == 1 && np_ < 0) {
+                bad = 1;            /* (NV4T has no DMA form) */
+            }
         }
         if (np_ > 0) {
             /* prg is pageable: the call returns when the driver has the
              * values, so the next job can write prg */
             bad = cudaMemcpyAsync(prg_d, prg, (size_t)np_ * 24, cudaMemcpyHostToDevice, gg_copy) !=
                   cudaSuccess;
-            if (!bad) {
+            if (!bad && j.mode == 1) {
+                /* (16 rows of the widest matrix in shared memory: opted in once) */
+                static size_t tp_set = 0;
+                const size_t sm = 16 * kq_row_bytes(KQ_NV4, j.c0 > j.c1 ? j.c0 : j.c1);
+                if (sm > 48 * 1024 && sm > tp_set) {
+                    cudaFuncSetAttribute(k_nm_tile_pull, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+                    tp_set = sm;
+                }
+                k_nm_tile_pull<<<gg_tile_blocks(), 256, sm, gg_copy>>>(prg_d, np_, j.c0, j.c1);
+                bad = cudaGetLastError() != cudaSuccess;
+            } else if (!bad) {
                 k_fetch_pull<<<gg_pull_blocks(), 256, 0, gg_copy>>>(prg_d, np_);
                 bad = cudaGetLastError() != cudaSuccess;
             }
@@ -464,8 +501,10 @@ static void *gg_cworker(void *arg)
         int bad = 0;
         for (int k = 0; k < j.count && !bad; ++k) {
             const int64_t *q = j.ranges + 3 * k;
+            /* (a page-locked source by DMA: the weightkeeper's segments that the caller registered; no
+             * memcpy by this thread beside the CPU's experts) */
             bad = gg_h2d_staged(&sg, (void *)(intptr_t)q[1], (const void *)(intptr_t)q[0],
-                                (size_t)q[2], gg_cstream) != 0;
+                                (size_t)q[2], gg_cstream, 1) != 0;
         }
         int slot = j.id % GG_CACHE_JOBS;
         bad = bad || cudaEventRecord(gg_cev[slot], gg_cstream) != cudaSuccess;

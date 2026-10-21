@@ -104,21 +104,6 @@ __device__ __forceinline__ float kq_e2m1x2(int c)
     return (c & 8) ? -v : v;
 }
 
-/* 4 E2M1 codes (4 bytes of codes, the low 4 bits of each byte) to 4 int8
- * (twice the values), as the dequantization of Marlin: prmt looks up the 4
- * magnitudes in a table of 8 bytes (0 1 2 3 4 6 8 12) at once, and the sign
- * bits negate the bytes (v ^ m) - m. */
-__device__ __forceinline__ uint32_t kt_e2m1x4(uint32_t q)
-{
-    uint32_t c = q & 0x0f0f0f0fu;
-    uint32_t i = c & 0x07070707u;
-    uint32_t t = i | (i >> 4);                       /* bytes 0, 2: 2 indices of 4 bits */
-    uint32_t sel = (t & 0xffu) | ((t >> 8) & 0xff00u);
-    uint32_t mag = __byte_perm(0x03020100u, 0x0c080604u, sel);
-    uint32_t m = ((c >> 3) & 0x01010101u) * 0xffu;
-    return __vsub4(mag ^ m, m);
-}
-
 /* An E4M3 scale times 2^-8, with no branch: its bits go to float16 as they
  * are (the exponent bias of float16 is 8 more). */
 __device__ __forceinline__ float kq_e4m3s(uint32_t b)

@@ -576,13 +576,22 @@ KQ_NV4V_RT(1, 3)
     {                                                                                                              \
         __m512 xsv[T];                                                                                             \
         for (int j = 0; j < T; ++j)                                                                                \
-            xsv[j] = _mm512_permutexvar_ps(two, _mm512_castps256_ps512(_mm256_loadu_ps(xs + (size_t)j * nbt + (b8)))); \
+            xsv[j] = _mm512_mul_ps(_mm512_permutexvar_ps(two, _mm512_castps256_ps512(_mm256_loadu_ps(xs + (size_t)j * nbt + (b8)))), \
+                                   _mm512_set1_ps(256.f));                                                         \
         for (int r = 0; r < R; ++r) {                                                                              \
-            const __m512i ix = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)kq_nv4_scales(w + r * rb, cols, b8))); \
-            const __m512 e = _mm512_i32gather_ps(ix, kq_e4m3_tab, 4);                                             \
+            /* the rows of the next call (the next R rows): their lines of this group ahead */                     \
+            _mm_prefetch((const char *)kq_nv4_scales(w + (r + R) * rb, cols, b8), _MM_HINT_T0);                   \
+            _mm_prefetch((const char *)kq_nv4_codes(w + (r + R) * rb, b8), _MM_HINT_T0);                          \
+            _mm_prefetch((const char *)kq_nv4_codes(w + (r + R) * rb, b8) + 64, _MM_HINT_T0);                     \
+            /* the E4M3 scales as half floats (the bits of E4M3 << 7: the value / 256, exact; a subnormal too), \
+             * x's scales times 256 (exact): the products of the table's values */                               \
+            const __m256i sb = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)kq_nv4_scales(w + r * rb, cols, b8))); \
+            const __m512 e = _mm512_cvtph_ps(_mm256_or_si256(_mm256_slli_epi16(_mm256_and_si256(sb, s80), 8),        \
+                                                             _mm256_slli_epi16(_mm256_and_si256(sb, s7f), 7)));      \
             for (int j = 0; j < T; ++j)                                                                            \
                 scl[r][j] = _mm512_mul_ps(_mm512_mul_ps(e, xsv[j]), _mm512_set1_ps(g[r]));                         \
         }                                                                                                          \
+        _Pragma("GCC unroll 4")                                                                                    \
         for (int q = 0; q < (nq); q += 2) {                                                                        \
             const int b = (b8) + q;                                                                                \
             __m512i xe[T], xo[T];                                                                                  \
@@ -622,6 +631,7 @@ KQ_NV4V_RT(1, 3)
             _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8),                              \
             _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12)};                     \
         const __m512i two = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);                      \
+        const __m256i s80 = _mm256_set1_epi16(0x80), s7f = _mm256_set1_epi16(0x7f);                                \
         const int nbt = cols / 32;                                                                                 \
         __m512 acc[R][T], scl[R][T];                                                                               \
         float g[R];                                                                                                \

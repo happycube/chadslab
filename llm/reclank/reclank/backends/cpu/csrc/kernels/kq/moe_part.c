@@ -257,11 +257,161 @@ static inline float kq_part_act(float g, float u, int dsv, int clamp, int gelu, 
                 : ma_silu(g) * u;
 }
 
+/* flag 4096 (DeepSeek V4.1 steps, RECLANK_DS_SPEC): a prefetch for the next layer's cold experts, not
+ * their rows. The CPU waits for the GPU's signal of each layer (its attention) with nothing to do; this
+ * task runs right after the last layer's, on its input hf (the FFN input of the layer before, in the
+ * host buffer of the signals): the router of the next layer on it (gate: bf16 [experts, hidden], bias:
+ * the selection's), sqrt(softplus) + bias, the top k, those that map (the GPU's slots, its host copy)
+ * does not hold, at most RECLANK_DS_SPEC_N (6); then each thread reads the rows it would take of them
+ * in the real task (the split of kq_part_units for one pair each, fuse's units of 16 rows of gate and
+ * up, then the down rows), so the task finds them in its caches (the same task, its experts from the
+ * caches: 1.27x on a real step). The reads stop when the next layer's signal comes (cur, next: the flag
+ * the last task wrote and the next task's flag in; with next >= cur the GPU has the next task's inputs
+ * out): a prefetch of all of them took 477 us, the wait for the signal 309, and held the task back (a
+ * step 34.1 -> 39.1 ms). The likeliest experts first, the gate and up rows of all, then the down rows.
+ * The task after compares its experts with the guess (rc_ds_spec_stats). */
+static float kq_spec_sel[1024];
+static int32_t kq_spec_list[16], kq_spec_rank[16];
+static int kq_spec_n = -1;
+static int64_t kq_spec_st[4];              /* the guessed experts, the task's, the hits, the tasks */
+static volatile uint64_t kq_spec_sink;
+
+void rc_ds_spec_stats(int64_t *out, int reset)
+{
+    for (int i = 0; i < 4; ++i) {
+        out[i] = kq_spec_st[i];
+    }
+    if (reset) {
+        memset(kq_spec_st, 0, sizeof(kq_spec_st));
+    }
+}
+
+static inline uint64_t kq_spec_touch(const uint8_t *p, size_t n)
+{
+    uint64_t s = 0;
+    for (size_t o = 0; o < n; o += 64) {
+        s += *(const volatile uint64_t *)(p + o);
+    }
+    return s;
+}
+
+static void kq_moe_spec_body(const float *hf, int k, int experts, const int64_t *pm_all, int hidden, int inner,
+                             const int32_t *gu, const int32_t *dn, int nparts, int team, const uint16_t *gate,
+                             const float *bias, const int32_t *map, const int64_t *cur, const int64_t *next)
+{
+    static int maxn = -1, dn_on = 1;
+    if (maxn < 0) {
+        const char *v = getenv("RECLANK_DS_SPEC_N"), *d = getenv("RECLANK_DS_SPEC_DN");
+        maxn = v && atoi(v) >= 0 ? atoi(v) : 6;
+        maxn = maxn < 16 ? maxn : 16;
+        dn_on = d ? atoi(d) != 0 : 1;
+    }
+    const int tid = omp_get_thread_num(), nth = nparts * team;
+    if (experts > 1024 || k > 16 || omp_get_num_threads() != nth) {
+        return;
+    }
+    int lo, hi;
+    kq_part_share(experts, tid, nth, &lo, &hi);
+    for (int e = lo; e < hi; ++e) {
+        const uint16_t *w = gate + (size_t)e * hidden;
+        float a = 0.f;
+        #pragma omp simd reduction(+ : a)
+        for (int c = 0; c < hidden; ++c) {
+            uint32_t u = (uint32_t)w[c] << 16;
+            float f;
+            memcpy(&f, &u, 4);
+            a += f * hf[c];
+        }
+        float sp = a > 20.f ? a : log1pf(expf(a));
+        kq_spec_sel[e] = sqrtf(sp) + bias[e];
+    }
+    #pragma omp barrier
+    if (tid == 0) {
+        /* the top k (ties: the lower id), the cold ones in id order (the order of the task's used) */
+        int top[16], n = 0;
+        for (int j = 0; j < k; ++j) {
+            int b = -1;
+            for (int e = 0; e < experts; ++e) {
+                int taken = 0;
+                for (int q = 0; q < j; ++q) {
+                    taken |= top[q] == e;
+                }
+                if (!taken && (b < 0 || kq_spec_sel[e] > kq_spec_sel[b])) {
+                    b = e;
+                }
+            }
+            top[j] = b;
+        }
+        for (int j = 0; j < k; ++j) {
+            if (top[j] >= 0 && map[top[j]] < 0 && n < maxn) {
+                kq_spec_rank[n] = top[j];
+                kq_spec_list[n++] = top[j];
+            }
+        }
+        for (int a = 1; a < n; ++a) {
+            for (int b = a; b > 0 && kq_spec_list[b - 1] > kq_spec_list[b]; --b) {
+                int x = kq_spec_list[b];
+                kq_spec_list[b] = kq_spec_list[b - 1];
+                kq_spec_list[b - 1] = x;
+            }
+        }
+        kq_spec_n = n;
+        kq_spec_st[0] += n;
+    }
+    #pragma omp barrier
+    const int n = kq_spec_n, part = tid / team, lt = tid % team;
+    const int ni = gu[2 * part + 1], nd = dn[2 * part + 1];
+    const int64_t *pm = pm_all + 12 * part;
+    const uint8_t *Gw = (const uint8_t *)(intptr_t)pm[0], *Uw = (const uint8_t *)(intptr_t)pm[4];
+    const uint8_t *Dw = (const uint8_t *)(intptr_t)pm[8];
+    const size_t Gs = (size_t)pm[2], Us = (size_t)pm[6], Ds = (size_t)pm[10];
+    const int Gr = (int)pm[3], Ur = (int)pm[7], Dr = (int)pm[11];
+    const size_t rbg = kq_row_bytes((int)pm[1], hidden), rbu = kq_row_bytes((int)pm[5], hidden);
+    const size_t rbd = kq_row_bytes((int)pm[9], inner);
+    /* the signal of the next task: then the reads stop (checked each unit of 16 rows) */
+    const int64_t want = cur != NULL ? __atomic_load_n(cur, __ATOMIC_ACQUIRE) : 0;
+#define KQ_SPEC_STOP() (next != NULL && __atomic_load_n(next, __ATOMIC_ACQUIRE) >= want)
+    uint64_t sink = 0;
+    for (int m = 0; m < 2 && (m == 0 || dn_on); ++m) {
+        for (int r = 0; r < n; ++r) {
+            /* (the rank's expert; the split of the task: its place in id order) */
+            const int e = kq_spec_rank[r];
+            int s0 = 0;
+            while (kq_spec_list[s0] != e) {
+                ++s0;
+            }
+            int64_t qa, qb;
+            kq_part_units(m == 0 ? ni / 16 : nd / 16, n, lt, team, s0, 1, &qa, &qb);
+            for (int64_t q = qa; q < qb; ++q) {
+                if (KQ_SPEC_STOP()) {
+                    goto done;
+                }
+                if (m == 0) {
+                    sink += kq_spec_touch(Gw + (size_t)e * Gs + (size_t)(Gr + 16 * q) * rbg, 16 * rbg);
+                    sink += kq_spec_touch(Uw + (size_t)e * Us + (size_t)(Ur + 16 * q) * rbu, 16 * rbu);
+                } else {
+                    sink += kq_spec_touch(Dw + (size_t)e * Ds + (size_t)(Dr + 16 * q) * rbd, 16 * rbd);
+                }
+            }
+        }
+    }
+done:
+#undef KQ_SPEC_STOP
+    kq_spec_sink += sink;
+}
+
 static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *val, int t, int k0,
                              int experts, const int64_t *pm_all, int hidden, int inner, const int32_t *gu,
                              const int32_t *dn, float *act2, float *out, int nparts, int team,
-                             const int32_t *kcount, int flags, const int64_t *scr)
+                             const int32_t *kcount, int flags, const int64_t *scr, const uint16_t *spec_gate,
+                             const float *spec_bias, const int32_t *spec_map, const int64_t *spec_cur,
+                             const int64_t *spec_next)
 {
+    if (flags & 4096) {
+        kq_moe_spec_body(hf, k0, experts, pm_all, hidden, inner, gu, dn, nparts, team, spec_gate, spec_bias,
+                         spec_map, spec_cur, spec_next);
+        return;
+    }
     const int tid = omp_get_thread_num();
     if (kq_pp_on < 0) {
         const char *v = getenv("RECLANK_PART_PROF");
@@ -468,6 +618,19 @@ static void kq_moe_part_body(const float *hf, const int32_t *ids, const float *v
             pair_q[pos] = q;
         }
         *nused_p = nu;
+        if (part == 0 && kcount != NULL && kq_spec_n >= 0) {
+            /* (the guess of the prefetch before: flag 4096) */
+            int h = 0;
+            for (int a = 0; a < nu; ++a) {
+                for (int b = 0; b < kq_spec_n; ++b) {
+                    h += used[a] == kq_spec_list[b];
+                }
+            }
+            kq_spec_st[1] += nu;
+            kq_spec_st[2] += h;
+            kq_spec_st[3] += 1;
+            kq_spec_n = -1;
+        }
         __atomic_store_n(cnt_b, 0, __ATOMIC_RELAXED);
         __atomic_store_n(cnt_e, 0, __ATOMIC_RELAXED);
     }
