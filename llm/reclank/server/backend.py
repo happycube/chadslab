@@ -355,20 +355,25 @@ class Backend:
         """Return the token ids that end a generation."""
         return self.engine.stop_ids()
 
-    # generate takes session (server/http.py passes the client's conversation id)
+    # generate takes session (server/http.py passes the client's conversation id) and stop (its
+    # stream's close)
     takes_session = True
+    takes_stop = True
 
-    def generate(self, prompt_ids, max_tokens, sampler, eos_ids, lane=None, tokens=0, session=None):
+    def generate(self, prompt_ids, max_tokens, sampler, eos_ids, lane=None, tokens=0, session=None,
+                 stop=None):
         """Yield the tokens of the answer; the engine runs on the model
         thread (lane: on that lane, beside the other's; tokens: the prompt
         tokens it reads, route_tokens()). session: the conversation id of the
-        client (session_of), for an engine that takes it (session_ids)."""
+        client (session_of), for an engine that takes it (session_ids).
+        stop: a threading.Event that stops the generation (ModelWorker.stream)."""
         eng = self.engines[lane] if lane is not None else self.engine
         kw = {"session": session} if getattr(eng, "session_ids", False) else {}
         if lane is None:
-            return self.worker.stream(lambda: eng.generate(prompt_ids, max_tokens, sampler, eos_ids, **kw))
+            return self.worker.stream(lambda: eng.generate(prompt_ids, max_tokens, sampler, eos_ids, **kw),
+                                      stop=stop)
         return self.worker.stream(lambda: eng.generate(prompt_ids, max_tokens, sampler, eos_ids, **kw),
-                                  lane=lane, tokens=tokens)
+                                  lane=lane, tokens=tokens, stop=stop)
 
     # ---- the answer
 

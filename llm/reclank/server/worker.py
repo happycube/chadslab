@@ -172,7 +172,7 @@ class LaneScheduler:
                 # while the other reads a prompt too (paused): then the parts take turns.
                 decodes = any(t is not None and (t.op is None or t.op.kind in ("run", "yield"))
                               for j, t in enumerate(self.slots) if j != i)
-                if now < s.until and decodes:
+                if now < s.until and decodes and not s.stop.is_set():
                     continue
                 s.op = None
             if s.op is not None and s.op.kind == "yield":
@@ -279,12 +279,15 @@ class ModelWorker:
 
     load = call
 
-    def stream(self, make, lane=None, tokens=0):
+    def stream(self, make, lane=None, tokens=0, stop=None):
         """Yield the items of the generator make() that runs on the model
         thread. A caller that stops early stops it. lane: a generation of that
         lane (the LaneScheduler runs it beside the other lane's); tokens: the
-        prompt tokens it reads (backend.route's estimate)."""
-        q, stop = queue.Queue(), threading.Event()
+        prompt tokens it reads (backend.route's estimate). stop: an Event that
+        stops it too, set by another thread: a caller that waits here for the
+        first token of a long prompt cannot stop early (the scheduler checks it
+        between the parts of the prompt; a request still waiting never starts)."""
+        q, stop = queue.Queue(), (stop if stop is not None else threading.Event())
         if lane is not None and self.lanes is not None:
             self.jobs.put(lambda: self.lanes.admit(lane, make, q, stop, tokens))
             try:

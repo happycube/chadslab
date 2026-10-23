@@ -476,12 +476,16 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._block(prompt_ids, max_tokens, sampler, stops, eos, model_id, chat)
 
-    def _gen(self, backend, prompt_ids, max_tokens, sampler, eos):
+    def _gen(self, backend, prompt_ids, max_tokens, sampler, eos, stop=None):
         lane = getattr(self, "_lane", None)
         # the conversation id of the client (server/backend.py session_of), for
         # an engine that keys its contexts by it (Gemma's --context-dir)
         sid = getattr(self, "_session", None)
         kw = {"session": sid} if sid is not None and getattr(backend, "takes_session", False) else {}
+        # stop: set when the client closes the stream; the model thread sees it between the parts
+        # of a prompt (a prompt read gives no token to check it after)
+        if stop is not None and getattr(backend, "takes_stop", False):
+            kw["stop"] = stop
         if lane is None:
             return backend.generate(prompt_ids, max_tokens, sampler, eos, **kw)
         return backend.generate(prompt_ids, max_tokens, sampler, eos, lane=lane,
@@ -623,7 +627,7 @@ class _Handler(BaseHTTPRequestHandler):
         def worker():
             try:
                 with self._guard(backend):
-                    for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos):
+                    for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos, stop=done):
                         q.put(("token", token))
                         if done.is_set():
                             break
