@@ -605,15 +605,15 @@ class Qwen4GPU(QwenGPU):
             # the logits in pinned memory: a row is 1 MB (248320 values), and
             # its copy from the GPU took 0.5 ms more than the head itself
             # into pageable memory (2.0 ms in place of 1.5; 4 rows 4.4 ms)
-            hx, out = np.zeros((rows, cfg.hidden_size), np.float32), pinned((rows, m.rows))
+            hx, out = np.zeros((rows, cfg.hidden_size), np.float32), pinned((rows, m.rows), free=True)
             out[:] = 0.0
             # the best token of each row too (GP_ARGMAX, the first index of
             # the largest value, as np.argmax): argmax() downloads only it
-            tok = pinned((rows,), np.int32)
+            tok = pinned((rows,), np.int32, free=True)
             hp.names.update(x=hx, out=out, tok=tok)
             p = None
             if prob:
-                p = pinned((rows,), np.float32)
+                p = pinned((rows,), np.float32, free=True)
                 hp.names["prob"] = p
             hp.emit(P.KQ_LINEAR, None, None, None, hx, w, type_, m.rows, m.cols, rows, out)
             if getattr(cfg, "b12x", False):

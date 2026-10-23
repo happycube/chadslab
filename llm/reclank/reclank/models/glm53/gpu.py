@@ -84,7 +84,6 @@ class GLM53GPU(Qwen4GPU):
         count with the dense ones (fewer hot experts)."""
         self.dspark = dspark
         self.head_progs, self.mtp_progs, self.sel_bufs = {}, {}, {}
-        self.commit_progs = {}
         self._qsa_buf = None
         self.mcache = None
         self.has_mtp = False
@@ -176,7 +175,8 @@ class GLM53GPU(Qwen4GPU):
                 mir.buffer_of(prog.names["log.%d" % i]).ptr, n, cfg.conv_kernel, cfg.kda_heads,
                 cfg.kda_heads, cfg.kda_dim, cfg.kda_dim, 4))
         if self.cache.kv:
-            g = self.commit_progs.get(id(prog))
+            # (on the verify program: closed with it when the LRU frees it, gpumm _free_program)
+            g = getattr(prog, "commit_g", None)
             if g is None:
                 cp = P.Program()
                 for i in self.cache.kv:
@@ -184,7 +184,8 @@ class GLM53GPU(Qwen4GPU):
                             prog.names["pbs.%d" % i], prog.names["pk.%d" % i], prog.names["pg.%d" % i],
                             cp.slot("pos"), cp.slot("keep"), cfg.index_pool, cfg.index_dim)
                 from reclank.backends.cuda.runtime import GPUProgram
-                g = self.commit_progs[id(prog)] = GPUProgram(cp.finish(), graph=False, mirror=mir)
+                g = prog.commit_g = GPUProgram(cp.finish(), graph=False, mirror=mir)
+                prog.__dict__.setdefault("side", []).append(g)
             kw = {"pos": pos, "keep": n}
             for i, (_lat, _pool, ks, ss) in self.cache.kv.items():
                 kw["kst.%d" % i], kw["sst.%d" % i] = ks, ss
@@ -194,7 +195,8 @@ class GLM53GPU(Qwen4GPU):
         self._pending = None
 
     def close(self):
-        for g in self.commit_progs.values():
-            g.close()
-        self.commit_progs = {}
+        for p in self._live_programs():
+            for g in getattr(p, "side", ()):
+                g.close()
+            p.side = []
         super().close()

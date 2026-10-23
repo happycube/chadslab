@@ -43,7 +43,10 @@ class ThinkGuard:
     token from the budget on that ends a line goes in, then force without
     its leading newlines; no line ended in NL_WAIT tokens (at most a quarter
     of the budget), force where it is. A close at the budget alone cut
-    "So (8" in the middle. A coding
+    "So (8" in the middle. para (DeepSeek): they wait for an empty line in
+    place of the end of a line (a token from the budget on after which the
+    text ends in two newlines, spaces between them too): the end of a
+    paragraph of the think part. A coding
     agent's client closed six requests at 303 s each (about 9600 tokens of
     the model at 32 tok/s), and a think of 15339 tokens took 632 s.
 
@@ -63,7 +66,8 @@ class ThinkGuard:
     state at the start (a prompt that ends in an open channel)."""
 
     def __init__(self, stop_ids, close_id, budget=0, force=(), think=True, wrap_at=None,
-                 wrap_think=(), wrap_answer=(), tool=(None, None), open_id=None, ends_line=None):
+                 wrap_think=(), wrap_answer=(), tool=(None, None), open_id=None, ends_line=None,
+                 para=False):
         self.stop, self.close, self.open, self.fixes = set(stop_ids), close_id, bool(think), 0
         self.open_id = open_id
         self.budget, self.force, self.n, self.queue, self.budget_hits = budget, list(force), 0, [], 0
@@ -74,6 +78,8 @@ class ThinkGuard:
         self.ends_line = ends_line
         self.wait = min(NL_WAIT, budget // 4) if ends_line is not None else 0
         self.waited = 0
+        # para: the newlines that end the text of the think part (an empty line: 2)
+        self.para, self.nls = bool(para) and ends_line is not None, 0
 
     def __call__(self, token):
         self.count += 1
@@ -118,10 +124,15 @@ class ThinkGuard:
         if token == self.close or not self.open:
             return token
         self.n += 1
+        if self.para and self.n < self.budget:
+            # (the newlines that end the text before the budget: the first token on may end an empty line)
+            self.nls = newlines_after(self.ends_line, token, self.nls)
         if self.budget and self.n >= self.budget and self.force:
             self.waited = self.n - self.budget
             if self.waited < self.wait:
-                if not self.ends_line(token):
+                if self.para:
+                    self.nls = newlines_after(self.ends_line, token, self.nls)
+                if not self.ends_line(token) or self.para and self.nls < 2:
                     return token
                 # (the line ends: the token, then force from its first word)
                 self.budget_hits += 1
@@ -174,15 +185,32 @@ def think_budget(budget, max_tokens, n_force):
 
 def newline_test(decode):
     """ThinkGuard's ends_line from a tokenizer's decode: True for a token whose text ends in a
-    newline (each token decoded once, when the guard first asks)."""
+    newline (each token decoded once, when the guard first asks). ends_line.tail(token): the
+    newlines of the spaces that end its text, and whether its text is all spaces (newlines_after)."""
     seen = {}
 
-    def ends_line(token):
+    def text(token):
         r = seen.get(token)
         if r is None:
-            r = seen[token] = decode([int(token)]).endswith("\n")
+            r = seen[token] = decode([int(token)])
         return r
+
+    def ends_line(token):
+        return text(token).endswith("\n")
+
+    def tail(token):
+        t = text(token)
+        rest = t.rstrip()
+        return t[len(rest):].count("\n"), not rest
+    ends_line.tail = tail
     return ends_line
+
+
+def newlines_after(ends_line, token, nls):
+    """The newlines that end the text after token (ThinkGuard para), nls before it: a token of
+    spaces alone adds its own; another, those that end it."""
+    k, blank = ends_line.tail(token)
+    return nls + k if blank else k
 
 
 def wrap_at_of(wrap_left, room, max_tokens):
@@ -205,7 +233,9 @@ def report(guard, tag, wrap_left):
         print("[%s] fewer than %d tokens of the context left at token %d of the answer: the words to "
               "wrap up" % (tag, wrap_left, guard.wrap_at), file=sys.stderr, flush=True)
     if guard.budget_hits:
-        at = (" at the end of a line, %d tokens on" % guard.waited if guard.waited < guard.wait else
-              " (no line ended in %d tokens)" % guard.wait if guard.wait else "")
+        at = (" at the end of a %s, %d tokens on" % ("paragraph" if guard.para else "line", guard.waited)
+              if guard.waited < guard.wait else
+              " (no %s ended in %d tokens)" % ("paragraph" if guard.para else "line", guard.wait)
+              if guard.wait else "")
         print("[%s] the think part reached its budget (%d tokens): closed%s" % (tag, guard.budget, at),
               file=sys.stderr, flush=True)

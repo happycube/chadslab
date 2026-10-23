@@ -485,14 +485,18 @@ def _alloc_retry(nbytes, oom=None, kind="other", owner=None):
                 raise
 
 
-def pinned(shape, dtype=np.float32):
+def pinned(shape, dtype=np.float32, free=False):
     """Return a NumPy array in pinned host memory. A copy between the GPU and
-    pinned memory does not wait for the host. The memory is not freed."""
+    pinned memory does not wait for the host. The memory is not freed, unless
+    free: then when the array and its views are gone (the arrays of programs
+    made again, which nothing outside the program holds)."""
     n = int(np.prod(shape)) * np.dtype(dtype).itemsize
     ptr = _lib().rc_gpu_host_alloc(max(n, 1))
     if not ptr:
         raise MemoryError(_lib().rc_gpu_last_error().decode())
     raw = (ctypes.c_uint8 * max(n, 1)).from_address(ptr)
+    if free:
+        weakref.finalize(raw, _lib().rc_gpu_host_free, ptr).atexit = False
     return np.frombuffer(raw, dtype=np.uint8, count=n).view(dtype).reshape(shape)
 
 
@@ -879,6 +883,10 @@ class ProgramLRU:
         if getattr(g, "fence", 0):
             _lib().rc_gpu_fence_done(g.fence, 1)
         g.close()
+        # the GPUPrograms made beside it on its arrays (prog.side: GLM's commit of a verify group)
+        for sg in getattr(prog, "side", ()):
+            sg.close()
+        prog.side = []
         for b in g.named.values():
             b.free()
         live = {_base(a) for a in self._pinned_arrays()}

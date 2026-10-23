@@ -466,7 +466,6 @@ class QwenGPU(WarmPool, ProgramLRU):
         self.xdev = None
         self.graph = graph
         self._dense = {}
-        self.cpu_progs = []
         self.n_events = 0
         # the mixed groups of a prompt (mix)
         self.mix_progs = {}
@@ -1497,7 +1496,7 @@ class QwenGPU(WarmPool, ProgramLRU):
                       self._tmp("de", lambda: z(pairs, hidden)), out, k, inner, hidden, gm.type,
                       dm.type, t, *shared, stype, slog)
             return
-        hp = self._buf("hp", lambda: pinned((t, hidden)))
+        hp = self._buf("hp", lambda: pinned((t, hidden), free=True))
         zdev = getattr(self, "zc_dev", {}).get(i)
         nzc = (self.zc if t == 1 else self.zc_mt) if zdev else 0
         zc = self._buf("zc", lambda: np.zeros(t * k + t, dtype=np.int32)) if nzc > 0 else None
@@ -1510,7 +1509,7 @@ class QwenGPU(WarmPool, ProgramLRU):
                 prog.emit(P.HOT_SPLIT, idx, val, st["slots"], cold, cold_val, k, wsel, zc, nzc)
             else:
                 prog.emit(P.HOT_SPLIT, idx, val, st["slots"], cold, cold_val, k, wsel)
-            vp, ip = pinned((k,)), pinned((2 * k + 1,), np.int32)
+            vp, ip = pinned((k,), free=True), pinned((2 * k + 1,), np.int32, free=True)
             st["ip"] = ip       # the selection of the step, for HotCache
         else:
             cold = self._buf("cold", lambda: np.zeros((t, k), dtype=np.int32))
@@ -1521,12 +1520,12 @@ class QwenGPU(WarmPool, ProgramLRU):
             else:
                 prog.emit(P.HOT_SPLIT_MT, idx, val, st["slots"], cold, cold_val, t * k,
                           prog.slot("nreal"), k)
-            vp = self._buf("vp", lambda: pinned((t, k)))
-            ip = self._buf("ip", lambda: pinned((t, k), np.int32))
+            vp = self._buf("vp", lambda: pinned((t, k), free=True))
+            ip = self._buf("ip", lambda: pinned((t, k), np.int32, free=True))
         if FLAGS:
             # The flag form (backends/cuda/csrc, GP_SIGNAL): no boundary record, so a
             # step is one graph. The flags of each layer are its own.
-            fl = pinned((2,), np.int64)
+            fl = pinned((2,), np.int64, free=True)
             prog.keep.append(fl)
             prog.emit(P.SIGNAL, fl[0:1], prog.slot("seq"), h, hp, hp.nbytes, cold_val, vp,
                       vp.nbytes, cold, ip, ip.nbytes)
@@ -1576,7 +1575,7 @@ class QwenGPU(WarmPool, ProgramLRU):
         mats = cops.kq_moe_mats(*(m.c() for m in st["mats"]), None)
         # pinned in the flag form: GP_AWAIT reads it through the map
         host_out = self._buf("host_rows" if rows else "host_out",
-                             lambda: pinned((t * k if rows else t, hidden)) if FLAGS else z(t, hidden))
+                             lambda: pinned((t * k if rows else t, hidden), free=True) if FLAGS else z(t, hidden))
         # the copy of the experts on the other node (_numa_copy_experts): the
         # threads there read it
         m1 = getattr(self, "numa_mats1", {}).get(i)
@@ -1614,7 +1613,7 @@ class QwenGPU(WarmPool, ProgramLRU):
                 cc.emit(P.REMOTE_JOIN, xdev.ctx_bytes, posted, host_out)
             cc.keep.append(mats)
             cpu = cc.finish()
-        self.cpu_progs.append(cpu)
+        prog.cpu_progs.append(cpu)
         if rows:
             seq = prog.slot("seq")
             prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
@@ -1744,7 +1743,10 @@ class QwenGPU(WarmPool, ProgramLRU):
 
     def _gpu_program(self, prog, entry):
         """The GPUProgram of prog (entry: (the name of its dict, key));
-        gpumm.ProgramLRU._build_program."""
+        gpumm.ProgramLRU._build_program. The scratch of its compile (_buf:
+        some arrays only by their address in a table) lives as long as it
+        does: its pinned arrays are freed with it."""
+        prog.pool = self._pool
         return self._build_program(prog, entry)
 
     def _alloc(self, nbytes, keep=None):
@@ -1765,9 +1767,9 @@ class QwenGPU(WarmPool, ProgramLRU):
         k, E, hidden, inner = cfg.top_k, cfg.num_experts, cfg.hidden_size, cfg.moe_inter
         t = h.shape[0]
         z = lambda *sh: P.lazy_zeros(sh)  # noqa: E731
-        hp = self._buf("hp", lambda: pinned((t, hidden)))
-        vp = self._buf("vp", lambda: pinned((t, k)))
-        ip = self._buf("ip", lambda: pinned((t, k), np.int32))
+        hp = self._buf("hp", lambda: pinned((t, hidden), free=True))
+        vp = self._buf("vp", lambda: pinned((t, k), free=True))
+        ip = self._buf("ip", lambda: pinned((t, k), np.int32, free=True))
         ev = self.n_events
         self.n_events += 1
         # MIX_Q16: the rows to the CPU and its part back as int16 (GP_Q16, GP_DQ16); not with
@@ -1776,14 +1778,14 @@ class QwenGPU(WarmPool, ProgramLRU):
         nq = 2 * t * hidden + 4 * (t * hidden // 128)
         if q16:
             hq = self._tmp("hq", lambda: P.lazy_zeros((nq,), np.uint8))
-            hqp = self._buf("hqp", lambda: pinned((nq,), np.uint8))
+            hqp = self._buf("hqp", lambda: pinned((nq,), np.uint8, free=True))
             prog.emit(P.Q16, h, hq, t * hidden)
             prog.emit(P.TO_HOST, hq, hqp, nq, val, vp, vp.nbytes, idx, ip, ip.nbytes, ev)
         else:
             prog.emit(P.TO_HOST, h, hp, hp.nbytes, val, vp, vp.nbytes, idx, ip, ip.nbytes, ev)
         # The plan, on the host.
-        tab_h = self._buf("tab_h", lambda: pinned((3 * E,), np.int64))
-        gidx_h = self._buf("gidx_h", lambda: pinned((t, k), np.int32))
+        tab_h = self._buf("tab_h", lambda: pinned((3 * E,), np.int64, free=True))
+        gidx_h = self._buf("gidx_h", lambda: pinned((t, k), np.int32, free=True))
         cidx = self._buf("cidx", lambda: np.zeros((t, k), np.int32))
         ranges = self._buf("ranges", lambda: np.zeros((3 * E, 3), np.int64))
         desc = self.mix_desc.setdefault(i, np.zeros(25, np.int64))
@@ -1793,13 +1795,13 @@ class QwenGPU(WarmPool, ProgramLRU):
         # RECLANK_GPU_MIX_SPLIT (1): the hot experts and the shared expert run
         # during the copies, the copied experts after them (two records)
         split = os.environ.get("RECLANK_GPU_MIX_SPLIT", "1") != "0"
-        gidx2_h = self._buf("gidx2_h", lambda: pinned((t, k), np.int32)) if split else None
+        gidx2_h = self._buf("gidx2_h", lambda: pinned((t, k), np.int32, free=True)) if split else None
         # prefetch (see mix): the experts of the layer copied before its plan
         pre_on = PREFETCH and split and prefetch
         gidx3_h = None
         if pre_on:
             pr = self._pre(i)
-            gidx3_h = self._buf("gidx3_h", lambda: pinned((t, k), np.int32))
+            gidx3_h = self._buf("gidx3_h", lambda: pinned((t, k), np.int32, free=True))
             # the gidx3 of this program: desc (one for all the mixed programs
             # of the layer) gets it at each run (_pre_desc)
             self.__dict__.setdefault("mix_gidx3", {})[t] = gidx3_h
@@ -1808,7 +1810,7 @@ class QwenGPU(WarmPool, ProgramLRU):
         pc.emit(P.MOE_PLAN, ip, self._nreal_h, t, k, E, st["slots"], desc, ca, cb, MIX_GPU,
                 tab_h, gidx_h, cidx, ranges, stats, gidx2_h)
         plan = pc.finish()
-        self.cpu_progs.append(plan)
+        prog.cpu_progs.append(plan)
         prog.emit(P.CPU_START, plan.buf, ev)
         prog.emit(P.CPU_WAIT)
         tab_d = self._buf("tab_d", lambda: np.zeros(3 * E, np.int64))
@@ -1843,7 +1845,7 @@ class QwenGPU(WarmPool, ProgramLRU):
         # pinned: its copy to the GPU (TO_DEV, after the CPU experts) is on the
         # path of each layer; from pageable memory it ran at 1.8 GB/s, 12 ms of
         # each layer of a group of 2048 tokens
-        host_out = self._buf("host_out_mix", lambda: pinned((t, hidden)))
+        host_out = self._buf("host_out_mix", lambda: pinned((t, hidden), free=True))
         # the copy of the experts on the other node, as in the step: on the
         # 2-socket Xeon a layer of a real-text group took 38.9 ms with 40
         # threads that all read node 0, 31.8 with it (RECLANK_GPU_MIX_NUMA=0:
@@ -1862,11 +1864,11 @@ class QwenGPU(WarmPool, ProgramLRU):
                 getattr(self, "numa_slot0", {}).get(i))
         cc.keep.append(mats)
         if q16:
-            oqp = self._buf("oqp", lambda: pinned((nq,), np.uint8))
+            oqp = self._buf("oqp", lambda: pinned((nq,), np.uint8, free=True))
             cc.emit(P.Q16, host_out, oqp, t * hidden)
         cc.threads = mix_threads()
         cpu = cc.finish()
-        self.cpu_progs.append(cpu)
+        prog.cpu_progs.append(cpu)
         prog.emit(P.CPU_START, cpu.buf, ev)
         # The experts of the GPU (hot and copied) and the shared expert.
         P_ = t * k + t
@@ -2231,13 +2233,13 @@ class QwenGPU(WarmPool, ProgramLRU):
             w, type_ = self.dense("lm_head")
             self._head_w = w
             hp = P.Program()
-            hx, out = np.zeros((rows, cfg.hidden_size), np.float32), pinned((rows, m.rows))
+            hx, out = np.zeros((rows, cfg.hidden_size), np.float32), pinned((rows, m.rows), free=True)
             out[:] = 0.0
-            tok = pinned((rows,), np.int32)
+            tok = pinned((rows,), np.int32, free=True)
             hp.names.update(x=hx, out=out, tok=tok)
             p = None
             if prob:
-                p = pinned((rows,), np.float32)
+                p = pinned((rows,), np.float32, free=True)
                 hp.names["prob"] = p
             if m.rot:
                 # an RQ8_0 head (convert_lfm25_gguf.py --dense rq8): x rotated in each 32

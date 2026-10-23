@@ -638,7 +638,7 @@ class NmEmit:
                 gidx, gout, part = S("zidx", t * k, np.int32), S("gout", t * L), S("part", t * L)
                 prog.emit(P.NM_PLAN, idx, d.hot[i][0], cold, cnt, gidx, t * k, k, prog.slot("nreal"), E,
                           float(PLAN_CPU), float(PLAN_GPU))
-                fl = pinned((2,), np.int64)
+                fl = pinned((2,), np.int64, free=True)
                 fl[:] = 0
                 prog.keep.append(fl)
                 seq = prog.slot("seq")
@@ -657,7 +657,7 @@ class NmEmit:
                 gidx, gout, part = S("zidx", t * k, np.int32), S("gout", t * L), S("part", t * L)
                 prog.emit(P.NM_SPLIT, idx, mine, S("cold", t * k, np.int32), cnt, t * k, k, prog.slot("nreal"))
                 prog.emit(P.NM_SPLIT, idx, rest, gidx, S("zcnt", 1, np.int32), t * k, k, prog.slot("nreal"))
-                fl = pinned((2,), np.int64)
+                fl = pinned((2,), np.int64, free=True)
                 fl[:] = 0
                 prog.keep.append(fl)
                 seq = prog.slot("seq")
@@ -690,7 +690,7 @@ class NmEmit:
                 cc.emit(P.NM_MOE, bufs["lat"], bufs["cold"], bufs["val"], t, k, upm.data, upm.type, dnm.data, dnm.type,
                         L, inner, bufs["scratch"], bufs["out"], int(X16), *d.m.node1(i))
                 cpu = cc.finish()
-                d.cpu_progs.append(cpu)
+                prog.cpu_progs.append(cpu)
                 prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
                 self.side_now()
                 self._await_add(prog, fl, seq, bufs["out"], part, gout, out, t * L, cnt)
@@ -706,7 +706,7 @@ class NmEmit:
                         L, inner, bufs["scratch"], bufs["out"], int(X16), *d.m.node1(i))
                 cc.emit(P.REMOTE_JOIN, xd.ctx_bytes, posted, bufs["out"])
                 cpu = cc.finish()
-                d.cpu_progs.append(cpu)
+                prog.cpu_progs.append(cpu)
                 prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
                 self.side_now()
                 self._await_add(prog, fl, seq, bufs["out"], part, gout, out, t * L, cnt)
@@ -730,7 +730,7 @@ class NmEmit:
                 _patch(prog, rec, a, v)
         else:
             prog.emit(P.NM_SPLIT, idx, slots, cold, cnt, t * k, k, prog.slot("nreal"))
-        fl = pinned((2,), np.int64)
+        fl = pinned((2,), np.int64, free=True)
         fl[:] = 0
         prog.keep.append(fl)
         seq = prog.slot("seq")
@@ -755,7 +755,7 @@ class NmEmit:
         if xd is not None:
             cc.emit(P.REMOTE_JOIN, xd.ctx_bytes, posted, bufs["out"])
         cpu = cc.finish()
-        d.cpu_progs.append(cpu)
+        prog.cpu_progs.append(cpu)
         prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
         self.side_now()
         if slots_all is not None:
@@ -786,7 +786,6 @@ class NemotronGPU:
         # the image spans of the sequence: (first position, rows [n, hidden]) whose rows replace the
         # embeddings of their positions (Super's vision: radio.py)
         self.media = []
-        self.cpu_progs = []
         self._bufs = {}
         self.mirror = Mirror()
         self.cache = NemotronKQCache(cfg, ctx, kv="bf16")

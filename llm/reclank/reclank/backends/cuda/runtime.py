@@ -136,6 +136,7 @@ def lib():
     L.rc_gpu_cache_query.argtypes = [i, i]
     L.rc_gpu_gdn_commit.argtypes = [vp, vp, vp] + [i] * 7
     L.rc_gpu_host_alloc.restype = vp
+    L.rc_gpu_host_free.argtypes = [vp]
     L.rc_gpu_d2d.argtypes = [vp, vp, sz]
     L.rc_gpu_ko_table.argtypes = [vp, vp, i, i, i]
     L.rc_gpu_zero.argtypes = [vp, sz]

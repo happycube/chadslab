@@ -568,7 +568,7 @@ class DSEngine(Engine):
         force = self.think_force
         return ThinkGuard(eos_ids, self.think_close_id, think_budget(self.think_budget, max_tokens, len(force)),
                           force, think=think, wrap_at=wrap_at, wrap_think=self.wrap_think,
-                          wrap_answer=self.wrap_answer, ends_line=self.ends_line)
+                          wrap_answer=self.wrap_answer, ends_line=self.ends_line, para=True)
 
     def generate(self, prompt_ids, max_tokens, sampler, eos_ids):
         ids = list(prompt_ids)

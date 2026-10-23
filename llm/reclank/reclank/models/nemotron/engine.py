@@ -616,7 +616,9 @@ def load(opts, meta, worker=None):
     template = opts.template or os.path.join(path, "chat_template.jinja")
     tok = NemotronTok(opts.tokenizer or os.path.join(path, "tokenizer.json"), template)
     m = NemotronKQ(path)
-    ctx = int(opts.ctx or 65536)
+    # (Super: 524288 positions, its bfloat16 cache of 8 attention layers and the MTP block's ~4.8 GB on the
+    # GPU, out of the hot experts; Bolt 65536)
+    ctx = int(opts.ctx or (524288 if m.cfg.mtp else 65536))
     backend = getattr(opts, "backend", "auto") or "auto"
     gpu = None
     if backend != "cpu":

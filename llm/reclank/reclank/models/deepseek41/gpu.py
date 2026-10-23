@@ -69,6 +69,10 @@ SIGNAL_CHAIN = os.environ.get("RECLANK_DS_SIGNAL_CHAIN", "1") != "0"
 # RECLANK_DS_SPEC=0/1 over all; RECLANK_DS_SPEC_N: the most experts a layer (6); RECLANK_DS_SPEC_DN=0:
 # the gate and up rows alone (33.79 ms)
 SPEC = None if os.environ.get("RECLANK_DS_SPEC") is None else os.environ["RECLANK_DS_SPEC"] != "0"
+# the decoder's bounded replay of a long prompt (DSV41GPU replay; RECLANK_DS_REPLAY=0: every layer on
+# every token): KL against the full forward 3.6e-3 (1000 tokens), 6.2e-3 (2300), 3.0e-3 (5018), 1.1e-2
+# (prompt3), the same argmax; a prompt in parts has the bits of the prompt whole
+REPLAY = os.environ.get("RECLANK_DS_REPLAY", "1") != "0"
 # make_room: a program that finds the GPU full first frees the others (made again when run), but not
 # twice in ROOM_S seconds: then the working set of programs does not fit, and the hot experts give a
 # slot of each layer (RECLANK_DS_ROOM_S)
@@ -153,7 +157,7 @@ class DSV41GPU:
     """See the module text."""
 
     def __init__(self, m, graph=True, keep_layers=True, hot_gb=HOT_GB, counts=None, hot_dyn=True, cache="min",
-                 group=None, rq8=False, x8_prefill=False, replay=True, ab=True, spec=True):
+                 group=None, rq8=False, x8_prefill=False, replay=None, ab=True, spec=True):
         """hot_gb: the GPU memory of the hot experts (whole experts, 18.8 MB
         each, the same count for each layer; default HOT_GB, 12); counts (layers x experts, or
         None): the first hot experts of each layer are the most counted, else
@@ -169,7 +173,8 @@ class DSV41GPU:
         the bfloat16 matrices (the head, the routers, the compressors, the
         indexer's) in RQ8_0 (Q8_0 of the rows turned in each 32, x turned the
         same) in place of BF12: 8.5 bits a value in place of 12.25, not exact
-        (an option; the FP8 matrices stay as they are). replay: a prompt of
+        (an option; the FP8 matrices stay as they are). replay (default
+        REPLAY, on): a prompt of
         more than the window runs the decoder (layers 20..39) on its last
         window of tokens only (DeepSeek's Decoder SWA Bounded Replay, V4.1
         3.2.2: the way DeepSeek serves the model, simulated in its
@@ -196,7 +201,7 @@ class DSV41GPU:
         self.hc_step = int(os.environ.get("RECLANK_DS_HC_STEP", "1"))
         # RECLANK_DS_VERIFY_MERGE=0: each half of a verify group runs its own hot and shared experts
         self.verify_merge = os.environ.get("RECLANK_DS_VERIFY_MERGE", "1") != "0"
-        self.replay = bool(replay) and max(m.kv_sources) == self.dec0 == m.cand_src
+        self.replay = bool(REPLAY if replay is None else replay) and max(m.kv_sources) == self.dec0 == m.cand_src
         self.w = m.w
         if self.w.z is None or self.w.z.index["layout"] == "dsv41-expert-planes-v1":
             raise ValueError("the GPU step needs a weightkeeper with the KQ_MXX layout (v2)")
@@ -665,7 +670,7 @@ class DSV41GPU:
         def z(*sh, dtype=np.float32, pin=False):
             if share:
                 return self._scratch(t, counts, sh, dtype, pin, most=win if stage == "dec" else None)
-            own.append(pinned(sh, dtype) if pin else np.zeros(sh, dtype))
+            own.append(pinned(sh, dtype, free=True) if pin else np.zeros(sh, dtype))
             return own[-1]
 
         def zo(*sh):
@@ -699,8 +704,8 @@ class DSV41GPU:
         # the backups that undo the rows of the refused drafts (restore)
         verify = t <= VERIFY_MAX
         # (pinned: the copy that ends each step does not stage through pageable memory: 0.22 -> 0.11 ms;
-        # a few MB at most stay allocated, the programs being made again only when cap doubles)
-        io.logits = pinned((t if verify else 1, m.w.src.cfg["vocab_size"]))
+        # freed with the program: make_room makes them again at every request of a long session)
+        io.logits = pinned((t if verify else 1, m.w.src.cfg["vocab_size"]), free=True)
         own.append(io.logits)
         tl = list(m.c.get("dspark_target_layer_ids", []))
         # the input of DSpark from its target layers (read just after the run: a
@@ -756,7 +761,11 @@ class DSV41GPU:
         # top k then over the chunks in turn (DS_TOPK_MERGE: the same choice)
         maxn = {i: min(self.kcache[i].shape[0], self.cap // m.ratios[i]) for i in self.kcache}
         sw = max(maxn.values())
-        chw = self.score_chunk(t, sw)
+        # (a group's scores are a view of the shared scratch, whose base has the rows of the largest
+        # group (_scratch's most): the chunks fit SCORE_MB for those rows. For its own t rows a small
+        # group took every entry, and its base most / t times SCORE_MB: 4 GB at cap 512K, where the
+        # programs then did not fit beside the hot experts at each request of a long session)
+        chw = self.score_chunk(max(t, win if stage == "dec" else max(self.group, win)) if share else t, sw)
         scores = dict.fromkeys(self.kcache, z(t, chw))
         sel = {i: z(t, m.ix_topk, dtype=np.int32) for i in m.index_sources}
         cnt = {i: z(t, dtype=np.int32) for i in m.index_sources}
@@ -814,12 +823,12 @@ class DSV41GPU:
         flags = {}
         # the stage of the cold experts of the most pairs (STAGE): each half's map with its stage slots
         # (and A's: B's map starts from A's), its stage slots alone, the experts it copies in
-        stage = self.stage_n if share else 0
-        if stage:
+        nstage = self.stage_n if share else 0
+        if nstage:
             sbuf = self.stage_buf(3 if len(lanes) == 2 else 1)
             smaps = [z(self.w.src.E, dtype=np.int32) for _ in lanes]
             omaps = [z(self.w.src.E, dtype=np.int32) for _ in lanes]
-            slists = [z(stage, dtype=np.int32) for _ in lanes]
+            slists = [z(nstage, dtype=np.int32) for _ in lanes]
         hmap = {}                   # (lane, layer) -> the map of its pairs (the hot slots and the stage's)
         pulls = {}                  # lane -> [layer, the first expert of its pull not copied yet]
 
@@ -828,7 +837,7 @@ class DSV41GPU:
             them in its ffn_post of layer i, after A's pull of layer i + 1 started), B's in the third."""
             if len(lanes) == 1:
                 return 0
-            return 2 * stage if j else (i % 2) * stage
+            return 2 * nstage if j else (i % 2) * nstage
 
         def pull(j, i, a, b):
             """GP_DS_STAGE_PULL of experts a..b of half j's list of layer i."""
@@ -840,9 +849,9 @@ class DSV41GPU:
             q = pulls.get(j)
             if q is None:
                 return
-            b = stage if rest else min(stage, q[1] + STAGE_CHUNK)
+            b = nstage if rest else min(nstage, q[1] + STAGE_CHUNK)
             pull(j, q[0], q[1], b)
-            if b == stage:
+            if b == nstage:
                 del pulls[j]
             else:
                 q[1] = b
@@ -977,9 +986,10 @@ class DSV41GPU:
         def flag_of(j, i):
             """The flags of layer i's CPU task of lane j (in, out: pinned; made once)."""
             if (j, i) not in flags:
-                fl = flags[j, i] = pinned((2,), np.int64)
+                fl = flags[j, i] = pinned((2,), np.int64, free=True)
                 fl[:] = 0
                 prog.keep.append(fl)
+                own.append(fl)
             return flags[j, i]
 
         def ffn_pre(j, i, local=True):
@@ -1011,12 +1021,12 @@ class DSV41GPU:
             # parts at the same time (their de rows, flag 64), the shared one
             cold, cold_val = colds[i]
             mp = hmap[j, i] = self.maps[i]
-            if stage:
+            if nstage:
                 # the cold experts of the most pairs to the stage (after A's of the layer, for B), their
                 # pairs the GPU's: the split leaves them out of the CPU's task
                 base = hmap[0, i] if j else self.maps[i]
                 mp = hmap[j, i] = smaps[j]
-                prog.emit(P.DS_STAGE_PICK, ids, base, mp, slists[j], n * k, self.w.src.E, stage, STAGE_MINP,
+                prog.emit(P.DS_STAGE_PICK, ids, base, mp, slists[j], n * k, self.w.src.E, nstage, STAGE_MINP,
                           stage_s0(j, i), omaps[j])
             if t == 1:
                 ipl = ip
@@ -1030,14 +1040,14 @@ class DSV41GPU:
             last_task[j] = fl
             prog.emit(P.SIGNAL, fl[0:1], seq, S(xa), hpl, hpl.nbytes, cold_val, vpl, vpl.nbytes, cold, ipl, ipl.nbytes,
                       prev[1:2] if prev is not None else None)
-            if stage:
+            if nstage:
                 # (after the signal: the CPU's task runs while the GPU copies, beside the kernels after;
                 # joined in ffn_post)
                 pump(1 - j)
                 if STAGE_CHUNK and len(lanes) == 2:
                     pulls[j] = [i, 0]
                 else:
-                    pull(j, i, 0, stage)
+                    pull(j, i, 0, nstage)
             if local:
                 ffn_local(j, i)
             if hcs:
@@ -1048,6 +1058,7 @@ class DSV41GPU:
                 cpu = self.parts.program(i, n, k, hpl, ipl, vpl, S(host_rows, k), ip[k:k + 1] if t == 1 else None,
                                          32 | 64 | 128 | (256 if x8 else 0), self.part_bufs)
             io.cpu.append(cpu)
+            own.append(cpu.buf)         # (in the mirror with the program's keep: forgotten with it)
             prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
             if self.spec and t == 1 and i + 1 < L and i + 1 in self.parts.pm:
                 # the next layer's guess, once this task is done (its flag out)
@@ -1055,9 +1066,11 @@ class DSV41GPU:
                 sp = self.parts.program_spec(i + 1, k, hpl, gw, gb, self.maps[i + 1], fl[1:2],
                                              flag_of(j, i + 1)[0:1])
                 io.cpu.append(sp)
-                sfl = pinned((1,), np.int64)
+                sfl = pinned((1,), np.int64, free=True)
                 sfl[:] = 0
                 prog.keep.append(sfl)
+                own.append(sfl)
+                own.append(sp.buf)
                 prog.emit(P.CPU_TASK, sp.buf, fl[1:2], sfl, seq)
 
         def ffn_local(j, i):
@@ -1067,9 +1080,9 @@ class DSV41GPU:
             f = "layers.%d.ffn." % i
             ids = S(io.ids[i], k)
             # (with the stage: the hot slots now, the stage's pairs and the sum in ffn_post, after the pull)
-            mp = self.maps[i] if stage else hmap.get((j, i), self.maps[i])
+            mp = self.maps[i] if nstage else hmap.get((j, i), self.maps[i])
             hot_moe(j, i, mp)
-            if hcs and not stage:
+            if hcs and not nstage:
                 # the GPU's pairs summed now, while the CPU's task runs (the CPU sends its own sum)
                 prog.emit(P.DS_COMBINE, ids, mp, S(hq["de"], k), None, S(part_d), k, dim, n, int(t > 1), 1)
             sx = f + "shared_experts."
@@ -1084,7 +1097,7 @@ class DSV41GPU:
             prog.emit(P.DS_HOT_MOE, S(xa), S(io.ids[i], k), S(io.vals[i], k), mp, self.stores[i], self.per,
                       self.off3, self.off2, n, k, dim, I, S(hq["qh"]), S(hq["ql"]), S(hq["xs"]), S(hq["act"], k),
                       S(hq["act2"], k), S(hq["aqh"], k), S(hq["aql"], k), S(hq["axs"], k), S(hq["de"], k),
-                      self.w.src.E, int(x8), sbuf if stage else None)
+                      self.w.src.E, int(x8), sbuf if nstage else None)
 
         def ffn_post(j, i):
             """The rows of the CPU's task back, the sum of the experts into the streams."""
@@ -1092,7 +1105,7 @@ class DSV41GPU:
             hl, p = S(h), "layers.%d." % i
             _ff, scf, bf = self.hcp(p + "hc_ffn")
             fl, cold = flags[j, i], colds[i][0]
-            if stage:
+            if nstage:
                 # the stage's pairs once the pull is in (the CPU's task still runs), then all the GPU's
                 # pairs summed as before (one DS_COMBINE: the same order)
                 pump(j, rest=True)
@@ -1217,7 +1230,7 @@ class DSV41GPU:
         b = store.get(key)
         if b is None or b.size < n:
             size = max(n, -(-n * most // t))
-            b = store[key] = pinned((size,), dt) if pin else np.zeros(size, dt)
+            b = store[key] = pinned((size,), dt, free=True) if pin else np.zeros(size, dt)
         return b[:n].reshape(shape)
 
     def run(self, t, part="full", vis=False):

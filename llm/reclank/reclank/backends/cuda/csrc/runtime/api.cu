@@ -297,15 +297,15 @@ static void gg_scratch_put(void *p)
     }
 }
 
-/* Load a program whose addresses are device addresses. Return a handle, or
- * NULL. use_graph 0 launches the kernels one at a time in each run. */
-void *rc_gpu_load(const int64_t *prog, int use_graph)
+/* rc_gpu_load; *made: the program as far as it got (freed by rc_gpu_load when this fails). */
+static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
 {
     if (prog[0] != GP_MAGIC) {
         snprintf(gg_error, sizeof(gg_error), "not a program");
         return NULL;
     }
     gg_prog *g = (gg_prog *)calloc(1, sizeof(gg_prog));
+    *made = g;
     g->n_env = (int)prog[1];
     g->n_code = (int)prog[2];
     /* Bit 0 of the flags: the CUDA graph. Bit 1: no tensor cores for this
@@ -570,6 +570,22 @@ void *rc_gpu_load(const int64_t *prog, int use_graph)
     return g;
 }
 
+int rc_gpu_unload(void *handle);
+
+/* Load a program whose addresses are device addresses. Return a handle, or
+ * NULL. use_graph 0 launches the kernels one at a time in each run. A load
+ * that fails frees what it made (its buffers, its graphs, its references to
+ * the shared scratch): a GPU short of memory makes room and loads again. */
+void *rc_gpu_load(const int64_t *prog, int use_graph)
+{
+    gg_prog *made = NULL;
+    void *h = gg_load(prog, use_graph, &made);
+    if (h == NULL && made != NULL) {
+        rc_gpu_unload(made);
+    }
+    return h;
+}
+
 /* Run a program. env holds the values of the slots after the bind; the run
  * computes the scalar slots itself. The run does not wait for the GPU. */
 /* The tables of the caches with keys only (ko_tab, kernels/operands.cu):
@@ -817,8 +833,10 @@ int rc_gpu_unload(void *handle)
             cudaGraphExecDestroy(g->seg[k].exec);
         }
     }
-    for (int k = 0; k < g->n_ev; ++k) {
-        cudaEventDestroy(g->ev[k]);
+    for (int k = 0; g->ev != NULL && k < g->n_ev; ++k) {
+        if (g->ev[k] != NULL) {
+            cudaEventDestroy(g->ev[k]);
+        }
     }
     free(g->seg);
     free(g->ev);

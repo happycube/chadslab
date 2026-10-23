@@ -271,6 +271,17 @@ A client points at `http://127.0.0.1:8080/v1`. The Bearer key defaults to
 `change-me`. Set it with `--api-key` or with `RECLANK_API_KEY`. An empty
 key turns the check off.
 
+The cache serves only the start of a prompt that has not changed. A
+client that edits old messages makes the server read the whole
+conversation again, and a long one can take longer than the client's
+timeout. Some clients drop old images to keep a request under a size
+limit. DeepSeek Harness (dsh) puts at most 20 MB of images in a request.
+Past that, it turns the oldest images into text, so in a session with many
+screenshots, every new image misses the cache. Raise the limit on the
+provider in `~/.dsh/settings.yaml`, for example
+`maxRequestImageBytes: 1073741824`. Give it a long `streamIdleTimeoutMs`
+as well.
+
 Key options of `python -m server`:
 
 | Option | Default | What it does |

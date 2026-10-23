@@ -225,10 +225,14 @@ class DSpark:
             hq = dict(qh=np.zeros((bs, dim), np.int8), ql=np.zeros((bs, dim), np.int8), xs=z(bs, dim // 32),
                       act=z(bs * k, 2 * I), act2=z(bs * k, I), aqh=np.zeros((bs * k, I), np.int8),
                       aql=np.zeros((bs * k, I), np.int8), axs=z(bs * k, I // 32), de=z(bs * k, dim))
-            rows_dummy = pinned((1, dim))
+            # (pinned, freed with the program: drop forgets them, and the main model's make_room drops
+            # DSpark's programs at every request of a long session)
+            rows_dummy = pinned((1, dim), free=True)
             prog.keep.append(rows_dummy)
-            hp, vp, ip, host_out = pinned((bs, dim)), pinned((bs * k,)), pinned((bs * k,), np.int32), pinned((bs, dim))
+            hp, vp, ip, host_out = (pinned((bs, dim), free=True), pinned((bs * k,), free=True),
+                                    pinned((bs * k,), np.int32, free=True), pinned((bs, dim), free=True))
             prog.keep += [hp, vp, ip, host_out]
+            own += [rows_dummy, hp, vp, ip, host_out]
             prev = None
             for b in range(self.blocks):
                 p = "mtp.%d." % b
@@ -262,9 +266,10 @@ class DSpark:
                 sx = f + "shared_experts."
                 if self.where in ("cpu", "cpu1"):
                     # the routed experts in the parts while the GPU does the shared one
-                    fl = pinned((2,), np.int64)
+                    fl = pinned((2,), np.int64, free=True)
                     fl[:] = 0
                     prog.keep.append(fl)
+                    own.append(fl)
                     prog.emit(P.SIGNAL, fl[0:1], seq, xa, hp, hp.nbytes, vals_r, vp, vp.nbytes, ids_r, ip, ip.nbytes)
                     lin8(xa, sx + "w1.weight", sg)
                     lin8(xa, sx + "w3.weight", su)
@@ -272,6 +277,7 @@ class DSpark:
                     lin8(sa, sx + "w2.weight", ys)
                     cpu = self.parts.program(b, bs, k, hp, ip, vp, host_out, None, 32 | 128, self.part_bufs)
                     io.cpu.append(cpu)
+                    own.append(cpu.buf)
                     prog.emit(P.CPU_TASK, cpu.buf, fl[0:1], fl[1:2], seq)
                     prog.emit(P.AWAIT, fl[1:2], seq, host_out, part, part.nbytes, None)
                 else:

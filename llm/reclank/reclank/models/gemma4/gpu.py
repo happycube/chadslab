@@ -814,8 +814,8 @@ class SplitCompiler(PoolCompiler):
         q4x = P.ops._Q4X_MOE.get(gu_q.ctypes.data)
         if self.mix_bufs is None:
             self.mix_bufs = dict(
-                hp=pinned((t, hidden)), vp=pinned((t, top_k)), ip=pinned((t, top_k), np.int32),
-                out=pinned((t, hidden)))
+                hp=pinned((t, hidden), free=True), vp=pinned((t, top_k), free=True),
+                ip=pinned((t, top_k), np.int32, free=True), out=pinned((t, hidden), free=True))
             if q4x is not None:
                 from reclank.backends.cpu import cops
                 self.mix_bufs.update(
@@ -887,7 +887,8 @@ class SplitCompiler(PoolCompiler):
         cold = self.buffer((t, top_k), np.int32)
         cold_val = self.buffer((t, top_k))
         self.p.emit(P.HOT_SPLIT_MT, idx, val, slots, cold, cold_val, t * top_k)
-        hp, vp, ip = pinned(h.shape), pinned((t, top_k)), pinned((t, top_k), np.int32)
+        # (freed with the program: the pool's warm frees the groups after a prompt)
+        hp, vp, ip = pinned(h.shape, free=True), pinned((t, top_k), free=True), pinned((t, top_k), np.int32, free=True)
         ev = self.n_events
         self.n_events += 1
         self.p.emit(P.TO_HOST, h, hp, h.nbytes, cold_val, vp, vp.nbytes, cold, ip, ip.nbytes, ev)
@@ -918,7 +919,7 @@ class SplitCompiler(PoolCompiler):
     def moe_group_cpu(self, h, val, idx, layer):
         """The experts of a group of tokens on the CPU: the MOE_MT record of
         the CPU interpreter on pinned copies of the input."""
-        hp, vp, ip = pinned(h.shape), pinned(val.shape), pinned(idx.shape, np.int32)
+        hp, vp, ip = pinned(h.shape, free=True), pinned(val.shape, free=True), pinned(idx.shape, np.int32, free=True)
         ev = self.n_events
         self.n_events += 1
         self.p.emit(P.TO_HOST, h, hp, h.nbytes, val, vp, val.nbytes, idx, ip, idx.nbytes, ev)

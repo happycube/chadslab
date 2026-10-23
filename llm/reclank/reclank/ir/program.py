@@ -116,6 +116,9 @@ class Program:
         self.bound = {}            # the arrays that a bind points to
         self.buf = None            # the int64 array that C runs; see finish
         self.names = {}            # the buffers of the compiler, by name
+        # the CPU programs whose buffers its records name (CPU_TASK, CPU_START): they live as long as
+        # it does, and go with it when the program is freed and made again
+        self.cpu_progs = []
 
     # ---- building ----------------------------------------------------------
     def slot(self, name, value=0):
