@@ -1633,13 +1633,13 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             const size_t su = nm_gtile_smem((int)L), sd = nm_gtile_smem((int)inner);
             dim3 gu((unsigned)E, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)E, (unsigned)cdiv(L, GM_BM));
             if (nm_tc_on()) {
+                /* (the up tiles quantize the act themselves, operands 8, 9, 20: no k_nm_gqa, which would
+                 * quantize operand 7 over them, the float act these tiles no longer write) */
                 if (x2) {
                     k_nm_gtile_tc<false, true><<<gu, 256, su, s>>>(dr, denv);
-                    k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
                     k_nm_gtile_tc<true, true><<<gd, 256, sd, s>>>(dr, denv);
                 } else {
                     k_nm_gtile_tc<false, false><<<gu, 256, su, s>>>(dr, denv);
-                    k_nm_gqa<<<(unsigned)cdiv(t * k * inner / 32, 128), 128, 0, s>>>(dr, denv);
                     k_nm_gtile_tc<true, false><<<gd, 256, sd, s>>>(dr, denv);
                 }
             } else if (x2) {
