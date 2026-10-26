@@ -170,8 +170,16 @@ __device__ __forceinline__ const uint8_t *hot_w(const gp_rec *r, const int64_t *
  * same lanes and sums: the same bits). int4_row on x in global memory read
  * 32 bytes of x a lane for each 4.5 bytes of weights. The 26B on the GTX
  * 1070, 6 hot pairs: gate and up 187 -> 85 us, down 123 -> 56 us.
- * RECLANK_GPU_HOT_XR=0 keeps a warp a row on x in global memory. */
+ * RECLANK_GPU_HOT_XR=0 keeps a warp a row on x in global memory. (Tried on the Quadro M4000: x rotated and
+ * int4_row_s, gemv.cu, the same bits: the 26B's decode 22.0 -> 21.2 tok/s.)
+ *
+ * The experts in Q4S (a GPU without dp4a): HOT_XS rows a warp, HOT_XP at once with the loads of the next
+ * pass first (int4_rows_p), the same bits. The M4000, the 26B's decode (nsys, 64 steps): gate and up 5.82 ->
+ * 5.27 ms a step, down 4.89 -> 3.90 (int4_row on Q4S was slower than on Q4_0, 7.2 and 5.4 against 6.2 and
+ * 5.0; 4 rows at once 6.35 and 4.08, 16 rows a warp 7.29 and 4.04, 4 rows a warp 5.35 and 4.46). */
 #define HOT_XR 4
+#define HOT_XS 8
+#define HOT_XP 2
 
 static int hot_xr_on(void)
 {
@@ -183,6 +191,7 @@ static int hot_xr_on(void)
     return on;
 }
 
+template <bool Q4S = false>
 __device__ __forceinline__ void hot_rows_xr(const uint8_t *we, const float *x, int rows, int cols,
                                             float *out)
 {
@@ -193,20 +202,49 @@ __device__ __forceinline__ void hot_rows_xr(const uint8_t *we, const float *x, i
     }
     __syncthreads();
     size_t rb = (size_t)(cols / 32) * 18;
+    if (Q4S) {
+        const int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * HOT_XS;
+        for (int rr = 0; rr < HOT_XS; rr += HOT_XP) {
+            if (row0 + rr >= rows) {
+                return;
+            }
+            /* (a row past the last reads the last, not stored) */
+            const uint8_t *wr[HOT_XP];
+            float v[HOT_XP];
+#pragma unroll
+            for (int p = 0; p < HOT_XP; ++p) {
+                wr[p] = we + (size_t)(row0 + rr + p < rows ? row0 + rr + p : rows - 1) * rb;
+            }
+            int4_rows_p<true, HOT_XP>(wr, hot_xs, cols, v);
+            if (threadIdx.x % 32 == 0) {
+#pragma unroll
+                for (int p = 0; p < HOT_XP; ++p) {
+                    if (row0 + rr + p < rows) {
+                        out[row0 + rr + p] = v[p];
+                    }
+                }
+            }
+        }
+        return;
+    }
     int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * HOT_XR;
     for (int rr = 0; rr < HOT_XR; ++rr) {
         int row = row0 + rr;
         if (row >= rows) {
             return;
         }
-        float v = int4_row(we + (size_t)row * rb, hot_xs, cols);
+        float v = int4_row<Q4S>(we + (size_t)row * rb, hot_xs, cols);
         if (threadIdx.x % 32 == 0) {
             out[row] = v;
         }
     }
 }
 
-__global__ void k_hot_gu_xr(const gp_rec *r, const int64_t *e)
+/* Q4S: the experts of the record (operand 16 is 2) in Q4S (int4_blk, gemv.cu: the pool's blocks and the stores
+ * packed after their copies on a GPU without dp4a). At most 64 registers: 4 blocks an SM (the Q4S form took 80,
+ * 3 blocks: on the M4000 slower than int4_row on Q4_0) */
+template <bool Q4S = false>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK, 4) k_hot_gu_xr(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     int j = blockIdx.y, slot = hot_slot(r, e, j);
@@ -214,11 +252,12 @@ __global__ void k_hot_gu_xr(const gp_rec *r, const int64_t *e)
     if (slot < 0) {
         return;
     }
-    hot_rows_xr(hot_w(r, e, slot, 0, (size_t)rows * (cols / 32) * 18),
+    hot_rows_xr<Q4S>(hot_w(r, e, slot, 0, (size_t)rows * (cols / 32) * 18),
                 DP(const float, 0) + (size_t)(j / DI(10)) * cols, rows, cols, DP(float, 6) + (size_t)j * rows);
 }
 
-__global__ void k_hot_dn_xr(const gp_rec *r, const int64_t *e)
+template <bool Q4S = false>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK, 4) k_hot_dn_xr(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
     int j = blockIdx.y, slot = hot_slot(r, e, j);
@@ -226,10 +265,11 @@ __global__ void k_hot_dn_xr(const gp_rec *r, const int64_t *e)
     if (slot < 0) {
         return;
     }
-    hot_rows_xr(hot_w(r, e, slot, 1, (size_t)rows * (inner / 32) * 18),
+    hot_rows_xr<Q4S>(hot_w(r, e, slot, 1, (size_t)rows * (inner / 32) * 18),
                 DP(const float, 7) + (size_t)j * inner, rows, inner, DP(float, 8) + (size_t)j * rows);
 }
 
+template <bool Q4S = false>
 __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -251,8 +291,8 @@ __global__ void k_hot_gu(const gp_rec *r, const int64_t *e)
     if (slot < 0 || row >= rows) {
         return;
     }
-    float v = int4_row(hot_w(r, e, slot, 0, (size_t)rows * rb) + (size_t)row * rb,
-                       DP(const float, 0) + (size_t)(j / DI(10)) * cols, cols);
+    float v = int4_row<Q4S>(hot_w(r, e, slot, 0, (size_t)rows * rb) + (size_t)row * rb,
+                            DP(const float, 0) + (size_t)(j / DI(10)) * cols, cols);
     if (threadIdx.x % 32 == 0) {
         DP(float, 6)[(size_t)j * rows + row] = v;
     }
@@ -275,6 +315,7 @@ __global__ void k_hot_gelu(const gp_rec *r, const int64_t *e)
     }
 }
 
+template <bool Q4S = false>
 __global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -295,8 +336,8 @@ __global__ void k_hot_dn(const gp_rec *r, const int64_t *e)
     if (slot < 0 || row >= rows) {
         return;
     }
-    float v = int4_row(hot_w(r, e, slot, 1, (size_t)rows * rb) + (size_t)row * rb,
-                       DP(const float, 7) + (size_t)j * inner, inner);
+    float v = int4_row<Q4S>(hot_w(r, e, slot, 1, (size_t)rows * rb) + (size_t)row * rb,
+                            DP(const float, 7) + (size_t)j * inner, inner);
     if (threadIdx.x % 32 == 0) {
         DP(float, 8)[(size_t)j * rows + row] = v;
     }

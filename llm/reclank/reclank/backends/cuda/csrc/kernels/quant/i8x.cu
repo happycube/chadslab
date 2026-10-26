@@ -638,6 +638,21 @@ static int kq_r2(int64_t t, int64_t rows)
     return on && t >= 2 && rows >= 2048;
 }
 
+/* kq_dequant8 of KQ_IQ2R rows: the same 8 values in the runtime's rows (iq2.cuh: part j of block b, the d after
+ * the parts). A call, as kq_iq2r_part (kquants.cu): the case inlined grows the generic kernels. */
+static __device__ __noinline__ void kq_iq2r_dequant8(const uint8_t *w, int cols, int c0, float *v)
+{
+    const int b = c0 / 256, l = (c0 % 32) / 8;
+    const uint2 pt = nm_q2_part(w, b, (c0 % 256) / 32);
+    const uint64_t g = nm_iq2_grid[(pt.x >> (8 * l)) & 255];
+    const int s7 = (pt.y >> (7 * l)) & 127, sg = s7 | ((__popc(s7) & 1) << 7);
+    const float db = __half2float(__ushort_as_half(nm_q2_dh(w, cols, b))) * (float)(2 * (pt.y >> 28) + 1) * 0.125f;
+    for (int u = 0; u < 8; ++u) {
+        const float q = db * (float)((g >> (8 * u)) & 255);
+        v[u] = ((sg >> u) & 1) ? -q : q;
+    }
+}
+
 /* 8 values of a row from column c0 (a multiple of 8), as float32. */
 __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float *v)
 {
@@ -655,6 +670,10 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
             const float q = db * (float)((g >> (8 * u)) & 255);
             v[u] = ((sg >> u) & 1) ? -q : q;
         }
+        return;
+    }
+    if (type == KQ_IQ2R) {
+        kq_iq2r_dequant8(w, cols, c0, v);
         return;
     }
     if (type == KQ_F32) {

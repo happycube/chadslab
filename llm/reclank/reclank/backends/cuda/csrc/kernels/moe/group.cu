@@ -100,7 +100,9 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
     int qend = off[ex + 1];
     int n0 = blockIdx.x * GN;
     int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
-    const uint8_t *we = (const uint8_t *)(intptr_t)wtab[ex];
+    /* (bit 0 of the address: the expert in Q4S, int4_blk; fill_tables of reclank/backends/cuda/runtime.py) */
+    const bool q4s = wtab[ex] & 1;
+    const uint8_t *we = (const uint8_t *)(intptr_t)(wtab[ex] & ~(int64_t)1);
     float acc[4][4] = {{0.f}};
     int groups = cols / 32;
     for (int g = 0; g < groups; ++g) {
@@ -127,8 +129,10 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
             int rr = x / 4, c = x % 4, n = n0 + rr;
             float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             if (n < rows) {
-                const uint8_t *blk = we + ((size_t)n * groups + g) * 18;
-                float d = __half2float(__ushort_as_half((uint16_t)(blk[0] | (blk[1] << 8))));
+                const uint8_t *wr = we + (size_t)n * groups * 18;
+                const uint8_t *blk = q4s ? wr + 16 * g - 2 : wr + (size_t)g * 18;
+                const uint8_t *dp = q4s ? wr + cols / 2 + 2 * g : blk;
+                float d = __half2float(__ushort_as_half((uint16_t)(dp[0] | (dp[1] << 8))));
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     int bq = blk[2 + 4 * c + i];
@@ -180,12 +184,16 @@ __global__ void k_moe_gemm(const gp_rec *r, const int64_t *e, const float *a, in
  * the values of k_moe_gemm), the loads of the next step in registers while
  * the tile works. The terms of each value add in the order of k_moe_gemm
  * with the same FMA: the same bits. */
+/* TP the pairs of a tile: 64 (GM), or 32 for the last tile of an expert with at most 32 (a 1024-token prompt
+ * of the 26B: the tiles of 64 were 64% full, of 64 and 32 ...); SPLIT: the 64 form leaves those to the 32 */
+template <int TP = GM, bool SPLIT = false>
 __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int64_t *e, const float *a,
                                                       int gather, const int64_t *wtab, int rows, int cols,
                                                       float *out)
 {
     PDL_START();
-    __shared__ __align__(16) float xs[32][GM + 4];
+    constexpr int NL = TP / 32, PT = TP / 16;      /* the float4 of x a thread loads; its pairs */
+    __shared__ __align__(16) float xs[32][TP + 4];
     __shared__ __align__(16) float ws[32][G8_LD];
     const int *tiles = DP(const int, 16);
     const int *off = DP(const int, 12);
@@ -195,29 +203,40 @@ __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int
         return;
     }
     const int ex = tiles[1 + 2 * tile], q0 = tiles[2 + 2 * tile], qend = off[ex + 1];
+    if ((TP == 32 && qend - q0 > 32) || (TP == 64 && SPLIT && qend - q0 <= 32)) {
+        return;
+    }
     const int n0 = blockIdx.x * G8_B;
     const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
-    const uint8_t *we = (const uint8_t *)(intptr_t)wtab[ex];
+    /* (bit 0 of the address: the expert in Q4S, as k_moe_gemm) */
+    const bool q4s = wtab[ex] & 1;
+    const uint8_t *we = (const uint8_t *)(intptr_t)(wtab[ex] & ~(int64_t)1);
     const int groups = cols / 32;
     const int wrow = tid / 2, half = tid & 1;
     const bool wok = n0 + wrow < rows;
     /* the rows of A of the 2 float4 of a thread (pair x / 8, columns 4 (x % 8)) */
-    int src[2];
+    int src[NL];
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < NL; ++i) {
         int q = q0 + (tid + 256 * i) / 8;
         src[i] = q < qend ? (gather ? pair_tok[q] : q) : -1;
     }
-    float4 lx[2];
+    float4 lx[NL];
     uint32_t lw0, lw1;
     float ld;
     auto fetch = [&](int g) {
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < NL; ++i) {
             lx[i] = src[i] >= 0 ? *(const float4 *)(a + (size_t)src[i] * cols + (size_t)g * 32 + 4 * ((tid + 256 * i) % 8))
                                 : make_float4(0.f, 0.f, 0.f, 0.f);
         }
-        if (wok) {
+        if (wok && q4s) {
+            const uint8_t *wr = we + (size_t)(n0 + wrow) * groups * 18;
+            const uint32_t *c = (const uint32_t *)(wr + 16 * g + 8 * half);
+            lw0 = c[0];
+            lw1 = c[1];
+            ld = __half2float(((const __half *)(wr + cols / 2))[g]);
+        } else if (wok) {
             const uint8_t *blk = we + ((size_t)(n0 + wrow) * groups + g) * 18;
             const uint16_t *c = (const uint16_t *)(blk + 2 + 8 * half);
             lw0 = (uint32_t)c[0] | ((uint32_t)c[1] << 16);
@@ -228,9 +247,9 @@ __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int
             ld = 0.f;
         }
     };
-    float acc[4][8];
+    float acc[PT][8];
     #pragma unroll
-    for (int u = 0; u < 4; ++u) {
+    for (int u = 0; u < PT; ++u) {
         #pragma unroll
         for (int v = 0; v < 8; ++v) {
             acc[u][v] = 0.f;
@@ -239,7 +258,7 @@ __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int
     fetch(0);
     for (int g = 0; g < groups; ++g) {
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < NL; ++i) {
             int x = tid + 256 * i, qq = x / 8, k = 4 * (x % 8);
             xs[k][qq] = lx[i].x;
             xs[k + 1][qq] = lx[i].y;
@@ -272,12 +291,22 @@ __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int
         }
         #pragma unroll 4
         for (int k = 0; k < 32; ++k) {
-            const float4 a0 = *(const float4 *)&xs[k][4 * ty];
+            float av[PT];
+            if constexpr (PT == 4) {
+                const float4 a0 = *(const float4 *)&xs[k][4 * ty];
+                av[0] = a0.x;
+                av[1] = a0.y;
+                av[2] = a0.z;
+                av[3] = a0.w;
+            } else {
+                const float2 a0 = *(const float2 *)&xs[k][2 * ty];
+                av[0] = a0.x;
+                av[1] = a0.y;
+            }
             const float4 b0 = *(const float4 *)&ws[k][4 * tx], b1 = *(const float4 *)&ws[k][64 + 4 * tx];
-            const float av[4] = {a0.x, a0.y, a0.z, a0.w};
             const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < PT; ++u) {
                 #pragma unroll
                 for (int v = 0; v < 8; ++v) {
                     acc[u][v] = fmaf(av[u], bv[v], acc[u][v]);
@@ -287,8 +316,8 @@ __global__ void __launch_bounds__(256, 2) k_moe_gemm8(const gp_rec *r, const int
         __syncthreads();
     }
     #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-        int q = q0 + 4 * ty + u;
+    for (int u = 0; u < PT; ++u) {
+        int q = q0 + PT * ty + u;
         if (q >= qend) {
             continue;
         }

@@ -11,8 +11,10 @@ translation unit. The headers shared with the CPU are in ../include.
   NVCC when it builds the arch, else the newest toolkit that builds it
   (/usr/local/cuda-13*, /usr/local/cuda-12*, the PATH). CUDA 13 stops at
   sm_75; Pascal (sm_61) needs CUDA 12.
-- The build gives an explicit -arch=sm_XY (not native), and the name of the
-  library has the arch and a hash of the sources, the toolkit, and the flags.
+- The build gives the machine code of an explicit arch (-gencode
+  code=sm_XY, not native; no PTX but for RECLANK_GPU_ARCH, see flags), and
+  the name of the library has the arch and a hash of the sources, the
+  toolkit, and the flags.
 - The optimizer and ptxas in parallel (nvcc -split-compile, CUDA 11.8 on):
   RECLANK_CUDA_SPLIT threads (default 16; 1: none). The 3090 with CUDA
   13.2: 247 s in one thread (cicc 128 s, ptxas 98 s, the host compiler
@@ -127,10 +129,21 @@ def sources():
     return sorted(CSRC.rglob("*.cu")) + sorted(CSRC.rglob("*.cuh")) + sorted(INCLUDE.glob("*.h"))
 
 
-def flags(arch, suffix=""):
-    a = ("-arch=sm_%d%s" % (arch, suffix)) if arch else "-arch=native"
-    out = ["-O3", a, "-shared", "-Xcompiler", "-fPIC", "-Wno-deprecated-gpu-targets",
-           "-I", str(INCLUDE), "-I", str(CSRC)]
+def flags(arch, suffix="", ptx=False):
+    # the machine code of the arch alone, not the compute_XY PTX that
+    # -arch=sm_XY adds: the driver compiles that PTX at the load for each newer
+    # GPU of the process, though this copy never runs there (the M4000's sm_52
+    # copy beside the 3060: 98 s in rc_gpu_ex_open for each new library, then
+    # from ~/.nv/ComputeCache). ptx (RECLANK_GPU_ARCH: an arch asked for, maybe
+    # not the GPU's, MAXWELL_PLAN.md section 5) keeps it.
+    if not arch:
+        a = ["-arch=native"]
+    elif ptx:
+        a = ["-arch=sm_%d%s" % (arch, suffix)]
+    else:
+        a = ["-gencode", "arch=compute_%d%s,code=sm_%d%s" % (arch, suffix, arch, suffix)]
+    out = ["-O3"] + a + ["-shared", "-Xcompiler", "-fPIC", "-Wno-deprecated-gpu-targets",
+                         "-I", str(INCLUDE), "-I", str(CSRC)]
     # an older GPU on this one (caps.cu): the kernels of that GPU, so a
     # tensor-core kernel that runs anyway traps (port.cuh, RC_NO_SM80)
     cc = os.environ.get("RECLANK_GPU_CC", "")
@@ -185,9 +198,11 @@ def prebuild(archs):
 
 def build(arch=None):
     """Build the library when needed; return its path."""
+    ptx = False
     if arch is None:
         da = device_arch()
         arch, suffix = da if da else (None, "")
+        ptx = bool(os.environ.get("RECLANK_GPU_ARCH"))
     else:
         arch, suffix = arch
     t = _PRE.get((arch, suffix))
@@ -196,7 +211,7 @@ def build(arch=None):
         if t is not threading.current_thread():
             t.join()
     nvcc, version = pick_nvcc(arch)
-    fl = flags(arch, suffix) + split_flags(version)
+    fl = flags(arch, suffix, ptx) + split_flags(version)
     text = "".join(p.read_text() for p in sources())
     key = hashlib.sha256((text + "|%d.%d|" % version + nvcc + "|" + " ".join(fl))
                          .encode()).hexdigest()[:16]

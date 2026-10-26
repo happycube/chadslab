@@ -352,7 +352,7 @@ __global__ void k_to_half(const float *x, __half *y, size_t n)
  * loops over the tokens then unroll, and a lane keeps NT sums. The general
  * form keeps 16 sums and ran at about half the rate of one token. R rows a
  * warp (k_mt_int4_rows). */
-template <int NT, int R = 1>
+template <int NT, int R = 1, bool Q4S = false>
 __global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int rows, int cols)
 {
     PDL_START();
@@ -379,10 +379,8 @@ __global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int ro
         float wl[R][4], wh[R][4];
         #pragma unroll
         for (int i = 0; i < R; ++i) {
-            const uint8_t *blk = wr[i] + (size_t)b * 18;
-            float d = __half2float(__ushort_as_half(*(const uint16_t *)blk));
-            const uint16_t *qp = (const uint16_t *)(blk + 2 + 4 * sub);
-            uint32_t q = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+            float d;
+            uint32_t q = int4_blk<Q4S>(wr[i], cols, b, sub, &d);
             #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 wl[i][u] = (float)((int)((q >> (8 * u)) & 15) - 8) * d;
@@ -428,7 +426,7 @@ __global__ void k_mt_gemv_n(const float *x, const uint8_t *w, float *out, int ro
  * is 1.4 to 1.9 times as fast (scripts/bench_mt_rows.cu; R 4 is not better
  * on most; R 2 on a matrix of 1024 rows was as often slower). One row a
  * warp still for the small matrices (mt_rows_r). */
-template <int NT, int R = 1>
+template <int NT, int R = 1, bool Q4S = false>
 __global__ void k_mt_int4_rows(const float *x, const uint8_t *w, float *out, int rows, int cols)
 {
     PDL_START();
@@ -456,10 +454,7 @@ __global__ void k_mt_int4_rows(const float *x, const uint8_t *w, float *out, int
         uint32_t q[R];
         #pragma unroll
         for (int i = 0; i < R; ++i) {
-            const uint8_t *blk = wr[i] + (size_t)b * 18;
-            d[i] = __half2float(__ushort_as_half(*(const uint16_t *)blk));
-            const uint16_t *qp = (const uint16_t *)(blk + 2 + 4 * sub);
-            q[i] = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+            q[i] = int4_blk<Q4S>(wr[i], cols, b, sub, &d[i]);
         }
         #pragma unroll
         for (int j = 0; j < NT; ++j) {
@@ -495,6 +490,7 @@ static inline int mt_rows_r(int t, int rows)
     return t >= 2 && rows >= 2048 ? 2 : 1;
 }
 
+template <bool Q4S = false>
 __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, int rows, int cols)
 {
     PDL_START();
@@ -510,10 +506,8 @@ __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, i
         sum[j] = 0.f;
     }
     for (int b = lane >> 2; b < blocks; b += 8) {
-        const uint8_t *blk = wr + (size_t)b * 18;
-        float d = __half2float(__ushort_as_half(*(const uint16_t *)blk));
-        const uint16_t *qp = (const uint16_t *)(blk + 2 + 4 * sub);
-        uint32_t q = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+        float d;
+        uint32_t q = int4_blk<Q4S>(wr, cols, b, sub, &d);
         float wl[4], wh[4];
         for (int u = 0; u < 4; ++u) {
             wl[u] = (float)((int)((q >> (8 * u)) & 15) - 8) * d;

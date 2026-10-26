@@ -80,21 +80,6 @@ __device__ __forceinline__ float nm_q2_lane(const uint8_t *row, int cols, int b,
     return db * s;
 }
 
-/* The dot of a KQ_IQ2R row with float x (a warp; every lane gets it): the float form of the hot
- * experts (RECLANK_NM_I8=0). */
-__device__ __forceinline__ float nm_q2_row_f(const uint8_t *row, const float *x, int cols)
-{
-    const int lane = threadIdx.x % 32;
-    float s = 0.f;
-    for (int b = 0; b < cols / 256; ++b) {
-        s += nm_q2_lane(row, cols, b, x + (size_t)b * 256, lane);
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        s += __shfl_xor_sync(RC_FULL_MASK, s, o);
-    }
-    return s;
-}
-
 /* The sums over the lanes of a warp of N values (N a power of 2, at most 32): value j in the lanes
  * lane / (32 / N) == j. A transposed butterfly: at the offsets 16, 8, .. each lane keeps the half of
  * its values on its side and adds the other lane's (N - 1 shuffles), then the plain steps for the
@@ -161,6 +146,27 @@ __device__ __forceinline__ void nm_q2_w8(uint32_t ix, uint32_t aux, int l, const
 __device__ __forceinline__ float nm_q2_db(uint16_t dh, uint32_t aux)
 {
     return __half2float(__ushort_as_half(dh)) * (float)(2 * (aux >> 28) + 1) * 0.125f;
+}
+
+/* GP_NM_HOT_MOE's experts (operand 22, the tables: 0 or none, the slots): the key of pair p's expert
+ * (its slot, or with the tables its id; < 0: not run here), and the rows from row of its up (op 4) or
+ * down (5) matrix of m rows of rb bytes: the slot's in the stack, or the table's address of the expert
+ * (NM_GROUP_MOE's pup / pdn: a hot slot or the host memory the GPU maps; a pair of idx -1 is another
+ * GPU's). */
+#define NM_TAB (r->tag[22] == GP_T_INT && r->v[22] != 0)
+__device__ __forceinline__ int nm_hot_key(const gp_rec *r, const int64_t *e, int p)
+{
+    const int x = DP(const int, 1)[p];
+    return NM_TAB ? x : DP(const int, 3)[x];
+}
+
+__device__ __forceinline__ const uint8_t *nm_hot_w(const gp_rec *r, const int64_t *e, int op, int p, int key,
+                                                   int m, int row, size_t rb)
+{
+    if (NM_TAB) {
+        return (const uint8_t *)(intptr_t)DP(const int64_t, op)[DP(const int, 1)[p]] + (size_t)row * rb;
+    }
+    return DP(const uint8_t, op) + ((size_t)key * m + row) * rb;
 }
 
 #define NM_TT 8                     /* the items of a pass: the decoded weights of a lane serve all */

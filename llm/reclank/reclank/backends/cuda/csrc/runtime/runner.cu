@@ -310,24 +310,41 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_mul<<<(unsigned)cdiv(hlit(r, 3, &bad) * hlit(r, 4, &bad), T), T, 0, s>>>(dr, denv);
         break;
     case GP_INT4_LINEAR:
-        k_int4_linear<<<(unsigned)cdiv(hlit(r, 4, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
-            dr, denv, 0, 1, 3, 4, 5);
+        i4_launch(r, dr, denv, g->henv, 0, 1, 3, 4, 5, i4s_ok(r, g->henv, 5, 1, 0, 1, &bad), s, &bad);
         break;
     case GP_INT4_MULTI4:
+        if (i4s_ok(r, g->henv, 1, 2, 4, 4, &bad) || i4_any_q4s(r, 2)) {
+            /* (a launch for each matrix: kernels/gemv.cu) */
+            const int st = i4s_ok(r, g->henv, 1, 2, 4, 4, &bad);
+            for (int m = 0; m < 4; ++m) {
+                if (r->v[2 + 4 * m] != 0) {
+                    i4_launch(r, dr, denv, g->henv, 0, 2 + 4 * m, 4 + 4 * m, 5 + 4 * m, 1, st, s, &bad);
+                }
+            }
+            break;
+        }
         k_int4_multi4<<<(unsigned)cdiv(multi4_rows(r, 2, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
             dr, denv, 0, 1, 2);
         break;
     case GP_RMS_NORM_MULTI4:
         /* x, wn, scratch, cols, eps, then the matrices from operand 5. */
         k_rms_norm<<<1, T, 0, s>>>(dr, denv, 0, 1, 2, 3, 4);
+        if (i4s_ok(r, g->henv, 3, 5, 4, 4, &bad) || i4_any_q4s(r, 5)) {
+            const int st = i4s_ok(r, g->henv, 3, 5, 4, 4, &bad);
+            for (int m = 0; m < 4; ++m) {
+                if (r->v[5 + 4 * m] != 0) {
+                    i4_launch(r, dr, denv, g->henv, 2, 5 + 4 * m, 7 + 4 * m, 8 + 4 * m, 3, st, s, &bad);
+                }
+            }
+            break;
+        }
         k_int4_multi4<<<(unsigned)cdiv(multi4_rows(r, 5, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
             dr, denv, 2, 3, 5);
         break;
     case GP_GELU_MUL_INT4:
         /* g, u, inner, scratch, w, s, out, rows, cols */
         k_gelu_mul<<<(unsigned)cdiv(hlit(r, 2, &bad), T), T, 0, s>>>(dr, denv);
-        k_int4_linear<<<(unsigned)cdiv(hlit(r, 7, &bad), ROWS_PER_BLOCK), W, 0, s>>>(
-            dr, denv, 3, 4, 6, 7, 8);
+        i4_launch(r, dr, denv, g->henv, 3, 4, 6, 7, 8, i4s_ok(r, g->henv, 8, 4, 0, 1, &bad), s, &bad);
         break;
     case GP_BF16_LINEAR: {
         /* x, w, out, rows, cols, tokens */
@@ -531,20 +548,33 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         unsigned k = (unsigned)hlit(r, 10, &bad) * t;
         /* KQ_Q4X (operand 16): a block for each group of 16 rows */
         int per = hlit(r, 16, &bad) == 1 ? 16 : ROWS_PER_BLOCK;
-        /* int4 rows: x in shared memory, HOT_XR rows a warp (k_hot_gu_xr) */
-        const int xr = hlit(r, 16, &bad) != 1 && hot_xr_on();
+        /* int4 rows: x in shared memory, HOT_XR rows a warp (k_hot_gu_xr); operand 16 is 2: the experts in
+         * Q4S (a GPU without dp4a: int4_blk), HOT_XS rows a warp */
+        const int xr = hlit(r, 16, &bad) != 1 && hot_xr_on(), q4 = hlit(r, 16, &bad) == 2;
         if (xr) {
-            k_hot_gu_xr<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), ROWS_PER_BLOCK * HOT_XR), k), W,
-                          (size_t)hlit(r, 12, &bad) * 4, s>>>(dr, denv);
+            per = ROWS_PER_BLOCK * (q4 ? HOT_XS : HOT_XR);
+        }
+        const dim3 ggu((unsigned)cdiv(hlit(r, 11, &bad), per), k);
+        const dim3 gdn((unsigned)cdiv(hlit(r, 13, &bad), per), k);
+        const size_t sgu = (size_t)hlit(r, 12, &bad) * 4, sdn = (size_t)hlit(r, 14, &bad) * 4;
+        if (xr && q4) {
+            k_hot_gu_xr<true><<<ggu, W, sgu, s>>>(dr, denv);
+        } else if (xr) {
+            k_hot_gu_xr<false><<<ggu, W, sgu, s>>>(dr, denv);
+        } else if (q4) {
+            k_hot_gu<true><<<ggu, W, 0, s>>>(dr, denv);
         } else {
-            k_hot_gu<<<dim3((unsigned)cdiv(hlit(r, 11, &bad), per), k), W, 0, s>>>(dr, denv);
+            k_hot_gu<false><<<ggu, W, 0, s>>>(dr, denv);
         }
         k_hot_gelu<<<k, T, 0, s>>>(dr, denv);
-        if (xr) {
-            k_hot_dn_xr<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), ROWS_PER_BLOCK * HOT_XR), k), W,
-                          (size_t)hlit(r, 14, &bad) * 4, s>>>(dr, denv);
+        if (xr && q4) {
+            k_hot_dn_xr<true><<<gdn, W, sdn, s>>>(dr, denv);
+        } else if (xr) {
+            k_hot_dn_xr<false><<<gdn, W, sdn, s>>>(dr, denv);
+        } else if (q4) {
+            k_hot_dn<true><<<gdn, W, 0, s>>>(dr, denv);
         } else {
-            k_hot_dn<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), per), k), W, 0, s>>>(dr, denv);
+            k_hot_dn<false><<<gdn, W, 0, s>>>(dr, denv);
         }
         k_hot_sum<<<dim3((unsigned)cdiv(hlit(r, 13, &bad), T), t), T, 0, s>>>(dr, denv);
         break;
@@ -781,12 +811,14 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                                                            NULL);
             }
         } else if (gemm8_on() && cols % 32 == 0 && inner % 32 == 0) {
-            /* no int8 products (Maxwell): the float tile of k_gemm8 */
-            k_moe_gemm8<<<dim3((unsigned)cdiv(gu_rows, G8_B), max_tiles), 256, 0, s>>>(
-                dr, denv, h, 1, gu, gu_rows, cols, act);
+            /* no int8 products (Maxwell): the float tile of k_gemm8; an expert's last tile of at most 32 pairs
+             * in the tile of 32 (k_moe_gemm8<32>; the same bits) */
+            const dim3 ggu((unsigned)cdiv(gu_rows, G8_B), max_tiles), gdn((unsigned)cdiv(dn_rows, G8_B), max_tiles);
+            k_moe_gemm8<GM, true><<<ggu, 256, 0, s>>>(dr, denv, h, 1, gu, gu_rows, cols, act);
+            k_moe_gemm8<32><<<ggu, 256, 0, s>>>(dr, denv, h, 1, gu, gu_rows, cols, act);
             k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
-            k_moe_gemm8<<<dim3((unsigned)cdiv(dn_rows, G8_B), max_tiles), 256, 0, s>>>(
-                dr, denv, act2, 0, dn, dn_rows, inner, de);
+            k_moe_gemm8<GM, true><<<gdn, 256, 0, s>>>(dr, denv, act2, 0, dn, dn_rows, inner, de);
+            k_moe_gemm8<32><<<gdn, 256, 0, s>>>(dr, denv, act2, 0, dn, dn_rows, inner, de);
         } else {
             k_moe_gemm<<<dim3((unsigned)cdiv(gu_rows, GN), max_tiles), 256, 0, s>>>(
                 dr, denv, h, 1, gu, gu_rows, cols, act);
@@ -825,6 +857,39 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                               (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
                               (float *)(intptr_t)hi(r, g->henv, 9), s) == 0) {
             /* NVFP4 rows of a step or a few tokens (kernels/quant/nv4.cu: FP4-Local's MTP head) */
+            break;
+        }
+        if (hlit(r, 5, &bad) == KQ_Q8_R && !i8x_on() && !bad &&
+            q8r_linear_launch((const float *)(intptr_t)hi(r, g->henv, 3), (const uint8_t *)(intptr_t)hi(r, g->henv, 4),
+                              (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
+                              (float *)(intptr_t)hi(r, g->henv, 9), s) == 0) {
+            /* KQ_Q8_R rows of a step or a few tokens on float x (no dp4a: Nemotron's Q8_0 matrices on
+             * Maxwell; kernels/quant/q8r_f32.cu) */
+            break;
+        }
+        if (hlit(r, 8, &bad) > MT_MAX && !gg_caps.dp4a && !bad &&
+            kq_gemm_f_launch((int)hlit(r, 5, &bad), (const float *)(intptr_t)hi(r, g->henv, 3),
+                             (const uint8_t *)(intptr_t)hi(r, g->henv, 4),
+                             kq_row_bytes((int)hlit(r, 5, &bad), (int)hlit(r, 7, &bad)), (int)hlit(r, 6, &bad),
+                             (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad), (float *)(intptr_t)hi(r, g->henv, 9), s) == 0) {
+            /* a large group in float32 without dp4a (Maxwell: Nemotron's KQ_NV4, KQ_IQ2R, KQ_Q8_R rows;
+             * kernels/quant/gemm_f32.cu); other types k_kq_gemm below */
+            break;
+        }
+        if (hlit(r, 5, &bad) == KQ_IQ2R && hlit(r, 8, &bad) <= MT_MAX && hlit(r, 7, &bad) % 256 == 0) {
+            /* KQ_IQ2R rows of a few tokens on float x (Nemotron's shared experts where NmEmit.linear does not
+             * take them: no dp4a; kernels/nemotron/iq2_f32.cu), 8 tokens a pass at most */
+            const int64_t t = hlit(r, 8, &bad);
+            const unsigned gb = (unsigned)cdiv(hlit(r, 6, &bad), 16);
+            if (t <= 1) {
+                k_nm_q2_lin_f<1><<<gb, 256, 0, s>>>(dr, denv);
+            } else if (t <= 2) {
+                k_nm_q2_lin_f<2><<<gb, 256, 0, s>>>(dr, denv);
+            } else if (t <= 4) {
+                k_nm_q2_lin_f<4><<<gb, 256, 0, s>>>(dr, denv);
+            } else {
+                k_nm_q2_lin_f<8><<<gb, 256, 0, s>>>(dr, denv);
+            }
             break;
         }
         if (kq_e3_k((int)hlit(r, 5, &bad))) {
@@ -1490,7 +1555,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             bad = 1;
             break;
         }
-        if (r->tag[13] != GP_T_NONE && t >= 2 && t <= NM_HG && t * k <= 128 && nm_hg_on() && !gg_nm_hg_off) {
+        /* the int8 form: operand 13, qx (a null one, the float form's padding before operand 22, is none) */
+        const int i8 = r->tag[13] == GP_T_SLOT || (r->tag[13] == GP_T_INT && r->v[13] != 0);
+        if (i8 && t >= 2 && t <= NM_HG && t * k <= 128 && nm_hg_on() && !gg_nm_hg_off) {
             /* a small group by expert (k_nm_hg_*: each expert's rows decoded once for its pairs) */
             k_nm_hot_qx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
             switch (nm_hg_form()) {
@@ -1503,7 +1570,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             k_nm_hg_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
             break;
-        } else if (r->tag[13] != GP_T_NONE) {
+        } else if (i8) {
             /* int8 x and act (dp4a) */
             k_nm_hot_qx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
             k_nm_hot_up8<<<dim3((unsigned)cdiv(inner, 4 * NM_HR), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
@@ -1515,8 +1582,10 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             k_nm_hot_down8<<<dim3((unsigned)(L / NM_HR), (unsigned)t), (unsigned)(32 * k), 0, s>>>(dr, denv);
         } else {
-            k_nm_hot_up<<<dim3((unsigned)cdiv(inner, 4), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
-            k_nm_hot_down<<<dim3((unsigned)cdiv(L, 4), (unsigned)(t * k)), 128, 0, s>>>(dr, denv);
+            /* the float form (no dp4a, or RECLANK_NM_I8=0): 2 rows a warp, the grid in shared memory
+             * (kernels/nemotron/iq2_f32.cu) */
+            k_nm_hot_up_f<<<dim3((unsigned)cdiv(inner, 16 * NMF_HR), (unsigned)(t * k)), 256, 0, s>>>(dr, denv);
+            k_nm_hot_down_f<<<dim3((unsigned)cdiv(L, 16 * NMF_HR), (unsigned)(t * k)), 256, 0, s>>>(dr, denv);
             k_nm_hot_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
         }
         if (r->tag[19] == GP_T_SLOT || (r->tag[19] == GP_T_INT && r->v[19] != 0)) {
@@ -1623,6 +1692,15 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         if (L % 256 != 0 || L > 1024 || inner % 256 != 0 || inner > 256 * NM_GMAXB || E > 4096) {
             bad = 1;
+            break;
+        }
+        if (!nm_tc_on() && !gg_caps.dp4a) {
+            /* no tensor cores and no dp4a (Maxwell): the float tiles on float x and act (k_nm_gtile_f,
+             * kernels/nemotron/iq2_f32.cu; no int8 x or act) */
+            k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            k_nm_gtile_f<false><<<dim3((unsigned)E, (unsigned)cdiv(inner, NMF_BM)), 256, nmf_gtile_smem((int)L), s>>>(dr, denv);
+            k_nm_gtile_f<true><<<dim3((unsigned)E, (unsigned)cdiv(L, NMF_BM)), 256, nmf_gtile_smem((int)inner), s>>>(dr, denv);
+            k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
             break;
         }
         k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
@@ -2485,19 +2563,28 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             break;
         }
-        /* the routed pairs of Q4_K and Q5_K experts: k_kqh_k (x in registers, rows a warp);
-         * the shared expert (the pairs from tk) with k_kqh_gu and k_kqh_dn */
-        const int kk = r->tag[22] == GP_T_NONE && kqh_k_ok(gt, (int)hidden) && kqh_k_ok(dt, (int)inner);
-        if (kk) {
+        /* the routed pairs of Q4_K and Q5_K experts: k_kqh_k (x in registers, rows a warp), for gate
+         * and up and for down each when its type has it (Qwen3.6's three layers of Q6_K down: their
+         * gate and up too; k_kqh_k has the operations of kq_row, the same bits); the shared expert
+         * (the pairs from tk) with k_kqh_gu and k_kqh_dn, when there is one (none: an expert device's
+         * job, LFM2; their blocks only returned, 28 us of a job on the M4000) */
+        const int kkg = r->tag[22] == GP_T_NONE && kqh_k_ok(gt, (int)hidden);
+        const int kkd = r->tag[22] == GP_T_NONE && kqh_k_ok(dt, (int)inner);
+        const int has_sh = hi(r, g->henv, 17) != 0;
+        if (kkg) {
             kqh_k_launch(dr, denv, gt, (int)hidden, 0, tk, inner, s);
-            k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), t, 2), W, 0, s>>>(dr, denv, (int)tk);
+            if (has_sh) {
+                k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), t, 2), W, 0, s>>>(dr, denv, (int)tk);
+            }
         } else {
             k_kqh_gu<<<dim3((unsigned)cdiv(inner, ROWS_PER_BLOCK), pairs, 2), W, 0, s>>>(dr, denv);
         }
         k_kqh_act<<<pairs, T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
-        if (kk) {
+        if (kkd) {
             kqh_k_launch(dr, denv, dt, (int)inner, 1, tk, hidden, s);
-            k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), t), W, 0, s>>>(dr, denv, (int)tk);
+            if (has_sh) {
+                k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), t), W, 0, s>>>(dr, denv, (int)tk);
+            }
         } else {
             k_kqh_dn<<<dim3((unsigned)cdiv(hidden, ROWS_PER_BLOCK), pairs), W, 0, s>>>(dr, denv);
         }

@@ -63,8 +63,8 @@ extern "C" int rc_gpu_host_unregister(void *p)
     return cudaHostUnregister(p) == cudaSuccess ? 0 : -1;
 }
 
-/* Queue a job. Return its id (0 or more), or -1. */
-extern "C" int rc_gpu_cache_copy(const int64_t *ranges, int count)
+/* Queue a job: its copies, then the packs into Q4S (gg_cjob). Return its id (0 or more), or -1. */
+extern "C" int rc_gpu_cache_copy_q4s(const int64_t *ranges, int count, const int64_t *packs, int npacks)
 {
     if (!gg_cworker_on) {
         CK(cudaStreamCreateWithFlags(&gg_cstream, cudaStreamNonBlocking));
@@ -86,7 +86,7 @@ extern "C" int rc_gpu_cache_copy(const int64_t *ranges, int count)
         return -1;
     }
     int id = gg_cjob_next++;
-    gg_cjob j = {ranges, count, id};
+    gg_cjob j = {ranges, count, id, packs, npacks};
     gg_cissued[id % GG_CACHE_JOBS] = 0;
     gg_cid[id % GG_CACHE_JOBS] = id;
     gg_cjobs[gg_cjob_tail % GG_CACHE_JOBS] = j;
@@ -94,6 +94,12 @@ extern "C" int rc_gpu_cache_copy(const int64_t *ranges, int count)
     pthread_cond_broadcast(&gg_ccv);
     pthread_mutex_unlock(&gg_cmu);
     return id;
+}
+
+/* Queue a job of copies. Return its id (0 or more), or -1. */
+extern "C" int rc_gpu_cache_copy(const int64_t *ranges, int count)
+{
+    return rc_gpu_cache_copy_q4s(ranges, count, NULL, 0);
 }
 
 /* 1: the copies of job id are on the GPU. 0: not yet. -1: an error. With

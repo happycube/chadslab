@@ -26,6 +26,69 @@ static int64_t multi4_rows(const gp_rec *r, int m0, int *bad)
     return rows;
 }
 
+/* The staged int4 rows of a step (k_int4_linear_s: kernels/gemv.cu) for a record on a
+ * GPU without dp4a: an even count of blocks a row, x within a block's shared memory, each of the n
+ * matrices at operands w0, w0 + step, ... (none: 0) at a multiple of 4. RECLANK_GPU_I4S=0: the warp a row
+ * of int4_row (the same bits). */
+static int i4s_ok(const gp_rec *r, const int64_t *henv, int ck, int w0, int step, int n, int *bad)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_I4S");
+        on = !(v && v[0] == '0');
+    }
+    const int64_t cols = hlit(r, ck, bad);
+    if (!on || gg_caps.dp4a || cols % 64 != 0 || cols * 4 > I4S_SMEM_MAX) {
+        return 0;
+    }
+    for (int m = 0; m < n; ++m) {
+        if (r->v[w0 + step * m] != 0 && (hi(r, henv, w0 + step * m) & 3) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* 1 when a matrix of the GP_INT4_MULTI4 operands from w0 is in Q4S (q4s_is) */
+static int i4_any_q4s(const gp_rec *r, int w0)
+{
+    for (int m = 0; m < 4; ++m) {
+        if (r->v[w0 + 4 * m] != 0 && q4s_is((const void *)(intptr_t)r->v[w0 + 4 * m])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static unsigned i4s_grid(int64_t rows);
+
+/* An int4 matrix of a step (operands x, w, out, rows, cols): staged (k_int4_linear_s; st from i4s_ok) or a
+ * warp a row (k_int4_linear), in Q4S when q4s_is */
+static void i4_launch(const gp_rec *r, const gp_rec *dr, const int64_t *denv, const int64_t *henv, int xk, int wk,
+                      int ok, int rk, int ck, int st, cudaStream_t s, int *bad)
+{
+    const int q4 = q4s_is((const void *)(intptr_t)hi(r, henv, wk));
+    const int64_t rows = hlit(r, rk, bad), cols = hlit(r, ck, bad);
+    const unsigned W = 32 * ROWS_PER_BLOCK;
+    if (st && q4) {
+        k_int4_linear_s<true><<<i4s_grid(rows), W, (size_t)cols * 4, s>>>(dr, denv, xk, wk, ok, rk, ck);
+    } else if (st) {
+        k_int4_linear_s<false><<<i4s_grid(rows), W, (size_t)cols * 4, s>>>(dr, denv, xk, wk, ok, rk, ck);
+    } else if (q4) {
+        k_int4_linear<true><<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv, xk, wk, ok, rk, ck);
+    } else {
+        k_int4_linear<false><<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv, xk, wk, ok, rk, ck);
+    }
+}
+
+/* the grid of the staged int4 rows: 4 blocks an SM (the M4000, 4096 x 2816: 104 us; 6 123, 8 107), at most
+ * a block for each 8 rows */
+static unsigned i4s_grid(int64_t rows)
+{
+    const int64_t cap = (int64_t)(gg_caps.sm_count > 0 ? gg_caps.sm_count : 16) * 4, need = cdiv(rows, ROWS_PER_BLOCK);
+    return (unsigned)(need < cap ? need : cap);
+}
+
 /* RECLANK_GPU_FD=0 keeps k_attn_part for the int16 cache of Qwen3.5 (a
  * test). */
 static int fd_on(void)
@@ -509,6 +572,41 @@ static int mt_rows_on(void)
     return on;
 }
 
+/* The rows kernels of a small group (t <= gg_gemv_max) of gemm_launch; Q4S: the matrix in Q4S (int4_blk) */
+template <bool Q4S>
+static void mt_launch(const float *x, const uint8_t *wb, float *out, int t, int rows, int cols, int *bad)
+{
+    const unsigned blk = 32 * ROWS_PER_BLOCK;
+    if (t <= 8 && mt_rows_on()) {
+        /* A verify group: the bits of a step for each token (k_mt_int4_rows),
+         * R rows a warp (mt_rows_r). Up to 8 tokens it is as fast as
+         * k_mt_gemv_n with 2 rows a warp (5 to 7 a little faster, 8 4%
+         * slower), so a verify group of up to 8 rows (7 drafts) verifies
+         * with the numbers of the decode. */
+        int R = mt_rows_r(t, rows);
+        unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK * R);
+        switch (t * 2 + (R == 2)) {
+#define GG_RT(n) case 2 * n: k_mt_int4_rows<n, 1, Q4S><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break; \
+                 case 2 * n + 1: k_mt_int4_rows<n, 2, Q4S><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break;
+        GG_RT(1) GG_RT(2) GG_RT(3) GG_RT(4) GG_RT(5) GG_RT(6) GG_RT(7) GG_RT(8)
+#undef GG_RT
+        default: *bad = 1;
+        }
+    } else {
+        int R = t <= MT_MAX ? mt_rows_r(t, rows) : 1;
+        unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK * R);
+        switch (t * 2 + (R == 2)) {
+#define GG_NT(n) case 2 * n: k_mt_gemv_n<n, 1, Q4S><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break; \
+                 case 2 * n + 1: k_mt_gemv_n<n, 2, Q4S><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break;
+        GG_NT(1) GG_NT(2) GG_NT(3) GG_NT(4) GG_NT(5) GG_NT(6) GG_NT(7) GG_NT(8)
+        GG_NT(9) GG_NT(10) GG_NT(11) GG_NT(12) GG_NT(13) GG_NT(14) GG_NT(15) GG_NT(16)
+#undef GG_NT
+        default:
+            k_mt_gemv<Q4S><<<cdiv(rows, ROWS_PER_BLOCK), blk, 0, gg_stream>>>(x, wb, out, t, rows, cols);
+        }
+    }
+}
+
 static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                         const int64_t *denv, int xk, int wk, int ok, int rk, int ck, int tk,
                         int *bad, int quant = 1)
@@ -521,34 +619,21 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
     const void *w = (const void *)(intptr_t)r->v[wk];
     float *out = (float *)(intptr_t)r->v[ok];
     int rows = (int)hlit(r, rk, bad), cols = (int)hlit(r, ck, bad), t = (int)hlit(r, tk, bad);
-    if (t <= gg_gemv_max && t <= 8 && mt_rows_on()) {
-        /* A verify group: the bits of a step for each token (k_mt_int4_rows),
-         * R rows a warp (mt_rows_r). Up to 8 tokens it is as fast as
-         * k_mt_gemv_n with 2 rows a warp (5 to 7 a little faster, 8 4%
-         * slower), so a verify group of up to 8 rows (7 drafts) verifies
-         * with the numbers of the decode. */
-        int R = mt_rows_r(t, rows);
-        unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK * R), blk = 32 * ROWS_PER_BLOCK;
-        const uint8_t *wb = (const uint8_t *)w;
-        switch (t * 2 + (R == 2)) {
-#define GG_RT(n) case 2 * n: k_mt_int4_rows<n><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break; \
-                 case 2 * n + 1: k_mt_int4_rows<n, 2><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break;
-        GG_RT(1) GG_RT(2) GG_RT(3) GG_RT(4) GG_RT(5) GG_RT(6) GG_RT(7) GG_RT(8)
-#undef GG_RT
-        default: *bad = 1;
+    /* (a matrix in Q4S: the kernels below that read it, int4_blk; the int8 ones do not) */
+    const int q4s = q4s_is(w);
+    if (t <= gg_gemv_max) {
+        if (q4s) {
+            mt_launch<true>(x, (const uint8_t *)w, out, t, rows, cols, bad);
+        } else {
+            mt_launch<false>(x, (const uint8_t *)w, out, t, rows, cols, bad);
         }
-    } else if (t <= gg_gemv_max) {
-        int R = t <= MT_MAX ? mt_rows_r(t, rows) : 1;
-        unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK * R), blk = 32 * ROWS_PER_BLOCK;
-        const uint8_t *wb = (const uint8_t *)w;
-        switch (t * 2 + (R == 2)) {
-#define GG_NT(n) case 2 * n: k_mt_gemv_n<n><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break; \
-                 case 2 * n + 1: k_mt_gemv_n<n, 2><<<grid, blk, 0, gg_stream>>>(x, wb, out, rows, cols); break;
-        GG_NT(1) GG_NT(2) GG_NT(3) GG_NT(4) GG_NT(5) GG_NT(6) GG_NT(7) GG_NT(8)
-        GG_NT(9) GG_NT(10) GG_NT(11) GG_NT(12) GG_NT(13) GG_NT(14) GG_NT(15) GG_NT(16)
-#undef GG_NT
-        default:
-            k_mt_gemv<<<cdiv(rows, ROWS_PER_BLOCK), blk, 0, gg_stream>>>(x, wb, out, t, rows, cols);
+    } else if (q4s) {
+        if (gemm8_on() && cols % 32 == 0 && ((uintptr_t)x & 15) == 0) {
+            k_gemm8<true><<<dim3((unsigned)cdiv(rows, G8_B), (unsigned)cdiv(t, G8_B)), 256, 0, gg_stream>>>(
+                x, (const uint8_t *)w, out, t, rows, cols);
+        } else {
+            k_gemm<3><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(
+                x, w, out, t, rows, cols);
         }
     } else if (gg_tc && ((gg_tc == 8 && g->tc) || g->i8) && cols % Q8K == 0 &&
                (size_t)t * cols <= g->xh_n) {
@@ -649,7 +734,7 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         }
     } else if (gemm8_on() && cols % 32 == 0 && ((uintptr_t)w & 1) == 0 && ((uintptr_t)x & 15) == 0) {
         /* no int8 products (Maxwell): the float tile of 8 by 8 a thread */
-        k_gemm8<<<dim3((unsigned)cdiv(rows, G8_B), (unsigned)cdiv(t, G8_B)), 256, 0, gg_stream>>>(
+        k_gemm8<false><<<dim3((unsigned)cdiv(rows, G8_B), (unsigned)cdiv(t, G8_B)), 256, 0, gg_stream>>>(
             x, (const uint8_t *)w, out, t, rows, cols);
     } else {
         k_gemm<0><<<dim3((unsigned)cdiv(rows, GN), (unsigned)cdiv(t, GM)), 256, 0, gg_stream>>>(

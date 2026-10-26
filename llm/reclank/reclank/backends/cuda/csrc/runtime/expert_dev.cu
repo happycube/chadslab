@@ -24,6 +24,7 @@
 #define EXG_TOK (EXG_PMAX * 16)
 #define EXG_W (EXG_TOK + EXG_PMAX * 4)
 #define EXG_H (EXG_W + EXG_PMAX * 4)
+#define EXK_GRAPHS 32            /* Qwen: the most graphs of one-token jobs */
 
 typedef struct {
     int dev, layers, hidden, inner, dn_rows;
@@ -47,6 +48,10 @@ typedef struct {
     int64_t *env_d;
     int8_t *qx, *qa, *qxl, *qal;
     float *sx, *sa;
+    /* Qwen: the graphs of a one-token job (its copies and kernels, which read the record from
+     * rec_d), one for each gate type, down type and count of pairs (kq_key) */
+    cudaGraphExec_t kq_exec[EXK_GRAPHS];
+    int kq_key[EXK_GRAPHS], kq_ng;
 } ex_dev;
 #define EXN_TMAX 8               /* a Nemotron job: at most 8 tokens (a verify group), 128 pairs */
 #define EXN_TK 128
@@ -331,6 +336,49 @@ static int rc_gpu_ex_kq_store_in(int layer, int count, const void *gate, const v
     return 0;
 }
 
+/* RECLANK_EX_GRAPH (1): a one-token Qwen job as a graph (ex_kq_capture); 0, its copies and launches */
+static int ex_graph_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_EX_GRAPH");
+        on = v == NULL || atoi(v) != 0;
+    }
+    return on;
+}
+
+/* The graph of a one-token job of key (the copy of nin bytes of the staging, the kernels of rec, the copy
+ * of its row back): the copies and launches of a job took the CPU 36 us before its own experts (nsys; the
+ * M4000, Qwen3.6), a graph's one launch a median of 25; both cards' decode +1-2%. Its kernels read the
+ * record from rec_d, so the graph serves every layer of the same types and count; -1 when it cannot be
+ * made (the caller launches the job). */
+static int ex_kq_capture(ex_dev *x, gg_prog *stub, const gp_rec *rec, size_t nin, int key)
+{
+    cudaGraph_t gr;
+    cudaGraphExec_t ge;
+    CK(cudaStreamBeginCapture(gg_stream, cudaStreamCaptureModeThreadLocal));
+    cudaMemcpyAsync(x->stage_d, x->stage_h, nin, cudaMemcpyHostToDevice, gg_stream);
+    int rc = gg_launch(stub, rec, x->rec_d, x->env_d);
+    cudaMemcpyAsync(x->out_h, x->out_d, (size_t)x->hidden * 4, cudaMemcpyDeviceToHost, gg_stream);
+    cudaError_t ce = cudaStreamEndCapture(gg_stream, &gr);
+    if (rc != 0 || ce != cudaSuccess) {
+        if (ce == cudaSuccess) {
+            cudaGraphDestroy(gr);
+        }
+        cudaGetLastError();
+        return -1;
+    }
+    ce = cudaGraphInstantiate(&ge, gr, 0);
+    cudaGraphDestroy(gr);
+    if (ce != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    x->kq_exec[x->kq_ng] = ge;
+    x->kq_key[x->kq_ng++] = key;
+    return 0;
+}
+
 /* Qwen: t tokens of k pairs each (idx: the expert of each pair, or -1; weights w) on their rows h:
  * one GP_KQ_HOT_MOE record (no shared expert), its out the sum of each token (t rows) */
 static int rc_gpu_ex_kq_job(int layer, int t, int k, const int32_t *idx, const float *w, const float *h)
@@ -364,6 +412,24 @@ static int rc_gpu_ex_kq_job(int layer, int t, int k, const int32_t *idx, const f
     memcpy(x->stage_h, &rec, sizeof(rec));
     memcpy(x->stage_h + EXN_VAL, w, (size_t)t * k * 4);
     memcpy(x->stage_h + EXN_X, h, (size_t)t * x->hidden * 4);
+    if (t == 1 && ex_graph_on()) {
+        const int key = x->gtype_l[layer] | x->dtype_l[layer] << 8 | k << 16;
+        int gi = 0;
+        while (gi < x->kq_ng && x->kq_key[gi] != key) {
+            ++gi;
+        }
+        if (gi == x->kq_ng && (gi == EXK_GRAPHS || ex_kq_capture(x, &stub, &rec, EXN_X + (size_t)x->hidden * 4,
+                                                                 key) != 0)) {
+            gi = -1;
+        }
+        if (gi >= 0) {
+            CK(cudaGraphLaunch(x->kq_exec[gi], gg_stream));
+            x->nout = x->hidden;
+            CK(cudaEventRecord(x->done, gg_stream));
+            x->pending = 1;
+            return 0;
+        }
+    }
     CK(cudaMemcpyAsync(x->stage_d, x->stage_h, EXN_X + (size_t)t * x->hidden * 4, cudaMemcpyHostToDevice,
                        gg_stream));
     if (gg_launch(&stub, &rec, x->rec_d, x->env_d) != 0) {
@@ -478,7 +544,9 @@ static int rc_gpu_ex_nm_job(int layer, int t, int k, const int32_t *idx, const f
                      k, x->L, x->inner_l[layer], t,
                      (int64_t)(intptr_t)x->qx, (int64_t)(intptr_t)x->sx, (int64_t)(intptr_t)x->qa,
                      (int64_t)(intptr_t)x->sa, (int64_t)(intptr_t)x->qxl, (int64_t)(intptr_t)x->qal};
-    for (int i = 0; i < 19; ++i) {
+    /* (no dp4a, Maxwell: operands 0-12 only, NM_HOT_MOE's float form on the float rows of x) */
+    const int nop = gg_caps.dp4a ? 19 : 13;
+    for (int i = 0; i < nop; ++i) {
         rec.tag[i] = GP_T_INT;
         rec.v[i] = v[i];
     }

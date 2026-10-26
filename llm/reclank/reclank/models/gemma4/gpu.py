@@ -17,7 +17,7 @@ from reclank.backends.cuda.gpumm import Buffer, DeviceCache, ProgramLRU, mem, me
 from reclank.models.gemma4.model import KV_KEEP
 from reclank.backends.cuda.runtime import (  # noqa: F401
     GPUCache, GPUProgram, HotCache, MT_CPU, PoolCompiler, WarmPool, _argmax_rows,
-    _check, _topk_rows, expert_host, fill_chunks, fill_tables, has_tc, int8_tiles, lib, stage_room)
+    _check, _topk_rows, expert_host, fill_chunks, fill_tables, has_tc, int8_tiles, lib, q4s_experts, stage_room)
 
 
 _HERE = Path(__file__).resolve().parent
@@ -90,6 +90,12 @@ Q4_I8 = os.environ.get("RECLANK_GPU_Q4_I8", "1") != "0"
 # 0.00012 -> 0.0004), off for the 26B (its activations have larger outliers:
 # KL 0.0001 -> 0.0009; MTP_PLAN.md). 1 or 0 sets it for both.
 Q4_I8_DENSE = os.environ.get("RECLANK_GPU_Q4_I8_DENSE")
+
+
+def _hot_form(model, q4x):
+    """Operand 16 of GP_HOT_MOE: 1 the experts in KQ_Q4X, 2 int4 rows in Q4S (the hot and warm experts of a GPU
+    without dp4a, runtime.q4s_experts: model._q4s_experts), 0 int4 rows as stored."""
+    return 1 if q4x else (2 if getattr(model, "_q4s_experts", False) else 0)
 
 
 def q4_i8_dense(model):
@@ -875,7 +881,7 @@ class SplitCompiler(PoolCompiler):
         t, top_k = idx.shape
         hidden = h.shape[1]
         pairs = t * top_k
-        q4x = 1 if expert_host(self.model, layer)[2] else 0
+        q4x = _hot_form(self.model, expert_host(self.model, layer)[2])
         if self.resident:
             # every expert on the GPU (the resident mode): no CPU part
             out = self.buffer(h.shape)
@@ -970,7 +976,7 @@ class SplitCompiler(PoolCompiler):
             self.p.emit(P.HOT_MOE, h, val, idx, slots, gu_store, dn_store,
                         self.buffer((top_k, 2 * inner)), self.buffer((top_k, inner)),
                         self.buffer((top_k, hidden)), out, top_k, 2 * inner, hidden,
-                        dn_q.shape[1], inner, 1, 1 if q4x else 0)
+                        dn_q.shape[1], inner, 1, _hot_form(self.model, q4x))
             return out
         # The cold experts, their count, and the selection of the step.
         cold = np.zeros(2 * top_k + 1, dtype=np.int32)
@@ -983,7 +989,7 @@ class SplitCompiler(PoolCompiler):
         self.p.emit(P.HOT_MOE, h, val, idx, slots, gu_store, dn_store,
                     self.buffer((top_k, 2 * inner)), self.buffer((top_k, inner)),
                     self.buffer((top_k, hidden)), gpu_part, top_k, 2 * inner, hidden,
-                    dn_q.shape[1], inner, 1, 1 if q4x else 0)
+                    dn_q.shape[1], inner, 1, _hot_form(self.model, q4x))
         cc = P.Compiler(self.model)
         host_out = pinned(h.shape) if self.flags else np.zeros(h.shape, dtype=np.float32)
         # An expert device (backends/cuda/devices.py: a second GPU of this
@@ -1734,6 +1740,11 @@ class ModelGPU(WarmPool, ProgramLRU):
         hot_init = {}
         if self.pooled:
             hot_init, self.hot = self.hot, {}
+        # the int4 experts in Q4S on a GPU without dp4a (runtime.q4s_experts): the programs and the tables read
+        # model._q4s_experts; HotCache and the pool's first experts (WarmPool._pool_place) pack the copies by
+        # q4s_cols (the cols of the rows of gate_up and of down), None as stored
+        self.q4s_experts = model._q4s_experts = q4s_experts(model)
+        self.q4s_cols = (model.cfg.hidden_size, model.cfg.moe_intermediate_size) if self.q4s_experts else None
         self.prog = compile_split_step(model, self.hot, kv, resident=self.resident,
                                        pooled=self.pooled)
         # the arenas of the temporaries of the programs (alloc.Arenas: the
@@ -1985,15 +1996,26 @@ class ModelGPU(WarmPool, ProgramLRU):
             # 26B) they and the KQ_Q4X experts take the int16 form: x as two
             # int8 planes, q = 128 hi + lo, and two int8 products of the
             # tensor cores for each block (k_quant_x2).
-            i8 = os.environ.get("RECLANK_GPU_I8_MOE", "1") == "1"
+            # The 26B keeps float32 products here too (and float32 attention, atc below): on the docs, the
+            # logits of a prompt's last token and of 8 steps after it (the CPU's tokens) against the CPU, KL
+            # (mean of the 9) at 700 / 1024 / 1500 / 4096 tokens: 0.064 0.066 0.17 0.013 with int16 x and
+            # the tensor cores' attention, 0.013 0.015 0.056 0.016 with float32 attention, 0.0037 0.0016 0.013
+            # 0.0075 with both float32 (the Quadro M4000's float32 kernels 0.017 0.020 0.036 0.027). The RTX
+            # 3060's prompt of 1024 tokens 549 -> 446 tok/s, of 4096 823 -> 408. RECLANK_GPU_I8_MOE=1 and
+            # RECLANK_GPU_ATTN_TC=1 for the fast forms.
+            moe = self.model.cfg.enable_moe_block
+            i8 = os.environ.get("RECLANK_GPU_I8_MOE", "0" if moe else "1") == "1"
             if i8 and self.model.prompt_act == "16":
                 i8 = 2
             # The attention runs on the tensor cores all the same
             # (k_flash_qc_tc): the queries and the keys have a norm, so
             # float16 has no overflow there. It is ten times as fast as the
             # float32 kernel, and on a chat text the KL to float32 goes from
-            # 0.0020 to 0.0024.
-            atc = os.environ.get("RECLANK_GPU_ATTN_TC", "1") == "1"
+            # 0.0020 to 0.0024. Not for the 26B (above): float16 scores of a peaked or long attention are off
+            # by 0.5-1% (scripts/check_attn_f32t.py through the tensor cores, RECLANK_GPU_CC=86: 26B peaked,
+            # 12B global and sliding 4e-3 to 9e-3, against 7e-4 to 1e-3 for the others); the last token of a
+            # prompt of 1024 tokens of the docs KL 0.38 to the CPU.
+            atc = os.environ.get("RECLANK_GPU_ATTN_TC", "0" if moe else "1") == "1"
             try:
                 built = self._build_program(prog, t, tc=tc, i8=i8, atc=atc)
             except MemoryError:

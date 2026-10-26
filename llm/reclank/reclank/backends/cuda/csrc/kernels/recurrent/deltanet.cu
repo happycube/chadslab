@@ -663,6 +663,140 @@ __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) k_kqh_k(const gp_rec *r, 
     }
 }
 
+/* The float of byte K of v (each byte an integer < 2^23: exact) without an I2F (a quarter rate on Maxwell,
+ * and a wait on its result): 0x4B0000vv less 2^23 */
+template <int K>
+__device__ __forceinline__ float kq_fbyte(uint32_t v)
+{
+    return __uint_as_float(__byte_perm(v, 0x4B000000u, 0x7440 | K)) - 8388608.f;
+}
+
+__device__ __forceinline__ float kq_dot4f(uint32_t q, float4 x)
+{
+    return kq_fbyte<0>(q) * x.x + kq_fbyte<1>(q) * x.y + kq_fbyte<2>(q) * x.z + kq_fbyte<3>(q) * x.w;
+}
+
+/* k_kqh_k on GPUs without dp4a (Maxwell; the float x): the operations of each lane and the sums of k_kqh_k (the
+ * same bits) in fewer instructions. Its scales and mins came from kq_scale_min (a branch on 2c < 4 within each
+ * warp, byte loads), the codes and scales through I2F: 13 instructions a weight, the M4000 at 22-44 GB/s.
+ * Here the 6-bit scales and mins of sub-blocks 2c, 2c + 1 come from the three words of the 12 bytes without a
+ * branch (bytes 2(c & 1), 2(c & 1) + 1 of each to bytes 0 and 1; c < 2: S = a & 0x3f3f, M = b & 0x3f3f; else
+ * S = (cw & 0x0f0f) | ((a >> 2) & 0x3030), M = ((cw >> 4) & 0x0f0f) | ((b >> 2) & 0x3030)) and every float
+ * from its bits (kq_fbyte). R rows a warp; XREG: x of each lane in registers and the loads of the R rows
+ * first (short rows: down), else x and the sums of each lane's 4 values in shared memory. Qwen3.6's expert
+ * jobs on the M4000 (bench: 1, 2, 3, 6 pairs): gate and up (R 2) 54, 81, 106, 208 -> 26, 44, 62, 110 us;
+ * down (R 4, XREG) 24, 37, 50, 88 -> 17, 28, 40, 71 us. The RTX 3060 (4, 6, 8 pairs): gate and up 26.4, 35.5,
+ * 47.9 -> 21.5, 30.2, 41.9 us, down 18.5, 23.4, 29.1 -> 14.3, 19.3, 26.4; Qwen's steps 2.35 -> 1.95 ms of
+ * these kernels, but the 3060 waits on the CPU's experts instead (k_await +0.27 ms): the rate the same. */
+template <int FIVE, int NB, int DN, int R, int XREG>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK, 4) k_kqh_kf(const gp_rec *r, const int64_t *e)
+{
+    constexpr int BS = FIVE ? 176 : 144, RB = NB * BS, RL = XREG ? R : 1;
+    __shared__ __align__(16) float xs[XREG ? 4 : NB * 256];
+    __shared__ float xsum[XREG ? 1 : NB * 64];
+    PDL_START();
+    int j = blockIdx.y, up = DN ? 2 : blockIdx.z, slot = kqh_slot(r, e, j);
+    int inner = DI(12), hidden = DI(13), k = DI(11);
+    int rows = DN ? hidden : inner;
+    if (slot < 0) {
+        return;
+    }
+    const float *xt = DN ? DP(const float, 8) + (size_t)j * inner : DP(const float, 0) + (size_t)(j / k) * hidden;
+    if (!XREG) {
+        for (int i = threadIdx.x; i < NB * 64; i += blockDim.x) {
+            const float4 v = ((const float4 *)xt)[i];
+            ((float4 *)xs)[i] = v;
+            xsum[i] = v.x + v.y + v.z + v.w;
+        }
+        __syncthreads();
+    }
+    int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * R;
+    if (row0 >= rows) {
+        return;
+    }
+    const int l = threadIdx.x % 32, c = l / 8, sub = l % 8;
+    float4 xlr[XREG ? NB : 1], xhr[XREG ? NB : 1];
+    float slr[XREG ? NB : 1], shr[XREG ? NB : 1];
+    if (XREG) {
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const float *xb = xt + b * 256 + 64 * c + 4 * sub;
+            xlr[b] = *(const float4 *)xb;
+            xhr[b] = *(const float4 *)(xb + 32);
+            slr[b] = xlr[b].x + xlr[b].y + xlr[b].z + xlr[b].w;
+            shr[b] = xhr[b].x + xhr[b].y + xhr[b].z + xhr[b].w;
+        }
+    }
+    const uint32_t psel = (c & 1) ? 0x4432u : 0x4410u;
+    const bool hs = c >= 2;
+    const int sh = hs ? 2 : 0;
+    const uint32_t keep = hs ? 0x0f0fu : 0x3f3fu, top = hs ? 0x3030u : 0u;
+    const uint8_t *wb = kqh_wslot(r, e, slot, up, (size_t)rows * RB);
+    float *out = DN ? DP(float, 9) + (size_t)j * hidden : DP(float, 7) + (size_t)j * 2 * inner + up * inner;
+    #pragma unroll
+    for (int r0 = 0; r0 < R; r0 += RL) {
+        if (row0 + r0 >= rows) {
+            break;
+        }
+        uint32_t q[RL][NB], h[RL][NB], s4[RL][NB][3], dd[RL][NB];
+        #pragma unroll
+        for (int p = 0; p < RL; ++p) {
+            const uint8_t *w = wb + (size_t)min(row0 + r0 + p, rows - 1) * RB;
+            #pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                const uint8_t *blk = w + b * BS;
+                q[p][b] = __ldg((const uint32_t *)(blk + (FIVE ? 48 : 16) + 32 * c + 4 * sub));
+                h[p][b] = FIVE ? __ldg((const uint32_t *)(blk + 16 + 4 * sub)) : 0;
+                dd[p][b] = __ldg((const uint32_t *)blk);
+                s4[p][b][0] = __ldg((const uint32_t *)(blk + 4));
+                s4[p][b][1] = __ldg((const uint32_t *)(blk + 8));
+                s4[p][b][2] = __ldg((const uint32_t *)(blk + 12));
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < RL; ++p) {
+            float sum = 0.f;
+            #pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                float4 xl, xh;
+                float sl, shh;
+                if (XREG) {
+                    xl = xlr[b];
+                    xh = xhr[b];
+                    sl = slr[b];
+                    shh = shr[b];
+                } else {
+                    const float *xb = xs + b * 256 + 64 * c + 4 * sub;
+                    xl = *(const float4 *)xb;
+                    xh = *(const float4 *)(xb + 32);
+                    sl = xsum[b * 64 + 16 * c + sub];
+                    shh = xsum[b * 64 + 16 * c + 8 + sub];
+                }
+                uint32_t lo = q[p][b] & 0x0f0f0f0fu, hi = (q[p][b] >> 4) & 0x0f0f0f0fu;
+                if (FIVE) {
+                    const uint32_t hc = h[p][b] >> (2 * c);
+                    lo |= (hc << 4) & 0x10101010u;
+                    hi |= (hc << 3) & 0x10101010u;
+                }
+                const uint32_t a2 = __byte_perm(s4[p][b][0], 0, psel), b2 = __byte_perm(s4[p][b][1], 0, psel);
+                const uint32_t c2 = __byte_perm(s4[p][b][2], 0, psel);
+                const uint32_t S = ((hs ? c2 : a2) & keep) | ((a2 >> sh) & top);
+                const uint32_t M = ((hs ? c2 >> 4 : b2) & keep) | ((b2 >> sh) & top);
+                const float d = __half2float(__ushort_as_half((unsigned short)(dd[p][b] & 0xffff)));
+                const float dm = __half2float(__ushort_as_half((unsigned short)(dd[p][b] >> 16)));
+                sum += d * (kq_fbyte<0>(S) * kq_dot4f(lo, xl) + kq_fbyte<1>(S) * kq_dot4f(hi, xh)) -
+                       dm * (kq_fbyte<0>(M) * sl + kq_fbyte<1>(M) * shh);
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                sum += __shfl_xor_sync(RC_FULL_MASK, sum, o);
+            }
+            if (l == 0 && row0 + r0 + p < rows) {
+                out[row0 + r0 + p] = sum;
+            }
+        }
+    }
+}
+
 /* RECLANK_GPU_KQH_K (1): k_kqh_k for the routed pairs of Q4_K and Q5_K experts
  * whose rows are 2, 4, 8, or 16 blocks; 0 keeps k_kqh_gu and k_kqh_dn (a test). */
 static int kqh_k_ok(int type, int cols)
@@ -678,12 +812,38 @@ static int kqh_k_ok(int type, int cols)
 }
 
 /* k_kqh_k for the tk routed pairs: gate and up (dn 0, rows inner, cols
- * hidden) or down (dn 1, rows hidden, cols inner; staged: its rows are short) */
+ * hidden) or down (dn 1, rows hidden, cols inner; staged: its rows are short);
+ * k_kqh_kf (gate and up 2 rows a warp, down 4 with x in registers when its
+ * rows are at most 4 blocks, else 2) without dp4a, and with RECLANK_GPU_KQH_KF
+ * (1) on the others */
 static void kqh_k_launch(const gp_rec *dr, const int64_t *denv, int type, int cols, int dn, unsigned tk,
                          int64_t rows, cudaStream_t s)
 {
-    dim3 grid((unsigned)((rows + ROWS_PER_BLOCK * KQH_K_R - 1) / (ROWS_PER_BLOCK * KQH_K_R)), tk, dn ? 1 : 2);
+    static int kf = -1;
+    if (kf < 0) {
+        const char *v = getenv("RECLANK_GPU_KQH_KF");
+        kf = v == NULL || atoi(v) != 0;
+    }
     const int five = type == KQ_Q5_K, nb = cols / 256, W = 32 * ROWS_PER_BLOCK;
+    if (kf || !gg_caps.dp4a) {
+        const int R = dn && nb <= 4 ? 4 : 2;
+        dim3 gf((unsigned)((rows + ROWS_PER_BLOCK * R - 1) / (ROWS_PER_BLOCK * R)), tk, dn ? 1 : 2);
+#define KQH_KF(F, N) \
+        if (five == F && nb == N) { \
+            if (dn && N <= 4) { \
+                k_kqh_kf<F, N, 1, 4, 1><<<gf, W, 0, s>>>(dr, denv); \
+            } else if (dn) { \
+                k_kqh_kf<F, N, 1, 2, 0><<<gf, W, 0, s>>>(dr, denv); \
+            } else { \
+                k_kqh_kf<F, N, 0, 2, 0><<<gf, W, 0, s>>>(dr, denv); \
+            } \
+            return; \
+        }
+        KQH_KF(0, 2) KQH_KF(0, 4) KQH_KF(0, 8) KQH_KF(0, 16)
+        KQH_KF(1, 2) KQH_KF(1, 4) KQH_KF(1, 8) KQH_KF(1, 16)
+#undef KQH_KF
+    }
+    dim3 grid((unsigned)((rows + ROWS_PER_BLOCK * KQH_K_R - 1) / (ROWS_PER_BLOCK * KQH_K_R)), tk, dn ? 1 : 2);
 #define KQH_K(F, N) \
     if (five == F && nb == N) { \
         if (dn) { \

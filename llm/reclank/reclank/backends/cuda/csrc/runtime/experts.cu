@@ -468,12 +468,16 @@ static void *gg_worker(void *arg)
  * then records an event. The host memory is the map of the model file, so a
  * copy call waits for the data; the worker does that wait, not the runner.
  * rc_gpu_cache_query gives 1 when the copies of a job are done. The caller keeps
- * the ranges until then. */
+ * the ranges until then. packs (rc_gpu_cache_copy_q4s: device address, bytes,
+ * cols): the int4 rows the copies wrote, into Q4S after them on the stream
+ * (k_q4s_pack: the hot experts of a GPU without dp4a), before the event. */
 #define GG_CACHE_JOBS 64
 
 typedef struct {
     const int64_t *ranges;
     int count, id;
+    const int64_t *packs;
+    int npacks;
 } gg_cjob;
 
 static pthread_mutex_t gg_cmu = PTHREAD_MUTEX_INITIALIZER;
@@ -505,6 +509,10 @@ static void *gg_cworker(void *arg)
              * memcpy by this thread beside the CPU's experts) */
             bad = gg_h2d_staged(&sg, (void *)(intptr_t)q[1], (const void *)(intptr_t)q[0],
                                 (size_t)q[2], gg_cstream, 1) != 0;
+        }
+        for (int k = 0; k < j.npacks && !bad; ++k) {
+            const int64_t *q = j.packs + 3 * k;
+            bad = q4s_pack_launch((uint8_t *)(intptr_t)q[0], (size_t)q[1], (int)q[2], gg_cstream) != cudaSuccess;
         }
         int slot = j.id % GG_CACHE_JOBS;
         bad = bad || cudaEventRecord(gg_cev[slot], gg_cstream) != cudaSuccess;

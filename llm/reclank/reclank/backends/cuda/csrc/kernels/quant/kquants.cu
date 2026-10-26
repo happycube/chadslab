@@ -321,6 +321,19 @@ __device__ __forceinline__ float kq_dot4(uint32_t q, float4 x)
            (float)((q >> 16) & 255) * x.z + (float)(q >> 24) * x.w;
 }
 
+/* kq_row_part of KQ_IQ2R rows (the runtime's rows: nm_q2_lane, the float form of the hot experts). A call:
+ * inlined, the case took the generic kernels that inline kq_row_part (k_kq_multi_i8<0, -1>) on sm_86 from 178
+ * registers to 255, and Qwen3.6's decode on the RTX 3060 2.5% slower. */
+static __device__ __noinline__ float kq_iq2r_part(const uint8_t *w, const float *x, int cols, int part, int nparts,
+                                                  int lane)
+{
+    float sum = 0.f;
+    for (int b = part; b < cols / 256; b += nparts) {
+        sum += nm_q2_lane(w, cols, b, x + (size_t)b * 256, lane);
+    }
+    return sum;
+}
+
 /* The product of one row with x (cols values), for part part of nparts of
  * the blocks of the row (part 0 of 1: the whole row). All the lanes of the
  * warp take part; each gets the sum. The parts let several warps share a
@@ -445,6 +458,8 @@ __device__ float kq_row_part(int type, const uint8_t *w, const float *x, int col
         for (int b = part; b < cols / 256; b += nparts) {
             sum += nm_iq2_lane(w + (size_t)b * 66, x + (size_t)b * 256, lane);
         }
+    } else if (type == KQ_IQ2R) {
+        sum = kq_iq2r_part(w, x, cols, part, nparts, lane);
     } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
         /* lane l: 4 bytes of the part pair c = l / 8: 4 values of part 2c
          * (the low 4 bits) and 4 of part 2c + 1 (the high 4 bits). */

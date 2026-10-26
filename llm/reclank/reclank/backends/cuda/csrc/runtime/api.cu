@@ -59,6 +59,66 @@ void rc_gpu_set_tc(int on)
     gg_tc = on;    /* 0: float32, 1: k_gemm_tc2, 2: k_gemm_tc (for a test), 8: k_gemm_q8 */
 }
 
+/* The int4 matrix (Q4_0 rows of cols values) at the device address p, n bytes, in Q4S in place (k_q4s_pack;
+ * int4_blk), and known as such to the launches (q4s_is): the dense matrices of a GPU without dp4a
+ * (reclank/backends/cuda/runtime.py, Mirror). Whole rows of an even count of blocks at a multiple of 4. */
+int rc_gpu_q4s_pack(void *p, size_t n, int cols)
+{
+    const size_t rb = (size_t)(cols / 32) * 18;
+    if (cols % 64 != 0 || n % rb != 0 || ((uintptr_t)p & 3) != 0 || q4s_n >= Q4S_MAX) {
+        snprintf(gg_error, sizeof(gg_error), "q4s_pack: %zu bytes of rows of %d at %p", n, cols, p);
+        return -1;
+    }
+    const uintptr_t lo = (uintptr_t)p, hi = lo + n;
+    int k = 0;
+    while (k < q4s_n && q4s_lo[k] < lo) {
+        ++k;
+    }
+    if ((k > 0 && q4s_hi[k - 1] > lo) || (k < q4s_n && q4s_lo[k] < hi)) {
+        snprintf(gg_error, sizeof(gg_error), "q4s_pack: %p overlaps a matrix in Q4S", p);
+        return -1;
+    }
+    CK(q4s_pack_launch((uint8_t *)p, n, cols, gg_stream));
+    CK(cudaStreamSynchronize(gg_stream));
+    for (int j = q4s_n; j > k; --j) {
+        q4s_lo[j] = q4s_lo[j - 1];
+        q4s_hi[j] = q4s_hi[j - 1];
+    }
+    q4s_lo[k] = lo;
+    q4s_hi[k] = hi;
+    ++q4s_n;
+    return 0;
+}
+
+/* n bytes of int4 rows of cols values at the device address p into Q4S in place, with no entry in the list
+ * of q4s_is (the hot experts of a GPU without dp4a: their records say so, operand 16 of GP_HOT_MOE and the
+ * tables of GP_MOE_GPU). After the work queued before it. */
+int rc_gpu_q4s_rows(void *p, size_t n, int cols)
+{
+    const size_t rb = (size_t)(cols / 32) * 18;
+    if (cols % 64 != 0 || n % rb != 0 || ((uintptr_t)p & 3) != 0) {
+        snprintf(gg_error, sizeof(gg_error), "q4s_rows: %zu bytes of rows of %d at %p", n, cols, p);
+        return -1;
+    }
+    CK(q4s_pack_launch((uint8_t *)p, n, cols, gg_stream));
+    return 0;
+}
+
+/* The range of rc_gpu_q4s_pack at p forgotten (its buffer freed) */
+void rc_gpu_q4s_drop(void *p)
+{
+    for (int k = 0; k < q4s_n; ++k) {
+        if (q4s_lo[k] == (uintptr_t)p) {
+            for (int j = k; j + 1 < q4s_n; ++j) {
+                q4s_lo[j] = q4s_lo[j + 1];
+                q4s_hi[j] = q4s_hi[j + 1];
+            }
+            --q4s_n;
+            return;
+        }
+    }
+}
+
 int rc_gpu_mem_info(size_t *free_b, size_t *total_b)
 {
     CK(cudaMemGetInfo(free_b, total_b));
@@ -695,6 +755,29 @@ int rc_gpu_q6k_head(const void *w, const float *x, float *out, int rows, int col
     /* rows of 8, 11, or 16 blocks: staged in shared memory (k_q6k_head_s; w is 16-byte
      * aligned, a cudaMalloc) */
     int nb = cols / 256;
+    if (!gg_caps.dp4a && (nb == 8 || nb == 11 || nb == 16) && ((uintptr_t)w & 15) == 0 && ((uintptr_t)x & 15) == 0) {
+        /* a GPU without dp4a (Maxwell): k_q6k_head_m (kernels/head/head.cu), one token warps that loop over the
+         * rows with x in registers (k_q6k_head_m1, 4 blocks an SM: the 26B's head 8.2 -> 6.3 ms on the M4000) */
+        const uint8_t *wb = (const uint8_t *)w;
+        const unsigned g1 = (unsigned)min((int64_t)(gg_caps.sm_count > 0 ? gg_caps.sm_count : 16) * 4,
+                                          cdiv(rows, ROWS_PER_BLOCK));
+#define Q6K_M(NX, NB) k_q6k_head_m<NX, NB><<<grid, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(wb, x, out, rows, cols, cap, nx)
+#define Q6K_M1(NB) k_q6k_head_m1<NB><<<g1, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(wb, x, out, rows, cap)
+        if (nb == 8) {
+            if (nx == 1) Q6K_M1(8); else if (nx == 2) Q6K_M(2, 8); else if (nx == 3) Q6K_M(3, 8);
+            else if (nx == 4) Q6K_M(4, 8); else Q6K_M(0, 8);
+        } else if (nb == 11) {
+            if (nx == 1) Q6K_M1(11); else if (nx == 2) Q6K_M(2, 11); else if (nx == 3) Q6K_M(3, 11);
+            else if (nx == 4) Q6K_M(4, 11); else Q6K_M(0, 11);
+        } else {
+            if (nx == 1) Q6K_M1(16); else if (nx == 2) Q6K_M(2, 16); else if (nx == 3) Q6K_M(3, 16);
+            else if (nx == 4) Q6K_M(4, 16); else Q6K_M(0, 16);
+        }
+#undef Q6K_M
+#undef Q6K_M1
+        CK(cudaGetLastError());
+        return 0;
+    }
     if ((nb == 8 || nb == 11 || nb == 16) && ((uintptr_t)w & 15) == 0) {
         /* 1 to 4 rows of x (a step, a verify group of MTP) with their own forms: the
          * form of any count kept 16 sums and took 14.1 ms for the 2 rows of a verify

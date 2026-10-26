@@ -26,10 +26,11 @@ import numpy as np
 
 from reclank.backends.cpu import cops
 from reclank.backends.cuda.gpumm import mem_info, pinned
-from reclank.backends.cuda.runtime import GPUProgram, Mirror
+from reclank.backends.cuda.runtime import GPUProgram, Mirror, int8_tiles
 from reclank.formats import iq2
 from reclank.ir import program as P
-from reclank.models.nemotron.kq import KQ_IQ2R, KQ_NV4, KQ_Q8_0, LM, NemotronKQCache, compile_nemotron_step
+from reclank.models.nemotron.kq import (KQ_IQ2R, KQ_NV4, KQ_Q8_0, KQ_Q8_R, LM, Mat, NemotronKQCache,
+                                        compile_nemotron_step, q8r_rows)
 from reclank.models.qwen.gpu35 import _DevCache
 
 # the programs of a prompt: a prompt runs in parts of exactly these sizes, the largest first (no
@@ -92,6 +93,12 @@ ZC_MIN = int(os.environ["RECLANK_NM_ZC_MIN"]) if os.environ.get("RECLANK_NM_ZC_M
 # 7680-35712 blocks for ~6 experts, 0.1-0.4 ms a matrix on the RTX 3060, 15.9 ms of a 39 ms step).
 # RECLANK_NM_ZC_ROWS=0: NM_GROUP_MOE for all.
 ZC_ROWS = int(os.environ.get("RECLANK_NM_ZC_ROWS", "8"))
+# a GPU of the float forms (no dp4a, no tensor cores: NemotronGPU.i8 False) splits its steps (the CPU's cold
+# experts beside the GPU's hot ones) and plans its prompt groups (PLAN_F): its float products of every cold
+# expert over the link lose to the CPU's (the Quadro M4000 at 8 GB/s, 12% hot, by zero copy against split:
+# decode 7.8 against 11.3 tok/s, a prompt of 256 tokens 22 against 31, of 1024 32 against 33).
+# RECLANK_NM_ZC_FLOAT=1: zero copy as the int8 GPUs
+ZC_FLOAT = os.environ.get("RECLANK_NM_ZC_FLOAT", "0") == "1"
 # Super: the time of a run of each size, s (the 3090 and the Xeon, real text, NM_PLAN's groups, 17% hot;
 # 2048 and 4096, staged, from a prompt of 8K tokens against 1024's there, their programs' making included):
 # NemotronGPU.parts picks the runs of a prompt by it (RECLANK_NM_GROUP_COST "size:s,...")
@@ -103,6 +110,17 @@ if os.environ.get("RECLANK_NM_GROUP_COST"):
 # the GPU
 PLAN_CPU = float(os.environ.get("RECLANK_NM_PLAN_CPU", "12600"))
 PLAN_GPU = float(os.environ.get("RECLANK_NM_PLAN_GPU", "300000"))
+# a GPU of the float forms (no dp4a: Maxwell), Bolt's prompt groups of more than ZC_ROWS rows: NM_PLAN as Super's,
+# the cold experts of few pairs the CPU's, the others with the hot ones NM_GROUP_MOE's float tiles on the mapped
+# experts (the step's kernels took the hot pairs one by one); the CPU's cost of a pair, the GPU's of a cold expert
+# (its copy hides behind the tiles' products) and of each pair it runs, ns. The Quadro M4000 with the Xeon W-2133
+# (11 threads), against the split: a prompt of 256 tokens 44 -> 46 tok/s, 1024 54 -> 62, 4096 53 -> 60 (the
+# GPU's pair at 20500 ns took most pairs, its tiles 8.6 s of a 1024 group: 54; at 45000 60, 90000 61; 50000
+# and 200000 a cold expert the same). RECLANK_NM_PLAN_F=0: split as the steps
+PLAN_F = os.environ.get("RECLANK_NM_PLAN_F", "1") != "0"
+PLAN_F_CPU = float(os.environ.get("RECLANK_NM_PLAN_F_CPU", "43000"))
+PLAN_F_GPU = float(os.environ.get("RECLANK_NM_PLAN_F_GPU", "0"))
+PLAN_F_PAIR = float(os.environ.get("RECLANK_NM_PLAN_F_PAIR", "65000"))
 # refresh_experts (between prompts: the engine's idle; backends/cuda/devices.py REFRESH, REFRESH_HALF):
 # RECLANK_EXPERT_REFRESH=0 keeps the expert device's first set (the routing profile's); the routing
 # before a call weighs half for each RECLANK_EXPERT_REFRESH_HALF tokens (128) of the new (three
@@ -112,6 +130,33 @@ PLAN_GPU = float(os.environ.get("RECLANK_NM_PLAN_GPU", "300000"))
 # experts once (~12 GB with a quarter hot), so even 0.8 GB/s (a P102-100 at x4 Gen1, ~64 tok/s) beats
 # 4-6 cores (~30 tok/s); below this the CPU takes the cold experts of a prompt
 ZC_GBPS = float(os.environ.get("RECLANK_NM_ZC_GBPS", "0.5"))
+
+
+class _Q8RModel:
+    """The model as NemotronGPU's programs read it on a GPU without dp4a (Q8R): each Q8_0 matrix of M as
+    KQ_Q8_R rows, the weightkeeper's ("q8r.<name>": models/nemotron/keep.py) or made once (q8r_rows); the
+    rest, and the attributes set on it, the model's."""
+
+    def __init__(self, m):
+        object.__setattr__(self, "_base", m)
+        object.__setattr__(self, "_mats", {})
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._base, name, value)
+
+    def M(self, name):
+        m = self._mats.get(name)
+        if m is None:
+            m = self._base.M(name)
+            if m is not None and m.type == KQ_Q8_0:
+                kept = self._base._kept("q8r." + name)
+                m = Mat(kept[1] if kept is not None else q8r_rows(m.data, m.rows, m.cols), KQ_Q8_R, m.rows,
+                        m.cols, m.scale)
+            self._mats[name] = m
+        return m
 
 
 def h2d_gbps(nbytes=64 << 20, reps=4):
@@ -133,8 +178,13 @@ def h2d_gbps(nbytes=64 << 20, reps=4):
     return reps * nbytes / dt / 1e9
 
 # the IQ2_XXS products on int8 x (dp4a: NM_QX, NM_IQ2_LIN, the int8 form of NM_HOT_MOE);
-# RECLANK_NM_I8=0 keeps the float products
+# RECLANK_NM_I8=0 keeps the float products, as a GPU without dp4a or the tensor cores (Maxwell:
+# NemotronGPU.i8)
 I8 = os.environ.get("RECLANK_NM_I8", "1") != "0"
+# a GPU without dp4a (Maxwell: KQ_LINEAR's float k_kq_linear, k_kq_gemm) takes the Q8_0 matrices as KQ_Q8_R
+# rows, made at the load (_Q8RModel): a lane read 4 values of Q8_0's 34-byte blocks by two 2-byte loads (the
+# Quadro M4000's head of 131072 x 4096 16.6 ms, 34 GB/s); RECLANK_NM_Q8R=0 keeps Q8_0
+Q8R = os.environ.get("RECLANK_NM_Q8R", "1") != "0"
 # x of the int8 products as int16 in two int8 planes (q = 256 hi + lo: two dp4a for each 4 values;
 # int8 x left ~0.5% noise in each product); RECLANK_NM_X16=0: int8 x
 X16 = os.environ.get("RECLANK_NM_X16", "1") != "0"
@@ -521,7 +571,7 @@ class NmEmit:
         IQ2_XXS ones always (NM_IQ2_LIN), and in a prompt group the NVFP4 (more than 8 rows: the rows
         kernel k_nv4_gemv2 takes up to 8, a verify group of the drafter) and Q8_0 ones (more than 16)
         too (NM_GEMM8: the tiled product)."""
-        if not I8:
+        if not self.dev.i8:
             return False
         # (2 to 8 rows: k_nm_t8v on the tensor cores, k_nm_t8d (dp4a) without; more than 16: the tiles)
         small = 2 <= t <= 8 and TC8
@@ -595,7 +645,7 @@ class NmEmit:
             prog.emit(P.NM_HOT_NV4, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, *tabs)
             return
         more = [None, None, None, 1] if tab else []
-        if I8:
+        if self.dev.i8:
             prog.emit(P.NM_HOT_MOE, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t,
                       S("qx", t * L, np.int8), S("sx", t * L // 32), S("qa", t * k * Im, np.int8),
                       S("sa", t * k * Im // 32), S("qxl", t * L, np.int8) if X16 else None,
@@ -646,10 +696,11 @@ class NmEmit:
             slots_all = d.no_hot[i]
         else:
             slots_all = None
-        if t >= d.zc_min and d.zc_tables is not None and i in d.zc_tables:
+        fplan = not d.i8 and not ZC_FLOAT and PLAN_F and t > ZC_ROWS
+        if t >= d.zc_min and (d.i8 or ZC_FLOAT or fplan) and d.zc_tables is not None and i in d.zc_tables:
             pup, pdn = d.zc_tables[i]
             gidx, gout, xd = idx, out, d.xdev if t <= 8 else None
-            mix = d.nv4 and PLAN_CPU > 0 and not d.staged(t)
+            mix = (d.nv4 and PLAN_CPU > 0 or fplan) and not d.staged(t)
             if mix:
                 # Super's prompt group (S6): NM_PLAN gives the cold experts of few pairs to the CPU (NM_MOE
                 # in its task, as a step's cold pairs), the others and the hot ones to NM_GROUP_MOE; the
@@ -658,7 +709,7 @@ class NmEmit:
                 cold, cnt = S("cold", t * k, np.int32), S("cnt", 1, np.int32)
                 gidx, gout, part = S("zidx", t * k, np.int32), S("gout", t * L), S("part", t * L)
                 prog.emit(P.NM_PLAN, idx, d.hot[i][0], cold, cnt, gidx, t * k, k, prog.slot("nreal"), E,
-                          float(PLAN_CPU), float(PLAN_GPU))
+                          *((PLAN_F_CPU, PLAN_F_GPU, PLAN_F_PAIR) if fplan else (float(PLAN_CPU), float(PLAN_GPU))))
                 fl = pinned((2,), np.int64, free=True)
                 fl[:] = 0
                 prog.keep.append(fl)
@@ -796,7 +847,10 @@ class NemotronGPU:
     LANE_ATTRS = ("cache", "cache_dev", "progs", "_bufs", "_ascr", "media", "lane_id")
 
     def __init__(self, model, ctx=8192, hot_gb=None, counts=None, graph=True, reserve_gb=0.0):
+        from reclank.backends.cuda.runtime import caps
         self.m, self.cfg = model, model.cfg
+        if Q8R and not caps().get("dp4a"):
+            self.m = _Q8RModel(model)
         cfg = self.cfg
         self.reserve_gb = float(reserve_gb)     # (the room kept out of the hot experts: relax keeps it free too)
         # Super's NVFP4 experts (KQ_NV4 rows): the hot pairs of a step or a verify group by NM_HOT_NV4, a
@@ -873,6 +927,9 @@ class NemotronGPU:
         # link; a prompt group of more than NV4_HOT_MAX rows every pair on the GPU, NM_GROUP_MOE's
         # k_nm_gtile_nv4 on the tensor cores)
         self.zc_min = ZC_MIN if ZC_MIN is not None else NV4_HOT_MAX + 1 if self.nv4 else 1
+        # the int8 products: a GPU without dp4a or the tensor cores (Maxwell) takes the float forms
+        # (kernels/nemotron/iq2_f32.cu: NM_HOT_MOE's, NM_GROUP_MOE's tiles, KQ_IQ2R's KQ_LINEAR)
+        self.i8 = I8 and int8_tiles()
         # every program counts the router's choices of each layer here (GP_COUNT; route_counts() reads
         # them back): with an expert device (refresh_experts), or RECLANK_NM_ROUTES=1
         Em = max(E for E, _n, _k in cfg.moe.values())
@@ -888,7 +945,7 @@ class NemotronGPU:
         self._prog(1)
         self.link_gbps = h2d_gbps()
         from reclank.backends.cuda.runtime import caps
-        if ZC and self.link_gbps >= ZC_GBPS and (not self.nv4 or caps().get("tc")):
+        if ZC and self.link_gbps >= ZC_GBPS and (not self.nv4 or caps().get("tc")) and (self.i8 or ZC_FLOAT or PLAN_F):
             t0 = time.time()
             self._zero_copy()
             if self.nv4 and self.zc_tables is not None:

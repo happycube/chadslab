@@ -30,8 +30,11 @@ __device__ __forceinline__ void w_block32(const void *w, int row, int cols, int 
             out32[k] = p[k];
         }
     } else {
-        const uint8_t *blk = (const uint8_t *)w + ((size_t)row * (cols / 32) + g) * 18;
-        float d = __half2float(__ushort_as_half((uint16_t)(blk[0] | (blk[1] << 8))));
+        /* F32W 3: the int4 row in Q4S (int4_blk) */
+        const uint8_t *wr = (const uint8_t *)w + (size_t)row * (cols / 32) * 18;
+        const uint8_t *blk = F32W == 3 ? wr + 16 * g - 2 : wr + (size_t)g * 18;
+        const uint8_t *dp = F32W == 3 ? wr + cols / 2 + 2 * g : blk;
+        float d = __half2float(__ushort_as_half((uint16_t)(dp[0] | (dp[1] << 8))));
         for (int k = 0; k < 16; ++k) {
             int b = blk[2 + k];
             out32[k] = (float)((b & 15) - 8) * d;
@@ -117,6 +120,7 @@ __global__ void k_gemm(const float *x, const void *w, float *out, int t, int row
 #define G8_B 128
 #define G8_LD 132                  /* the floats of a row of the tiles in shared memory (4 of pad) */
 
+template <bool Q4S = false>
 __global__ void __launch_bounds__(256, 2) k_gemm8(const float *x, const uint8_t *w, float *out, int t,
                                                   int rows, int cols)
 {
@@ -141,7 +145,14 @@ __global__ void __launch_bounds__(256, 2) k_gemm8(const float *x, const uint8_t 
             lx[i] = j < t ? *(const float4 *)(x + (size_t)j * cols + (size_t)g * 32 + 4 * (q % 8))
                           : make_float4(0.f, 0.f, 0.f, 0.f);
         }
-        if (wok) {
+        if (wok && Q4S) {
+            /* (int4_blk: the codes of the row, then the d of each block) */
+            const uint8_t *wr = w + (size_t)(n0 + wrow) * groups * 18;
+            const uint32_t *c = (const uint32_t *)(wr + 16 * g + 8 * half);     /* (rows at a multiple of 4) */
+            lw0 = c[0];
+            lw1 = c[1];
+            ld = __half2float(((const __half *)(wr + cols / 2))[g]);
+        } else if (wok) {
             const uint8_t *blk = w + ((size_t)(n0 + wrow) * groups + g) * 18;
             const uint16_t *c = (const uint16_t *)(blk + 2 + 8 * half);
             lw0 = (uint32_t)c[0] | ((uint32_t)c[1] << 16);

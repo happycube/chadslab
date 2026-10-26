@@ -321,13 +321,14 @@ __global__ void k_nm_split(const gp_rec *r, const int64_t *e)
     }
 }
 
-/* GP_NM_PLAN (Super's prompt groups, S6 of docs/NEMOTRON_SUPER_PLAN.md): idx, slots (the GPU's slot of each
- * expert, or -1), cold (out: the CPU's pairs, their expert or -1), count (out: their count), gidx (out:
- * the GPU's pairs), tk, k, nreal, E, a (the CPU's cost of a pair), b (the GPU's cost of a cold expert:
- * its copy over the link). The pairs of each expert counted; the cold experts of at most c pairs are
- * the CPU's, the others and every hot one the GPU's, c the count where the CPU's time (a for each of
- * its pairs) and the GPU's (b for each of its cold experts) are the most even (a = 0: none the CPU's).
- * One block. */
+/* GP_NM_PLAN (Super's prompt groups, S6 of docs/NEMOTRON_SUPER_PLAN.md; Bolt's on a GPU without dp4a): idx,
+ * slots (the GPU's slot of each expert, or -1), cold (out: the CPU's pairs, their expert or -1), count
+ * (out: their count), gidx (out: the GPU's pairs), tk, k, nreal, E, a (the CPU's cost of a pair), b (the
+ * GPU's cost of a cold expert: its copy over the link), g (or none: the GPU's cost of each pair it runs,
+ * hot ones too: Maxwell's float tiles, where the copies hide behind the products). The pairs of each
+ * expert counted; the cold experts of at most c pairs are the CPU's, the others and every hot one the
+ * GPU's, c the count where the CPU's time (a for each of its pairs) and the GPU's (b for each of its
+ * cold experts, g for each of its pairs) are the most even (a = 0: none the CPU's). One block. */
 #define NM_PLAN_E 4096
 #define NM_PLAN_T 4096
 __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t *e)
@@ -336,9 +337,9 @@ __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t
     const int *idx = DP(const int, 0), *slots = DP(const int, 1);
     int *cold = DP(int, 2), *count = DP(int, 3), *gidx = DP(int, 4);
     const int tk = DI(5), k = DI(6), nreal = DI(7), E = DI(8);
-    const float a = df(r, e, 9), b = df(r, e, 10);
+    const float a = df(r, e, 9), b = df(r, e, 10), g = r->tag[11] != GP_T_NONE ? df(r, e, 11) : 0.f;
     __shared__ int cnt[NM_PLAN_E], hist[NM_PLAN_T + 1];
-    __shared__ int cut, n;
+    __shared__ int cut, n, hot;
     const int nr = nreal > 0 && nreal * k < tk ? nreal : tk / k;      /* (a count is at most nr) */
     for (int x = threadIdx.x; x < E; x += blockDim.x) {
         cnt[x] = 0;
@@ -347,7 +348,7 @@ __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t
         hist[x] = 0;
     }
     if (threadIdx.x == 0) {
-        n = 0;
+        n = hot = 0;
     }
     __syncthreads();
     for (int p = threadIdx.x; p < nr * k; p += blockDim.x) {
@@ -357,20 +358,24 @@ __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t
     for (int x = threadIdx.x; x < E; x += blockDim.x) {
         if (cnt[x] > 0 && slots[x] < 0) {
             atomicAdd(&hist[cnt[x]], 1);
+        } else if (cnt[x] > 0) {
+            atomicAdd(&hot, cnt[x]);
         }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        int left = 0;
+        int left = 0, lp = 0;           /* the cold experts left to the GPU, their pairs */
         for (int c = 1; c <= nr; ++c) {
             left += hist[c];
+            lp += c * hist[c];
         }
-        float cpu = 0.f, best = (float)left * b;
+        float cpu = 0.f, best = (float)left * b + g * (float)(hot + lp);
         int bc = 0;
         for (int c = 1; c <= nr && a > 0.f; ++c) {
             cpu += a * (float)c * (float)hist[c];
             left -= hist[c];
-            const float tt = fmaxf(cpu, (float)left * b);
+            lp -= c * hist[c];
+            const float tt = fmaxf(cpu, (float)left * b + g * (float)(hot + lp));
             if (tt < best) {
                 best = tt;
                 bc = c;
@@ -397,67 +402,8 @@ __global__ void __launch_bounds__(1024) k_nm_plan(const gp_rec *r, const int64_t
     }
 }
 
-/* GP_NM_HOT_MOE's experts (operand 22, the tables: 0 or none, the slots): the key of pair p's expert
- * (its slot, or with the tables its id; < 0: not run here), and the rows from row of its up (op 4) or
- * down (5) matrix of m rows of rb bytes: the slot's in the stack, or the table's address of the expert
- * (NM_GROUP_MOE's pup / pdn: a hot slot or the host memory the GPU maps; a pair of idx -1 is another
- * GPU's). */
-#define NM_TAB (r->tag[22] == GP_T_INT && r->v[22] != 0)
-__device__ __forceinline__ int nm_hot_key(const gp_rec *r, const int64_t *e, int p)
-{
-    const int x = DP(const int, 1)[p];
-    return NM_TAB ? x : DP(const int, 3)[x];
-}
-
-__device__ __forceinline__ const uint8_t *nm_hot_w(const gp_rec *r, const int64_t *e, int op, int p, int key,
-                                                   int m, int row, size_t rb)
-{
-    if (NM_TAB) {
-        return (const uint8_t *)(intptr_t)DP(const int64_t, op)[DP(const int, 1)[p]] + (size_t)row * rb;
-    }
-    return DP(const uint8_t, op) + ((size_t)key * m + row) * rb;
-}
-
-/* GP_NM_HOT_MOE: x, idx, val, slots, up, down, act, de, out, k, L, inner, t; a warp for each row
- * of each pair (grid: rows / 4, pairs) */
-__global__ void k_nm_hot_up(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    const int k = DI(9), L = DI(10), inner = DI(11), pr = blockIdx.y;
-    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    const int slot = nm_hot_key(r, e, pr);
-    if (row >= inner || slot < 0) {
-        return;
-    }
-    const size_t rb = nm_q2_rb(L);
-    const uint8_t *w = nm_hot_w(r, e, 4, pr, slot, inner, row, rb);
-    float v = nm_q2_row_f(w, DP(const float, 0) + (size_t)(pr / k) * L, L);
-    if (threadIdx.x % 32 == 0) {
-        v = fmaxf(v, 0.f);
-        DP(float, 6)[(size_t)pr * inner + row] = v * v;
-    }
-}
-
-__global__ void k_nm_hot_down(const gp_rec *r, const int64_t *e)
-{
-    PDL_START();
-    const int L = DI(10), inner = DI(11), pr = blockIdx.y;
-    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (row >= L) {
-        return;
-    }
-    const int slot = nm_hot_key(r, e, pr);
-    float v = 0.f;
-    if (slot >= 0) {
-        const size_t rb = nm_q2_rb(inner);
-        const uint8_t *w = nm_hot_w(r, e, 5, pr, slot, L, row, rb);
-        v = nm_q2_row_f(w, DP(const float, 6) + (size_t)pr * inner, inner) * DP(const float, 2)[pr];
-    }
-    if (threadIdx.x % 32 == 0) {
-        DP(float, 7)[(size_t)pr * L + row] = v;
-    }
-}
-
+/* GP_NM_HOT_MOE: x, idx, val, slots, up, down, act, de, out, k, L, inner, t (its float form: kernels/nemotron/iq2_f32.cu,
+ * k_nm_hot_up_f / k_nm_hot_down_f; then k_nm_hot_sum) */
 __global__ void k_nm_hot_sum(const gp_rec *r, const int64_t *e)
 {
     PDL_START();

@@ -8,7 +8,8 @@ start, made once and handed to every round.
   (NM_MOE reads a layer's stack at one address);
 - the Mamba projections in the KQ_NV4 rows of kq_nv4_pack (the NVFP4 nibbles and scales as stored);
 - the shared experts in KQ_IQ2R rows ("iq2r.<name>");
-- every other tensor its bytes as the shard has them (Q8_0 blocks, bfloat16, float32).
+- every other tensor its bytes as the shard has them (Q8_0 blocks, bfloat16, float32), and each Q8_0
+  matrix in KQ_Q8_R rows too ("q8r.<name>": a GPU without dp4a, NemotronGPU's Q8R; 1.2 GB).
 
 Super (docs/NEMOTRON_SUPER_PLAN.md S4): the NVFP4 routed experts in stacks of KQ_NV4 rows (65 GB, a
 copy on each node for the parts when they fit); the NVFP4 shared experts in KQ_NV4 rows; the FP8
@@ -61,10 +62,11 @@ def _model(path):
 
 def layout(path, nodes, share, o):
     """The index: "exps.<layer>.<up|down>" (place experts: whole on each node it lists),
-    "nv4.<name>" (the KQ_NV4 rows), "iq2r.<name>" (the KQ_IQ2R rows) and "raw.<name>" (the bytes of
-    the shard) on the GPU's node."""
+    "nv4.<name>" (the KQ_NV4 rows), "iq2r.<name>" (the KQ_IQ2R rows), "raw.<name>" (the bytes of
+    the shard) and "q8r.<name>" (a Q8_0 matrix's KQ_Q8_R rows) on the GPU's node."""
     from reclank.backends.cpu import cops
     from reclank.formats import iq2
+    from reclank.models.nemotron.kq import q8r_row_bytes
     m = _model(path)
     cfg, ck = m.cfg, m.ck
     parts = len(nodes)
@@ -116,20 +118,28 @@ def layout(path, nodes, share, o):
         tens["raw." + name] = dict(place="node", seg=dpart, off=at(dpart, n), bytes=n, dtype=t["dtype"],
                                    shape=list(t["shape"]), kind="dense")
         order.append("raw." + name)
+        if base is not None and t["dtype"] == "U8" and len(t["shape"]) == 3 and t["shape"][-1] == 34:
+            rows, cols = t["shape"][0], t["shape"][1] * 32
+            n = rows * q8r_row_bytes(cols)
+            tens["q8r." + base] = dict(place="node", seg=dpart, off=at(dpart, n), bytes=n, rows=rows, cols=cols,
+                                       type="q8r", kind="dense")
+            order.append("q8r." + base)
     ck.close()
     return dict(layout=LAYOUT, model=MODEL_SUPER if super_ else MODEL, iq2=IQ2, source="nemotron",
                 file=os.path.abspath(path), nodes=list(nodes), share=list(share), dense_part=dpart, copies=copies,
-                types=dict(dense="as stored (NVFP4 in KQ_NV4 rows, IQ2_XXS in KQ_IQ2R rows, FP8 as stored)",
+                types=dict(dense="as stored (NVFP4 in KQ_NV4 rows, IQ2_XXS in KQ_IQ2R rows, FP8 as stored; "
+                                 "Q8_0 in KQ_Q8_R rows too)",
                            experts="nvfp4 stacks in KQ_NV4 rows" if super_ else "iq2_xxs stacks in KQ_IQ2R rows",
                            ngram="none"),
                 tensors=tens, order=order, meta=[], part_bytes=list(used))
 
 
 def fill(sh, index, segs, threads, log):
-    """The tensors into the segments: the bytes of the shards, the KQ_NV4 and KQ_IQ2R rows packed,
-    then the stacks of experts (each expert's KQ_IQ2R rows after the other)."""
+    """The tensors into the segments: the bytes of the shards, the KQ_NV4, KQ_IQ2R and KQ_Q8_R rows
+    packed, then the stacks of experts (each expert's KQ_IQ2R rows after the other)."""
     from reclank.backends.cpu import cops
     from reclank.formats import iq2
+    from reclank.models.nemotron.kq import q8r_rows
     m = _model(index["file"])
     ck = m.ck
     t0, n = time.time(), 0
@@ -145,6 +155,8 @@ def fill(sh, index, segs, threads, log):
             cops.kq_nv4_pack([np.ascontiguousarray(w)], [np.ascontiguousarray(s)], [g], d["rows"], d["cols"], dst)
         elif name.startswith("iq2r."):
             iq2.to_rows(ck.raw(name[5:] + ".weight"), dst)
+        elif name.startswith("q8r."):
+            q8r_rows(ck.raw(name[4:] + ".weight"), d["rows"], d["cols"], dst)
         else:
             dst[:] = ck.bytes(name[4:])
         n += d["bytes"]

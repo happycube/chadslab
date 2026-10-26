@@ -87,6 +87,10 @@ def lib():
     L.rc_gpu_where.restype = vp
     L.rc_gpu_init.argtypes = [i]
     L.rc_gpu_mem_info.argtypes = [ctypes.POINTER(sz), ctypes.POINTER(sz)]
+    L.rc_gpu_q4s_pack.argtypes = [ctypes.c_void_p, sz, ctypes.c_int]
+    L.rc_gpu_q4s_drop.argtypes = [ctypes.c_void_p]
+    L.rc_gpu_q4s_rows.argtypes = [ctypes.c_void_p, sz, ctypes.c_int]
+    L.rc_gpu_cache_copy_q4s.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
     L.rc_gpu_malloc.argtypes = [sz]
     L.rc_gpu_malloc.restype = vp
     L.rc_gpu_free.argtypes = [vp]
@@ -312,6 +316,7 @@ class Mirror:
         self.arrays = {}    # host start -> array
         self.bufs = {}      # host start -> Buffer
         self.checked = set()  # the int4 matrices whose scales are checked
+        self.q4s = {}       # host start -> cols: the int4 matrices whose device copies are in Q4S (_mark_q4s)
         # the kind of the new device copies (GpuMem), and the key of the
         # program they are made for (the reclaimers keep it)
         self.kind = "program"
@@ -342,7 +347,10 @@ class Mirror:
         it is freed); the place of the call is kept for an error later."""
         b = self.bufs.pop(start, None)
         if b is not None:
+            if start in self.q4s:
+                lib().rc_gpu_q4s_drop(b.ptr)
             b.free()
+        self.q4s.pop(start, None)
         if start in self.arrays:
             del self.arrays[start]
             self.starts.remove(start)
@@ -361,6 +369,8 @@ class Mirror:
             # pinned: the programs hold its address in their code
             b = self.bufs[start] = Buffer(a.nbytes, self.kind, keep=self.keep, pinned=True)
             b.upload(a)
+            if start in self.q4s:
+                _check(lib().rc_gpu_q4s_pack(b.ptr, a.nbytes, self.q4s[start]))
         return b
 
     def translate(self, addr):
@@ -375,6 +385,75 @@ class Mirror:
 
     def nbytes(self):
         return sum(b.nbytes for b in self.bufs.values())
+
+
+# the int4 matrices of the records of the int4 products: (operand of w, operand of cols) of each
+_INT4_W = {
+    P.INT4_LINEAR: [(1, 5)],
+    P.INT4_MULTI4: [(2 + 4 * m, 1) for m in range(4)],
+    P.RMS_NORM_MULTI4: [(5 + 4 * m, 3) for m in range(4)],
+    P.GELU_MUL_INT4: [(4, 8)],
+    P.INT4_LINEAR_MT: [(1, 5)],
+    P.INT4_MULTI4_MT: [(3 + 4 * m, 1) for m in range(4)],
+}
+# RECLANK_GPU_Q4S=0: the int4 matrices of a GPU without dp4a as stored (Q4_0)
+Q4S = os.environ.get("RECLANK_GPU_Q4S", "1") != "0"
+
+
+def _int4_w(op, args):
+    """The (operand of w, operand of cols) of the int4 matrices of a record in Q4S: those of _INT4_W, and the
+    stores of the experts of a GP_HOT_MOE whose operand 16 is 2 (its experts in Q4S, q4s_experts)."""
+    if op == P.HOT_MOE:
+        return [(4, 12), (5, 14)] if len(args) > 16 and args[16][0] == P.T_INT and args[16][1] == 2 else []
+    return _INT4_W.get(op, ())
+
+
+def q4s_experts(model):
+    """True when the int4 experts of model on this GPU go to Q4S (int4_blk of backends/cuda/csrc/kernels/gemv.cu):
+    a GPU without dp4a (Maxwell), RECLANK_GPU_Q4S, the experts as int4 rows (not KQ_Q4X) of an even count of
+    blocks. Its hot and warm experts are packed after their copies (HotCache, WarmPool._pool_place, the stores
+    by _mark_q4s); GP_HOT_MOE says so by operand 16 (2) and the tables of GP_MOE_GPU by bit 0 (fill_tables)."""
+    if not Q4S or caps().get("dp4a", 0):
+        return False
+    layer = next((i for i, w in model._layers.items() if isinstance(w, dict) and "experts.gate_up_proj" in w), None)
+    if layer is None:
+        return False
+    gu, dn, q4x = expert_host(model, layer)
+    cfg = model.cfg
+    return not q4x and cfg.hidden_size % 64 == 0 and cfg.moe_intermediate_size % 64 == 0
+
+
+def _mark_q4s(prog, mirror):
+    """On a GPU without dp4a (Maxwell): the int4 matrices of the int4 products of prog in Q4S on the device
+    (the codes of a row, then the float16 scale of each block: int4_blk of backends/cuda/csrc/kernels/gemv.cu;
+    the GEMV of a step reads a lane's 4 bytes of codes in one aligned load, not two 2-byte ones, with the same
+    bits), packed in place after their upload (Mirror.device, rc_gpu_q4s_pack). A matrix already on the device
+    stays as it is (the launches ask rc_gpu's list for each). The CPU's host copies do not change. Another record
+    that reads such a matrix is an error."""
+    for op, args in prog.recs:
+        for wk, ck in _int4_w(op, args):
+            if wk >= len(args) or args[wk][0] != P.T_INT or args[wk][1] == 0:
+                continue
+            addr, cols = args[wk][1], args[ck][1]
+            start = mirror.owner(addr)
+            if start is None:
+                continue
+            rb = cols // 32 * 18
+            ok = (cols % 64 == 0 and (addr - start) % rb == 0 and mirror.arrays[start].nbytes % rb == 0
+                  and mirror.q4s.get(start, cols) == cols)
+            if ok and (start in mirror.q4s or start not in mirror.bufs):
+                mirror.q4s[start] = cols
+    if not mirror.q4s:
+        return
+    for op, args in prog.recs:
+        ws = {wk for wk, _ck in _int4_w(op, args)}
+        for k, (tag, val) in enumerate(args):
+            if tag != P.T_INT or val == 0 or k in ws:
+                continue
+            start = mirror.owner(val)
+            if start is not None and start in mirror.q4s:
+                raise RuntimeError("an int4 matrix in Q4S is operand %d of a record %d (RECLANK_GPU_Q4S=0: as stored)"
+                                   % (k, op))
 
 
 def _check_scales(prog, done=None):
@@ -435,6 +514,8 @@ class GPUProgram:
             if isinstance(a, np.ndarray):
                 self.mirror.add(a)
         _check_scales(prog, self.mirror.checked)
+        if Q4S and not caps().get("dp4a", 0):
+            _mark_q4s(prog, self.mirror)
         buf = prog.buf.copy()
         n_env = int(buf[1])
         code = buf[4 + n_env:].view(P.REC)
@@ -832,9 +913,13 @@ class WarmPool:
                 if not free:
                     return placed
                 b = int(free.pop(0))
+                # (the cols of each part's rows when the experts go to Q4S: GemmaGPU.q4s_cols)
+                q4s = getattr(self, "q4s_cols", None)
                 for part, (srcs, nb, _dst) in enumerate(parts):
                     a = int(srcs[int(x)]) if isinstance(srcs, np.ndarray) else srcs + int(x) * nb
                     _check(lib().rc_gpu_h2d(pool.addr(part, b), a, nb))
+                    if q4s is not None:
+                        _check(lib().rc_gpu_q4s_rows(pool.addr(part, b), nb, q4s[part]))
                 slots[x] = HotCache.WARM + b
                 pool.owner[b] = -4
                 placed.append((key, int(x), b))
@@ -929,6 +1014,9 @@ def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=Non
     n = gu.shape[0]
     egu, edn = gu.nbytes // n, dn.nbytes // n
     dgu, ddn = stage[layer % 2 if buf is None else buf]
+    # bit 0 of an address: the hot or warm expert in Q4S (HotCache packs them; the copies of a group to the
+    # buffers stay as stored): k_moe_gemm8 and k_moe_gemm read the flag
+    tag = 1 if getattr(model, "_q4s_experts", False) else 0
     room = min(dgu.nbytes // egu, ddn.nbytes // edn)
     slots, hgu, hdn = hot if hot is not None else (np.full(n, -1), 0, 0)
     runs = []
@@ -937,14 +1025,14 @@ def fill_tables(model, layer, hot, stage, tgu, tdn, ranges, gslots=None, pre=Non
         gslots[:] = -1
     for x in range(n):
         if slots[x] >= HotCache.WARM:
-            tgu[x] = pool.addr(0, int(slots[x]) - HotCache.WARM)
-            tdn[x] = pool.addr(1, int(slots[x]) - HotCache.WARM)
+            tgu[x] = pool.addr(0, int(slots[x]) - HotCache.WARM) | tag
+            tdn[x] = pool.addr(1, int(slots[x]) - HotCache.WARM) | tag
             if gslots is not None:
                 gslots[x] = slots[x]
             continue
         if slots[x] >= 0:
-            tgu[x] = hgu + int(slots[x]) * egu
-            tdn[x] = hdn + int(slots[x]) * edn
+            tgu[x] = (hgu + int(slots[x]) * egu) | tag
+            tdn[x] = (hdn + int(slots[x]) * edn) | tag
             if gslots is not None:
                 gslots[x] = slots[x]
             continue
@@ -1282,6 +1370,9 @@ class HotCache:
                 parts=[(gq.ctypes.data, gq.nbytes // n, dev.g.mirror.buffer_of(gu_store).ptr),
                        (dq.ctypes.data, dq.nbytes // n, dev.g.mirror.buffer_of(dn_store).ptr)],
                 ip=dev.prog.hot_ip[layer]))
+            if getattr(dev, "q4s_cols", None) is not None:
+                # the cols of the rows of each part: the copies into the slots go to Q4S after them
+                self.layers[-1]["q4s"] = dev.q4s_cols
         m = len(self.layers)
         # One row for each entry of layers: the score of each expert, the
         # experts in the slots, and the experts of the pending copies.
@@ -1826,16 +1917,20 @@ class HotCache:
         after the slot tables of the rows changed (their old experts cold)."""
         if not items:
             return
-        pool, rows = self.pool, []
+        pool, rows, packs = self.pool, [], []
         for r, x, slot in items:
+            q4s = self.layers[r].get("q4s")
             for part, (src, nb, dst) in enumerate(self.layers[r]["parts"]):
                 # src: the host address of expert 0 (expert x at x nb), or the
                 # address of each expert (an int64 array: QwenGPU._expert_srcs)
                 a = int(src[x]) if isinstance(src, np.ndarray) else src + x * nb
                 rows += _pieces(a, self._slot_addr(part, dst, nb, slot), nb)
+                if q4s is not None:
+                    packs.append((self._slot_addr(part, dst, nb, slot), nb, q4s[part]))
         # The old experts are cold on the GPU before the copies start.
         self._upload(changed)
-        ranges = np.array(rows, dtype=np.int64)
+        # (the packs into Q4S after the ranges, in one array that pending keeps)
+        ranges = np.array(rows + packs, dtype=np.int64)
         # GpuMem: the segments of the pool that the copies write stay until
         # they land (prepare)
         segs = []
@@ -1843,7 +1938,8 @@ class HotCache:
             segs = list({id(b): b for b in (pool.bufs[(s - self.WARM) // pool.K]
                                            for _r, _x, s in items if s >= self.WARM)}.values())
             mem().lock(segs)
-        job = lib().rc_gpu_cache_copy(ranges.ctypes.data, len(rows))
+        job = lib().rc_gpu_cache_copy_q4s(ranges.ctypes.data, len(rows), ranges.ctypes.data + 24 * len(rows),
+                                          len(packs))
         if job < 0:
             mem().unlock(segs)
             raise RuntimeError(lib().rc_gpu_last_error().decode())

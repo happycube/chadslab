@@ -178,6 +178,181 @@ __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) k_q6k_head_s(const uint8_
     }
 }
 
+/* Byte K (0 to 3) of the 6-bit values c (each below 64) less 32, as a float: as i4m (gemv.cu), the byte
+ * masked in place with the bits of 2^23 and one FMA by 2^-8K; byte 3 from c >> 8 (h). Exact. */
+template <int K>
+__device__ __forceinline__ float q6m(uint32_t c, uint32_t h)
+{
+    const uint32_t v = K == 3 ? h : c;
+    constexpr int S = K == 3 ? 16 : 8 * K;
+    const float f = __uint_as_float((v & (0x3Fu << S)) | 0x4B000000u);
+    return fmaf(f, 1.f / (float)(1u << S), -(8388608.f / (float)(1u << S) + 32.f));
+}
+
+/* k_q6k_head_s for a GPU without dp4a (Maxwell), the row staged as there: lane L takes 8 adjacent values
+ * of each block, y[128 n + 32 j + l0 + u] for u < 8 (n = L / 16, j = L / 4 % 4, l0 = 8 (L % 4)), which
+ * have one scale; their 6 bits 4 a word by masks (the low or high nibbles of 4 bytes of ql, 2 bits of 4
+ * bytes of qh), each value by q6m (no shift, no conversion), x by 2 float4. k_q6k_head_s took a conversion
+ * of the scale and two products a value and 14 byte loads for 8 (the Quadro M4000: the head of the 26B, 8.6
+ * ms a step, 70 GB/s). The sums are in an order of their own; the steps and the verify groups take this
+ * kernel alike. */
+template <int NX, int NB>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) k_q6k_head_m(const uint8_t *w, const float *x,
+                                                                   float *out, int rows, int cols,
+                                                                   float cap, int nx)
+{
+    constexpr int NS = NX ? NX : HEAD_MAX;
+    constexpr int RB = NB * 210, NV = RB / 16 + 2, PER = (NV + 31) / 32;
+    __shared__ __align__(16) uint8_t sm[ROWS_PER_BLOCK][NV * 16];
+    if (NX) {
+        nx = NX;
+    }
+    PDL_START();
+    int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
+    int l = threadIdx.x % 32;
+    if (row >= rows) {
+        return;
+    }
+    size_t start = (size_t)row * RB, a0 = start & ~(size_t)15;
+    int off = (int)(start - a0), nv = (off + RB + 15) / 16;
+    uint8_t *buf = sm[threadIdx.x / 32];
+    const uint4 *src = (const uint4 *)(w + a0);
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        int i = l + 32 * p;
+        if (i < nv) {
+            ((uint4 *)buf)[i] = __ldg(src + i);
+        }
+    }
+    const uint8_t *wr = buf + off;
+    __syncwarp();
+    const int n = l >> 4, j = (l >> 2) & 3, l0 = 8 * (l & 3);
+    const int oql = 64 * n + 32 * (j & 1) + l0, oqh = 128 + 32 * n + l0, osc = 192 + 8 * n + l0 / 16 + 2 * j;
+    const int shl = j >= 2 ? 4 : 0, shh = 2 * j, ox = 128 * n + 32 * j + l0;
+    float sum[NS];
+    for (int k = 0; k < NS; ++k) {
+        sum[k] = 0.f;
+    }
+    #pragma unroll 2
+    for (int b = 0; b < NB; ++b) {
+        const uint8_t *bp = wr + b * 210;      /* (an even address: 2-byte loads) */
+        const uint16_t *pl = (const uint16_t *)(bp + oql), *ph = (const uint16_t *)(bp + oqh);
+        const uint32_t wl0 = (uint32_t)pl[0] | ((uint32_t)pl[1] << 16), wl1 = (uint32_t)pl[2] | ((uint32_t)pl[3] << 16);
+        const uint32_t wh0 = (uint32_t)ph[0] | ((uint32_t)ph[1] << 16), wh1 = (uint32_t)ph[2] | ((uint32_t)ph[3] << 16);
+        const uint32_t c0 = ((wl0 >> shl) & 0x0F0F0F0Fu) | (((wh0 >> shh) & 0x03030303u) << 4);
+        const uint32_t c1 = ((wl1 >> shl) & 0x0F0F0F0Fu) | (((wh1 >> shh) & 0x03030303u) << 4);
+        const uint32_t h0 = c0 >> 8, h1 = c1 >> 8;
+        const float d = __half2float(__ushort_as_half(*(const uint16_t *)(bp + 208)));
+        const float ds = d * (__uint_as_float(((uint32_t)bp[osc] ^ 0x80u) | 0x4B000000u) - 8388736.f);
+        const float v[8] = {q6m<0>(c0, h0), q6m<1>(c0, h0), q6m<2>(c0, h0), q6m<3>(c0, h0),
+                            q6m<0>(c1, h1), q6m<1>(c1, h1), q6m<2>(c1, h1), q6m<3>(c1, h1)};
+        for (int k = 0; k < NS; ++k) {
+            if (k < nx) {
+                const float4 *x4 = (const float4 *)(x + (size_t)k * cols + 256 * b + ox);
+                const float4 xa = x4[0], xb = x4[1];
+                float acc = v[0] * xa.x;
+                acc = fmaf(v[1], xa.y, acc);
+                acc = fmaf(v[2], xa.z, acc);
+                acc = fmaf(v[3], xa.w, acc);
+                acc = fmaf(v[4], xb.x, acc);
+                acc = fmaf(v[5], xb.y, acc);
+                acc = fmaf(v[6], xb.z, acc);
+                acc = fmaf(v[7], xb.w, acc);
+                sum[k] = fmaf(ds, acc, sum[k]);
+            }
+        }
+    }
+    for (int k = 0; k < NS; ++k) {
+        if (k < nx) {
+            float v = sum[k];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+            }
+            if (l == 0) {
+                out[(size_t)k * rows + row] = cap > 0.f ? cap * tanhf(v / cap) : v;
+            }
+        }
+    }
+}
+
+/* k_q6k_head_m of one token, the lanes and the sums as there: a warp loops over rows (a grid of a few blocks
+ * an SM), the lane's 8 NB values of x in registers for all of them (each row read x again, 11 KB from L1: 2.9
+ * GB of a step of the 26B), the 16-byte loads of the next row in registers while this one works. */
+template <int NB>
+__global__ void __launch_bounds__(32 * ROWS_PER_BLOCK) k_q6k_head_m1(const uint8_t *w, const float *x,
+                                                                    float *out, int rows, float cap)
+{
+    constexpr int RB = NB * 210, NV = RB / 16 + 2, PER = (NV + 31) / 32;
+    __shared__ __align__(16) uint8_t sm[ROWS_PER_BLOCK][NV * 16];
+    PDL_START();
+    const int l = threadIdx.x % 32, nw = blockDim.x / 32;
+    const int n = l >> 4, j = (l >> 2) & 3, l0 = 8 * (l & 3);
+    const int oql = 64 * n + 32 * (j & 1) + l0, oqh = 128 + 32 * n + l0, osc = 192 + 8 * n + l0 / 16 + 2 * j;
+    const int shl = j >= 2 ? 4 : 0, shh = 2 * j, ox = 128 * n + 32 * j + l0;
+    float xr[NB][8];
+    #pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const float4 *x4 = (const float4 *)(x + 256 * b + ox);
+        const float4 xa = x4[0], xb = x4[1];
+        xr[b][0] = xa.x; xr[b][1] = xa.y; xr[b][2] = xa.z; xr[b][3] = xa.w;
+        xr[b][4] = xb.x; xr[b][5] = xb.y; xr[b][6] = xb.z; xr[b][7] = xb.w;
+    }
+    uint8_t *buf = sm[threadIdx.x / 32];
+    int row = blockIdx.x * nw + threadIdx.x / 32;
+    uint4 nx4[PER];
+    auto load = [&](int r) {
+        const size_t a0 = ((size_t)r * RB) & ~(size_t)15;
+        const uint4 *src = (const uint4 *)(w + a0);
+        const int nv = ((int)((size_t)r * RB - a0) + RB + 15) / 16;
+        #pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int i = l + 32 * p;
+            nx4[p] = r < rows && i < nv ? __ldg(src + i) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    load(row);
+    for (; row < rows; row += gridDim.x * nw) {
+        __syncwarp();
+        #pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            if (l + 32 * p < NV) {
+                ((uint4 *)buf)[l + 32 * p] = nx4[p];
+            }
+        }
+        __syncwarp();
+        load(row + gridDim.x * nw);
+        const uint8_t *wr = buf + (int)(((size_t)row * RB) & 15);
+        float sum = 0.f;
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const uint8_t *bp = wr + b * 210;
+            const uint16_t *pl = (const uint16_t *)(bp + oql), *ph = (const uint16_t *)(bp + oqh);
+            const uint32_t wl0 = (uint32_t)pl[0] | ((uint32_t)pl[1] << 16), wl1 = (uint32_t)pl[2] | ((uint32_t)pl[3] << 16);
+            const uint32_t wh0 = (uint32_t)ph[0] | ((uint32_t)ph[1] << 16), wh1 = (uint32_t)ph[2] | ((uint32_t)ph[3] << 16);
+            const uint32_t c0 = ((wl0 >> shl) & 0x0F0F0F0Fu) | (((wh0 >> shh) & 0x03030303u) << 4);
+            const uint32_t c1 = ((wl1 >> shl) & 0x0F0F0F0Fu) | (((wh1 >> shh) & 0x03030303u) << 4);
+            const uint32_t h0 = c0 >> 8, h1 = c1 >> 8;
+            const float d = __half2float(__ushort_as_half(*(const uint16_t *)(bp + 208)));
+            const float ds = d * (__uint_as_float(((uint32_t)bp[osc] ^ 0x80u) | 0x4B000000u) - 8388736.f);
+            float acc = q6m<0>(c0, h0) * xr[b][0];
+            acc = fmaf(q6m<1>(c0, h0), xr[b][1], acc);
+            acc = fmaf(q6m<2>(c0, h0), xr[b][2], acc);
+            acc = fmaf(q6m<3>(c0, h0), xr[b][3], acc);
+            acc = fmaf(q6m<0>(c1, h1), xr[b][4], acc);
+            acc = fmaf(q6m<1>(c1, h1), xr[b][5], acc);
+            acc = fmaf(q6m<2>(c1, h1), xr[b][6], acc);
+            acc = fmaf(q6m<3>(c1, h1), xr[b][7], acc);
+            sum = fmaf(ds, acc, sum);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            sum += __shfl_xor_sync(RC_FULL_MASK, sum, o);
+        }
+        if (l == 0) {
+            out[row] = cap > 0.f ? cap * tanhf(sum / cap) : sum;
+        }
+    }
+}
+
 /* The output head of a Q4_0 table (a GGUF file that keeps the tied head in
  * Q4_0): the work of k_q6k_head. A row is cols / 32 blocks of 18 bytes: a
  * float16 scale d and 16 bytes. Byte j holds value j (the low nibble) and

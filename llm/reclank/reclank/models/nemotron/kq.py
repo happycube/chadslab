@@ -57,6 +57,29 @@ def bf12_mat(bits):
     return Mat(out.reshape(-1), KQ_BF12, bits.shape[0], bits.shape[1])
 
 
+# Q8_0 in rows for the GPU without dp4a (NemotronGPU: Q8R; backends/cuda/csrc/kernels/quant/kquants.cu)
+KQ_Q8_R = 100
+
+
+def q8r_rows(data, rows, cols, out=None):
+    """Q8_0 blocks (rows x cols / 32 of 34 bytes: the float16 scale, then 32 int8 values) as KQ_Q8_R rows
+    (into out, rows of q8r_row_bytes(cols), when given): the int8 values of the row, then the float16 scale
+    of each 32, then zeros to a multiple of 16 bytes (QwenGPU.dense's form)."""
+    nb = cols // 32
+    b = np.asarray(data).reshape(rows, nb, 34)
+    out = np.empty((rows, q8r_row_bytes(cols)), np.uint8) if out is None else out.reshape(rows, q8r_row_bytes(cols))
+    q, d = out[:, :cols], out[:, cols:cols + 2 * nb]
+    q.shape, d.shape = (rows, nb, 32), (rows, nb, 2)      # (views: an error, not a copy, when not)
+    q[...] = b[:, :, 2:]
+    d[...] = b[:, :, :2]
+    out[:, cols + 2 * nb:] = 0
+    return out.reshape(-1)
+
+
+def q8r_row_bytes(cols):
+    return (cols // 32 * 34 + 15) // 16 * 16
+
+
 class Mat:
     """A matrix as the records take it: the bytes, the type, rows, cols; scale: a factor of every
     output (FP8's tensor scale), or None."""
@@ -120,8 +143,8 @@ class NemotronKQ:
         self._emb = self.ck.file(BB + "embeddings.weight") if self.w is None else None
 
     def _kept(self, name):
-        """The weightkeeper's tensor name ("raw.<name>", "nv4.<name>" or "iq2r.<name>"): (its entry,
-        its bytes), or None."""
+        """The weightkeeper's tensor name ("raw.<name>", "nv4.<name>", "iq2r.<name>" or "q8r.<name>"):
+        (its entry, its bytes), or None."""
         if self.w is None:
             return None
         d = self.w.index["tensors"].get(name)
