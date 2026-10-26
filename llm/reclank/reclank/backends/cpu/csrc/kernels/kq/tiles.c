@@ -405,6 +405,12 @@ static void kq_rows4(const uint8_t *w, size_t rb, int type, int cols, const int8
         return;
     }
 #endif
+#if defined(KQ2_ROWS4)
+    if ((type == KQ_Q4_K || type == KQ_Q5_K) && cols % 256 == 0 && cols <= 256 * KQ2_R4_NB && kq2_rows4_on()) {
+        kq2_rows4_q45k(w, rb, type == KQ_Q5_K, cols, xq, xs, xm, n, out, ostride);
+        return;
+    }
+#endif
     for (int i = 0; i < 4; ++i) {
         kq_row(w + (size_t)i * rb, type, cols, xq, xs, xm, x, n, out + i, ostride);
     }
