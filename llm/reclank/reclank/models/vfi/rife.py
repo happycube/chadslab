@@ -43,6 +43,12 @@ ENC_RIFE_OUT. The frames go in and out as their bytes (gpu_io): ("head", Hp, Wp,
 unpacks the h x w frame into the padded slot (ENC_UNPACK_U8P) and, with aux_plan(), makes its
 thumbnails' inputs (ENC_THUMB_U8) and its probe frame (PIL's BOX, ENC_RESAMPLE_U8) for aux();
 ("net", Hp, Wp, scale, h, w) packs the h x w frame (ENC_PACK_U8C).
+
+Float frames (push() of a float32 frame, frame_f32()): the same network without the bytes, for
+sources of more than 8 bits. ("headf", Hp, Wp, shift): the padded frame (its values as given, in
+[0, 1] for the trained range, not clamped) uploaded into xin and copied to slot 1, then the Head;
+("netf", Hp, Wp, scale): the frame at t left in out (float32, not clamped or rounded). Fed u8 / 255,
+the output is the byte path's before its rounding.
 """
 from __future__ import annotations
 
@@ -223,6 +229,13 @@ class RIFE:
                                    out8=np.zeros((N * 3 + 3) // 4, np.float32))
         return self.slots[key]
 
+    def _xin(self, Hp, Wp):
+        """the host array of a float frame (padded, (Hp Wp, 3)): headf's input"""
+        key = ("xin", Hp, Wp)
+        if key not in self.slots:
+            self.slots[key] = np.zeros((Hp * Wp, 3), np.float32)
+        return self.slots[key]
+
     def _io(self, h, w):
         """the GPU's byte buffers of an h x w frame: its bytes in (raw8), the output frame's (out8c),
         the thumbnails' taps and block sums and the probe frame (aux_plan())"""
@@ -249,10 +262,13 @@ class RIFE:
         if io is not None:
             for k, v in self._io(*io).items():
                 B.array(k, v)
-        if kind == "head":
-            self._head(B, Hp, Wp, key[3], io, len(key) > 6 and key[6])
+        f32 = kind in ("headf", "netf")                     # (float frames: no bytes)
+        if kind == "headf":
+            B.array("xin", self._xin(Hp, Wp))
+        if kind in ("head", "headf"):
+            self._head(B, Hp, Wp, key[3], io, len(key) > 6 and key[6], f32=f32)
         else:
-            self._net(B, Hp, Wp, key[3], io)
+            self._net(B, Hp, Wp, key[3], io, f32=f32)
         return B.finish(self.cpu_threads)
 
     @property
@@ -311,11 +327,13 @@ class RIFE:
         B.free(y)
         return out
 
-    def _head(self, B, Hp, Wp, shift, io=None, aux=False):
+    def _head(self, B, Hp, Wp, shift, io=None, aux=False, f32=False):
         if shift:
             B.f("set", "x0", ("copy", "x1"))
             B.f("set", "f0", ("copy", "f1"))
-        if io is None:
+        if f32:
+            B.f("set", "x1", ("copy", "xin"))
+        elif io is None:
             B.f("enc_unpack_u8", "img8", "x1", 255.0)
         else:
             h, w = io
@@ -351,7 +369,7 @@ class RIFE:
         elif pp["horiz"] is None:
             B.f("set", "probe8", ("copy", "raw8"))
 
-    def _net(self, B, Hp, Wp, scale, io=None):
+    def _net(self, B, Hp, Wp, scale, io=None, f32=False):
         N = Hp * Wp
         # fused (the GPU's default): no full-resolution buffer A; each block's input from the frames,
         # the heads and the blocks' tmp by ENC_RIFE_IN, the output by ENC_RIFE_OUT (the same bits)
@@ -451,6 +469,8 @@ class RIFE:
                     B.f("enc_resize", A, B.array(k, np.zeros((N, 3), np.float32)), 1, Hp, Wp, Hp, Wp, 3, 0, A_COLS, o,
                         3, 0)
             B.f("enc_mix", A, out, N, A_COLS, 0, 3, 15, 3)
+        if f32:
+            return
         if io is not None:
             B.f("enc_pack_u8c", out, "out8c", io[0], io[1], Wp, 3, 255.0)
             return
@@ -464,13 +484,26 @@ class RIFE:
         self.n = 0
 
     def push(self, frame):
-        """the next frame (uint8 (h, w, 3)): its Head, the previous one into slot 0"""
+        """the next frame (uint8 (h, w, 3), or float32 (h, w, 3): 0 to 1 the trained range): its Head, the
+        previous one into slot 0"""
         h, w = frame.shape[:2]
         scale = self.scale or auto_scale(h, w)
         if self.size is None or self.size[:2] != (h, w) or self.size[4] != scale:
             self.size = (h, w) + padded(h, w, scale, self.pad) + (scale,)
             self.n = 0
         _, _, Hp, Wp, _ = self.size
+        if frame.dtype.kind == "f":
+            x = self._xin(Hp, Wp).reshape(Hp, Wp, 3)
+            x[:h, :w] = frame
+            x[h:], x[:h, w:] = 0, 0                 # (the padding: zeros, as the byte path's)
+            prog, g = self.runner.get(("headf", Hp, Wp, int(self.n > 0)), self.gpu)
+            if g is not None:
+                g.upload("xin")
+                g.run()
+            else:
+                prog.run()
+            self.n += 1
+            return
         if self.gpu_io:
             frame = np.ascontiguousarray(frame, np.uint8)
             key = ("head", Hp, Wp, int(self.n > 0), h, w, (h, w) in self.plans)
@@ -539,6 +572,23 @@ class RIFE:
         else:
             prog.run()
         return prog.names["out8"].view(np.uint8)[:Hp * Wp * 3].reshape(Hp, Wp, 3)[:h, :w].copy()
+
+    def frame_f32(self, t):
+        """the frame at t (0 < t < 1) between the last two frames pushed: float32 (h, w, 3), not clamped
+        (push() float frames for more than 8 bits; byte frames give the byte path's values / 255)"""
+        if self.n < 2:
+            raise RuntimeError("push two frames first")
+        h, w, Hp, Wp, s = self.size
+        prog, g = self.runner.get(("netf", Hp, Wp, s), self.gpu)
+        prog.names["tb15"][14] = prog.names["tb28"][14] = np.float32(t)
+        if g is not None:
+            g.upload("tb15")
+            g.upload("tb28")
+            g.run()
+            g.download("out")
+        else:
+            prog.run()
+        return prog.names["out"].reshape(Hp, Wp, 3)[:h, :w].copy()
 
     def outputs(self, names):
         """copies of the net program's arrays (a check: "out", "flow", "A")"""

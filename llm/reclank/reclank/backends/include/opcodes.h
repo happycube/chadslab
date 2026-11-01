@@ -253,6 +253,7 @@ enum {
     GP_ENC_THUMB_U8    = 329,   /* gpu     the pixels of rows x columns of a frame's bytes, and its blocks' sums of the three channels */
     GP_NM_TAKE         = 330,   /* gpu     of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked */
     GP_NM_PULL         = 331,   /* gpu     NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL */
+    GP_ENC_CONV3       = 332,   /* gpu     a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -316,7 +317,7 @@ static inline int gp_op_known(int op)
     case GP_ENC_WARP: case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM:
     case GP_ENC_RIFE_IN: case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P:
     case GP_ENC_PACK_U8C: case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE:
-    case GP_NM_PULL:
+    case GP_NM_PULL: case GP_ENC_CONV3:
         return 1;
     default:
         return 0;

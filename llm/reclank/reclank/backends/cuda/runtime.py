@@ -76,7 +76,8 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.ENC_WARP: tuple(range(5, 14)), P.ENC_PRELU: (2, 3), P.ENC_MIX: tuple(range(2, 10)),
         P.ENC_CONV_MM: (7, 8, 9, 10, 12), P.ENC_RIFE_IN: tuple(range(13, 21)),
         P.ENC_RIFE_OUT: tuple(range(12, 20)), P.ENC_UNPACK_U8P: (2, 3, 4, 5, 6), P.ENC_PACK_U8C: (2, 3, 4, 5),
-        P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14))}
+        P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14)),
+        P.ENC_CONV3: tuple(range(7, 13))}
 
 
 def _no_numpy_hugepages():

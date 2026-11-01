@@ -2391,6 +2391,25 @@ def k_enc_conv_mm(c, lin, x, idx, cin, slope=None, res=None, scat=None, blk=0, o
     return out
 
 
+def k_enc_conv3(c, lin, x, groups, H, W, up=0, slope=None, res=None, rs=1.0, out=None):
+    """(enc_conv3 lin x groups H W [up [slope [res [rs]]]]): a 3 x 3 conv, zero padding, of the H x W image
+    whose input channels are groups ((offset, row stride, channels) triples into x, in order; each a
+    multiple of 8 channels; up 1: of the H / 2 x W / 2 image upsampled 2x nearest), lin float32 W (m, 9
+    cin) in im2col's order (tap, channel), + its bias; then x rs + res (an array of the output's shape)
+    when res is given, then LeakyReLU of slope (m values) when given. GPU only (ENC_CONV3): direct tiles,
+    its own order of the sums (not ENC_GATHER + ENC_LINEAR's bits)."""
+    assert not getattr(c, "pack", False), "enc_conv3 is a record of GPU programs"
+    g = np.ascontiguousarray(np.asarray(groups, np.int32).reshape(-1, 3))
+    cin, m = int(g[:, 2].sum()), lin.shape[0]
+    assert lin.shape[1] == 9 * cin and lin.w.dtype == np.float32 and (g[:, 2] % 8 == 0).all() and m in (32, 64)
+    assert (g[:, :2] % 4 == 0).all()
+    out = c.buffer((H * W, m)) if out is None else out
+    c.p.emit(ENC_CONV3, x, g.reshape(-1), lin.w, lin.b, res,
+             None if slope is None else np.ascontiguousarray(slope, np.float32), out, int(H), int(W), cin, m,
+             int(up), len(g), float(rs))
+    return out
+
+
 def k_enc_rife_in(c, x0, x1, f0, f1, tmps, scales, xs, m, tb, gx, gy, Hp, Wp, s, dx, dy):
     """(enc_rife_in x0 x1 f0 f1 tmps scales xs m tb gx gy Hp Wp s dx dy): RIFE's block len(tmps)'s input
     xs (Hp / s x Wp / s pixels of 28) without its full-resolution buffer: the flow of the blocks' tmp
@@ -2466,6 +2485,7 @@ KERNELS = {
     "enc_rife_in": k_enc_rife_in,
     "enc_rife_out": k_enc_rife_out,
     "enc_conv_mm": k_enc_conv_mm,
+    "enc_conv3": k_enc_conv3,
     "enc_warp": k_enc_warp,
     "enc_prelu": k_enc_prelu,
     "enc_mix": k_enc_mix,

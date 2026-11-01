@@ -95,6 +95,12 @@ class RealESRGAN:
         RRDB (4h 4w, 3), SRVGG (h w, 3 s^2)."""
         c = _EncCompiler(0.0, pack=not gpu)
         env = c.env
+        # the GPU's convs by ENC_CONV_MM (no im2col buffer; LeakyReLU in its epilogue); RECLANK_ESR_IM2COL=1:
+        # the ENC_GATHER + ENC_LINEAR tiles (the CPU's form)
+        conv_mm = gpu and os.environ.get("RECLANK_ESR_IM2COL", "0") != "1"
+        # RRDB's 3 x 3 convs of 32 or 64 outputs on the GPU by ENC_CONV3 (direct tiles: each input value read
+        # once a tile; its own order of the sums, so not the CPU's bits); RECLANK_ESR_EXACT=1: ENC_CONV_MM
+        direct = conv_mm and os.environ.get("RECLANK_ESR_EXACT", "0") != "1"
         ar = _Arena()
         forms, tiles, views = [], [], []
         n = [0]
@@ -105,10 +111,16 @@ class RealESRGAN:
             n[0] += 1
             return "_v%d" % n[0]
 
-        def conv(x, cin, lin, idx, rows, out=None, block=None):
-            """the conv of im2col idx over x (blocks of block values: cin / block a pixel's)"""
+        def conv(x, cin, lin, idx, rows, out=None, block=None, slope=None):
+            """the conv of im2col idx over x (blocks of block values: cin / block a pixel's), then
+            LeakyReLU of slope (its value) when given"""
             out = ar.new(name(), rows, lin.shape[0]) if out is None else out
             bl = block or cin
+            if conv_mm:
+                # (one ENC_CONV_MM: the im2col read through idx, LeakyReLU in its epilogue: the same values)
+                tail = () if slope is None else (np.full(lin.shape[0], slope, np.float32),)
+                forms.append(("set", out, ("enc_conv_mm", lin, x, np.ascontiguousarray(idx, np.int32), bl) + tail))
+                return out
             col_cols[0] = max(col_cols[0], idx.shape[1] * bl)
             for r0 in range(0, rows, TILE):
                 r1 = min(rows, r0 + TILE)
@@ -118,6 +130,16 @@ class RealESRGAN:
                 ar.alias[ot] = out
                 views.append((ot, out, r0, r1))
                 forms.extend([("set", col, ("enc_gather", x, it, bl)), ("set", ot, ("enc_linear", lin, col))])
+            if slope is not None:
+                act(out, rows, lin.shape[0], "_lr32" if lin.shape[0] == 32 else "_lr")
+            return out
+
+        def conv3(x, groups, lin, hh, ww, out=None, up=0, slope=None, res=None, rs=1.0):
+            """the ENC_CONV3 of the hh x ww image whose channels are groups of x ((offset, row stride,
+            channels)), then x rs + res, LeakyReLU of slope (its value) when given"""
+            out = ar.new(name(), hh * ww, lin.shape[0]) if out is None else out
+            sl = None if slope is None else np.full(lin.shape[0], slope, np.float32)
+            forms.append(("set", out, ("enc_conv3", lin, x, np.asarray(groups, np.int32), hh, ww, up, sl, res, rs)))
             return out
 
         def act(x, rows, cols, slope):
@@ -181,10 +203,15 @@ class RealESRGAN:
 
             def rdb(src, dst, p):
                 pool, A, regs = src
+                if direct:          # (the dense input: A's 64 channels, then the outputs' 32 each, in place)
+                    gr = [(0, 64, 64)] + [((2 + r) * P * 32, 32, 32) for r in range(4)]
+                    for k in range(1, 5):
+                        conv3(pool, gr[:k], self.conv(p + "conv%d" % k), h, w, out=regs[k - 1], slope=0.2)
+                    conv3(pool, gr, self.conv(p + "conv5"), h, w, out=dst[1], res=A, rs=0.2)
+                    return
                 for k in range(1, 5):
                     conv(pool, 64 + 32 * (k - 1), self.conv(p + "conv%d" % k), dense_index(k), P, out=regs[k - 1],
-                         block=32)
-                    act(regs[k - 1], P, 32, "_lr32")
+                         block=32, slope=0.2)
                 x5 = conv(pool, 192, self.conv(p + "conv5"), dense_index(5), P, block=32)
                 forms.extend([("set", dst[1], ("enc_mul_vec", x5, "_s02")), ("enc_add", dst[1], A)])
             for b in range(self.n):
@@ -195,18 +222,25 @@ class RealESRGAN:
                 rdb(pools[0], pools[1], p + "rdb3.")
                 t = ar.new(name(), P, 64)
                 forms.extend([("set", t, ("enc_mul_vec", pools[1][1], "_s02")), ("enc_add", body, t)])
-            bb = conv(body, 64, self.conv("conv_body"), i9, P)
-            forms.append(("enc_add", feat, bb))
+            if direct:
+                conv3(body, [(0, 64, 64)], self.conv("conv_body"), h, w, out=feat, res=feat)
+            else:
+                bb = conv(body, 64, self.conv("conv_body"), i9, P)
+                forms.append(("enc_add", feat, bb))
             x, hh, ww = feat, h, w
             for nm in ("conv_up1", "conv_up2"):
                 hq, wq = hh, ww
                 iu = idx_of(("up", hh, ww), lambda: conv_index(2 * hq, 2 * wq, lambda y, x_: (y // 2) * wq + x_ // 2))
                 hh, ww = 2 * hh, 2 * ww
-                x = conv(x, 64, self.conv(nm), iu, hh * ww)
-                act(x, hh * ww, 64, "_lr")
+                if direct:
+                    x = conv3(x, [(0, 64, 64)], self.conv(nm), hh, ww, up=1, slope=0.2)
+                else:
+                    x = conv(x, 64, self.conv(nm), iu, hh * ww, slope=0.2)
             i4 = idx_of(("c", hh, ww), lambda: conv_index(hh, ww))
-            x = conv(x, 64, self.conv("conv_hr"), i4, hh * ww)
-            act(x, hh * ww, 64, "_lr")
+            if direct:
+                x = conv3(x, [(0, 64, 64)], self.conv("conv_hr"), hh, ww, slope=0.2)
+            else:
+                x = conv(x, 64, self.conv("conv_hr"), i4, hh * ww, slope=0.2)
             x = conv(x, 64, self.conv("conv_last"), i4, hh * ww)
             outs = (hh * ww, 3)
         env["y"] = np.zeros(outs, np.float32)
@@ -247,7 +281,13 @@ class RealESRGAN:
 
     def upscale(self, img, parts=None):
         """The output (s h, s w, 3) uint8 of an image (h, w, 3) uint8 (RealESRGANer.enhance)."""
-        x = img.transpose(2, 0, 1).astype(np.float32) / np.float32(255.0)
+        y = self.upscale_f32(img.astype(np.float32) / np.float32(255.0), parts)
+        return np.round(np.clip(y, 0, 1) * np.float32(255.0)).astype(np.uint8)
+
+    def upscale_f32(self, img, parts=None):
+        """The output (s h, s w, 3) float32 of a float32 image (h, w, 3) (0 to 1 the trained range):
+        upscale() before its clamp and rounding (for sources of more than 8 bits)."""
+        x = np.ascontiguousarray(img.transpose(2, 0, 1), np.float32)
         h, w = x.shape[1:]
         ph = pw = 0
         if self.scale == 2:
@@ -260,7 +300,7 @@ class RealESRGAN:
         y = self.network(np.ascontiguousarray(xin))[:, :h * self.scale, :w * self.scale]
         if parts is not None:
             parts.update(x=x, y=y)
-        return np.round(np.clip(y, 0, 1).transpose(1, 2, 0) * np.float32(255.0)).astype(np.uint8)
+        return y.transpose(1, 2, 0)
 
     def release(self):
         if self.gpu:

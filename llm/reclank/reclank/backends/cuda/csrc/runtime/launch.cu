@@ -970,6 +970,9 @@ static void enc_rife_out(const gp_rec *r, const int64_t *e, int *bad, cudaStream
 static void enc_conv_mm(const float *src, const int *idx, const float *w, const float *b, const float *res,
                         const float *slope, float *y, int n, int m, int taps, int cin, const int *scat, int blk,
                         int sms, cudaStream_t s);
+static void enc_conv3(const float *x, const int *groups, const float *w, const float *b, const float *res,
+                      const float *slope, float *y, int H, int W, int cin, int m, int up, int ng, float rs,
+                      cudaStream_t s);
 static void enc_sgemm(const float *x, const void *w, int f20, const float *b, float *y, int n, int m, int k,
                       float imin, float imax, float omin, float omax, int sms, cudaStream_t s);
 __global__ void k_enc_rms(const float *x, const float *w, float *y, int rows, int d, float eps);

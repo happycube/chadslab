@@ -301,6 +301,8 @@ TABLE = [
     # Nemotron Super on a small CPU: a step's cold experts split with the GPUs' links (models/nemotron/gpu.py TAKE)
     ("NM_TAKE", 330, G, "of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked"),
     ("NM_PULL", 331, G, "NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL"),
+    # Real-ESRGAN's convs (models/realesrgan)
+    ("ENC_CONV3", 332, G, "a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}

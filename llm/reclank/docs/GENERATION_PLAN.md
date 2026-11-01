@@ -1225,3 +1225,23 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1, phase 3 needs
   ffmpeg held to one CPU the new code's decoded frames are the old ones' (md5), on twelve the same
   quality (44.04 / 44.02 dB, 37.42 / 37.42 against the frames written). RIFE's output frames the same
   bytes and speed. tests/unit/test_media.py.
+- **Float frames, field deinterlacing and Real-ESRGAN's convs:** RIFE and Real-ESRGAN take and give
+  float32 frames (RIFE push() of a float32 frame and frame_f32(), the "headf" / "netf" programs;
+  RealESRGAN.upscale_f32()), for sources of more than 8 bits: fed the bytes / 255, the byte paths'
+  values before their rounding (tests/unit/test_vfi.py). scripts/deinterlace_rife.py: each field of an
+  interlaced video a progressive frame, its own lines its decoded samples and the other field's lines
+  RIFE's (each parity its own half-height stream, so no half-line shift), at the field rate; the
+  fields to float RGB by their matrix without clamping (an LD capture had 35% of its pixels outside
+  0..1: the 8-bit round trip alone cost ~10 levels of 10-bit luma; held-out fields 27.5 -> 29.4 dB);
+  scene cuts by CutDetector's thumbnail rule; --upscale realesrgan-x2plus 2x (the network on the values
+  clipped to 0..1, the clipped-off part added back bicubic: closer to the input than the raw values);
+  H.264 (High 4:2:2 for 10-bit 4:2:2) or FFV1; --gpu-lock takes the GPU lock and lets it go every
+  10 min. Real-ESRGAN's GPU convs: ENC_CONV_MM (the same bits as the im2col tiles; x2plus 768 x 484
+  1.80 -> 0.65 s), its narrow outputs (m 32 / 64) by k_enc_conv_mm_nar (8 x 4 / 8 x 8 a thread, chunks
+  of 16 of k: 0.52 s, the same bits, RIFE's too; RECLANK_CONV_MM2=0 off): DRAM-bound, as the order of
+  the sums (each tap's channels in turn) reads each input row ~9 times; then ENC_CONV3 (record 332):
+  direct tiles of 8 x 32 pixels, each 8-channel chunk with its border and its weights in shared memory,
+  the dense blocks' channel groups read in place, the 2x nearest upsampling and the x 0.2 + residual in
+  it: 0.26 s (14-15 TFLOPS), float32 in its own order (the output within 8.6e-6 of the exact path;
+  against the reference x2plus 86.9 dB, x4plus 87.5, anime 90.3, at most a level of 255);
+  RECLANK_ESR_EXACT=1 the ENC_CONV_MM path, RECLANK_ESR_IM2COL=1 the tiles.

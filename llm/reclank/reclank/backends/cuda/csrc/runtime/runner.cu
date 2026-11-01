@@ -386,6 +386,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         break;
     }
+    case GP_ENC_CONV3: {
+        /* x, groups, w, b, res, slope, y, H, W, cin, m, up, ng, rs: a 3 x 3 conv by direct tiles */
+        int H = (int)hlit(r, 7, &bad), W = (int)hlit(r, 8, &bad), cin = (int)hlit(r, 9, &bad);
+        int m = (int)hlit(r, 10, &bad), up = (int)hlit(r, 11, &bad), ng = (int)hlit(r, 12, &bad);
+        if (H > 0 && W > 0) {
+            enc_conv3((const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+                      (const float *)(intptr_t)hi(r, g->henv, 2), (const float *)(intptr_t)hi(r, g->henv, 3),
+                      (const float *)(intptr_t)hi(r, g->henv, 4), (const float *)(intptr_t)hi(r, g->henv, 5),
+                      (float *)(intptr_t)hi(r, g->henv, 6), H, W, cin, m, up, ng, hlitf(r, 13, &bad), s);
+        }
+        break;
+    }
     case GP_ENC_RIFE_IN:
         enc_rife_in(r, g->henv, &bad, s);
         break;

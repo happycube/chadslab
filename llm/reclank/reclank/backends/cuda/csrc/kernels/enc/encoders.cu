@@ -459,12 +459,156 @@ __global__ void __launch_bounds__(256) k_enc_conv_mm(const float *src, const int
     }
 }
 
+/* ENC_CONV_MM of the narrow outputs (m = BN: 32 or 64; cin a multiple of KC; no scat): one column tile
+ * of all of m, 256 rows a block, each thread NTM x NTN of y (8 x 4 or 8 x 8: three or four shared loads
+ * of 128 bits for 32 or 64 FMAs, against k_enc_conv_mm's 8 x 2 / 8 x 4). A chunk of KC (8 or 16) of k
+ * is one tap, so a row's gathered values of a chunk are KC / 4 float4 loads. The same bits as
+ * k_enc_conv_mm: each value fmaf over k in order from 0, then its epilogue. */
+template <int NTM, int NTN, int BN, int KC>
+__global__ void __launch_bounds__(256, 2) k_enc_conv_mm_nar(const float *src, const int *idx, const float *w,
+                                                         const float *b, const float *res, const float *slope,
+                                                         float *y, int n, int taps, int cin)
+{
+    PDL_START();
+    constexpr int CT = BN / NTN, BM = NTM * (256 / CT), XV = KC / 4, WV = BN * KC / 4;
+    static_assert(BM == 256, "256 rows a block");
+    __shared__ __align__(16) float xs[2][KC][BM];
+    __shared__ __align__(16) float ws[2][KC][BN];
+    const int k = taps * cin, m = BN;
+    const int r0 = blockIdx.x * BM;
+    const int tid = threadIdx.x, tx = tid % CT, ty = tid / CT;
+    float acc[NTM][NTN];
+    #pragma unroll
+    for (int i = 0; i < NTM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < NTN; ++j) {
+            acc[i][j] = 0.f;
+        }
+    }
+    float4 xv[XV], wv[(WV + 255) / 256];
+    auto load = [&](int k0) {
+        const int r = r0 + tid;
+        int sr = -1;
+        if (r < n) {
+            const int t = k0 / cin;
+            sr = idx[(size_t)r * taps + t];
+        }
+        const float4 *p = (const float4 *)(src + (size_t)(sr < 0 ? 0 : sr) * cin + (k0 % cin));
+        #pragma unroll
+        for (int q = 0; q < XV; ++q) {
+            xv[q] = sr >= 0 ? p[q] : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        #pragma unroll
+        for (int q = 0; q < (WV + 255) / 256; ++q) {
+            const int f = tid + q * 256;
+            if (f < WV) {
+                wv[q] = *(const float4 *)(w + (size_t)(f / XV) * k + k0 + (f % XV) * 4);
+            }
+        }
+    };
+    auto store = [&](int buf) {
+        #pragma unroll
+        for (int q = 0; q < XV; ++q) {
+            xs[buf][4 * q][tid] = xv[q].x; xs[buf][4 * q + 1][tid] = xv[q].y;
+            xs[buf][4 * q + 2][tid] = xv[q].z; xs[buf][4 * q + 3][tid] = xv[q].w;
+        }
+        #pragma unroll
+        for (int q = 0; q < (WV + 255) / 256; ++q) {
+            const int f = tid + q * 256;
+            if (f < WV) {
+                const int c = f / XV, h = (f % XV) * 4;
+                ws[buf][h][c] = wv[q].x; ws[buf][h + 1][c] = wv[q].y; ws[buf][h + 2][c] = wv[q].z;
+                ws[buf][h + 3][c] = wv[q].w;
+            }
+        }
+    };
+    load(0);
+    store(0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < k; k0 += KC) {
+        const bool more = k0 + KC < k;
+        if (more) {
+            load(k0 + KC);
+        }
+        #pragma unroll
+        for (int kk = 0; kk < KC; ++kk) {
+            float a[NTM], bv[NTN];
+            #pragma unroll
+            for (int i = 0; i < NTM; i += 4) {
+                float4 v = *(const float4 *)&xs[buf][kk][ty * NTM + i];
+                a[i] = v.x; a[i + 1] = v.y; a[i + 2] = v.z; a[i + 3] = v.w;
+            }
+            #pragma unroll
+            for (int j = 0; j < NTN; j += 4) {
+                float4 v = *(const float4 *)&ws[buf][kk][tx * NTN + j];
+                bv[j] = v.x; bv[j + 1] = v.y; bv[j + 2] = v.z; bv[j + 3] = v.w;
+            }
+            #pragma unroll
+            for (int i = 0; i < NTM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < NTN; ++j) {
+                    acc[i][j] = fmaf(a[i], bv[j], acc[i][j]);
+                }
+            }
+        }
+        if (more) {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < NTM; ++i) {
+        const int r = r0 + ty * NTM + i;
+        if (r >= n) {
+            continue;
+        }
+        #pragma unroll
+        for (int j = 0; j < NTN; ++j) {
+            const int c = tx * NTN + j;
+            float v = __fadd_rn(acc[i][j], b ? b[c] : 0.f);
+            if (res != nullptr) {
+                v = __fadd_rn(v, res[(size_t)r * m + c]);
+            }
+            if (slope != nullptr) {
+                v = v > 0.f ? v : __fmul_rn(v, slope[c]);
+            }
+            y[(size_t)r * m + c] = v;
+        }
+    }
+}
+
 /* ENC_CONV_MM's launch: rows of 128 (64 when there are too few blocks for the SMs), the narrowest
- * column tile of 16, 32, 64 or 128 that wastes the fewest columns of m. */
+ * column tile of 16, 32, 64 or 128 that wastes the fewest columns of m. m 32 or 64 with cin a
+ * multiple of 8 and no scat: k_enc_conv_mm_nar (RECLANK_CONV_MM2=0: not). */
 static void enc_conv_mm(const float *src, const int *idx, const float *w, const float *b, const float *res,
                         const float *slope, float *y, int n, int m, int taps, int cin, const int *scat, int blk,
                         int sms, cudaStream_t s)
 {
+    static int nar = -1;
+    if (nar < 0) {
+        const char *e = getenv("RECLANK_CONV_MM2");
+        nar = e ? atoi(e) != 0 : 1;
+    }
+    static int kc = -1;
+    if (kc < 0) {
+        const char *e = getenv("RECLANK_CONV_MM2_KC");
+        kc = e ? atoi(e) : 16;
+    }
+    if (nar && scat == nullptr && (m == 32 || m == 64) && cin % 8 == 0) {
+        const unsigned gx = (unsigned)((n + 255) / 256);
+#define ECN(TN_, BN_, KC_) k_enc_conv_mm_nar<8, TN_, BN_, KC_><<<gx, 256, 0, s>>>(src, idx, w, b, res, slope, y, n, \
+                                                                               taps, cin)
+        const bool k16 = kc == 16 && cin % 16 == 0;
+        if (m == 32) {
+            if (k16) ECN(4, 32, 16); else ECN(4, 32, 8);
+        } else {
+            if (k16) ECN(8, 64, 16); else ECN(8, 64, 8);
+        }
+#undef ECN
+        return;
+    }
     int bn = 128;
     long bw = -1;
     for (int c : {128, 64, 32, 16}) {          /* (a tie keeps the wider tile) */
@@ -484,6 +628,140 @@ static void enc_conv_mm(const float *src, const int *idx, const float *w, const 
         if (bn == 16) ECM(4, 1); else if (bn == 32) ECM(4, 2); else if (bn == 64) ECM(4, 4); else ECM(4, 8);
     }
 #undef ECM
+}
+
+/* ENC_CONV3: a 3 x 3 conv (zero padding) of an H x W image of pixel rows by direct tiles: a block
+ * 8 x 32 pixels of all M outputs; for each chunk of 8 input channels the tile with its border (10 x
+ * 34 pixels) and the chunk's 9 x 8 x M weights in shared memory, then each thread 8 pixels of a row
+ * times NTN outputs (each input value read once a block, against 9 times from L2 / DRAM by the
+ * implicit im2col of ENC_CONV_MM). The input channels are ng groups (offset, row stride, channels:
+ * a multiple of 8) of x in order (Real-ESRGAN's dense blocks read their concatenation in place);
+ * up: x is the H / 2 x W / 2 image, read upsampled 2x nearest. W rows (M, 9 cin) in im2col's order
+ * (tap, channel). Each value: the sum over the chunks, then the channels, then the taps (float32,
+ * fmaf; not ENC_CONV_MM's order), + b, then x rs + res when res is not NULL, then LeakyReLU of slope
+ * when slope is not NULL. */
+#define EC3_TH 8
+#define EC3_TW 32
+#define EC3_CK 8
+template <int NTN, int M>
+__global__ void __launch_bounds__(256, 2) k_enc_conv3(const float *x, const int *groups, const float *w,
+                                                      const float *b, const float *res, const float *slope,
+                                                      float *y, int H, int W, int cin, int up, int ng, float rs)
+{
+    PDL_START();
+    constexpr int HP = EC3_TH + 2, WP = EC3_TW + 2, CG = M / NTN;
+    static_assert(CG == 8, "eight column groups");
+    __shared__ __align__(16) float xsm[EC3_CK][HP][WP];
+    __shared__ __align__(16) float wsm[EC3_CK][9][M];
+    const int tid = threadIdx.x, cg = tid % CG, pg = tid / CG;
+    const int ty = pg / 4, xs0 = (pg % 4) * 8;
+    const int X0 = blockIdx.x * EC3_TW, Y0 = blockIdx.y * EC3_TH;
+    const int sw = up ? W / 2 : W;
+    float acc[8][NTN];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        #pragma unroll
+        for (int j = 0; j < NTN; ++j) {
+            acc[i][j] = 0.f;
+        }
+    }
+    for (int c0 = 0; c0 < cin; c0 += EC3_CK) {
+        int off = 0, ld = 0, gc = c0;
+        for (int g = 0; g < ng; ++g) {
+            if (gc < groups[3 * g + 2]) {
+                off = groups[3 * g];
+                ld = groups[3 * g + 1];
+                break;
+            }
+            gc -= groups[3 * g + 2];
+        }
+        __syncthreads();
+        for (int e = tid; e < HP * WP * 2; e += 256) {
+            const int pix = e >> 1, half = e & 1, hy = pix / WP, hx = pix - hy * WP;
+            const int Y = Y0 + hy - 1, X = X0 + hx - 1;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (Y >= 0 && Y < H && X >= 0 && X < W) {
+                const long sp = up ? (long)(Y >> 1) * sw + (X >> 1) : (long)Y * W + X;
+                v = *(const float4 *)(x + off + sp * ld + gc + half * 4);
+            }
+            xsm[half * 4][hy][hx] = v.x;
+            xsm[half * 4 + 1][hy][hx] = v.y;
+            xsm[half * 4 + 2][hy][hx] = v.z;
+            xsm[half * 4 + 3][hy][hx] = v.w;
+        }
+        for (int e = tid; e < M * 18; e += 256) {
+            const int t = (e / M) >> 1, half = (e / M) & 1, o = e % M;
+            const float4 v = *(const float4 *)(w + (size_t)o * 9 * cin + t * cin + c0 + half * 4);
+            wsm[half * 4][t][o] = v.x;
+            wsm[half * 4 + 1][t][o] = v.y;
+            wsm[half * 4 + 2][t][o] = v.z;
+            wsm[half * 4 + 3][t][o] = v.w;
+        }
+        __syncthreads();
+        #pragma unroll 2
+        for (int cc = 0; cc < EC3_CK; ++cc) {
+            #pragma unroll
+            for (int dy = 0; dy < 3; ++dy) {
+                float a[10];
+                #pragma unroll
+                for (int q = 0; q < 10; ++q) {
+                    a[q] = xsm[cc][ty + dy][xs0 + q];
+                }
+                #pragma unroll
+                for (int dx = 0; dx < 3; ++dx) {
+                    float bv[NTN];
+                    #pragma unroll
+                    for (int j = 0; j < NTN; j += 4) {
+                        const float4 v = *(const float4 *)&wsm[cc][dy * 3 + dx][cg * NTN + j];
+                        bv[j] = v.x; bv[j + 1] = v.y; bv[j + 2] = v.z; bv[j + 3] = v.w;
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        #pragma unroll
+                        for (int j = 0; j < NTN; ++j) {
+                            acc[i][j] = fmaf(a[i + dx], bv[j], acc[i][j]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const int Y = Y0 + ty;
+    if (Y >= H) {
+        return;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int X = X0 + xs0 + i;
+        if (X >= W) {
+            continue;
+        }
+        const size_t p = (size_t)Y * W + X;
+        #pragma unroll
+        for (int j = 0; j < NTN; ++j) {
+            const int o = cg * NTN + j;
+            float v = __fadd_rn(acc[i][j], b ? b[o] : 0.f);
+            if (res != nullptr) {
+                v = __fadd_rn(__fmul_rn(v, rs), res[p * M + o]);
+            }
+            if (slope != nullptr) {
+                v = v > 0.f ? v : __fmul_rn(v, slope[o]);
+            }
+            y[p * M + o] = v;
+        }
+    }
+}
+
+static void enc_conv3(const float *x, const int *groups, const float *w, const float *b, const float *res,
+                      const float *slope, float *y, int H, int W, int cin, int m, int up, int ng, float rs,
+                      cudaStream_t s)
+{
+    const dim3 grid((unsigned)((W + EC3_TW - 1) / EC3_TW), (unsigned)((H + EC3_TH - 1) / EC3_TH));
+    if (m == 32) {
+        k_enc_conv3<4, 32><<<grid, 256, 0, s>>>(x, groups, w, b, res, slope, y, H, W, cin, up, ng, rs);
+    } else {
+        k_enc_conv3<8, 64><<<grid, 256, 0, s>>>(x, groups, w, b, res, slope, y, H, W, cin, up, ng, rs);
+    }
 }
 
 /* y = x / sqrt(mean(x^2) + eps), times w when w is not NULL. One warp for

@@ -353,6 +353,27 @@ def test_rife_cpu_against_reference(real):
         assert np.abs(out - real[key]).max() < 1e-4, t
 
 
+@pytest.mark.skipif(not os.environ.get("RECLANK_RIFE"), reason="RECLANK_RIFE: the folder of flownet.safetensors")
+def test_rife_float_frames(real):
+    """float32 frames (push() of floats, frame_f32()): fed the bytes / 255, the byte path's values before
+    its rounding, and the reference's"""
+    from reclank.models.vfi.rife import RIFE
+    R = RIFE(os.environ["RECLANK_RIFE"], gpu=False, cpu_threads=4)
+    a, b = real["frames"]
+    for t, key in ((0.5, "out_05"), (0.25, "out_025")):
+        R.reset()
+        R.push(a)
+        R.push(b)
+        u8 = R.frame(t)
+        R.reset()
+        R.push(a.astype(f32) / f32(255))
+        R.push(b.astype(f32) / f32(255))
+        got = R.frame_f32(t)
+        assert got.dtype == f32 and got.shape == a.shape
+        assert np.array_equal(np.clip(np.rint(got * f32(255)), 0, 255).astype(np.uint8), u8), t
+        assert np.abs(got - real[key]).max() < 1e-4, t
+
+
 def test_encode_colors():
     """the encode's yuv420p by the source's tags (media.yuv_colors: tests/unit/test_media.py)"""
     src = {"color_space": "bt709", "color_transfer": "bt709", "color_primaries": "bt709", "color_range": "pc"}
