@@ -37,7 +37,7 @@ static void kq_nvx_body(const uint8_t *w, int rows, int cols, const int8_t *xq, 
  * not stored. For each row and token: one fma for each column, in order, as
  * kq_x16f_group16: the same bits. */
 /* Column c of a group of 16 rows of a KQ_BF16X16 (bf 1), KQ_BF12X16 (bf 2),
- * or KQ_F32X16 (bf 0) matrix as 16 floats. KQ_BF12X16: in each block of 32
+ * KQ_F20X16 (bf 3) or KQ_F32X16 (bf 0) matrix as 16 floats. KQ_BF12X16: in each block of 32
  * columns (784 bytes) the 16 rows' sign and mantissa bytes column by column
  * (512), their gap nibbles (256: byte 16 j + r has the gap of column j of
  * row r in its low half, of column j + 16 in its high half), and their
@@ -63,6 +63,24 @@ static inline __attribute__((always_inline)) __m512 kq_x16f_col(const uint8_t *w
                         _mm512_slli_epi32(_mm512_and_si512(l, _mm512_set1_epi32(0x7f)), 16));
         __mmask16 z = _mm512_cmpeq_epi32_mask(gap, _mm512_set1_epi32(15)) &
                       _mm512_cmpeq_epi32_mask(l, _mm512_set1_epi32(0x80));
+        return _mm512_castsi512_ps(_mm512_maskz_mov_epi32((__mmask16)~z, b));
+    }
+    if (bf == 3) {
+        /* KQ_F20X16 (1296 bytes a block of 32 columns): the bits of kq_f20_bits */
+        const uint8_t *blk = wg + (size_t)(c >> 5) * 1296;
+        int cc = c & 31;
+        __m512i l = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(blk + 32 * cc)));
+        __m512i h = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(blk + 1024 + 16 * (cc & 15))));
+        __m512i gap = _mm512_and_si512(_mm512_srlv_epi32(h, _mm512_set1_epi32(4 * (cc >> 4))),
+                                       _mm512_set1_epi32(15));
+        __m512i e = _mm512_and_si512(_mm512_sub_epi32(_mm512_cvtepu8_epi32(
+                        _mm_loadu_si128((const __m128i *)(blk + 1280))), gap), _mm512_set1_epi32(255));
+        __m512i b = _mm512_or_si512(_mm512_or_si512(
+                        _mm512_slli_epi32(_mm512_and_si512(l, _mm512_set1_epi32(0x8000)), 16),
+                        _mm512_slli_epi32(e, 23)),
+                        _mm512_slli_epi32(_mm512_and_si512(l, _mm512_set1_epi32(0x7fff)), 8));
+        __mmask16 z = _mm512_cmpeq_epi32_mask(gap, _mm512_set1_epi32(15)) &
+                      _mm512_cmpeq_epi32_mask(l, _mm512_set1_epi32(0x8000));
         return _mm512_castsi512_ps(_mm512_maskz_mov_epi32((__mmask16)~z, b));
     }
     return _mm512_loadu_ps((const float *)(wg + (size_t)64 * c));
@@ -163,9 +181,13 @@ static void kq_x16f_group(const uint8_t *wg, int bf, int cols, size_t xstride, c
         }
         for (int c = 0; c < cols; ++c) {
             __m256 w0, w1;
-            if (bf == 2) {
+            if (bf >= 2) {
                 float tmp[16];
-                kq_bf12x16_col(wg, c, tmp);
+                if (bf == 2) {
+                    kq_bf12x16_col(wg, c, tmp);
+                } else {
+                    kq_f20x16_col(wg, c, tmp);
+                }
                 w0 = _mm256_loadu_ps(tmp);
                 w1 = _mm256_loadu_ps(tmp + 8);
             } else if (bf) {
@@ -205,9 +227,13 @@ static void kq_x16f_group(const uint8_t *wg, int bf, int cols, size_t xstride, c
             float s = 0.f;
             for (int c = 0; c < cols; ++c) {
                 float v;
-                if (bf == 2) {
+                if (bf >= 2) {
                     float tmp[16];
-                    kq_bf12x16_col(wg, c, tmp);
+                    if (bf == 2) {
+                        kq_bf12x16_col(wg, c, tmp);
+                    } else {
+                        kq_f20x16_col(wg, c, tmp);
+                    }
                     v = tmp[r];
                 } else if (bf) {
                     uint32_t u = (uint32_t)((const uint16_t *)wg)[16 * c + r] << 16;
@@ -223,7 +249,7 @@ static void kq_x16f_group(const uint8_t *wg, int bf, int cols, size_t xstride, c
 }
 #endif
 
-/* out (t x rows) of a KQ_BF16X16 or KQ_F32X16 matrix, inside a parallel
+/* out (t x rows) of a KQ_BF16X16, KQ_BF12X16, KQ_F20X16 or KQ_F32X16 matrix, inside a parallel
  * region. A task: at most 4 tokens, 4 groups or 1 (kq_x16f_groups4); more
  * tokens, KQ_X16F_GB groups on 16 tokens, so x comes from the cache of the
  * core for all of them (kq_x16f_group16). Tiles of 4 groups by 64 tokens in
@@ -232,7 +258,7 @@ static void kq_x16f_group(const uint8_t *wg, int bf, int cols, size_t xstride, c
 static void kq_x16f_body(const uint8_t *w, int type, int rows, int cols, const float *x, int t,
                          float *out)
 {
-    int ng = (rows + 15) / 16, bf = type == KQ_BF16X16 ? 1 : (type == KQ_BF12X16 ? 2 : 0);
+    int ng = (rows + 15) / 16, bf = type == KQ_BF16X16 ? 1 : type == KQ_BF12X16 ? 2 : type == KQ_F20X16 ? 3 : 0;
     size_t gb = (size_t)16 * kq_row_bytes(type, cols);
     int u = 1, tk = 16;
 #if defined(__AVX512F__)
@@ -275,7 +301,7 @@ static void kq_linear_body(const uint8_t *w, int type, int rows, int cols, const
         kq_e3_linear_body(w, kq_e3_bits(type), rows, cols, x, t, out);
         return;
     }
-    if (type == KQ_BF16X16 || type == KQ_F32X16 || type == KQ_BF12X16) {
+    if (type == KQ_BF16X16 || type == KQ_F32X16 || type == KQ_BF12X16 || type == KQ_F20X16) {
         kq_x16f_body(w, type, rows, cols, x, t, out);
         return;
     }

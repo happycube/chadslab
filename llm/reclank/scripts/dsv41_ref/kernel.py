@@ -2,6 +2,10 @@
 in plain torch on the CPU, for scripts/dsv41_reference.py (DEEPSEEK_V41_PLAN.md
 Phase 0). The model code imports this module in place of the tilelang one.
 
+Written from DeepSeek V4.1 Flash's reference code
+(deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/kernel.py; MIT License; Copyright
+(c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+
 The rounding is the kernels': act_quant takes the amax of each group (at
 least 1e-4), the scale amax * (1/448) or, with scale_fmt, the power of two
 above it (fast_round_scale: the exponent of the float32 bits, plus one when

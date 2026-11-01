@@ -1,6 +1,10 @@
 """DSpark of DeepSeek V4.1 Flash on the GPU (DEEPSEEK_V41_PLAN.md Phase 5): the
 draft of 5 tokens and the loop of the speculative decoding.
 
+Ported from DeepSeek V4.1 Flash's reference code
+(deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/model.py; MIT License;
+Copyright (c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+
 The drafter (the reference's DSparkBlock, model.py; mtp.0 .. mtp.2 of the
 checkpoint): three blocks with the window attention only (128 positions, the
 rope of the window layers) and 128 routed experts each (top 3, all on the
@@ -155,7 +159,9 @@ class DSpark:
                 host = np.concatenate([w1.reshape(-1), w3.reshape(-1), w2.reshape(-1)])
                 assert host.nbytes == g.per
                 _check(lib().rc_gpu_h2d(buf.ptr + e * g.per, host.ctypes.data, g.per))
-            self.stores.append(ph)
+            # (GP_DS_HOT_MOE's store: the table of each slot's address)
+            tab = buf.ptr + np.arange(self.E, dtype=np.int64) * g.per
+            self.stores.append(tab)
             self.maps.append(np.arange(self.E, dtype=np.int32))
 
     # ---- the programs

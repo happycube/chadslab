@@ -537,13 +537,14 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
     /* the int16 act of each pair (made after the up rows, before the down rows: scratch past the low
      * planes, the region of the tiles' int16 act) */
     int16_t *ap = (int16_t *)(al + (size_t)np * inner + (size_t)t * L * 2);
-#if defined(NM_X2_VNNI)
     static int runs_on = -1;            /* RECLANK_NM_NV4_RUNS=0: the tasks by pair (a measure) */
     if (runs_on < 0) {
         const char *e = getenv("RECLANK_NM_NV4_RUNS");
         runs_on = e == NULL || atoi(e) != 0;
     }
-    if (runs_on && nv4u && nv4d && inner % CH == 0 && CH % dspan == 0 && np <= 4 * NM_FEW) {
+    /* (without VNNI, kq_rows_x2_nv4 on the factors of kq_nv4_fd: x's checked here (uok), the act's of each
+     * pair in its down tasks, kq_dot_x2's rows where they fail) */
+    if (runs_on && nv4u && nv4d && uok && inner % CH == 0 && CH % dspan == 0 && np <= 4 * NM_FEW) {
         /* by expert (a verify group: the tokens share experts): a task reads its rows of an expert once
          * for all the pairs of the expert (the rows of a block in the L1 for the second token on), the
          * kernels and the sums as by pair: the same bits. Each thread makes the runs (pairs by expert,
@@ -587,7 +588,11 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
             for (int r = r0; r < r0 + CH; r += 16) {
                 for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
                     const int pr = rpr[a], j = pr / k;
+#if defined(NM_X2_VNNI)
                     kq_rows_x2_nv4v(w + (size_t)r * urb, urb, L, 16, xpu[j], xs[j], 1, act + (size_t)pr * inner + r, 1);
+#else
+                    kq_rows_x2_nv4(w + (size_t)r * urb, urb, L, 16, xpu[j], fdu[j], 1, act + (size_t)pr * inner + r, 1);
+#endif
                 }
             }
             for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
@@ -614,6 +619,7 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
         for (int task = 0; task < nr * dch; ++task) {
             const int ru = task / dch, r0 = (task % dch) * DR;
             const uint8_t *w = down + ((size_t)rex[ru] * L + r0) * drb;
+#if defined(NM_X2_VNNI)
             for (int r = 0; r < DR; r += 16) {
                 for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
                     const int pr = rpr[a];
@@ -621,6 +627,21 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
                                     1, po + (size_t)pr * L + r0 + r, 1);
                 }
             }
+#else
+            for (int a = rst[ru]; a < rst[ru + 1]; ++a) {
+                const int pr = rpr[a];
+                const float *asr = as + (size_t)pr * (inner / 32);
+                float fd[4096 / 32];
+                if (inner <= 4096 && kq_nv4_fd(asr, inner, fd)) {
+                    kq_rows_x2_nv4(w, drb, inner, DR, ap + (size_t)pr * inner, fd, 1, po + (size_t)pr * L + r0, 1);
+                } else {
+                    for (int r = 0; r < DR; ++r) {
+                        po[(size_t)pr * L + r0 + r] = kq_dot_x2(w + (size_t)r * drb, down_type, inner, aq + (size_t)pr * inner,
+                                                                al + (size_t)pr * inner, asr);
+                    }
+                }
+            }
+#endif
             if (__atomic_add_fetch(&dcnt[r0 / DR], 1, __ATOMIC_ACQ_REL) == nr) {
                 for (int j = 0; j < t; ++j) {
                     for (int r = r0; r < r0 + DR; ++r) {
@@ -648,7 +669,6 @@ static void nm_moe_few(const float *x, const int32_t *ids, const float *val, int
         }
         return;
     }
-#endif
 #endif
     const int uch = (inner + CH - 1) / CH;
     #pragma omp for schedule(dynamic, 1)

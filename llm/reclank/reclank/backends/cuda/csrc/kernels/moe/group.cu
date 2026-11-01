@@ -392,3 +392,110 @@ __global__ void k_moe_sum(const gp_rec *r, const int64_t *e)
     }
     DP(float, 20)[i] = acc;
 }
+
+/* ---- a window of the pairs (operand 23: win pairs a window; models/gemma4/gpu.py MOE_WIN) ----
+ * act, act2 and de hold the rows of one window of the sorted pairs (win + GM of them: an expert's last
+ * tile in a window may run past its end into the slack, and the next window computes those pairs again).
+ * The products of a window write and read them by the pair's sorted place less w0, and k_moe_sum_w adds
+ * the window's outputs to the tokens' rows. k_moe_order puts each expert's pairs in the order of their
+ * tokens, so the windows, and the order of the sums, are the same from run to run. */
+#define MOE_ORDER_MAX 4096
+
+/* After k_moe_sort: the pairs of expert blockIdx.x in the order of their tokens (a block for each expert;
+ * at most MOE_ORDER_MAX tokens: models/gemma4/gpu.py moe_win). Each pair's place is the count of the
+ * expert's pairs of an earlier token (an expert is in a token's slots once). */
+__global__ void __launch_bounds__(256) k_moe_order(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    __shared__ int tok[MOE_ORDER_MAX];
+    const int x = blockIdx.x, top_k = DI(4);
+    const int *idx = DP(const int, 2), *cnt = DP(const int, 11), *off = DP(const int, 12);
+    int *pair_tok = DP(int, 14), *pair_of = DP(int, 15);
+    const int n = cnt[x], q0 = off[x];
+    if (n <= 1 || n > MOE_ORDER_MAX) {
+        return;
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        tok[i] = pair_tok[q0 + i];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int j = tok[i];
+        int rank = 0;
+        for (int a = 0; a < n; ++a) {
+            rank += tok[a] < j;
+        }
+        pair_tok[q0 + rank] = j;
+        for (int sl = 0; sl < top_k; ++sl) {
+            if (idx[(size_t)j * top_k + sl] == x) {
+                pair_of[(size_t)j * top_k + sl] = q0 + rank;
+            }
+        }
+    }
+}
+
+/* the tiles of the pairs of window [w0, w1) of the sorted order: up to GM pairs of one expert each */
+__global__ void k_moe_tiles_w(const gp_rec *r, const int64_t *e, int w0, int w1)
+{
+    PDL_START();
+    const int *off = DP(const int, 12);
+    int *tiles = DP(int, 16);
+    int n = 0;
+    for (int x = 0; x < MOE_EXPERTS_MAX; ++x) {
+        const int a = max(off[x], w0), b = min(off[x + 1], w1);
+        for (int p0 = a; p0 < b; p0 += GM) {
+            tiles[1 + 2 * n] = x;
+            tiles[2 + 2 * n] = p0;
+            ++n;
+        }
+    }
+    tiles[0] = n;
+}
+
+/* k_moe_gelu on the pairs of window [w0, w0 + n) (act and act2 hold the window's rows) */
+__global__ void k_moe_gelu_w(const gp_rec *r, const int64_t *e, int w0, int n)
+{
+    PDL_START();
+    const int inner = DI(10);
+    n = min(n, DP(const int, 12)[MOE_EXPERTS_MAX] - w0);
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n <= 0 || i >= (size_t)n * inner) {
+        return;
+    }
+    size_t q = i / inner, c = i % inner;
+    const float *g = DP(const float, 17) + q * 2 * inner;
+    float v = g[c];
+    DP(float, 18)[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
+                                                (v + 0.044715f * v * v * v))) * g[inner + c];
+}
+
+/* k_moe_sum for window [w0, w1): each token's slots in their order, those of the window's pairs (de at
+ * their place less w0), added to the rows of the windows before (the first window starts them at 0); 4
+ * columns a thread (dn_rows a multiple of 4) */
+__global__ void k_moe_sum_w(const gp_rec *r, const int64_t *e, int w0, int w1, int first)
+{
+    PDL_START();
+    const int dn4 = DI(9) / 4, top_k = DI(4);
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)DI(3) * dn4 || (!first && w0 >= DP(const int, 12)[MOE_EXPERTS_MAX])) {
+        return;
+    }
+    size_t j = i / dn4, c = i % dn4;
+    const float *val = DP(const float, 1);
+    const int *pair_of = DP(const int, 15);
+    const float4 *de = DP(const float4, 19);
+    float4 *out = DP(float4, 20) + i;
+    float4 acc = first ? make_float4(0.f, 0.f, 0.f, 0.f) : *out;
+    for (int s2 = 0; s2 < top_k; ++s2) {
+        int q = pair_of[j * top_k + s2];
+        if (q >= w0 && q < w1) {
+            const float v = val[j * top_k + s2];
+            const float4 d = de[(size_t)(q - w0) * dn4 + c];
+            acc.x += v * d.x;
+            acc.y += v * d.y;
+            acc.z += v * d.z;
+            acc.w += v * d.w;
+        }
+    }
+    *out = acc;
+}

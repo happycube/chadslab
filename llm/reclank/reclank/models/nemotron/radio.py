@@ -2,6 +2,10 @@
 checkpoint's image_processing_nemotron_h_omni.py, modeling_radio.py and the vision projector of
 modeling_nemotron_h_omni.py, op for op in NumPy float32. The slow reference of the runtime.
 
+Ported from the Nemotron 3.5 checkpoints' code (image_processing_nemotron_h_omni.py,
+modeling_radio.py and modeling_nemotron_h_omni.py; Apache License 2.0; Copyright (c) 2026,
+NVIDIA CORPORATION). See THIRD_PARTY_NOTICES.md.
+
     the image (RGB; an RGBA image loses its alpha, as PIL's convert) -> one tile of
     (hp x wp) patches of 16 pixels: the aspect kept, the patches between min_num_patches
     (1024) and max_num_patches (13312), each side even -> torch's antialiased bicubic

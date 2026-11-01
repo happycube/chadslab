@@ -246,6 +246,19 @@ static void hot(const char *dir, int reps)
 {
     Dump d;
     load(d, dir);
+    if (d.dev[4] != NULL) {
+        /* (the store's operand: the table of each slot's address, over the dumped slots one after the other) */
+        size_t per = (size_t)d.rec.v[5], ns = d.host[4].size() / per;
+        std::vector<int64_t> tab(ns);
+        for (size_t s = 0; s < ns; ++s) {
+            tab[s] = (int64_t)(intptr_t)((uint8_t *)d.dev[4] + s * per);
+        }
+        void *dt;
+        CKB(cudaMalloc(&dt, ns * 8));
+        CKB(cudaMemcpy(dt, tab.data(), ns * 8, cudaMemcpyHostToDevice));
+        d.rec.v[4] = (int64_t)(intptr_t)dt;
+        CKB(cudaMemcpy(d.drec, &d.rec, sizeof(gp_rec), cudaMemcpyHostToDevice));
+    }
     const gp_rec &R = d.rec;
     int t = (int)R.v[8], k = (int)R.v[9], H = (int)R.v[10], I = (int)R.v[11], E = (int)R.v[21];
     const int *idx = (const int *)d.host[1].data(), *map = (const int *)d.host[3].data();

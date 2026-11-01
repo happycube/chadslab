@@ -645,8 +645,11 @@ def load(opts, meta, worker=None):
                 raise
             print("no GPU (%s): the CPU engine" % exc, flush=True)
     vision = None
+    # (Super's RADIO and projector: Bolt's checkpoint has modeling_radio.py too, its C-RADIO v4-H not done, and the
+    # server failed to load it on the projector's tensors)
     images = gpu and str(opts.mmproj or "on").lower() not in ("off", "none", "0") and \
-        os.path.exists(os.path.join(path, "modeling_radio.py"))
+        os.path.exists(os.path.join(path, "modeling_radio.py")) and \
+        "vision_projector.vision_final_layernorm.weight" in m.ck.where
     lanes = int(getattr(opts, "lanes", 1) or 1) if gpu else 1
     if gpu:
         from reclank.models.nemotron.gpu import NemotronGPU, load_counts

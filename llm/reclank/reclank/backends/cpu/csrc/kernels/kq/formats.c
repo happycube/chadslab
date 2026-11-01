@@ -1,6 +1,10 @@
 /* The GGUF block formats of llama.cpp: products for one token, a small
  * group, and the experts of a MoE layer.
  *
+ * The block formats ported from ggml (ggml/src/ggml-common.h,
+ * ggml/src/ggml-quants.c; MIT License; Copyright (c) 2023-2026 The ggml
+ * authors). See THIRD_PARTY_NOTICES.md.
+ *
  * This file is part of the cops library: bf16_linear.c includes it, and it
  * uses the helpers there (fp16_to_f32) and in moe.c.
  *
@@ -126,6 +130,15 @@
  * | mantissa else. */
 #define KQ_BF12 57
 #define KQ_BF12X16 63
+/* F20 (gguf.F20): float32 values to 16 significant bits in groups of 32, as BF12 with a 15-bit
+ * mantissa: lo[cols] uint16 (sign << 15 | the top 15 bits of the mantissa, rounded to nearest,
+ * even), hi[cols / 2] (the exponent gaps, as BF12's), E[cols / 32] (the largest exponent of each
+ * group), padded to 16 bytes. Sign 1, gap 15, mantissa 0 decodes to 0 (the zero code, also of the
+ * values more than 15 binades under their group's largest); bits sign << 31 | (E - gap) << 23 |
+ * mantissa << 8 else. KQ_F20X16: groups of 16 rows, in each block of 32 columns the 16 rows' lo
+ * column by column (1024 bytes), their gap nibbles (256, as KQ_BF12X16's) and their E (16). */
+#define KQ_F20 68
+#define KQ_F20X16 69
 /* DeepSeek V4.1 Flash (mxx.c): KQ_MXX, MXFP4 in the groups of 16 rows of
  * KQ_NVX with an E8M0 scale of each row and block (272 bytes for 32
  * columns); KQ_FP8B32, FP8 rows with E8M0 scales of 32 x 32 blocks. */

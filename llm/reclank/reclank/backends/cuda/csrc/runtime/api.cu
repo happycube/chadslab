@@ -294,16 +294,27 @@ typedef struct gg_shared {
 } gg_shared;
 static gg_shared *gg_sh;        /* the newest first */
 
+/* The rows of a window of the sort of a GP_KQ_GROUP_MOE of P pairs of MUL1
+ * experts (e3_win): its act, act2 and de have these rows. */
+extern "C" int64_t rc_gpu_e3_win(int64_t P)
+{
+    return e3_win(P);
+}
+
 /* rc_gpu_scratch_own(1): the programs loaded from now on get scratches of
  * their own, which no other program takes (lane B of docs/LANES_PLAN.md runs
  * at the same time as the model's programs: with lane B's step on the e3
- * scratch of the model's step, a hot MoE read the other lane's tables). */
+ * scratch of the model's step, a hot MoE read the other lane's tables).
+ * rc_gpu_scratch_own(2): scratches of a class of their own, shared by the
+ * programs loaded so (the large programs of a prompt: a step loaded after
+ * one kept its scratch, of GBs, when it was freed). */
 static int gg_scratch_own;
 #define GG_SH_OWN 0x100
+#define GG_SH_BIG 0x200
 
 extern "C" int rc_gpu_scratch_own(int on)
 {
-    gg_scratch_own = on != 0;
+    gg_scratch_own = on;
     return 0;
 }
 
@@ -311,10 +322,12 @@ extern "C" int rc_gpu_scratch_own(int on)
  * NULL (no memory). */
 static void *gg_scratch_get(int kind, size_t n, int zero)
 {
-    if (gg_scratch_own) {
+    if (gg_scratch_own == 1) {
         kind |= GG_SH_OWN;      /* (no other program finds it) */
+    } else if (gg_scratch_own == 2) {
+        kind |= GG_SH_BIG;
     }
-    for (gg_shared *e = gg_sh; e != NULL && !gg_scratch_own; e = e->next) {
+    for (gg_shared *e = gg_sh; e != NULL && gg_scratch_own != 1; e = e->next) {
         if (e->kind == kind) {
             if (e->n >= n) {
                 ++e->refs;
@@ -384,11 +397,19 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
     size_t code_b = (size_t)g->n_code * sizeof(gp_rec);
     g->hcode = (gp_rec *)malloc(code_b);
     memcpy(g->hcode, prog + 4 + g->n_env, code_b);
+    /* the parts of the attention of attn_launch (12.6 MB): only for a program with its records (a program
+     * of DeepSeek or Nemotron has none: 1.4 GB over the ~110 programs of DeepSeek's server) */
+    int parts = 0;
+    for (int pc = 0; pc < g->n_code; ++pc) {
+        int op = g->hcode[pc].op;
+        parts |= op == GP_ATTN_F32 || op == GP_ATTN_F32H || op == GP_ATTN_QC || op == GP_ATTN_Q8 ||
+                 op == GP_ATTN_V8 || op == GP_ATTN_TQ || op == GP_ATTN_QSA;
+    }
     if (cudaMallocHost(&g->henv, env_b) != cudaSuccess ||
         cudaMalloc(&g->denv, env_b) != cudaSuccess ||
         cudaMalloc(&g->dcode, code_b) != cudaSuccess ||
         cudaMemcpy(g->dcode, g->hcode, code_b, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMalloc(&g->part, GG_PART_FLOATS * sizeof(float)) != cudaSuccess) {
+        (parts && cudaMalloc(&g->part, GG_PART_FLOATS * sizeof(float)) != cudaSuccess)) {
         snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: no memory");
         return NULL;
     }
@@ -452,7 +473,22 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
         } else if (r->op == GP_BF16_LINEAR && r->v[5] > MT_MAX) {
             n = (size_t)r->v[5] * (size_t)r->v[4];
         } else if (r->op == GP_ENC_LINEAR && r->v[2] && r->v[5] > MT_MAX) {
-            n = (size_t)r->v[5] * (size_t)r->v[7];      /* the rows x cols of x */
+            /* the rows x cols of x (float16 W, wbf 2: its two float16 planes and the scales of its blocks of 32) */
+            n = r->v[2] == 2 ? 2 * (size_t)r->v[5] * ((size_t)r->v[7] + ((size_t)r->v[7] + 31) / 32)
+                             : (size_t)r->v[5] * (size_t)r->v[7];
+        } else if (r->op == GP_ENC_GATHER_MM) {
+            n = 2 * (size_t)r->v[9] * (size_t)r->v[8];  /* the two bfloat16 planes of the rows of x */
+        } else if (r->op == GP_ENC_GNORM) {
+            /* the parts (double) and the stats (float) of k_enc_gnorm_part / _stats */
+            n = (size_t)r->v[6] * (size_t)((r->v[4] + 255) / 256) * 8 + (size_t)r->v[6] * 4;
+        } else if (r->op == GP_ENC_ATTN_KV) {
+            /* the parts of k_enc_attn_kv_part: n heads S (hd + 2) floats */
+            n = 2 * (size_t)r->v[6] * (size_t)r->v[7] * (size_t)((r->v[9] + EKV_C - 1) / EKV_C) * ((size_t)r->v[8] + 2);
+        } else if (r->op == GP_ENC_ATTN_X2) {
+            n = 6 * (size_t)r->v[6] * (size_t)r->v[7] * (size_t)r->v[8];   /* q, k, v: two bfloat16 planes each */
+        } else if (r->op == GP_ENC_ATTN_X2C) {
+            /* q's nq rows, k's and v's nq + nc rows: two bfloat16 planes each */
+            n = (2 * (size_t)r->v[8] + 4 * ((size_t)r->v[8] + (size_t)r->v[9])) * (size_t)r->v[10] * (size_t)r->v[11];
         } else if (r->op == GP_ENC_ATTN && r->v[6] % 8 == 0) {
             n = 3 * (size_t)r->v[4] * (size_t)r->v[5] * (size_t)r->v[6];   /* q, k, v (k_enc_attn_tc) */
         } else if (r->op == GP_KQ_GROUP_MOE && (r->v[16] == KQ_BF16 || r->v[16] == KQ_BF12)) {
@@ -526,9 +562,11 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
     }
     /* The int8 scratch of the products of large groups on the tensor cores. */
     size_t kneed = 0;
+    int q4x_moe = 0;
     for (int pc = 0; pc < g->n_code; ++pc) {
         const gp_rec *r = g->hcode + pc;
         size_t n = 0;
+        q4x_moe |= r->op == GP_MOE_GPU && r->v[5] == 1;
         if (r->op == GP_KQ_LINEAR) {
             n = (size_t)r->v[8] * (size_t)r->v[7];
         } else if (r->op == GP_KQ_MULTI) {
@@ -543,10 +581,16 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
             n = t * (size_t)r->v[13];
             n = P * (size_t)r->v[12] > n ? P * (size_t)r->v[12] : n;
         } else if (r->op == GP_MOE_GPU && (r->v[5] == 1 || (!gg_caps.tc && gg_caps.dp4a && moe_q40_mode() > 0))) {
-            /* (KQ_Q4X experts, or int4 ones on dp4a: k_moe_gemm_q40_dp4a) */
+            /* (KQ_Q4X experts, or int4 ones on dp4a: k_moe_gemm_q40_dp4a; with a window of the pairs,
+             * operand 23, the int8 rows of h and then those of a window's act2) */
             size_t t = (size_t)r->v[3], P = t * (size_t)r->v[4];
+            size_t win = r->tag[23] != GP_T_NONE && r->v[23] > 0 ? (size_t)r->v[23] : P;
             n = t * (size_t)r->v[8];
-            n = P * (size_t)r->v[10] > n ? P * (size_t)r->v[10] : n;
+            if (win < P) {
+                n += (win + GM < P ? win + GM : P) * (size_t)r->v[10];
+            } else {
+                n = P * (size_t)r->v[10] > n ? P * (size_t)r->v[10] : n;
+            }
         }
         kneed = n > kneed ? n : kneed;
     }
@@ -559,7 +603,8 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
         for (int pc = 0; pc < g->n_code; ++pc) {
             hot |= g->hcode[pc].op == GP_KQ_HOT_MOE;
         }
-        g->kqx_lo = g->i8 == 2 || !gg_caps.tc || hot;
+        /* (and the KQ_Q4X experts of GP_MOE_GPU: int16 unless the program asks for int8) */
+        g->kqx_lo = g->i8 == 2 || !gg_caps.tc || hot || (q4x_moe && g->i8 == 0 && q4x_x2_on());
         if ((g->kqx = (int8_t *)gg_scratch_get(GG_SH_KQX, kneed + kneed / 32 * 8 + (g->kqx_lo ? kneed : 0), 0)) ==
             NULL) {
             snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: no memory for the int8 scratch");
@@ -576,8 +621,9 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
             eneed = n > eneed ? n : eneed;
         }
         if (r->op == GP_KQ_GROUP_MOE && kq_e3_k((int)r->v[11]) && r->tag[3] != GP_T_SLOT) {
-            /* MUL1 experts of a group: P = t k + t rows of the sort (int16 x: e3_x16_on) */
-            size_t n = e3h_ws_bytes(r->v[3] * r->v[4] + r->v[3], (int)r->v[6], (int)r->v[7], e3_x16_on());
+            /* MUL1 experts of a group: P = t k + t rows of the sort, a window of them (e3_win; int16 x:
+             * e3_x16_on) */
+            size_t n = e3h_ws_bytes(e3_win(r->v[3] * r->v[4] + r->v[3]), (int)r->v[6], (int)r->v[7], e3_x16_on());
             eneed = n > eneed ? n : eneed;
         }
         if (r->op == GP_KQ_HOT_MOE && kq_e3_k((int)r->v[14]) && r->tag[16] != GP_T_SLOT) {

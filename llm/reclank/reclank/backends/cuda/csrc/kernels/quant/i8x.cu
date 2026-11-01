@@ -792,10 +792,12 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
     }
     for (int k0 = 0; k0 < cols; k0 += KG_K) {
         float v[8];
-        if (wrow != NULL && type == KQ_NVX) {
+        /* (cols a multiple of 8 past the last 32: zeros past cols) */
+        const bool in = k0 + lc < cols;
+        if (wrow != NULL && in && type == KQ_NVX) {
             int row = r0 + lr;
             kq_dequant8_nvx(W + (size_t)(row & ~15) * rb, row & 15, k0 + lc, v);
-        } else if (wrow != NULL) {
+        } else if (wrow != NULL && in) {
             kq_dequant8(type, wrow, cols, k0 + lc, v);
         } else {
             for (int u = 0; u < 8; ++u) {
@@ -806,7 +808,7 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
         for (int u = 0; u < 8; ++u) {
             Ws[lc + u][lr] = v[u];
         }
-        if (xrow != NULL) {
+        if (xrow != NULL && in) {
             float4 a = *(const float4 *)(xrow + k0 + lc), b = *(const float4 *)(xrow + k0 + lc + 4);
             v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
             v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;

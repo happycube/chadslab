@@ -708,12 +708,18 @@ __global__ void __launch_bounds__(256) k_qmoe_gu(const gp_rec *r, const int64_t 
 
 /* rot: as k_kqh_act (the warps cover whole groups: the count is a
  * multiple of 32) */
-__global__ void k_qmoe_act(const gp_rec *r, const int64_t *e, int rot)
+/* wn > 0: the rows of a window of the sort from row w0 (e3_win), act and act2
+ * of its rows */
+__global__ void k_qmoe_act(const gp_rec *r, const int64_t *e, int rot, int w0 = 0, int wn = 0)
 {
     PDL_START();
     int inner = DI(7);
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t)DP(const int, 18)[1] * inner) {
+    int64_t rows = DP(const int, 18)[1];
+    if (wn > 0) {
+        rows = min(rows - w0, (int64_t)wn);
+    }
+    if (i >= rows * inner) {
         return;
     }
     int64_t p = i / inner, c = i % inner;
@@ -743,7 +749,9 @@ __global__ void __launch_bounds__(256) k_qmoe_dn(const gp_rec *r, const int64_t 
             DP(float, 21) + (size_t)p0 * hidden, (size_t)hidden);
 }
 
-__global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
+/* wn > 0: the pairs of the window of the sort [w0, w0 + wn) (de of its rows),
+ * added to the output of the windows before (the first writes it) */
+__global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e, int w0 = 0, int wn = 0)
 {
     PDL_START();
     qmoe_w w = qmoe_work(r, e);
@@ -753,23 +761,71 @@ __global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
         return;
     }
     const float *val = DP(const float, 1), *de = DP(const float, 21);
+    const unsigned win = wn > 0 ? (unsigned)wn : 0xffffffffu;
     float acc = 0.f;
     int ps = w.pof[t * k + tok];
     /* no shared expert (sgate null: the copied experts of a mixed group,
      * after its hot experts): only the routed pairs */
     const int noshared = DP(const void, 13) == NULL;
     if (ps >= 0 || noshared) {
-        if (ps >= 0) {
-            acc = de[(size_t)ps * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
+        if (ps >= 0 && (unsigned)(ps - w0) < win) {
+            acc = de[(size_t)(ps - w0) * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
         }
         for (int s2 = 0; s2 < k; ++s2) {
             int p = w.pof[tok * k + s2];
-            if (p >= 0) {           /* -1: an expert of the CPU (GP_MOE_PLAN) */
-                acc += val[tok * k + s2] * de[(size_t)p * hidden + c];
+            if (p >= 0 && (unsigned)(p - w0) < win) {       /* -1: an expert of the CPU (GP_MOE_PLAN) */
+                acc += val[tok * k + s2] * de[(size_t)(p - w0) * hidden + c];
             }
         }
     }
-    DP(float, 22)[(size_t)tok * hidden + c] = acc;
+    float *out = DP(float, 22) + (size_t)tok * hidden + c;
+    *out = w0 > 0 ? *out + acc : acc;
+}
+
+/* After k_qmoe_sort_par, for the windows of the sort (e3_win): the pairs of
+ * each routed expert x (block x) in the order of their index q, as
+ * k_qmoe_sort places them (the atomics of k_qmoe_sort_par place them in any
+ * order, and a window's edge in an expert then took other pairs from run to
+ * run, its sum in another order). 1024 threads. */
+__global__ void __launch_bounds__(1024) k_qmoe_place(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    __shared__ int wsum[32];
+    __shared__ int base;
+    int t = DI(3), k = DI(4), x = blockIdx.x;
+    int nr = DI(23);
+    nr = nr > 0 && nr < t ? nr : t;
+    const int *idx = DP(const int, 2);
+    qmoe_w w = qmoe_work(r, e);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (threadIdx.x == 0) {
+        base = w.start[x];
+    }
+    __syncthreads();
+    for (int q0 = 0; q0 < nr * k; q0 += 1024) {
+        int q = q0 + threadIdx.x;
+        int f = q < nr * k && idx[q] == x;
+        unsigned m = __ballot_sync(0xffffffffu, f);
+        if (lane == 0) {
+            wsum[warp] = __popc(m);
+        }
+        __syncthreads();
+        int before = 0, all = 0;
+        for (int v = 0; v < 32; ++v) {
+            before += v < warp ? wsum[v] : 0;
+            all += wsum[v];
+        }
+        if (f) {
+            int pos = base + before + __popc(m & ((1u << lane) - 1));
+            w.ptok[pos] = q / k;
+            w.pof[q] = pos;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            base += all;
+        }
+        __syncthreads();
+    }
 }
 
 

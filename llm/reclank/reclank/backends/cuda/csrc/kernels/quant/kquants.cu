@@ -1,4 +1,7 @@
 /* ---------- Qwen3.5 on the GGUF formats (QWEN_PLAN.md, phase 4) ----------
+ * The block formats ported from ggml (ggml/src/ggml-common.h, ggml/src/ggml-quants.c;
+ * MIT License; Copyright (c) 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+ *
  * The records of compile_qwen_step (reclank/models/qwen/qwen35.py). The products read x
  * in float32: GP_KQ_QUANT does nothing on the GPU, and GP_KQ_LINEAR reads
  * operand 3 (the float rows). The weights are the blocks of the GGUF file

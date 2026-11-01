@@ -107,7 +107,16 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     /* ---- the media encoders: the operands of bf16_linear.c gp_step ---- */
     case GP_ENC_LINEAR: {
         int n = (int)hlit(r, 5, &bad), m = (int)hlit(r, 6, &bad), k = (int)hlit(r, 7, &bad);
-        if (enc_tc_on() && gg_tc && g->tc && hlit(r, 2, &bad) && k % 8 == 0 && n > MT_MAX &&
+        if (hlit(r, 2, &bad) == 2 && enc_tc_on() && gg_tc && g->tc && k % 8 == 0 && n > MT_MAX &&
+            2 * (size_t)n * k + 2 * (size_t)n * ((k + 31) / 32) <= g->xh_n) {
+            /* float16 W (wbf 2): each block of 32 columns of x scaled, as two float16 planes (gg_gemm_f16) */
+            gg_gemm_f16((const float *)(intptr_t)hi(r, g->henv, 0), (const uint16_t *)(intptr_t)hi(r, g->henv, 1),
+                        (const float *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 4), n, m, k,
+                        (uint16_t *)g->xh, hlitf(r, 8, &bad), hlitf(r, 9, &bad), hlitf(r, 10, &bad),
+                        hlitf(r, 11, &bad), s);
+            break;
+        }
+        if (enc_tc_on() && gg_tc && g->tc && hlit(r, 2, &bad) == 1 && k % 8 == 0 && n > MT_MAX &&
             (size_t)n * k <= g->xh_n) {
             /* bfloat16 W on the tensor cores: x to float16 (with the input
              * clamps), then k_enc_gemm_tc (the bias and the output clamps) */
@@ -119,6 +128,41 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 g->xh, (const uint16_t *)(intptr_t)hi(r, g->henv, 1),
                 (const float *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 4),
                 n, m, k, hlitf(r, 10, &bad), hlitf(r, 11, &bad));
+            break;
+        }
+        if (hlit(r, 2, &bad) == 2 && n <= MT_MAX && k % 8 == 0 && hi(r, g->henv, 0) % 16 == 0 &&
+            hi(r, g->henv, 1) % 16 == 0) {
+            /* float16 W, few rows (a decoder's step): k_enc_gemv_f16 on 8, 4, 2 or 1 rows at a time */
+            const float *x = (const float *)(intptr_t)hi(r, g->henv, 0);
+            const __half *w = (const __half *)(intptr_t)hi(r, g->henv, 1);
+            const float *b = (const float *)(intptr_t)hi(r, g->henv, 3);
+            float *y = (float *)(intptr_t)hi(r, g->henv, 4);
+            float i0 = hlitf(r, 8, &bad), i1 = hlitf(r, 9, &bad), o0 = hlitf(r, 10, &bad), o1 = hlitf(r, 11, &bad);
+            unsigned nb = (unsigned)cdiv(m, 8);
+            for (int r0 = 0; r0 < n;) {
+                int rest = n - r0, nr = rest >= 8 ? 8 : rest >= 4 ? 4 : rest >= 2 ? 2 : 1;
+                const float *xr = x + (size_t)r0 * k;
+                float *yr = y + (size_t)r0 * m;
+                if (nr == 8) {
+                    k_enc_gemv_f16<8><<<nb, 256, 0, s>>>(xr, w, b, yr, m, k, i0, i1, o0, o1);
+                } else if (nr == 4) {
+                    k_enc_gemv_f16<4><<<nb, 256, 0, s>>>(xr, w, b, yr, m, k, i0, i1, o0, o1);
+                } else if (nr == 2) {
+                    k_enc_gemv_f16<2><<<nb, 256, 0, s>>>(xr, w, b, yr, m, k, i0, i1, o0, o1);
+                } else {
+                    k_enc_gemv_f16<1><<<nb, 256, 0, s>>>(xr, w, b, yr, m, k, i0, i1, o0, o1);
+                }
+                r0 += nr;
+            }
+            break;
+        }
+        if ((hlit(r, 2, &bad) == 0 || (hlit(r, 2, &bad) == 3 && k % 32 == 0)) && enc_sgemm_on() &&
+            hi(r, g->henv, 0) % 16 == 0 && hi(r, g->henv, 1) % 16 == 0) {
+            /* float32 W, or F20 rows (wbf 3): k_enc_sgemm (the same bits) */
+            enc_sgemm((const float *)(intptr_t)hi(r, g->henv, 0), (const void *)(intptr_t)hi(r, g->henv, 1),
+                      hlit(r, 2, &bad) == 3, (const float *)(intptr_t)hi(r, g->henv, 3),
+                      (float *)(intptr_t)hi(r, g->henv, 4), n, m, k, hlitf(r, 8, &bad), hlitf(r, 9, &bad),
+                      hlitf(r, 10, &bad), hlitf(r, 11, &bad), enc_sms(), s);
             break;
         }
         dim3 grid((unsigned)cdiv(m, 64), (unsigned)cdiv(n, 64));
@@ -138,6 +182,14 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     }
     case GP_ENC_LNORM: {
         int rows = (int)hlit(r, 4, &bad);
+        if (hlit(r, 7, &bad) == 1 && hlit(r, 5, &bad) <= 256 * ELN_V) {
+            /* x, w, b, y, rows, cols, eps, a block a row (a decoder's step) */
+            k_enc_lnorm_row<<<(unsigned)rows, 256, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3),
+                (int)hlit(r, 5, &bad), hlitf(r, 6, &bad));
+            break;
+        }
         k_enc_lnorm<<<(unsigned)cdiv(rows, 8), 256, 0, s>>>(
             (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
             (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3), rows,
@@ -155,7 +207,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         int64_t n = hlit(r, 3, &bad);
         k_enc_gelu_mul<<<(unsigned)cdiv(n, T), T, 0, s>>>(
             (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
-            (float *)(intptr_t)hi(r, g->henv, 2), n);
+            (float *)(intptr_t)hi(r, g->henv, 2), n, (int)hlit(r, 4, &bad));
         break;
     }
     case GP_ENC_SILU_MUL: {
@@ -234,6 +286,514 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         k_enc_rope2d<<<(unsigned)cdiv(total, T), T, 0, s>>>(
             (float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
             (const float *)(intptr_t)hi(r, g->henv, 2), n, heads, hd);
+        break;
+    }
+    case GP_ENC_ATTN_BIAS: {
+        /* q, k, v, o, bias, wtype, n, heads, hd, g, scale: a block of g threads for each
+         * (window, head), K and V of the window in shared memory */
+        int n = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad);
+        int hd = (int)hlit(r, 8, &bad), gw = (int)hlit(r, 9, &bad);
+        size_t smem = (size_t)2 * gw * hd * sizeof(float);
+        if (gw <= 0 || gw > 64 || hd > 128 || n % gw != 0 || smem > 48 * 1024) {
+            bad = 1;
+            break;
+        }
+        k_enc_attn_bias<<<dim3((unsigned)(n / gw), (unsigned)heads), 64, smem, s>>>(
+            (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+            (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3),
+            (const float *)(intptr_t)hi(r, g->henv, 4), (const int *)(intptr_t)hi(r, g->henv, 5),
+            heads, hd, gw, hlitf(r, 10, &bad));
+        break;
+    }
+    case GP_ENC_GATHER: {
+        /* x, idx, y, n, blocks, cols: one block of 128 threads for each block of a row */
+        int64_t nb = hlit(r, 3, &bad) * hlit(r, 4, &bad);
+        k_enc_gather<<<(unsigned)nb, 128, 0, s>>>(
+            (const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+            (float *)(intptr_t)hi(r, g->henv, 2), nb, (int)hlit(r, 5, &bad));
+        break;
+    }
+    case GP_ENC_GNORM: {
+        /* x, w, b, y, rows, cols, groups, eps, silu: the parts and the stats in xh */
+        int64_t rows = hlit(r, 4, &bad);
+        int cols = (int)hlit(r, 5, &bad), groups = (int)hlit(r, 6, &bad), cg = cols / groups;
+        int nch = (int)cdiv(rows, EGN_R);
+        size_t need = (size_t)groups * nch * 8 + (size_t)groups * 4;     /* uint16 places */
+        if (rows <= 0 || groups <= 0 || cols % groups != 0 || need > g->xh_n) {
+            bad = 1;
+            break;
+        }
+        double *part = (double *)g->xh;
+        float *stats = (float *)(part + (size_t)groups * nch * 2);
+        const float *x = (const float *)(intptr_t)hi(r, g->henv, 0);
+        k_enc_gnorm_part<<<dim3((unsigned)groups, (unsigned)nch), EGN_R, 0, s>>>(x, rows, cols, cg, part);
+        k_enc_gnorm_stats<<<(unsigned)groups, 256, 0, s>>>(part, nch, (double)rows * cg, hlitf(r, 7, &bad), stats);
+        int64_t n = rows * cols;
+        k_enc_gnorm_apply<<<(unsigned)cdiv(n, T), T, 0, s>>>(
+            x, (const float *)(intptr_t)hi(r, g->henv, 1), (const float *)(intptr_t)hi(r, g->henv, 2),
+            (float *)(intptr_t)hi(r, g->henv, 3), n, cols, cg, stats, (int)hlit(r, 8, &bad));
+        break;
+    }
+    case GP_ENC_ROPE_TAB: {
+        /* x, cos, sin, n, heads, hd: a thread a pair */
+        int64_t np_ = hlit(r, 3, &bad) * hlit(r, 4, &bad) * (hlit(r, 5, &bad) / 2);
+        if (np_ > 0) {
+            k_enc_rope_tab<<<(unsigned)cdiv(np_, T), T, 0, s>>>(
+                (float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                (const float *)(intptr_t)hi(r, g->henv, 2), hlit(r, 3, &bad), (int)hlit(r, 4, &bad),
+                (int)hlit(r, 5, &bad), (int)hlit(r, 6, &bad));
+        }
+        break;
+    }
+    case GP_ENC_SNAKE: {
+        /* x, alpha, beta, y, rows, cols */
+        int64_t n = hlit(r, 4, &bad) * hlit(r, 5, &bad);
+        if (n > 0) {
+            k_enc_snake<<<(unsigned)cdiv(n, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3), n,
+                (int)hlit(r, 5, &bad));
+        }
+        break;
+    }
+    case GP_ENC_RESIZE: {
+        /* x, y, n, h, w, H, W, C, mode [, xs, xo, ys, yo]: a thread a value */
+        int64_t n = hlit(r, 2, &bad), h = hlit(r, 3, &bad), w = hlit(r, 4, &bad), H = hlit(r, 5, &bad);
+        int64_t W = hlit(r, 6, &bad), C = hlit(r, 7, &bad);
+        int mode = (int)hlit(r, 8, &bad);
+        int strided = r->tag[9] != GP_T_NONE;
+        int64_t xs = strided ? hlit(r, 9, &bad) : C, xo = strided ? hlit(r, 10, &bad) : 0;
+        int64_t ys = strided ? hlit(r, 11, &bad) : C, yo = strided ? hlit(r, 12, &bad) : 0;
+        int64_t tot = n * H * W * C;
+        if (tot > 0 && h > 0 && w > 0) {
+            k_enc_resize<<<(unsigned)cdiv(tot, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
+                                                              (float *)(intptr_t)hi(r, g->henv, 1), n, h, w, H, W,
+                                                              C, mode, xs, xo, ys, yo);
+        }
+        break;
+    }
+    case GP_ENC_CONV_MM: {
+        /* src, idx, w, b, res, slope, y, n, m, taps, cin, scat, blk: the bits of ENC_GATHER + ENC_LINEAR
+         * (+ ENC_ADD, ENC_PRELU; + the ENC_GATHER of its output rows: scat) without the im2col buffer */
+        int n = (int)hlit(r, 7, &bad), m = (int)hlit(r, 8, &bad), taps = (int)hlit(r, 9, &bad);
+        int cin = (int)hlit(r, 10, &bad), blk = (int)hlit(r, 12, &bad);
+        if (n > 0 && m > 0) {
+            enc_conv_mm((const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+                        (const float *)(intptr_t)hi(r, g->henv, 2), (const float *)(intptr_t)hi(r, g->henv, 3),
+                        (const float *)(intptr_t)hi(r, g->henv, 4), (const float *)(intptr_t)hi(r, g->henv, 5),
+                        (float *)(intptr_t)hi(r, g->henv, 6), n, m, taps, cin,
+                        (const int *)(intptr_t)hi(r, g->henv, 11), blk > 0 ? blk : 1, enc_sms(), s);
+        }
+        break;
+    }
+    case GP_ENC_RIFE_IN:
+        enc_rife_in(r, g->henv, &bad, s);
+        break;
+    case GP_ENC_RIFE_OUT:
+        enc_rife_out(r, g->henv, &bad, s);
+        break;
+    case GP_ENC_UNPACK_U8P: {
+        /* x, y, h, w, Hp, Wp, C, d */
+        int64_t h = hlit(r, 2, &bad), w = hlit(r, 3, &bad), Hp = hlit(r, 4, &bad), Wp = hlit(r, 5, &bad);
+        int64_t C = hlit(r, 6, &bad), n = Hp * Wp * C;
+        if (n > 0) {
+            k_enc_unpack_u8p<<<(unsigned)cdiv(n, T), T, 0, s>>>((const unsigned char *)(intptr_t)hi(r, g->henv, 0),
+                                                                (float *)(intptr_t)hi(r, g->henv, 1), h, w, Hp, Wp, C,
+                                                                hlitf(r, 7, &bad));
+        }
+        break;
+    }
+    case GP_ENC_PACK_U8C: {
+        /* x, y, h, w, Wp, C, s */
+        int64_t h = hlit(r, 2, &bad), w = hlit(r, 3, &bad), Wp = hlit(r, 4, &bad), C = hlit(r, 5, &bad);
+        if (h * w * C > 0) {
+            k_enc_pack_u8c<<<(unsigned)cdiv(h * w * C, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
+                                                                      (unsigned char *)(intptr_t)hi(r, g->henv, 1),
+                                                                      h, w, Wp, C, hlitf(r, 6, &bad));
+        }
+        break;
+    }
+    case GP_ENC_RESAMPLE_U8: {
+        /* x, y, bounds, k, outer, n, inner, sa, so, ks, off (the bytes of x before its first row) */
+        int64_t outer = hlit(r, 4, &bad), n = hlit(r, 5, &bad), inner = hlit(r, 6, &bad);
+        if (outer * n * inner > 0) {
+            k_enc_resample_u8<<<(unsigned)cdiv(outer * n * inner, T), T, 0, s>>>(
+                (const unsigned char *)(intptr_t)hi(r, g->henv, 0) + hlit(r, 10, &bad),
+                (unsigned char *)(intptr_t)hi(r, g->henv, 1), (const int *)(intptr_t)hi(r, g->henv, 2),
+                (const int *)(intptr_t)hi(r, g->henv, 3), outer, n, inner, hlit(r, 7, &bad), hlit(r, 8, &bad),
+                hlit(r, 9, &bad));
+        }
+        break;
+    }
+    case GP_ENC_THUMB_U8: {
+        /* x, taps, rows, cols, sums, ry0, ry1, rx0, rx1, nr, nc, ny, nx, w: the pixels of rows x cols (3
+         * channels), the channels' sums of ny x nx blocks */
+        const unsigned char *x = (const unsigned char *)(intptr_t)hi(r, g->henv, 0);
+        int64_t nr = hlit(r, 9, &bad), nc = hlit(r, 10, &bad), ny = hlit(r, 11, &bad), nx = hlit(r, 12, &bad);
+        int64_t w = hlit(r, 13, &bad);
+        if (nr * nc > 0) {
+            k_enc_take_u8<<<(unsigned)cdiv(nr * nc * 3, T), T, 0, s>>>(
+                x, (unsigned char *)(intptr_t)hi(r, g->henv, 1), (const int *)(intptr_t)hi(r, g->henv, 2),
+                (const int *)(intptr_t)hi(r, g->henv, 3), nr, nc, w, 3);
+        }
+        if (ny * nx > 0) {
+            k_enc_block_sums_u8<<<(unsigned)(ny * nx), 256, 0, s>>>(
+                x, (int *)(intptr_t)hi(r, g->henv, 4), (const int *)(intptr_t)hi(r, g->henv, 5),
+                (const int *)(intptr_t)hi(r, g->henv, 6), (const int *)(intptr_t)hi(r, g->henv, 7),
+                (const int *)(intptr_t)hi(r, g->henv, 8), nx, w);
+        }
+        break;
+    }
+    case GP_ENC_WARP: {
+        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy: a thread a pixel */
+        int64_t h = hlit(r, 5, &bad), w = hlit(r, 6, &bad), C = hlit(r, 7, &bad), xs = hlit(r, 8, &bad);
+        int64_t xo = hlit(r, 9, &bad), fs = hlit(r, 10, &bad), fo = hlit(r, 11, &bad), ys = hlit(r, 12, &bad);
+        int64_t yo = hlit(r, 13, &bad);
+        if (h > 0 && w > 0) {
+            k_enc_warp<<<(unsigned)cdiv(h * w, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                (float *)(intptr_t)hi(r, g->henv, 2), (const float *)(intptr_t)hi(r, g->henv, 3),
+                (const float *)(intptr_t)hi(r, g->henv, 4), h, w, C, xs, xo, fs, fo, ys, yo, hlitf(r, 14, &bad),
+                hlitf(r, 15, &bad));
+        }
+        break;
+    }
+    case GP_ENC_PRELU: {
+        /* x, y, rows, cols, a: a thread a value */
+        int64_t rows = hlit(r, 2, &bad), cols = hlit(r, 3, &bad);
+        if (rows > 0 && cols > 0) {
+            k_enc_prelu<<<(unsigned)cdiv(rows * cols, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), rows, cols,
+                (const float *)(intptr_t)hi(r, g->henv, 4));
+        }
+        break;
+    }
+    case GP_ENC_MIX: {
+        /* x, y, n, xs, ao, bo, mo, C, ys, yo: a thread a pixel */
+        int64_t n = hlit(r, 2, &bad);
+        if (n > 0) {
+            k_enc_mix<<<(unsigned)cdiv(n, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), n,
+                hlit(r, 3, &bad), hlit(r, 4, &bad), hlit(r, 5, &bad), hlit(r, 6, &bad), hlit(r, 7, &bad),
+                hlit(r, 8, &bad), hlit(r, 9, &bad));
+        }
+        break;
+    }
+    case GP_ENC_DIBR: {
+        /* img, s, keys, zb, tmp, out, H, W, off, stride, sign, gap, mode, iters, tol: interp.c's
+         * steps, a kernel each (keys zeroed, splat, resolve, stretch, the copy to out, then the
+         * fill: mode 0 once, mode 1 iters times with the copy back) */
+        const float *img = (const float *)(intptr_t)hi(r, g->henv, 0), *sv = (const float *)(intptr_t)hi(r, g->henv, 1);
+        unsigned long long *keys = (unsigned long long *)(intptr_t)hi(r, g->henv, 2);
+        float *zb = (float *)(intptr_t)hi(r, g->henv, 3), *tmp = (float *)(intptr_t)hi(r, g->henv, 4);
+        float *out = (float *)(intptr_t)hi(r, g->henv, 5);
+        int64_t H = hlit(r, 6, &bad), W = hlit(r, 7, &bad), off = hlit(r, 8, &bad), stride = hlit(r, 9, &bad);
+        float sign = (float)hlit(r, 10, &bad), gap = hlitf(r, 11, &bad), tol = hlitf(r, 14, &bad);
+        int mode = (int)hlit(r, 12, &bad), iters = (int)hlit(r, 13, &bad);
+        int64_t n = H * W;
+        if (n <= 0) {
+            break;
+        }
+        unsigned nb = (unsigned)cdiv(n, T);
+        cudaMemsetAsync(keys, 0, (size_t)n * 8, s);
+        k_dibr_splat<<<nb, T, 0, s>>>(sv, keys, H, W, sign, gap);
+        k_dibr_resolve<<<nb, T, 0, s>>>(img, sv, keys, zb, tmp, H, W, sign);
+        k_dibr_stretch<<<nb, T, 0, s>>>(keys, zb, tmp, H, W);
+        k_dibr_copy<<<nb, T, 0, s>>>(keys, tmp, out, H, W, off, stride, 0);
+        int steps = mode == 0 ? 1 : iters;
+        for (int it = 0; it < steps; ++it) {
+            k_dibr_fill<<<nb, T, 0, s>>>(keys, zb, tmp, out, H, W, off, stride, mode, tol);
+            if (mode == 1) {
+                k_dibr_copy<<<nb, T, 0, s>>>(keys, tmp, out, H, W, off, stride, 2);
+            }
+        }
+        break;
+    }
+    case GP_ENC_RESIZE_TAPS: {
+        /* x, y, n, h, w, H, W, C, ky, iy, wy, kx, ix, wx: a thread a value */
+        int64_t n = hlit(r, 2, &bad), h = hlit(r, 3, &bad), w = hlit(r, 4, &bad), H = hlit(r, 5, &bad);
+        int64_t W = hlit(r, 6, &bad), C = hlit(r, 7, &bad), ky = hlit(r, 8, &bad), kx = hlit(r, 11, &bad);
+        int64_t tot = n * H * W * C;
+        if (tot > 0) {
+            k_enc_resize_taps<<<(unsigned)cdiv(tot, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), n, h, w, H, W, C,
+                ky, (const int *)(intptr_t)hi(r, g->henv, 9), (const float *)(intptr_t)hi(r, g->henv, 10), kx,
+                (const int *)(intptr_t)hi(r, g->henv, 12), (const float *)(intptr_t)hi(r, g->henv, 13));
+        }
+        break;
+    }
+    case GP_ENC_UNPACK_U8: {
+        int64_t n = hlit(r, 2, &bad);
+        if (n > 0) {
+            k_enc_unpack_u8<<<(unsigned)cdiv(n, T), T, 0, s>>>((const unsigned char *)(intptr_t)hi(r, g->henv, 0),
+                                                               (float *)(intptr_t)hi(r, g->henv, 1), n,
+                                                               hlitf(r, 3, &bad));
+        }
+        break;
+    }
+    case GP_ENC_PACK_U8: {
+        int64_t n = hlit(r, 2, &bad);
+        if (n > 0) {
+            k_enc_pack_u8<<<(unsigned)cdiv(n, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
+                                                             (unsigned char *)(intptr_t)hi(r, g->henv, 1), n);
+        }
+        break;
+    }
+    case GP_ENC_DUPUP: {
+        /* x, out, h, w, cin, cout, ft, fs */
+        int h = (int)hlit(r, 2, &bad), w = (int)hlit(r, 3, &bad), cin = (int)hlit(r, 4, &bad);
+        int cout = (int)hlit(r, 5, &bad), ft = (int)hlit(r, 6, &bad), fs = (int)hlit(r, 7, &bad);
+        int64_t n = (int64_t)fs * h * fs * w * cout;
+        if (n > 0 && cin > 0) {
+            k_enc_dupup<<<(unsigned)cdiv(n, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
+                                                           (float *)(intptr_t)hi(r, g->henv, 1), h, w, cin, cout,
+                                                           ft, fs);
+        }
+        break;
+    }
+    case GP_ENC_F20_PACK: {
+        /* x, y, rows, cols: a warp a group of 32 values */
+        int64_t rows = hlit(r, 2, &bad), cols = hlit(r, 3, &bad);
+        if (rows > 0 && cols > 0 && cols % 32 == 0) {
+            k_enc_f20_pack<<<(unsigned)cdiv(rows * cols, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (uint8_t *)(intptr_t)hi(r, g->henv, 1), rows, (int)cols);
+        } else if (rows > 0) {
+            bad = 1;
+        }
+        break;
+    }
+    case GP_ENC_F20_UNPACK: {
+        /* x, y, rows, cols: a thread a value */
+        int64_t rows = hlit(r, 2, &bad), cols = hlit(r, 3, &bad);
+        if (rows > 0 && cols > 0) {
+            k_enc_f20_unpack<<<(unsigned)cdiv(rows * cols, T), T, 0, s>>>(
+                (const uint8_t *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), rows, (int)cols);
+        }
+        break;
+    }
+    case GP_ENC_ATTN_WIDE: {
+        /* q, k, v, o, s (chunk x n), vt (hd x n), n, hd, chunk: one head of hd (any) over all n
+         * keys, scale 1, in float32: v transposed into vt, then for each part of chunk queries
+         * the scores into s (k_enc_gemm), their softmax, and o = s vt^T (k_enc_gemm) */
+        int n = (int)hlit(r, 6, &bad), hd = (int)hlit(r, 7, &bad), ch = (int)hlit(r, 8, &bad);
+        if (n <= 0 || hd <= 0 || ch <= 0) {
+            bad = 1;
+            break;
+        }
+        const float *q = (const float *)(intptr_t)hi(r, g->henv, 0), *k = (const float *)(intptr_t)hi(r, g->henv, 1);
+        const float *v = (const float *)(intptr_t)hi(r, g->henv, 2);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3), *sc = (float *)(intptr_t)hi(r, g->henv, 4);
+        float *vt = (float *)(intptr_t)hi(r, g->henv, 5);
+        k_transpose<<<dim3((unsigned)cdiv(hd, 32), (unsigned)cdiv(n, 32)), dim3(32, 8), 0, s>>>(v, vt, n, hd);
+        for (int r0 = 0; r0 < n; r0 += ch) {
+            int nr = n - r0 < ch ? n - r0 : ch;
+            k_enc_gemm<<<dim3((unsigned)cdiv(n, 64), (unsigned)cdiv(nr, 64)), 256, 0, s>>>(
+                q + (size_t)r0 * hd, k, 0, NULL, sc, nr, n, hd, -INFINITY, INFINITY, -INFINITY, INFINITY);
+            k_softmax_rows<<<(unsigned)nr, 256, 0, s>>>(sc, n);
+            k_enc_gemm<<<dim3((unsigned)cdiv(hd, 64), (unsigned)cdiv(nr, 64)), 256, 0, s>>>(
+                sc, vt, 0, NULL, o + (size_t)r0 * hd, nr, hd, n, -INFINITY, INFINITY, -INFINITY, INFINITY);
+        }
+        break;
+    }
+    case GP_ENC_ELU: {
+        /* x, y, n */
+        int64_t n = hlit(r, 2, &bad);
+        if (n > 0) {
+            k_enc_elu<<<(unsigned)cdiv(n, T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), n);
+        }
+        break;
+    }
+    case GP_ENC_SCATTER: {
+        /* x, idx, y, n, cols: a block of 128 threads a row */
+        int n = (int)hlit(r, 3, &bad);
+        if (n > 0) {
+            k_enc_scatter<<<(unsigned)n, 128, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+                (float *)(intptr_t)hi(r, g->henv, 2), n, (int)hlit(r, 4, &bad));
+        }
+        break;
+    }
+    case GP_ENC_ATTN_KV: {
+        /* q, k, v, o, lo, hi, n, heads, hd, span, kv_heads: k_enc_attn_kv_part<hd / 32> on the S
+         * parts of EKV_C keys of a span (the longest range), their sums in xh; then k_enc_attn_kv_join */
+        int n = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad), hd = (int)hlit(r, 8, &bad);
+        int kvh = (int)hlit(r, 10, &bad);
+        kvh = kvh > 0 ? kvh : heads;
+        int S = (int)cdiv(hlit(r, 9, &bad), EKV_C);
+        size_t np = (size_t)n * heads * S * (hd + 2);
+        if (n <= 0 || S <= 0) {
+            break;
+        }
+        if (2 * np > g->xh_n || (hd != 32 && hd != 64 && hd != 128) || heads % kvh != 0) {
+            bad = 1;
+            break;
+        }
+        dim3 grid((unsigned)n, (unsigned)heads, (unsigned)S);
+        const float *q = (const float *)(intptr_t)hi(r, g->henv, 0), *k = (const float *)(intptr_t)hi(r, g->henv, 1);
+        const float *v = (const float *)(intptr_t)hi(r, g->henv, 2);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3), *part = (float *)g->xh;
+        const int *lo = (const int *)(intptr_t)hi(r, g->henv, 4), *hi_ = (const int *)(intptr_t)hi(r, g->henv, 5);
+        if (hd == 32) {
+            k_enc_attn_kv_part<1><<<grid, 128, 0, s>>>(q, k, v, lo, hi_, heads, part, kvh);
+        } else if (hd == 64) {
+            k_enc_attn_kv_part<2><<<grid, 128, 0, s>>>(q, k, v, lo, hi_, heads, part, kvh);
+        } else {
+            k_enc_attn_kv_part<4><<<grid, 128, 0, s>>>(q, k, v, lo, hi_, heads, part, kvh);
+        }
+        k_enc_attn_kv_join<<<dim3((unsigned)n, (unsigned)heads), (unsigned)hd, 0, s>>>(part, o, heads, hd, S);
+        break;
+    }
+    case GP_ENC_GATHER_MM: {
+        /* x, idx, out, w (KQ_BF12 rows), rows, cols, t, blocks, gc (cols / blocks), the rows of x,
+         * xready (gg_gemm_bf12_gather) */
+        int64_t rows = hlit(r, 4, &bad), cols = hlit(r, 5, &bad), t = hlit(r, 6, &bad);
+        int64_t nb = hlit(r, 7, &bad), gc = hlit(r, 8, &bad), src = hlit(r, 9, &bad);
+        if (!bf16_tc_on() || gc % 32 != 0 || nb * gc != cols ||
+            (size_t)src * gc * (bf16_tc_on() != 8 ? 2 : 1) > g->xh_n) {
+            bad = 1;
+            break;
+        }
+        gg_gemm_bf12_gather((const float *)(intptr_t)hi(r, g->henv, 0), (int)src, (int)gc,
+                            (const int *)(intptr_t)hi(r, g->henv, 1), (int)nb,
+                            (const uint8_t *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 2),
+                            (int)t, (int)rows, (uint16_t *)g->xh, s, (int)hlit(r, 10, &bad));
+        break;
+    }
+    case GP_ENC_ROPE1D: {
+        /* x, pos, inv, n, heads, hd */
+        int n = (int)hlit(r, 3, &bad), heads = (int)hlit(r, 4, &bad), hd = (int)hlit(r, 5, &bad);
+        int64_t total = (int64_t)n * heads * (hd / 2);
+        k_enc_rope1d<<<(unsigned)cdiv(total, T), T, 0, s>>>(
+            (float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+            (const float *)(intptr_t)hi(r, g->henv, 2), n, heads, hd);
+        break;
+    }
+    case GP_ENC_ATTN_X2: {
+        /* q, k, v, o, lo, hi, n, heads, hd: k_enc_attn_x2 (q, k, v as two bfloat16 planes in xh) */
+        int n = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad), hd = (int)hlit(r, 8, &bad);
+        size_t nE = (size_t)n * heads * hd;
+        const int *lo = (const int *)(intptr_t)hi(r, g->henv, 4), *hi_ = (const int *)(intptr_t)hi(r, g->henv, 5);
+        if (!(enc_tc_on() && gg_tc && g->tc) && hd % 4 == 0 && hd <= 128 &&
+            (hi(r, g->henv, 0) | hi(r, g->henv, 1) | hi(r, g->henv, 2) | hi(r, g->henv, 3)) % 16 == 0) {
+            /* no tensor cores (Pascal, Maxwell): float32, k_enc_attn_tile */
+            enc_attn_tile((const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                          (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3), lo, hi_,
+                          n, heads, hd, s);
+            break;
+        }
+        if (!(enc_tc_on() && gg_tc && g->tc) || hd % 8 != 0 || hd > 128 || 6 * nE > g->xh_n) {
+            bad = 1;
+            break;
+        }
+        uint16_t *xh = (uint16_t *)g->xh;
+        for (int a = 0; a < 3; ++a) {
+            k_to_bf16<<<(unsigned)((nE + 255) / 256), 256, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, a), nE,
+                                                                  NULL, xh + 2 * a * nE, 1, (int)nE,
+                                                                  xh + (2 * a + 1) * nE);
+        }
+        dim3 grid((unsigned)cdiv(n, EA_Q), (unsigned)heads);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3);
+        if (hd <= 64) {
+            k_enc_attn_x2<64><<<grid, 128, EAX_SMEM(64), s>>>(xh, xh + 2 * nE, xh + 4 * nE, nE, nE, o, lo, hi_, n, heads,
+                                                              hd);
+        } else {
+            static int attr = 0;
+            if (!attr) {
+                cudaFuncSetAttribute(k_enc_attn_x2<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)EAX_SMEM(128));
+                attr = 1;
+            }
+            k_enc_attn_x2<128><<<grid, 128, EAX_SMEM(128), s>>>(xh, xh + 2 * nE, xh + 4 * nE, nE, nE, o, lo, hi_, n,
+                                                                  heads, hd);
+        }
+        break;
+    }
+    case GP_ENC_ATTN_X2C: {
+        /* q, k, v, kc, vc, o, lo, hi, nq, nc, heads, hd: the planes in xh, q's nq rows (2 nEq), then k's and
+         * v's nq + nc rows each (2 nEk): their first nq rows of k and v (k_to_bf16), the cache's nc rows
+         * decoded from F20 (k_f20_to_bf16); then k_enc_attn_x2 of the nq queries */
+        int nq = (int)hlit(r, 8, &bad), nc = (int)hlit(r, 9, &bad), heads = (int)hlit(r, 10, &bad);
+        int hd = (int)hlit(r, 11, &bad), cols = heads * hd;
+        size_t nEq = (size_t)nq * cols, nEk = (size_t)(nq + nc) * cols;
+        if (!(enc_tc_on() && gg_tc && g->tc) || hd % 8 != 0 || hd > 128 || cols % 32 != 0 ||
+            2 * nEq + 4 * nEk > g->xh_n) {
+            bad = 1;
+            break;
+        }
+        uint16_t *qp = (uint16_t *)g->xh, *kp = qp + 2 * nEq, *vp = kp + 2 * nEk;
+        const int *lo = (const int *)(intptr_t)hi(r, g->henv, 6), *hi_ = (const int *)(intptr_t)hi(r, g->henv, 7);
+        k_to_bf16<<<(unsigned)((nEq + 255) / 256), 256, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0), nEq, NULL,
+                                                              qp, 1, (int)nEq, qp + nEq);
+        for (int a = 0; a < 2; ++a) {
+            uint16_t *p = a ? vp : kp;
+            k_to_bf16<<<(unsigned)((nEq + 255) / 256), 256, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 1 + a), nEq,
+                                                                  NULL, p, 1, (int)nEq, p + nEk);
+            if (nc > 0) {
+                k_f20_to_bf16<<<(unsigned)cdiv((int64_t)nc * cols, 256), 256, 0, s>>>(
+                    (const uint8_t *)(intptr_t)hi(r, g->henv, 3 + a), p + nEq, p + nEk + nEq, nc, cols);
+            }
+        }
+        dim3 grid((unsigned)cdiv(nq, EA_Q), (unsigned)heads);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 5);
+        if (hd <= 64) {
+            k_enc_attn_x2<64><<<grid, 128, EAX_SMEM(64), s>>>(qp, kp, vp, nEq, nEk, o, lo, hi_, nq, heads, hd);
+        } else {
+            static int attr = 0;
+            if (!attr) {
+                cudaFuncSetAttribute(k_enc_attn_x2<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)EAX_SMEM(128));
+                attr = 1;
+            }
+            k_enc_attn_x2<128><<<grid, 128, EAX_SMEM(128), s>>>(qp, kp, vp, nEq, nEk, o, lo, hi_, nq, heads, hd);
+        }
+        break;
+    }
+    case GP_ENC_ATTN_TILE: {
+        /* q, k, v, o, lo, hi, n, heads, hd: k_enc_attn_tile (float32; float4 rows) */
+        int n = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad), hd = (int)hlit(r, 8, &bad);
+        const float *q = (const float *)(intptr_t)hi(r, g->henv, 0), *k = (const float *)(intptr_t)hi(r, g->henv, 1);
+        const float *v = (const float *)(intptr_t)hi(r, g->henv, 2);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3);
+        if (hd % 4 != 0 || hd > 128 || ((uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)o) % 16 != 0) {
+            bad = 1;
+            break;
+        }
+        const int *lo = (const int *)(intptr_t)hi(r, g->henv, 4), *hi_ = (const int *)(intptr_t)hi(r, g->henv, 5);
+        enc_attn_tile(q, k, v, o, lo, hi_, n, heads, hd, s);
+        break;
+    }
+    case GP_ENC_ATTN_RANGE: {
+        /* q, k, v, o, lo, hi, n, heads, kv_heads, hd */
+        int n = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad);
+        int kvh = (int)hlit(r, 8, &bad), hd = (int)hlit(r, 9, &bad);
+        if (hd > 512 || hd % 32 != 0 || kvh <= 0 || heads % kvh != 0) {
+            bad = 1;
+            break;
+        }
+        size_t smem = (size_t)(EAR_K * (hd + 1) + EAR_W * hd) * sizeof(float);
+        dim3 grid((unsigned)cdiv(n, EAR_W), (unsigned)heads);
+        const float *q = (const float *)(intptr_t)hi(r, g->henv, 0), *k = (const float *)(intptr_t)hi(r, g->henv, 1);
+        const float *v = (const float *)(intptr_t)hi(r, g->henv, 2);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3);
+        const int *lo = (const int *)(intptr_t)hi(r, g->henv, 4), *hi_ = (const int *)(intptr_t)hi(r, g->henv, 5);
+        /* one kernel for each hd / 32 (k_enc_attn_range_t); hd of 512 takes 82 KB */
+#define EAR_CASE(NI)                                                                                    \
+        case NI: {                                                                                      \
+            static int set = 0;                                                                         \
+            if (smem > 48 * 1024 && !set) {                                                             \
+                cudaFuncSetAttribute(k_enc_attn_range_t<NI>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                     (int)smem);                                                        \
+                set = 1;                                                                                \
+            }                                                                                           \
+            k_enc_attn_range_t<NI><<<grid, 32 * EAR_W, smem, s>>>(q, k, v, o, lo, hi_, n, heads, kvh, hd); \
+            break;                                                                                      \
+        }
+        switch (hd / 32) {
+            EAR_CASE(1) EAR_CASE(2) EAR_CASE(3) EAR_CASE(4) EAR_CASE(5) EAR_CASE(6) EAR_CASE(7) EAR_CASE(8)
+            EAR_CASE(9) EAR_CASE(10) EAR_CASE(11) EAR_CASE(12) EAR_CASE(13) EAR_CASE(14) EAR_CASE(15) EAR_CASE(16)
+        }
+#undef EAR_CASE
         break;
     }
     case GP_ENC_ATTN: {
@@ -705,66 +1265,116 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         float *act = (float *)(intptr_t)hlit(r, 17, &bad);
         float *act2 = (float *)(intptr_t)hlit(r, 18, &bad);
         float *de = (float *)(intptr_t)hlit(r, 19, &bad);
+        /* operand 23 (or none, 0): win, the pairs of a window (models/gemma4/gpu.py MOE_WIN, the KQ_Q4X
+         * experts; group.cu k_moe_order): act, act2 and de hold one window's pairs (win + GM rows), and each
+         * window's outputs go into the tokens' rows after it */
+        const int64_t win = r->tag[23] != GP_T_NONE ? hlit(r, 23, &bad) : 0;
+        const int nw = win > 0 && win < pairs ? (int)cdiv(pairs, win) : 1;
+        if (nw > 1 && hlit(r, 5, &bad) != 1) {
+            snprintf(gg_error, sizeof(gg_error), "GP_MOE_GPU: a window of the pairs needs the KQ_Q4X experts");
+            return -1;
+        }
         k_moe_sort<<<1, 1024, 0, s>>>(dr, denv);
-        k_moe_tiles<<<1, 1, 0, s>>>(dr, denv);
+        if (nw > 1) {
+            k_moe_order<<<MOE_EXPERTS_MAX, 256, 0, s>>>(dr, denv);
+        } else {
+            k_moe_tiles<<<1, 1, 0, s>>>(dr, denv);
+        }
         if (hlit(r, 5, &bad) == 1) {
-            /* KQ_Q4X experts: int8 x on the tensor cores (k_moe_gemm_q4x), as
-             * the int8 x of the prompt of the CPU (the flag tc of the program
-             * is about the float16 products of the other layout) */
+            /* KQ_Q4X experts: int8 or int16 x (below) on the tensor cores (k_moe_gemm_q4x), or on dp4a
+             * (the flag tc of the program is about the float16 products of the other layout) */
             int kd = !kt_on() && kt_dp4a_on();      /* Pascal: the tiles on dp4a */
+            /* with windows the int8 rows of a window's act2 go after those of h (h is quantized once) */
+            const size_t ho = nw > 1 ? (size_t)t * cols : 0;
+            const size_t an = (size_t)(nw > 1 && win + GM < pairs ? win + GM : pairs) * inner;
             if (!((kt_on() || kd) && gu_rows % KT_BN == 0 && dn_rows % KT_BN == 0 &&
                   cols % 32 == 0 && inner % 32 == 0 && (size_t)t * cols <= g->kqx_n &&
-                  (size_t)pairs * inner <= g->kqx_n)) {
+                  ho + an <= g->kqx_n)) {
                 snprintf(gg_error, sizeof(gg_error),
                          "GP_MOE_GPU with KQ_Q4X needs the tensor cores or dp4a (kt %d, rows %d %d, "
                          "x %zu %zu of %zu)", kt_on(), gu_rows, dn_rows, (size_t)(t * cols),
-                         (size_t)(pairs * inner), g->kqx_n);
+                         ho + an, g->kqx_n);
                 return -1;
             }
             float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
-            if (kd) {
-                int x2 = g->i8 == 2;
-                dim3 ggu((unsigned)(gu_rows / KT_BN), max_tiles), gdn((unsigned)(dn_rows / KT_BN), max_tiles);
-                if (x2) {
-                    kt_quant_x2(g, h, (size_t)(t * cols));
-                    k_moe_gemm_q4x_dp4a<1><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu,
-                                                               gu_rows, cols, act, kt_lo(g));
-                } else {
-                    kt_quant(g, h, (size_t)(t * cols));
-                    k_moe_gemm_q4x_dp4a<0><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu,
-                                                               gu_rows, cols, act, NULL);
-                }
-                k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
-                if (x2) {
-                    kt_quant_x2(g, act2, (size_t)(pairs * inner));
-                    k_moe_gemm_q4x_dp4a<1><<<gdn, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 0, dn,
-                                                               dn_rows, inner, de, kt_lo(g));
-                } else {
-                    kt_quant(g, act2, (size_t)(pairs * inner));
-                    k_moe_gemm_q4x_dp4a<0><<<gdn, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 0, dn,
-                                                               dn_rows, inner, de, NULL);
-                }
-            } else if (g->i8 == 2) {
-                /* the int16 form of h and of the GELU (k_quant_x2) */
-                size_t sm = KT_SMEM_X2(64, 2);
+            /* x as int16 (two int8 planes, q = 128 hi + lo: k_quant_x2) unless the program asks for int8
+             * (i8 1): KQ_Q4X has no float32 product, and a program of float32 products (i8 0, the 26B)
+             * takes the nearest form (RECLANK_GPU_Q4X_X2=0: int8). The 26B's experts on int8 x (and the CPU's
+             * pairs: gpu.py MIX_X16) gave the last token of a prompt of 1024 KL 0.049 to the float32 experts
+             * on the Quadro P1000, int16 0.006; its prompt of 2048 151 -> 131 tok/s (AVX2, 4 threads). The
+             * RTX 3060: 613 tok/s at 1024, against 510 for the float32 products of the Q4_0 experts */
+            const int x2 = g->i8 == 2 || (g->i8 == 0 && q4x_x2_on());
+            /* (the int16 form: the lo plane; kd: the tiles on dp4a, else the tensor cores) */
+            int8_t *lo = x2 ? kt_lo(g) : NULL;
+            const size_t sm = x2 ? KT_SMEM_X2(64, 2) : KT_SMEM(64, 3);
+            const dim3 ggu((unsigned)(gu_rows / KT_BN), max_tiles), gdn((unsigned)(dn_rows / KT_BN), max_tiles);
+            if (!kd) {
                 kt_attr();
+            }
+            if (x2) {
                 kt_quant_x2(g, h, (size_t)(t * cols));
-                k_moe_gemm_q4x<1><<<dim3((unsigned)(gu_rows / KT_BN), max_tiles), 256, sm, s>>>(
-                    dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, act, kt_lo(g));
-                k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
-                kt_quant_x2(g, act2, (size_t)(pairs * inner));
-                k_moe_gemm_q4x<1><<<dim3((unsigned)(dn_rows / KT_BN), max_tiles), 256, sm, s>>>(
-                    dr, denv, g->kqx, xs, xsum, 0, dn, dn_rows, inner, de, kt_lo(g));
             } else {
-                size_t sm = KT_SMEM(64, 3);
-                kt_attr();
                 kt_quant(g, h, (size_t)(t * cols));
-                k_moe_gemm_q4x<0><<<dim3((unsigned)(gu_rows / KT_BN), max_tiles), 256, sm, s>>>(
-                    dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, act, NULL);
-                k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
-                kt_quant(g, act2, (size_t)(pairs * inner));
-                k_moe_gemm_q4x<0><<<dim3((unsigned)(dn_rows / KT_BN), max_tiles), 256, sm, s>>>(
-                    dr, denv, g->kqx, xs, xsum, 0, dn, dn_rows, inner, de, NULL);
+            }
+            for (int w = 0; w < nw; ++w) {
+                const int64_t w0 = (int64_t)w * win, wn = nw > 1 ? (pairs - w0 < win ? pairs - w0 : win) : pairs;
+                if (nw > 1) {
+                    k_moe_tiles_w<<<1, 1, 0, s>>>(dr, denv, (int)w0, (int)(w0 + wn));
+                }
+                /* the products index act and de by the pairs' sorted places: a window's rows from w0 */
+                float *aw = act - w0 * gu_rows, *dw = de - w0 * dn_rows;
+                if (kd && x2) {
+                    k_moe_gemm_q4x_dp4a<1><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, aw,
+                                                               lo);
+                } else if (kd) {
+                    k_moe_gemm_q4x_dp4a<0><<<ggu, 256, 0, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, aw,
+                                                               NULL);
+                } else if (x2) {
+                    k_moe_gemm_q4x<1><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, aw, lo);
+                } else {
+                    k_moe_gemm_q4x<0><<<ggu, 256, sm, s>>>(dr, denv, g->kqx, xs, xsum, 1, gu, gu_rows, cols, aw,
+                                                           NULL);
+                }
+                if (nw > 1) {
+                    k_moe_gelu_w<<<(unsigned)cdiv(wn * inner, T), T, 0, s>>>(dr, denv, (int)w0, (int)wn);
+                } else {
+                    k_moe_gelu<<<(unsigned)cdiv(pairs * inner, T), T, 0, s>>>(dr, denv);
+                }
+                /* act2 (the window's rows) into the scratch at ho */
+                int8_t *aq = g->kqx + ho, *al = x2 ? lo + ho : NULL;
+                float *as = xs + ho / 32, *asum = xsum + ho / 32;
+                const size_t n2 = (size_t)wn * inner;
+                if (ho == 0 && x2) {
+                    kt_quant_x2(g, act2, n2);
+                } else if (ho == 0) {
+                    kt_quant(g, act2, n2);
+                } else if (x2) {
+                    k_quant_x2<<<(unsigned)cdiv((int64_t)(n2 / 32) * 8, 256), 256, 0, s>>>(act2, aq, al, as, asum,
+                                                                                         n2 / 32);
+                } else {
+                    k_kq_quant_x<<<(unsigned)cdiv((int64_t)(n2 / 32) * 8, 256), 256, 0, s>>>(act2, aq, as, asum,
+                                                                                           n2 / 32);
+                }
+                const size_t ab = (size_t)w0 * inner;
+                if (kd) {
+                    if (x2) {
+                        k_moe_gemm_q4x_dp4a<1><<<gdn, 256, 0, s>>>(dr, denv, aq - ab, as - ab / 32, asum - ab / 32, 0,
+                                                                   dn, dn_rows, inner, dw, al - ab);
+                    } else {
+                        k_moe_gemm_q4x_dp4a<0><<<gdn, 256, 0, s>>>(dr, denv, aq - ab, as - ab / 32, asum - ab / 32, 0,
+                                                                   dn, dn_rows, inner, dw, NULL);
+                    }
+                } else if (x2) {
+                    k_moe_gemm_q4x<1><<<gdn, 256, sm, s>>>(dr, denv, aq - ab, as - ab / 32, asum - ab / 32, 0, dn,
+                                                           dn_rows, inner, dw, al - ab);
+                } else {
+                    k_moe_gemm_q4x<0><<<gdn, 256, sm, s>>>(dr, denv, aq - ab, as - ab / 32, asum - ab / 32, 0, dn,
+                                                           dn_rows, inner, dw, NULL);
+                }
+                if (nw > 1) {
+                    k_moe_sum_w<<<(unsigned)cdiv(t * dn_rows / 4, T), T, 0, s>>>(dr, denv, (int)w0, (int)(w0 + wn),
+                                                                           w == 0);
+                }
             }
         } else if (gg_tc && g->tc && cols % TK == 0 && inner % TK == 0 &&
             (size_t)t * cols <= g->xh_n && (size_t)pairs * inner <= g->xh_n) {
@@ -826,7 +1436,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_moe_gemm<<<dim3((unsigned)cdiv(dn_rows, GN), max_tiles), 256, 0, s>>>(
                 dr, denv, act2, 0, dn, dn_rows, inner, de);
         }
-        k_moe_sum<<<(unsigned)cdiv(t * dn_rows, T), T, 0, s>>>(dr, denv);
+        if (nw == 1) {
+            k_moe_sum<<<(unsigned)cdiv(t * dn_rows, T), T, 0, s>>>(dr, denv);
+        }
         break;
     }
     case GP_ROUTER:
@@ -958,7 +1570,8 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 KD_SWITCH(f, k_kq_dp4a, 0, gr, 0, xl);
             }
         } else if (hlit(r, 8, &bad) > MT_MAX) {
-            if (hlit(r, 7, &bad) % KG_K != 0) {
+            /* (bfloat16 rows: cols a multiple of 8, a VAE's conv_in of 16 channels by 3 x 3 on Pascal) */
+            if (hlit(r, 7, &bad) % KG_K != 0 && !(hlit(r, 5, &bad) == KQ_BF16 && hlit(r, 7, &bad) % 8 == 0)) {
                 bad = 1;
             }
             k_kq_gemm<<<dim3((unsigned)cdiv(hlit(r, 6, &bad), KG_B),
@@ -1200,19 +1813,29 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             const float *hx = (const float *)(intptr_t)hi(r, g->henv, 0);
             float *act = (float *)(intptr_t)hi(r, g->henv, 19), *de = (float *)(intptr_t)hi(r, g->henv, 21);
             const float *act2 = (const float *)(intptr_t)hi(r, g->henv, 20);
-            if (bad || !Ks ||
-                e3_group_moe_launch(0, dr, denv, (int)P, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
-                                    g->e3, g->e3_n, s, tiles, g->tc) != 0) {
-                bad = 1;
-                break;
+            /* the sort in windows of W rows (e3_win: act, act2, de and the
+             * workspace of W rows), each window's pairs added to the tokens'
+             * rows after it; the empty windows past the pairs of the group exit */
+            const int64_t W = e3_win(P);
+            if (W < P && qmoe_sort_par_on() && (E + 2) * 8 <= 48 * 1024) {
+                k_qmoe_place<<<(unsigned)E, 1024, 0, s>>>(dr, denv);
             }
-            k_qmoe_act<<<(unsigned)cdiv(P * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4);
-            if (e3_group_moe_launch(1, dr, denv, (int)P, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
-                                    g->e3, g->e3_n, s, tiles, g->tc) != 0) {
-                bad = 1;
-                break;
+            for (int64_t w0 = 0; w0 < P && !bad; w0 += W) {
+                const int win = W < P ? (int)W : 0;
+                if (!Ks ||
+                    e3_group_moe_launch(0, dr, denv, (int)W, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
+                                        g->e3, g->e3_n, s, tiles, g->tc, (int)w0) != 0) {
+                    bad = 1;
+                    break;
+                }
+                k_qmoe_act<<<(unsigned)cdiv(W * inner, T), T, 0, s>>>(dr, denv, gg_moe_rot & ~4, (int)w0, win);
+                if (e3_group_moe_launch(1, dr, denv, (int)W, (int)hidden, (int)inner, Kr, Kd, Ks, hx, act, act2, de,
+                                        g->e3, g->e3_n, s, tiles, g->tc, (int)w0) != 0) {
+                    bad = 1;
+                    break;
+                }
+                k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv, (int)w0, win);
             }
-            k_qmoe_sum<<<dim3((unsigned)cdiv(hidden, T), (unsigned)t), T, 0, s>>>(dr, denv);
             break;
         }
         /* the shared expert in bfloat16 (RECLANK_DENSE=bf16): the routed
@@ -1542,6 +2165,24 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_NM_SPLIT:
         k_nm_split<<<1, 256, 0, s>>>(dr, denv);
         break;
+    case GP_NM_TAKE:
+        if (hlit(r, 6, &bad) > NM_TAKE_E || hlit(r, 5, &bad) > 65535) {
+            bad = 1;
+            break;
+        }
+        if (hlit(r, 13, &bad) % 16 != 0 || hlit(r, 14, &bad) % 16 != 0) {
+            bad = 1;
+            break;
+        }
+        k_nm_take<<<1, 1024, 0, s>>>(dr, denv);
+        break;
+    case GP_NM_PULL:
+        if (hlit(r, 13, &bad) % 16 != 0 || hlit(r, 14, &bad) % 16 != 0) {
+            bad = 1;
+            break;
+        }
+        k_nm_pull<<<(unsigned)(gg_caps.sm_count > 0 ? gg_caps.sm_count : 16), 256, 0, s>>>(dr, denv);
+        break;
     case GP_NM_PLAN:
         if (hlit(r, 8, &bad) > NM_PLAN_E || hlit(r, 5, &bad) / hlit(r, 6, &bad) > NM_PLAN_T) {
             bad = 1;
@@ -1656,14 +2297,33 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 cudaFuncSetAttribute(k_nm_gtile_nv4<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sd);
                 set_d = sd;
             }
-            k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
-            k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            /* operand 23 (or none): a chunk of the experts and a window of its pairs, x0 | nx << 16 | pass << 32 |
+             * cap << 40 (nm.cu nm_window; the stage of a layer in chunks on a GPU of 12 GB, NemotronGPU.stage_c): the
+             * tiles of its experts; x's planes and the sort with the first chunk's first window; the sums with the last
+             * chunk, or (cap) of each window (k_nm_gsumw). The staged tiles only (operand 22); a window NV4T's */
+            int x0 = 0, nx = (int)E, pass = 0, cap = 0;
+            if (r->tag[23] != GP_T_NONE) {
+                const int64_t c = hlit(r, 23, &bad);
+                x0 = (int)(c & 0xffff);
+                nx = (int)((c >> 16) & 0xffff);
+                pass = (int)((c >> 32) & 0xff);
+                cap = (int)(c >> 40);
+                if (nx <= 0 || x0 + nx > E || r->tag[22] == GP_T_NONE || hlit(r, 22, &bad) == 0 ||
+                    (cap > 0 && hlit(r, 22, &bad) != 2)) {
+                    bad = 1;
+                    break;
+                }
+            }
+            if (x0 == 0 && pass == 0) {
+                k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+                k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            }
             dim3 gu((unsigned)E, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)E, (unsigned)cdiv(L, GM_BM));
             /* (the up tiles quantize the act themselves: operand 7 unused). Operand 22 (or none): the experts in
              * the GPU's memory (the stage buffers: k_nm_gtile_nv4c, 64 x 64 tiles) */
             if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) == 2 && L % 64 == 0 && inner % 64 == 0) {
                 /* the experts in NV4T (the stage buffers by k_nm_tile_pull): k_nm_gtile_nv4t */
-                dim3 cu((unsigned)(inner / 64), (unsigned)E), cd((unsigned)(L / 64), (unsigned)E);
+                dim3 cu((unsigned)(inner / 64), (unsigned)nx), cd((unsigned)(L / 64), (unsigned)nx);
                 if (x2) {
                     k_nm_gtile_nv4t<false, true><<<cu, 256, 0, s>>>(dr, denv);
                     k_nm_gtile_nv4t<true, true><<<cd, 256, 0, s>>>(dr, denv);
@@ -1672,7 +2332,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                     k_nm_gtile_nv4t<true, false><<<cd, 256, 0, s>>>(dr, denv);
                 }
             } else if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) != 0 && L % 64 == 0 && inner % 64 == 0 && nm_gc_on()) {
-                dim3 cu((unsigned)(inner / 64), (unsigned)E), cd((unsigned)(L / 64), (unsigned)E);
+                dim3 cu((unsigned)(inner / 64), (unsigned)nx), cd((unsigned)(L / 64), (unsigned)nx);
                 if (x2) {
                     k_nm_gtile_nv4c<false, true><<<cu, 256, 0, s>>>(dr, denv);
                     k_nm_gtile_nv4c<true, true><<<cd, 256, 0, s>>>(dr, denv);
@@ -1680,6 +2340,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                     k_nm_gtile_nv4c<false, false><<<cu, 256, 0, s>>>(dr, denv);
                     k_nm_gtile_nv4c<true, false><<<cd, 256, 0, s>>>(dr, denv);
                 }
+            } else if (nx != E) {
+                bad = 1;            /* (a chunk: the staged tiles only) */
+                break;
             } else if (x2) {
                 k_nm_gtile_nv4<false, true><<<gu, 256, su, s>>>(dr, denv);
                 k_nm_gtile_nv4<true, true><<<gd, 256, sd, s>>>(dr, denv);
@@ -1687,7 +2350,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 k_nm_gtile_nv4<false, false><<<gu, 256, su, s>>>(dr, denv);
                 k_nm_gtile_nv4<true, false><<<gd, 256, sd, s>>>(dr, denv);
             }
-            k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            if (cap > 0) {
+                k_nm_gsumw<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            } else if (x0 + nx == E) {
+                k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            }
             break;
         }
         if (L % 256 != 0 || L > 1024 || inner % 256 != 0 || inner > 256 * NM_GMAXB || E > 4096) {

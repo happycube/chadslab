@@ -1,5 +1,9 @@
 /* ---------- EXL3 MUL1 matrices (KQ_E3; EXL3_PLAN.md) ----------
  *
+ * Ported from ExLlamaV3 (turboderp-org/exllamav3,
+ * exllamav3/exllamav3_ext/quant; MIT License; Copyright (c) 2025 Turboderp).
+ * See THIRD_PARTY_NOTICES.md.
+ *
  * The form of backends/cpu/csrc/kernels/kq/exl3.c: a matrix of k inputs and
  * n outputs, K bits, is one block: the trellis of the file of ExLlamaV3
  * ((k / 16) (n / 16) tiles of 16 x 16 weights, 32 K bytes each), suh (k
@@ -547,7 +551,8 @@ __global__ void __launch_bounds__(256, 2) k_e3_mma(const uint8_t *wm, int k, int
 template <int K, bool X16>
 __global__ void __launch_bounds__(256, 2) k_e3g_mma(const gp_rec *r, const int64_t *e, int mode,
                                                  const uint8_t *const *tw, const int *ik, int k, int n,
-                                                 const int8_t *xq, const float *xs, int ni, float *part)
+                                                 const int8_t *xq, const float *xs, int ni, float *part,
+                                                 int w0, int wn)
 {
     const int *work = DP(const int, 18);
     const int tile = blockIdx.y;
@@ -556,7 +561,12 @@ __global__ void __launch_bounds__(256, 2) k_e3g_mma(const gp_rec *r, const int64
     }
     const int E = DI(5), P = DI(3) * DI(4) + DI(3);
     const int *tiles = work + 8 + 2 * (E + 2) + 2 * P;      /* (qmoe_work) */
-    const int p0 = tiles[3 * tile + 1], nt = tiles[3 * tile + 2];
+    /* the rows of the tile in the window of the sort [w0, w0 + wn) (the items' rows from w0) */
+    const int a0 = max(tiles[3 * tile + 1], w0), a1 = min(tiles[3 * tile + 1] + tiles[3 * tile + 2], w0 + wn);
+    if (a0 >= a1) {
+        return;
+    }
+    const int p0 = a0 - w0, nt = a1 - a0;
     const int nob = n / 128, m = mode == 0 ? (int)blockIdx.x / nob : 0, ob = blockIdx.x % nob;
     const int it = mode == 0 ? 2 * p0 + m : p0;
     const uint8_t *wm = tw[it];
@@ -939,6 +949,27 @@ static int e3_x16_on(void)
     return on;
 }
 
+/* The rows of a window of the sort of a GP_KQ_GROUP_MOE of P pairs of MUL1
+ * experts (RECLANK_GPU_E3_WIN, rows; 0: P): the products, act, act2 and de
+ * of one window at a time, each window's outputs added to the tokens' rows
+ * (k_qmoe_sum w0); its workspace (e3h_ws_bytes) and the program's act, act2
+ * and de (models/qwen/gpu35.py, rc_gpu_e3_win) of these rows. Qwen3.8,
+ * a mixed group of 4096 rows: 45056 pairs, 1.97 GB, in 4 windows of 11264
+ * rows (0.49 GB). */
+static int64_t e3_win(int64_t P)
+{
+    static int64_t rows = -1;
+    if (rows < 0) {
+        const char *v = getenv("RECLANK_GPU_E3_WIN");
+        rows = v != NULL ? atoll(v) : 12288;
+    }
+    if (rows <= 0 || P <= rows) {
+        return P;
+    }
+    int64_t nw = (P + rows - 1) / rows;
+    return ((P + nw - 1) / nw + 63) / 64 * 64;
+}
+
 /* The bytes of the scratch of a GP_KQ_HOT_MOE of P pairs; x16: of a
  * GP_KQ_GROUP_MOE with int16 x (the int16 rows of gate and up, which the
  * rows of down take after them). */
@@ -1028,7 +1059,7 @@ static int e3_hot_moe_launch(const gp_rec *dr, const int64_t *denv, int t, int k
  * (operand 21), and k_qmoe_sum adds them up. A row past the sorted rows
  * (work[1]) has no matrix. */
 __global__ void k_e3g_setup(const gp_rec *r, const int64_t *e, int P, int Kr, int Kd, int Ks,
-                            const uint8_t **tw, const uint8_t **su, const uint8_t **sv, int *xr, int *ik)
+                            const uint8_t **tw, const uint8_t **su, const uint8_t **sv, int *xr, int *ik, int w0)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= P) {
@@ -1038,11 +1069,12 @@ __global__ void k_e3g_setup(const gp_rec *r, const int64_t *e, int P, int Kr, in
     const int *work = DP(const int, 18);
     const int *start = work + 8 + E + 2, *ptok = start + E + 2;
     int x = -1;
-    if (p < work[1]) {
-        int lo = 0, hi = E;                     /* the expert x with start[x] <= p < start[x + 1] */
+    const int pg = w0 + p;                      /* (row pg of the sort: item rows from the window's w0) */
+    if (pg < work[1]) {
+        int lo = 0, hi = E;                     /* the expert x with start[x] <= pg < start[x + 1] */
         while (lo < hi) {
             int mid = (lo + hi + 1) / 2;
-            if (start[mid] <= p) {
+            if (start[mid] <= pg) {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -1061,7 +1093,7 @@ __global__ void k_e3g_setup(const gp_rec *r, const int64_t *e, int P, int Kr, in
         tw[it] = w;
         su[it] = w != NULL ? w + (size_t)hidden * inner * K / 8 : NULL;
         sv[it] = w != NULL ? su[it] + 2 * (size_t)kin : NULL;
-        xr[it] = part < 2 ? (x >= 0 ? ptok[p] : 0) : p;
+        xr[it] = part < 2 ? (x >= 0 ? ptok[pg] : 0) : p;
         ik[it] = K;
     }
 }
@@ -1070,14 +1102,14 @@ __global__ void k_e3g_setup(const gp_rec *r, const int64_t *e, int P, int Kr, in
  * GP_KQ_GROUP_MOE of P pairs (rows of the sort). ws: e3h_ws_bytes(P, ...). */
 static void e3g_mma(int K, int mode, const gp_rec *dr, const int64_t *denv, const uint8_t *const *tw, const int *ik,
                     int k, int n, const int8_t *xq, const float *xs, int ni, float *part, unsigned tiles,
-                    cudaStream_t s, int x16)
+                    cudaStream_t s, int x16, int w0, int wn)
 {
     dim3 g((unsigned)((mode == 0 ? 2 : 1) * (n / 128)), tiles);
 #define E3_GCASE(KK) case KK: \
         if (x16) { \
-            k_e3g_mma<KK, true><<<g, 256, 0, s>>>(dr, denv, mode, tw, ik, k, n, xq, xs, ni, part); \
+            k_e3g_mma<KK, true><<<g, 256, 0, s>>>(dr, denv, mode, tw, ik, k, n, xq, xs, ni, part, w0, wn); \
         } else { \
-            k_e3g_mma<KK, false><<<g, 256, 0, s>>>(dr, denv, mode, tw, ik, k, n, xq, xs, ni, part); \
+            k_e3g_mma<KK, false><<<g, 256, 0, s>>>(dr, denv, mode, tw, ik, k, n, xq, xs, ni, part, w0, wn); \
         } \
         break;
     switch (K) {
@@ -1088,10 +1120,11 @@ static void e3g_mma(int K, int mode, const gp_rec *dr, const int64_t *denv, cons
 
 /* tiles: the most tiles of the sort (the grid of k_e3g_mma); tc: the tensor
  * cores may run (as e3_linear_launch): the products of each tile of an
- * expert (k_e3g_mma), else the GEMV of each item. */
+ * expert (k_e3g_mma), else the GEMV of each item. w0: the first row of the
+ * sort of a window of P rows (e3_win; act, act2 and de have its rows). */
 static int e3_group_moe_launch(int phase, const gp_rec *dr, const int64_t *denv, int P, int hidden, int inner,
                                int Kr, int Kd, int Ks, const float *x, float *act, const float *act2, float *de,
-                               uint8_t *ws, size_t ws_n, cudaStream_t s, unsigned tiles = 0, int tc = 0)
+                               uint8_t *ws, size_t ws_n, cudaStream_t s, unsigned tiles = 0, int tc = 0, int w0 = 0)
 {
     const int mma = tc && e3_tc_on() && tiles > 0, x16 = mma && e3_x16_on();
     if (hidden % 128 || inner % 128 || ws == NULL || ws_n < e3h_ws_bytes(P, hidden, inner, x16)) {
@@ -1118,12 +1151,12 @@ static int e3_group_moe_launch(int phase, const gp_rec *dr, const int64_t *denv,
         aq = xq;        /* (2 P inner of the 4 P hidden bytes: those of gate and up are done) */
     }
     if (phase == 0) {
-        k_e3g_setup<<<(unsigned)((P + 127) / 128), 128, 0, s>>>(dr, denv, P, Kr, Kd, Ks, tw, su, sv, xr, ik);
+        k_e3g_setup<<<(unsigned)((P + 127) / 128), 128, 0, s>>>(dr, denv, P, Kr, Kd, Ks, tw, su, sv, xr, ik, w0);
         e3b_had_in_rows(nh, 2 * P, s, x, (size_t)hidden, xr, tw, su, hidden, xq, xs, xn, mma, x16);
         if (mma) {
-            e3g_mma(Kr, 0, dr, denv, tw, ik, hidden, inner, xq, xs, 2 * P, part, tiles, s, x16);
+            e3g_mma(Kr, 0, dr, denv, tw, ik, hidden, inner, xq, xs, 2 * P, part, tiles, s, x16, w0, P);
             if (Ks != Kr) {
-                e3g_mma(Ks, 0, dr, denv, tw, ik, hidden, inner, xq, xs, 2 * P, part, tiles, s, x16);
+                e3g_mma(Ks, 0, dr, denv, tw, ik, hidden, inner, xq, xs, 2 * P, part, tiles, s, x16, w0, P);
             }
             e3b_had_out_rows(ni, 2 * P, s, part, 1, 2 * P, inner, xs, xn, nh, tw, sv, act, (size_t)inner);
             return 0;
@@ -1140,9 +1173,9 @@ static int e3_group_moe_launch(int phase, const gp_rec *dr, const int64_t *denv,
     e3b_had_in_rows(ni, P, s, act2, (size_t)inner, xr + 2 * P, tw + 2 * P, su + 2 * P, inner, aq, as, an, mma,
                     x16);
     if (mma) {
-        e3g_mma(Kd, 1, dr, denv, tw + 2 * P, ik + 2 * P, inner, hidden, aq, as, P, pdn, tiles, s, x16);
+        e3g_mma(Kd, 1, dr, denv, tw + 2 * P, ik + 2 * P, inner, hidden, aq, as, P, pdn, tiles, s, x16, w0, P);
         if (Ks != Kd) {
-            e3g_mma(Ks, 1, dr, denv, tw + 2 * P, ik + 2 * P, inner, hidden, aq, as, P, pdn, tiles, s, x16);
+            e3g_mma(Ks, 1, dr, denv, tw + 2 * P, ik + 2 * P, inner, hidden, aq, as, P, pdn, tiles, s, x16, w0, P);
         }
         e3b_had_out_rows(nh, P, s, pdn, 1, P, hidden, as, an, ni, tw + 2 * P, sv + 2 * P, de, (size_t)hidden);
         return 0;

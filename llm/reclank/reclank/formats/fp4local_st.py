@@ -1,6 +1,13 @@
 """Qwen3.8-Flash-Next from nvidia/Qwen3.8-Flash-Next-FP4-Local (docs/FP4LOCAL_PLAN.md):
 NVIDIA's QAD checkpoint (ModelOpt 0.47.0, quant_algo MIXED_PRECISION).
 
+Ported from flashinfer's b12x (local-inference-lab/flashinfer,
+scripts/convert_csf_blocks.py and flashinfer/experimental/b12x; Apache License 2.0;
+Copyright (c) 2025 by the b12x authors; Copyright 2023-2026 FlashInfer community;
+Copyright 2025-2026 NVIDIA) and vLLM (local-inference-lab/vllm,
+vllm/models/qwen4_exp/nvidia; Apache License 2.0; Copyright contributors to the vLLM
+project). See THIRD_PARTY_NOTICES.md.
+
 FP4LSource is NVFP4Source (reclank/formats/nvfp4_st.py: the GGUF view that
 reclank/models/qwen/qwen38.py reads) on the tensors of this checkpoint:
 

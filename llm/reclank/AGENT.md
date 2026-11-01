@@ -32,8 +32,11 @@ reclank/                  the package
                           emit, finish, run, profile, run_py
   core/                   sampling, speculative (MTP), session, think_guard
   formats/                the weight files: gguf, safetensors, nvfp4_st, iq2, exl3, ...
-  runtime/                threads, numa, weightkeeper (weights kept in shared memory)
+  runtime/                threads, numa, weightkeeper (weights kept in shared memory;
+                          several at once by --name, each its own socket)
   encoders/               the media encoders (vision, audio)
+  setup/                  python -m reclank.setup: the machine, the model table
+                          (catalog.py: a Model an entry), the first-use guide
   models/<family>/        the model code; engine.py is the server interface
                           (models/base.py); keep*.py the weightkeeper plugins
   backends/

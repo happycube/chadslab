@@ -1,5 +1,10 @@
 """Run the Gemma 4 12B model with NumPy only.
 
+Ported from transformers (src/transformers/models/gemma4/modeling_gemma4.py,
+Copyright 2026 the HuggingFace Team;
+models/gemma4_unified/modeling_gemma4_unified.py, Copyright 2026 the
+HuggingFace Team; Apache License 2.0). See THIRD_PARTY_NOTICES.md.
+
 The model has 48 decoder layers. This module gives two classes:
     KVCache  Store the keys and values of each layer.
     Model    Load the weights and run the model.

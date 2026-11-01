@@ -964,8 +964,16 @@ static int al16(int64_t p)
 /* The kernels of the media encoders (defined with their entry points below). */
 __global__ void k_enc_gemm(const float *x, const void *w, int wbf, const float *b, float *y,
                            int n, int m, int k, float imin, float imax, float omin, float omax);
+struct RifeTmps;
+static void enc_rife_in(const gp_rec *r, const int64_t *e, int *bad, cudaStream_t s);
+static void enc_rife_out(const gp_rec *r, const int64_t *e, int *bad, cudaStream_t s);
+static void enc_conv_mm(const float *src, const int *idx, const float *w, const float *b, const float *res,
+                        const float *slope, float *y, int n, int m, int taps, int cin, const int *scat, int blk,
+                        int sms, cudaStream_t s);
+static void enc_sgemm(const float *x, const void *w, int f20, const float *b, float *y, int n, int m, int k,
+                      float imin, float imax, float omin, float omax, int sms, cudaStream_t s);
 __global__ void k_enc_rms(const float *x, const float *w, float *y, int rows, int d, float eps);
-__global__ void k_enc_gelu_mul(const float *g, const float *u, float *y, int64_t n);
+__global__ void k_enc_gelu_mul(const float *g, const float *u, float *y, int64_t n, int use_erf);
 __global__ void k_enc_lnorm(const float *x, const float *w, const float *b, float *y, int rows,
                             int d, float eps);
 __global__ void k_enc_gelu(const float *x, float *y, int64_t n, int use_erf);
@@ -983,10 +991,114 @@ __global__ void k_enc_local_attn(const float *q, const float *k, const float *v,
 __global__ void k_enc_rope2d(float *x, const int *pos, const float *inv, int n, int heads, int hd);
 __global__ void k_enc_attn(const float *q, const float *k, const float *v, float *o,
                            int n, int heads, int hd);
+__global__ void k_enc_rope1d(float *x, const int *pos, const float *inv, int n, int heads, int hd);
+__global__ void k_enc_gather(const float *x, const int *idx, float *y, int64_t nb, int cols);
+#define ELN_V 8
+__global__ void k_enc_lnorm_row(const float *x, const float *w, const float *b, float *y, int d, float eps);
+#define EGN_R 256
+__global__ void k_enc_gnorm_part(const float *x, int64_t rows, int cols, int cg, double *part);
+__global__ void k_enc_gnorm_stats(const double *part, int nch, double count, float eps, float *stats);
+__global__ void k_enc_gnorm_apply(const float *x, const float *w, const float *b, float *y, int64_t n, int cols,
+                                  int cg, const float *stats, int silu);
+__global__ void k_enc_rope_tab(float *x, const float *cs, const float *sn, int64_t n, int heads, int hd, int neox);
+__global__ void k_enc_snake(const float *x, const float *al, const float *be, float *y, int64_t n, int cols);
+__global__ void k_enc_elu(const float *x, float *y, int64_t n);
+__global__ void k_enc_dupup(const float *x, float *y, int h, int w, int cin, int cout, int ft, int fs);
+__global__ void k_enc_f20_pack(const float *x, uint8_t *y, int64_t rows, int cols);
+__global__ void k_enc_f20_unpack(const uint8_t *x, float *y, int64_t rows, int cols);
+__global__ void k_f20_to_bf16(const uint8_t *x, uint16_t *y, uint16_t *ylo, int64_t rows, int cols);
+__global__ void k_enc_resize(const float *x, float *y, int64_t n, int64_t h, int64_t w, int64_t H, int64_t W,
+                             int64_t C, int mode, int64_t xs, int64_t xo, int64_t ys, int64_t yo);
+__global__ void k_enc_warp(const float *x, const float *fl, float *y, const float *gx, const float *gy, int64_t h,
+                           int64_t w, int64_t C, int64_t xs, int64_t xo, int64_t fs, int64_t fo, int64_t ys,
+                           int64_t yo, float dx, float dy);
+__global__ void k_enc_prelu(const float *x, float *y, int64_t rows, int64_t cols, const float *a);
+__global__ void k_enc_mix(const float *x, float *y, int64_t n, int64_t xs, int64_t ao, int64_t bo, int64_t mo,
+                          int64_t C, int64_t ys, int64_t yo);
+__global__ void k_enc_unpack_u8p(const unsigned char *x, float *y, int64_t h, int64_t w, int64_t Hp, int64_t Wp,
+                                 int64_t C, float d);
+__global__ void k_enc_pack_u8c(const float *x, unsigned char *y, int64_t h, int64_t w, int64_t Wp, int64_t C,
+                               float s);
+__global__ void k_enc_resample_u8(const unsigned char *x, unsigned char *y, const int *bounds, const int *k,
+                                  int64_t outer, int64_t n, int64_t inner, int64_t sa, int64_t so, int64_t ks);
+__global__ void k_enc_take_u8(const unsigned char *x, unsigned char *y, const int *rows, const int *cols,
+                              int64_t nr, int64_t nc, int64_t w, int64_t C);
+__global__ void k_enc_block_sums_u8(const unsigned char *x, int *y, const int *ry0, const int *ry1, const int *rx0,
+                                    const int *rx1, int64_t nx, int64_t w);
+__global__ void k_dibr_splat(const float *s, unsigned long long *keys, int64_t H, int64_t W, float sign, float gap);
+__global__ void k_dibr_resolve(const float *img, const float *s, const unsigned long long *keys, float *zb,
+                               float *tmp, int64_t H, int64_t W, float sign);
+__global__ void k_dibr_stretch(const unsigned long long *keys, float *zb, float *tmp, int64_t H, int64_t W);
+__global__ void k_dibr_copy(const unsigned long long *keys, float *tmp, float *out, int64_t H, int64_t W,
+                            int64_t off, int64_t stride, int what);
+__global__ void k_dibr_fill(const unsigned long long *keys, const float *zb, const float *tmp, float *out, int64_t H,
+                            int64_t W, int64_t off, int64_t stride, int mode, float tol);
+__global__ void k_enc_pack_u8(const float *x, unsigned char *y, int64_t n);
+__global__ void k_enc_unpack_u8(const unsigned char *x, float *y, int64_t n, float d);
+__global__ void k_enc_resize_taps(const float *x, float *y, int64_t n, int64_t h, int64_t w, int64_t H, int64_t W,
+                                  int64_t C, int64_t ky, const int *iy, const float *wy, int64_t kx, const int *ix,
+                                  const float *wx);
+__global__ void k_transpose(const float *x, float *y, int rows, int cols);
+__global__ void k_softmax_rows(float *s, int n);
+__global__ void k_enc_scatter(const float *x, const int *idx, float *y, int n, int cols);
+#define EKV_C 128
+template <int NI>
+__global__ void k_enc_attn_kv_part(const float *q, const float *k, const float *v, const int *lo, const int *hi,
+                                   int heads, float *part, int kv_heads);
+__global__ void k_enc_attn_kv_join(const float *part, float *o, int heads, int hd, int S);
+template <int NR>
+__global__ void k_enc_gemv_f16(const float *x, const __half *w, const float *b, float *y, int m, int k, float imin,
+                               float imax, float omin, float omax);
+__global__ void k_enc_attn_bias(const float *q, const float *k, const float *v, float *o, const float *bias,
+                                const int *wt, int heads, int hd, int g, float scale);
+#define EAR_W 8
+#define EAR_K 32
+template <int NI>
+__global__ void k_enc_attn_range_t(const float *q, const float *k, const float *v, float *o,
+                                   const int *lo, const int *hi, int n, int heads, int kv_heads,
+                                   int hd_);
 #define EA_Q 64
 template <int HP>
 __global__ void k_enc_attn_tc(const __half *q, const __half *k, const __half *v, float *o, int n,
                               int heads, int hd);
+template <int HP>
+__global__ void k_enc_attn_x2(const uint16_t *qp, const uint16_t *kp, const uint16_t *vp, size_t nE, size_t nEk,
+                              float *o, const int *lo, const int *hi, int n, int heads, int hd);
+#define EAX_SMEM(HP) ((size_t)4 * 64 * ((HP) + 8) * sizeof(uint16_t))   /* 4 planes of EA_K rows of HP + 8 */
+#define EAT_Q 128
+#define EAT_K 32
+template <int HP, int BQ, int NT, int MINB, bool HALF>
+__global__ void k_enc_attn_tile(const float *q, const float *k, const float *v, float *o, const int *lo, const int *hi,
+                                int n, int heads, int hd);
+/* Q, a step's K or V (rows of HP + 4; HALF: 64), P (rows of EAT_K + 4; HALF: EAT_K) */
+static void enc_attn_tile(const float *q, const float *k, const float *v, float *o, const int *lo, const int *hi,
+                          int n, int heads, int hd, cudaStream_t s);
+#define EAT_SMEM(HP, BQ, HALF) ((size_t)((BQ) * (HP) + EAT_K * ((HALF) ? 64 : (HP) + 4) + \
+                                         (BQ) * ((HALF) ? EAT_K : EAT_K + 4)) * sizeof(float))
+
+/* ENC_LINEAR of float32 W (and of F20 W) in k_enc_sgemm (the bits of k_enc_gemm, in larger
+ * tiles) unless RECLANK_GPU_ENC_SGEMM=0. */
+static int enc_sgemm_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_ENC_SGEMM");
+        on = v == NULL || strcmp(v, "0") != 0;
+    }
+    return on;
+}
+
+static int enc_sms(void)
+{
+    static int n = 0;
+    if (n == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        n = n > 0 ? n : 1;
+    }
+    return n;
+}
 
 /* The encoders on the tensor cores (ENC_LINEAR, ENC_ATTN) unless
  * RECLANK_GPU_ENC_TC=0. */

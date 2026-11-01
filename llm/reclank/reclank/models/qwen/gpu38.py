@@ -347,8 +347,10 @@ class Qwen4GPU(QwenGPU):
         Return the input of the head of each token."""
         t = len(tokens)
         size = size or t
+        # (the pool first: _warm_on can free the programs of a prompt, this one too once made; a
+        # part of a prompt keeps them, QwenGPU._warm_on)
+        self._warm_on(prompt=not verify)
         prog, g = self._group(size, verify, fetch)
-        self._warm_on()
         if self.hot_cache is not None:
             self.hot_cache.prepare(wait=fetch)
         if fetch:
@@ -434,8 +436,8 @@ class Qwen4GPU(QwenGPU):
         t = len(ids)
         size = next((s for s in (1, 2, 4, 8, 16, 64, 128, 256) if s >= t), None)
         assert size is not None, "a group of the MTP layer has at most 256 rows"
+        self._warm_on(prompt=size > MT)
         prog, g = self._mtp_group(size)
-        self._warm_on()
         if self.hot_cache is not None:
             self.hot_cache.prepare()
         e, h = prog.names["e"], prog.names["h"]

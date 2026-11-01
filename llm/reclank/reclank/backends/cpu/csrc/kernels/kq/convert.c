@@ -1,5 +1,11 @@
 /* ---------- the conversions of the safetensors loader (reclank/formats/nvfp4_st.py) ---------- */
 
+/* Parts ported from ggml (ggml/src/ggml-quants.c: quantize_row_q8_0_ref, make_qx_quants,
+ * make_qkx2_quants, the Q4_K, Q5_K and Q6_K quantizers; MIT License; Copyright (c) 2023-2026 The
+ * ggml authors) and, the CSF decode, from flashinfer (local-inference-lab/flashinfer,
+ * scripts/convert_csf_blocks.py; Apache License 2.0; Copyright 2023-2026 FlashInfer community;
+ * Copyright 2025-2026 NVIDIA). See THIRD_PARTY_NOTICES.md. */
+
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -979,6 +985,177 @@ void rc_kq_pack_bf12x16(const uint8_t *src, int64_t rows, int cols, uint8_t *dst
                 blk[768 + r] = w[cols + cols / 2 + b];
             }
         }
+    }
+}
+
+/* float32 rows (cols a multiple of 32) to F20 (formats.c): each value rounded to 16 significant
+ * bits (to nearest, even), then in its group of 32 the gap of its exponent to the group's largest;
+ * gaps over 15 (and zeros, denormals) the zero code. rep: the values zeroed (not 0 before), the
+ * values of the zero code's bits (decoded as 0: sign 1, gap 15, mantissa 0), the values not
+ * finite, the largest zeroed |value|, the sum of the squares of the finite values. */
+void rc_kq_f32_to_f20(const float *src, int64_t rows, int cols, uint8_t *dst, double *rep)
+{
+    size_t rb = kq_row_bytes(KQ_F20, cols);
+    int ng = cols / 32;
+    double nz = 0, ncol = 0, nbad = 0, big = 0, ss = 0;
+    #pragma omp parallel for schedule(static) reduction(+ : nz, ncol, nbad, ss) reduction(max : big)
+    for (int64_t r = 0; r < rows; ++r) {
+        const uint32_t *w = (const uint32_t *)(src + (size_t)r * cols);
+        uint8_t *o = dst + (size_t)r * rb;
+        uint16_t *lo = (uint16_t *)o;
+        memset(o, 0, rb);
+        for (int g = 0; g < ng; ++g) {
+            uint32_t u[32];
+            int E = 0;
+            for (int j = 0; j < 32; ++j) {
+                uint32_t v = w[32 * g + j];
+                if (((v >> 23) & 255) == 255) {
+                    nbad += 1;
+                    u[j] = 0;
+                    continue;
+                }
+                float f;
+                memcpy(&f, &v, 4);
+                ss += (double)f * f;
+                /* to nearest, even at bit 8 (a carry into the exponent is the next binade's
+                 * value; to 255, Inf: not finite) */
+                v = (uint32_t)(((uint64_t)v + 0x7f + ((v >> 8) & 1)) & 0xffffff00u);
+                if (((v >> 23) & 255) == 255) {
+                    nbad += 1;
+                    v = 0;
+                }
+                u[j] = v;
+                int e = (v >> 23) & 255;
+                E = e > E ? e : E;
+            }
+            o[2 * (size_t)cols + (size_t)cols / 2 + g] = (uint8_t)E;
+            for (int j = 0; j < 32; ++j) {
+                uint32_t v = u[j];
+                int sgn = v >> 31, e = (v >> 23) & 255, m = (v >> 8) & 0x7fff;
+                int gap = E - e;
+                if (gap > 15) {
+                    /* out of range (or a zero, a denormal, under a larger E): the zero code */
+                    if ((v & 0x7fffffffu) != 0) {
+                        nz += 1;
+                        float f;
+                        memcpy(&f, &v, 4);
+                        double a = fabs((double)f);
+                        big = a > big ? a : big;
+                    }
+                    gap = 15;
+                    sgn = 1;
+                    m = 0;
+                } else if (gap == 15 && sgn == 1 && m == 0) {
+                    ncol += 1;
+                }
+                lo[32 * g + j] = (uint16_t)(sgn << 15 | m);
+                o[2 * (size_t)cols + 16 * g + (j & 15)] |= (uint8_t)(gap << (4 * (j >> 4)));
+            }
+        }
+    }
+    rep[0] = nz;
+    rep[1] = ncol;
+    rep[2] = nbad;
+    rep[3] = big;
+    rep[4] = ss;
+}
+
+/* A float32 row (cols a multiple of 32) to an F20 row (o: kq_row_bytes(KQ_F20, cols) bytes): the
+ * bits of rc_kq_f32_to_f20's rows, without its report (ENC_F20_PACK, common/interp.c). */
+static void kq_f20_encode_row(const float *src, int cols, uint8_t *o)
+{
+    const uint32_t *w = (const uint32_t *)src;
+    uint16_t *lo = (uint16_t *)o;
+    memset(o, 0, kq_row_bytes(KQ_F20, cols));
+    for (int g = 0; g < cols / 32; ++g) {
+        uint32_t u[32];
+        int E = 0;
+        for (int j = 0; j < 32; ++j) {
+            uint32_t v = w[32 * g + j];
+            if (((v >> 23) & 255) == 255) {
+                u[j] = 0;
+                continue;
+            }
+            v = (uint32_t)(((uint64_t)v + 0x7f + ((v >> 8) & 1)) & 0xffffff00u);
+            if (((v >> 23) & 255) == 255) {
+                v = 0;
+            }
+            u[j] = v;
+            int e = (v >> 23) & 255;
+            E = e > E ? e : E;
+        }
+        o[2 * (size_t)cols + (size_t)cols / 2 + g] = (uint8_t)E;
+        for (int j = 0; j < 32; ++j) {
+            uint32_t v = u[j];
+            int sgn = v >> 31, e = (v >> 23) & 255, m = (v >> 8) & 0x7fff;
+            int gap = E - e;
+            if (gap > 15) {
+                gap = 15;
+                sgn = 1;
+                m = 0;
+            }
+            lo[32 * g + j] = (uint16_t)(sgn << 15 | m);
+            o[2 * (size_t)cols + 16 * g + (j & 15)] |= (uint8_t)(gap << (4 * (j >> 4)));
+        }
+    }
+}
+
+/* The float32 values of an F20 row (cols values). Also ENC_F20_UNPACK's rows. */
+static void kq_f20_decode_row(const uint8_t *w, int cols, float *o)
+{
+    for (int j = 0; j < cols; ++j) {
+        int gap = (w[2 * (size_t)cols + 16 * (j >> 5) + (j & 15)] >> (4 * ((j >> 4) & 1))) & 15;
+        uint32_t u = kq_f20_bits(((const uint16_t *)w)[j], gap, w[2 * (size_t)cols + (size_t)cols / 2 + (j >> 5)]);
+        memcpy(o + j, &u, 4);
+    }
+}
+
+/* F20 rows to KQ_F20X16 (kq_x16f_col): groups of 16 rows, the last one padded with rows of
+ * zeros. */
+void rc_kq_pack_f20x16(const uint8_t *src, int64_t rows, int cols, uint8_t *dst)
+{
+    size_t rb = kq_row_bytes(KQ_F20, cols), gbytes = (size_t)16 * kq_row_bytes(KQ_F20X16, cols);
+    int64_t ng = (rows + 15) / 16;
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < ng; ++g) {
+        uint8_t *o = dst + (size_t)g * gbytes;
+        memset(o, 0, gbytes);
+        for (int r = 0; r < 16; ++r) {
+            int64_t row = 16 * g + r;
+            if (row >= rows) {
+                continue;
+            }
+            const uint8_t *w = src + (size_t)row * rb;
+            for (int b = 0; b < cols / 32; ++b) {
+                uint8_t *blk = o + (size_t)b * 1296;
+                for (int cc = 0; cc < 32; ++cc) {
+                    memcpy(blk + 32 * cc + 2 * r, w + 2 * (32 * (size_t)b + cc), 2);
+                }
+                for (int j = 0; j < 16; ++j) {
+                    blk[1024 + 16 * j + r] = w[2 * (size_t)cols + 16 * b + j];
+                }
+                blk[1280 + r] = w[2 * (size_t)cols + (size_t)cols / 2 + b];
+            }
+        }
+    }
+}
+
+/* The float32 values (rows x cols) of F20 rows (type KQ_F20) or of KQ_F20X16. */
+void rc_kq_f20_to_f32(const uint8_t *src, int type, int64_t rows, int cols, float *dst)
+{
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        float *o = dst + (size_t)r * cols;
+        if (type == KQ_F20X16) {
+            const uint8_t *wg = src + (size_t)(r / 16) * 16 * kq_row_bytes(KQ_F20X16, cols);
+            for (int c = 0; c < cols; ++c) {
+                float tmp[16];
+                kq_f20x16_col(wg, c, tmp);
+                o[c] = tmp[r % 16];
+            }
+            continue;
+        }
+        kq_f20_decode_row(src + (size_t)r * kq_row_bytes(KQ_F20, cols), cols, o);
     }
 }
 

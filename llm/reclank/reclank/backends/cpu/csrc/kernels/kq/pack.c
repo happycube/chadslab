@@ -30,3 +30,29 @@ int rc_kq_q4x_pack(const uint8_t *packed, const float *scales, int64_t rows, int
     }
     return bad ? -1 : 0;
 }
+
+/* rc_kq_q4x_pack backwards: the KQ_Q4X bytes of a matrix (rows a multiple of
+ * 16, cols columns) to its Q4_0 blocks (rows x cols / 32 x 18), for the
+ * kernels that read Q4_0 (the GPU's dense products: the weightkeeper holds
+ * the Gemma 4 26B's matrices only in KQ_Q4X). */
+void rc_kq_q4x_unpack(const uint8_t *src, int64_t rows, int cols, uint8_t *dst)
+{
+    int nb = cols / 32;
+    int64_t ng = rows / 16;
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < ng; ++g) {
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t *blk = src + ((size_t)g * nb + b) * KQ_Q4X_BB;
+            for (int r = 0; r < 16; ++r) {
+                uint8_t *o = dst + ((size_t)(16 * g + r) * nb + b) * 18;
+                int sh = r < 8 ? 0 : 4;
+                memcpy(o, blk + 256 + 2 * r, 2);
+                for (int v = 0; v < 16; ++v) {
+                    int lo = (blk[32 * (v / 4) + 4 * (r % 8) + v % 4] >> sh) & 15;
+                    int hi = (blk[32 * ((v + 16) / 4) + 4 * (r % 8) + v % 4] >> sh) & 15;
+                    o[2 + v] = (uint8_t)(lo | hi << 4);
+                }
+            }
+        }
+    }
+}

@@ -62,9 +62,13 @@ and ran out of memory. The design now is in-process (`backends/cuda/devices.py`,
   to the CPU's). The CPU computes its own cold experts in the meantime.
 - GeForce cards have no peer access: a job crosses host memory (the rows
   of a layer each way, a few KB).
-- Exclusive caching: the primary's HotCache leaves out the experts the
-  device holds (`HotCache.exclude`). Shared caching lost speed at 4K
-  (55.4 -> 52.6 tok/s): the two cards held the same experts.
+- Shared caching: the primary's HotCache may take the device's experts
+  too, and the device runs those of its experts the primary lacks.
+  `RECLANK_EXPERT_EXCLUSIVE=1` leaves them out (`HotCache.exclude`);
+  `HotCache.remote` counts the pairs on no GPU either way. Exclusive
+  caching won with the 1070 before the pool and the refresh (Gemma at 4K:
+  52.6 shared, 58.7 exclusive, below); since, shared wins for Qwen on the
+  1070 and for Gemma on the P1000.
 - NUMA: each GPU's node comes from sysfs; the device's pinned buffers are
   made by a thread on its node.
 
@@ -72,7 +76,9 @@ On the device a job reuses the primary's kernels where it can: a record
 (`gp_rec`) of the job through `gg_launch` (Nemotron's `GP_NM_HOT_MOE`;
 Qwen's `GP_KQ_HOT_MOE`, with a program struct of zeros so that the float-x
 kernels run, which read only the record). Gemma's jobs use their own small
-kernels on `hot_rows_xr`.
+kernels on `hot_rows_xr`, or on `q4x_group_block` for the weightkeeper's
+KQ_Q4X experts (the bytes as the keeper holds them; float32 x, so any
+arch).
 
 ## 3. Gemma 4 26B
 
@@ -106,6 +112,30 @@ CPU's int4 cold experts are cheap. A profile of the 3060 alone shows about
 
 The prompt (4K, both cards) runs at about 590 tok/s; the 1070 does not take
 part in prompts.
+
+The weightkeeper's KQ_Q4X (the 3060 and a Quadro P1000 of 4 GB, the
+Xeon W-2133's avx512 build): the P1000 holds 1010 experts
+(3.38 GB) as the keeper's bytes. Its logits match the 3060 alone's (KL
+8e-8 over a 1024 prompt and 16 forced steps). Exclusive caching lost
+here: the 3060's pool held fewer experts in the same 8.7 GB (2358 against
+2600 alone), and the P1000's job for a layer costs about what the CPU's
+Q4X float-x rows cost for the few pairs it took. Shared caching (Gemma's
+default now, as Qwen's) gives the 3060 its full pool and the P1000 the
+pairs the pool lacks. Decode, tok/s:
+
+| | a chat, 256 | 1024 of `docs/*.md`, 128 | 4K of `docs/*.md`, 256 | the server, 6 turns of 255 |
+|---|---|---|---|---|
+| the 3060 alone | 66.7 | 66.5 | 67.5 | 70.7 (69.9-71.8) |
+| both, exclusive | 65.9 | 65.5 | 66.5 | 67.8 (64.8-69.8) |
+| both, shared | **69.3** | **67.4** | **68.1** | **71.7** (70.7-72.8) |
+
+The chat and the 1024 prompt decode the same text in all three (the 4K
+one parts at near ties, the 3060 alone from exclusive too). The pairs on
+no GPU in the server's turns: alone 2.1-5.6%, exclusive 0.4-1.4%, shared
+1.6-2.5%. Shared, the idle refresh copies more (170-580 experts, 0.11-0.38
+s, against 46-145): the 3060 took much of what the P1000 held, and the
+P1000 moves on to the next. Q4_0 copies on the P1000 (`hot_rows_xr`,
+exclusive) were slower still: 61.1 on the chat.
 
 ## 4. Nemotron 3.5 Bolt
 

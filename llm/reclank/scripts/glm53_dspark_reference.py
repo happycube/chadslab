@@ -3,6 +3,9 @@
 preview; P7 of docs/GLM53_PLAN.md), replayed on a trace of the reference (scripts/glm53_reference.py
 --trace-prefill N --trace-decode M: the streams after each layer, h<i> [rows, 4, 4096]).
 
+Written from speculators (vllm-project/speculators, src/speculators/models/dspark; Apache License
+2.0; by Red Hat). See THIRD_PARTY_NOTICES.md.
+
 The drafter as speculators' DSpark runs it (as scripts/minicpm_dspark_reference.py), in float32 torch
 on the CPU, with its own embed_tokens and lm_head:
 

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """The reference of nvidia/Qwen3.8-Flash-Next-FP4-Local on the CPU (docs/FP4LOCAL_PLAN.md, P2).
 
+Written from flashinfer's b12x (local-inference-lab/flashinfer, scripts/convert_csf_blocks.py and
+flashinfer/experimental/b12x; Apache License 2.0; Copyright (c) 2025 by the b12x authors;
+Copyright 2023-2026 FlashInfer community; Copyright 2025-2026 NVIDIA) and vLLM
+(local-inference-lab/vllm, vllm/models/qwen4_exp/nvidia; Apache License 2.0; Copyright
+contributors to the vLLM project). See THIRD_PARTY_NOTICES.md.
+
 scripts/qwen38_flash_reference.py (the transformers model of Qwen3.8-Flash-Next in float32, the
 routed experts loaded as the router picks them, the n-gram rows on demand) on this checkpoint,
 with the contract of the plan's section 2, written from the formats and the serving source and

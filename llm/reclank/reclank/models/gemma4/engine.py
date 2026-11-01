@@ -459,15 +459,19 @@ def load(opts, meta=None):
             "ends_line": newline_test(tok.decode)}
     if opts.mmproj:
         from reclank.models.gemma4.encoders import load_embedder
-        # The encoders on the GPU when the model is (RECLANK_MEDIA_GPU=0: CPU).
-        media_gpu = gpu_on and os.environ.get("RECLANK_MEDIA_GPU", "1") != "0"
+        # The encoders on the GPU when the model is, except on a small card
+        # (RECLANK_MEDIA_GPU=0: CPU, 1: GPU). The 26B's image encoder holds
+        # about 2 GB of the GPU after its first image: on a 4 GB card the
+        # cache then finds no room.
+        media_env = os.environ.get("RECLANK_MEDIA_GPU")
+        media_gpu = gpu_on and (media_env == "1" if media_env else not small_card)
         q8 = opts.mmproj_q8 == "on" or (opts.mmproj_q8 in (None, "auto") and e4b)
         eng.embedder = load_embedder(opts.mmproj, gpu=media_gpu, q8=q8)
         eng.image_budget = opts.image_budget or defaults["image_budget"]
         eng.video_frames = opts.video_frames or 32
         eng.video_budget = opts.video_budget or defaults["video_budget"]
-        print("media input: %s (images%s), image budget %d%s" % (
+        print("media input: %s (images%s), image budget %d%s, encoder on the %s" % (
             opts.mmproj, " and audio" if eng.embedder.has_audio else "",
             eng.image_budget, ", Q8_0 encoder weights" if getattr(eng.embedder, "q8", False)
-            else ""), flush=True)
+            else "", "GPU" if media_gpu else "CPU"), flush=True)
     return eng, defaults

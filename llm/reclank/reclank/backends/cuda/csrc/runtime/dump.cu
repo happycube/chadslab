@@ -140,9 +140,27 @@ static int ds_dump_hot(const gg_prog *g, const gp_rec *r)
         }
     }
     free(map);
+    /* (the store's slots one after the other, from the addresses of its table: op_04.bin as before) */
+    gp_rec rs = *r;
+    void *slots = NULL;
+    if (ns > 0) {
+        int64_t *tab = (int64_t *)malloc(ns * 8);
+        CK(cudaMemcpy(tab, (const void *)(intptr_t)hi(r, e, 4), ns * 8, cudaMemcpyDeviceToHost));
+        CK(cudaMalloc(&slots, ns * per));
+        for (size_t s = 0; s < ns; ++s) {
+            if (tab[s] != 0) {
+                CK(cudaMemcpy((uint8_t *)slots + s * per, (const void *)(intptr_t)tab[s], per, cudaMemcpyDeviceToDevice));
+            }
+        }
+        free(tab);
+        rs.v[4] = (int64_t)(intptr_t)slots;
+        rs.tag[4] = GP_T_INT;
+    }
     size_t tk = (size_t)t * k;
     int ops[] = {1, 2, 3, 4, 23, 12, 13, 14, 15, 17, 18, 19, 20};
     size_t nb[] = {tk * 4, tk * 4, (size_t)E * 4, ns * per, nst * per, (size_t)t * H, (size_t)t * H,
                    (size_t)t * (H / 32) * 4, tk * 2 * I * 4, tk * I, tk * I, tk * (I / 32) * 4, tk * H * 4};
-    return ds_dump_write(g, r, "hot", n, ops, nb, 13);
+    int rc = ds_dump_write(g, &rs, "hot", n, ops, nb, 13);
+    cudaFree(slots);
+    return rc;
 }

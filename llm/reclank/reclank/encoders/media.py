@@ -1,5 +1,10 @@
 """Soft tokens: the rows of images and audio in a prompt.
 
+Ported from transformers (src/transformers/models/gemma4/processing_gemma4.py
+and video_processing_gemma4.py, Copyright 2026 the HuggingFace Team;
+models/qwen3_vl/modeling_qwen3_vl.py, Copyright 2025 The Qwen Team and The
+HuggingFace Inc. team; Apache License 2.0). See THIRD_PARTY_NOTICES.md.
+
 The chat template writes one placeholder for each image (<|image|>) and each
 clip (<|audio|>). expand() puts the soft tokens in place of each placeholder,
 as the processor of transformers does:

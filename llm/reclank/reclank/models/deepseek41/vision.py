@@ -1,6 +1,11 @@
 """The image input of DeepSeek V4.1 Flash (DEEPSEEK_V41_PLAN.md, Phase 6): the
 checkpoint's inference/image_processor.py and vision.py.
 
+Ported from DeepSeek V4.1 Flash's reference code
+(deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/image_processor.py and
+vision.py; MIT License; Copyright (c) 2023 DeepSeek). See
+THIRD_PARTY_NOTICES.md.
+
     the image (RGB), padded (ImageOps.pad, gray 127) to the largest size of
     patches of 14 x 14 whose tokens fit max_image_tokens (1024; at least
     min_pixels) -> values (x / 255 - 0.5) / 0.5 rounded to bfloat16 ->

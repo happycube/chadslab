@@ -23,6 +23,288 @@
  * faulty operation. A limit below zero runs every record.
  */
 
+/* ---------- 2D to stereo (ENC_RESIZE, ENC_DIBR) ----------
+ * The float operations of the GPU's kernels (encoders.cu) and of the NumPy
+ * references, one by one: no contraction into FMAs, so the CPU, the GPU and
+ * NumPy give the same bits. */
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+
+/* the source pixels and weights of output d of a bilinear resize of n_in to
+ * n_out (torch's upsample_bilinear2d, float): mode 1 align_corners */
+static void gp_lerp_src(int64_t d, int64_t n_in, int64_t n_out, int mode, int64_t *i0, int64_t *i1, float *l0,
+                        float *l1)
+{
+    float src;
+    if (mode == 1) {
+        float scale = n_out > 1 ? (float)(n_in - 1) / (float)(n_out - 1) : 0.f;
+        src = scale * (float)d;
+    } else {
+        float scale = (float)n_in / (float)n_out;
+        src = scale * ((float)d + 0.5f) - 0.5f;
+        if (src < 0.f) {
+            src = 0.f;
+        }
+    }
+    int64_t a = (int64_t)src;
+    if (a > n_in - 1) {
+        a = n_in - 1;
+    }
+    *i0 = a;
+    *i1 = a < n_in - 1 ? a + 1 : a;
+    *l1 = src - (float)a;
+    *l0 = 1.0f - *l1;
+}
+
+static float gp_lerp2(float ly0, float ly1, float lx0, float lx1, float a, float b, float c, float d)
+{
+    float u = lx0 * a, v = lx1 * b, p = lx0 * c, q = lx1 * d;
+    float top = u + v, bot = p + q;
+    return ly0 * top + ly1 * bot;
+}
+
+/* float32 -> uint32 of the same order, and back */
+static uint32_t gp_orderable(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+static float gp_unorder(uint32_t u)
+{
+    uint32_t b = (u & 0x80000000u) ? (u & 0x7fffffffu) : ~u;
+    float f;
+    memcpy(&f, &b, 4);
+    return f;
+}
+
+/* source pixel j of a row: its box, and the segment to j + 1 */
+static void gp_dibr_splat(const float *sr, uint64_t *kr, int64_t W, int64_t j, float sign, float gap)
+{
+    float sj = sr[j];
+    float p = (float)j + sign * sj;
+    uint64_t kb = ((uint64_t)gp_orderable(sj) << 32) | ((uint64_t)j << 1);
+    int64_t lo = (int64_t)ceilf(p - 0.5f), hi = (int64_t)ceilf(p + 0.5f);
+    for (int64_t X = lo; X < hi; ++X) {
+        if (X >= 0 && X < W && kr[X] < kb) {
+            kr[X] = kb;
+        }
+    }
+    if (j + 1 >= W) {
+        return;
+    }
+    float sb = sr[j + 1];
+    float p1 = (float)(j + 1) + sign * sb;
+    float span = p1 - p;
+    if (!(span > 0.f && span <= 1.0f + gap)) {
+        return;
+    }
+    lo = (int64_t)ceilf(p);
+    hi = (int64_t)ceilf(p1);
+    float ds = sb - sj;
+    for (int64_t X = lo; X < hi; ++X) {
+        if (X < 0 || X >= W) {
+            continue;
+        }
+        float t = ((float)X - p) / span;
+        float sx = sj + t * ds;
+        uint64_t k = ((uint64_t)gp_orderable(sx) << 32) | ((uint64_t)j << 1) | 1u;
+        if (kr[X] < k) {
+            kr[X] = k;
+        }
+    }
+}
+
+/* target pixel X of row y: the colour of its winner into tmp, its s into zb */
+static void gp_dibr_resolve(const float *img, const float *s, const uint64_t *keys, float *zb, float *tmp, int64_t W,
+                            int64_t y, int64_t X, float sign)
+{
+    uint64_t k = keys[y * W + X];
+    float *o = tmp + (y * W + X) * 3;
+    if (k == 0) {
+        o[0] = o[1] = o[2] = 0.f;
+        return;
+    }
+    zb[y * W + X] = gp_unorder((uint32_t)(k >> 32));
+    int64_t j = (int64_t)((k >> 1) & 0x7fffffffu);
+    const float *a = img + (y * W + j) * 3;
+    if (!(k & 1u)) {
+        o[0] = a[0], o[1] = a[1], o[2] = a[2];
+        return;
+    }
+    const float *sr = s + y * W;
+    float p0 = (float)j + sign * sr[j], p1 = (float)(j + 1) + sign * sr[j + 1];
+    float t = ((float)X - p0) / (p1 - p0);
+    const float *b = a + 3;
+    for (int c = 0; c < 3; ++c) {
+        float d = b[c] - a[c];
+        float td = t * d;
+        o[c] = a[c] + td;
+    }
+}
+
+/* a hole pixel: the colour and s of its farther drawn neighbour in the row
+ * (the nearest drawn pixel on each side; the smaller key; the only one at an
+ * edge; none: black, s = -inf) */
+static void gp_dibr_stretch(const uint64_t *keys, float *zb, float *tmp, int64_t W, int64_t y, int64_t X)
+{
+    const uint64_t *kr = keys + y * W;
+    if (kr[X]) {
+        return;
+    }
+    int64_t L = X - 1, R = X + 1;
+    while (L >= 0 && !kr[L]) {
+        --L;
+    }
+    while (R < W && !kr[R]) {
+        ++R;
+    }
+    int64_t src = -1;
+    if (L >= 0 && (R >= W || kr[L] <= kr[R])) {
+        src = L;
+    } else if (R < W) {
+        src = R;
+    }
+    float *o = tmp + (y * W + X) * 3;
+    if (src < 0) {
+        o[0] = o[1] = o[2] = 0.f;
+        zb[y * W + X] = -INFINITY;
+        return;
+    }
+    const float *a = tmp + (y * W + src) * 3;
+    o[0] = a[0], o[1] = a[1], o[2] = a[2];
+    zb[y * W + X] = zb[y * W + src];
+}
+
+/* a hole pixel's fill into o: mode 0 the 5-tap horizontal mean of tmp
+ * (clamped at the row's ends); mode 1 the mean of the 3 x 3 neighbours (in the
+ * image) that are holes or have zb <= its zb + tol, in row order */
+static void gp_dibr_fill(const uint64_t *keys, const float *zb, const float *tmp, float *o, int64_t H, int64_t W,
+                         int64_t y, int64_t X, int mode, float tol)
+{
+    float acc[3] = {0.f, 0.f, 0.f};
+    if (mode == 0) {
+        for (int d = -2; d <= 2; ++d) {
+            int64_t xx = X + d < 0 ? 0 : X + d > W - 1 ? W - 1 : X + d;
+            const float *t = tmp + (y * W + xx) * 3;
+            for (int c = 0; c < 3; ++c) {
+                acc[c] = acc[c] + t[c];
+            }
+        }
+        for (int c = 0; c < 3; ++c) {
+            o[c] = acc[c] / 5.0f;
+        }
+        return;
+    }
+    float lim = zb[y * W + X] + tol;
+    float cnt = 0.f;
+    for (int64_t dy = -1; dy <= 1; ++dy) {
+        int64_t yy = y + dy;
+        if (yy < 0 || yy >= H) {
+            continue;
+        }
+        for (int64_t dx = -1; dx <= 1; ++dx) {
+            int64_t xx = X + dx;
+            if (xx < 0 || xx >= W) {
+                continue;
+            }
+            int64_t q = yy * W + xx;
+            if (keys[q] && !(zb[q] <= lim)) {
+                continue;
+            }
+            const float *t = tmp + q * 3;
+            for (int c = 0; c < 3; ++c) {
+                acc[c] = acc[c] + t[c];
+            }
+            cnt = cnt + 1.0f;
+        }
+    }
+    for (int c = 0; c < 3; ++c) {
+        o[c] = acc[c] / cnt;
+    }
+}
+
+static float gp_taps2(const float *x, int64_t w, int64_t C, int64_t c, const int32_t *iy, const float *wy,
+                      int64_t ky, const int32_t *ix, const float *wx, int64_t kx)
+{
+    float acc = 0.f;
+    for (int64_t k = 0; k < ky; ++k) {
+        const float *row = x + (int64_t)iy[k] * w * C + c;
+        float h = 0.f;
+        for (int64_t j = 0; j < kx; ++j) {
+            float p = wx[j] * row[(int64_t)ix[j] * C];
+            h = h + p;
+        }
+        float q = wy[k] * h;
+        acc = acc + q;
+    }
+    return acc;
+}
+
+/* ---------- frame interpolation (ENC_WARP, ENC_PRELU, ENC_MIX) ----------
+ * The float operations of encoders.cu's kernels and of models/vfi/ref.py one
+ * by one (no contraction): the three give the same bits (ENC_MIX's expf
+ * apart). */
+
+/* pixel (i, j) of ENC_WARP: torch's CUDA grid_sampler_2d (bilinear, border,
+ * align_corners): the grid plus the flow over (size - 1) / 2, unnormalized,
+ * clipped, the four corners in bounds summed nw, ne, sw, se */
+static void vfi_warp_px(const float *x, const float *fl, float *y, const float *gx, const float *gy, int64_t i,
+                        int64_t j, int64_t h, int64_t w, int64_t C, int64_t xs, int64_t xo, int64_t fs, int64_t fo,
+                        int64_t ys, int64_t yo, float dx, float dy)
+{
+    const float *f = fl + (i * w + j) * fs + fo;
+    float gxv = gx[j] + f[0] / dx, gyv = gy[i] + f[1] / dy;
+    float ix = ((gxv + 1.f) / 2.f) * (float)(w - 1), iy = ((gyv + 1.f) / 2.f) * (float)(h - 1);
+    ix = fminf((float)(w - 1), fmaxf(ix, 0.f));
+    iy = fminf((float)(h - 1), fmaxf(iy, 0.f));
+    float xw = floorf(ix), yn = floorf(iy), xe = xw + 1.f, ysth = yn + 1.f;
+    float nw = (xe - ix) * (ysth - iy), ne = (ix - xw) * (ysth - iy);
+    float sw = (xe - ix) * (iy - yn), se = (ix - xw) * (iy - yn);
+    int64_t x0 = (int64_t)xw, y0 = (int64_t)yn, x1 = x0 + 1, y1 = y0 + 1;
+    int okw = x0 >= 0 && x0 < w, oke = x1 >= 0 && x1 < w, okn = y0 >= 0 && y0 < h, oks = y1 >= 0 && y1 < h;
+    const float *xb = x + xo;
+    float *o = y + (i * w + j) * ys + yo;
+    for (int64_t c = 0; c < C; ++c) {
+        float acc = 0.f;
+        if (okw && okn) {
+            acc = acc + xb[(y0 * w + x0) * xs + c] * nw;
+        }
+        if (oke && okn) {
+            acc = acc + xb[(y0 * w + x1) * xs + c] * ne;
+        }
+        if (okw && oks) {
+            acc = acc + xb[(y1 * w + x0) * xs + c] * sw;
+        }
+        if (oke && oks) {
+            acc = acc + xb[(y1 * w + x1) * xs + c] * se;
+        }
+        o[c] = acc;
+    }
+}
+
+static void vfi_prelu_row(const float *x, float *y, const float *a, int64_t cols)
+{
+    for (int64_t c = 0; c < cols; ++c) {
+        float v = x[c];
+        y[c] = v > 0.f ? v : v * a[c];
+    }
+}
+
+/* a row of ENC_MIX: a s + b (1 - s), s = 1 / (1 + exp(-m)) */
+static void vfi_mix_row(const float *r, float *o, int64_t ao, int64_t bo, int64_t mo, int64_t C)
+{
+    float s = 1.f / (1.f + expf(-r[mo]));
+    float t = 1.f - s;
+    for (int64_t c = 0; c < C; ++c) {
+        float u = r[ao + c] * s, v = r[bo + c] * t;
+        o[c] = u + v;
+    }
+}
+
+#pragma GCC pop_options
+
 static void gp_step(const gp_rec *r, int64_t *e)
 {
     switch (r->op) {
@@ -931,7 +1213,9 @@ static void gp_step(const gp_rec *r, int64_t *e)
          * y (n, m) = clamp(clamp(x, imin, imax) W^T + b, omin, omax). The
          * scratch (n k floats, or 0) holds the clamped x. x16 (or 0) is W in
          * groups of 16 rows (KQ_BF16X16 or KQ_F32X16, rc_kq_pack_x16f): the
-         * product of many rows (kq_x16f_body). */
+         * product of many rows (kq_x16f_body). wbf 3: F20, w and x16 its
+         * KQ_F20X16 (rc_kq_pack_f20x16); wbf 4: BF12, w and x16 its
+         * KQ_BF12X16 (rc_kq_pack_bf12x16). */
         const float *x = GP_P(const float, 0);
         const float *b = GP_P(const float, 3);
         float *y = GP_P(float, 4);
@@ -949,7 +1233,9 @@ static void gp_step(const gp_rec *r, int64_t *e)
         }
         const uint8_t *x16 = GP_P(const uint8_t, 13);
         if (x16 != NULL) {
-            kq_x16f_body(x16, GP_I(2) ? KQ_BF16X16 : KQ_F32X16, m, k, x, n, y);
+            int wbf = (int)GP_I(2);
+            kq_x16f_body(x16, wbf == 4 ? KQ_BF12X16 : wbf == 3 ? KQ_F20X16 : wbf ? KQ_BF16X16 : KQ_F32X16, m, k, x,
+                         n, y);
         } else if (GP_I(2)) {
             gemma_bf16_linear_body(GP_P(const uint16_t, 1), x, y, m, k, n);
         } else {
@@ -1132,11 +1418,20 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     }
     case GP_ENC_GELU_MUL: {
-        /* g, u, y, n: y = gelu_tanh(g) u, in blocks of 4096 values */
+        /* g, u, y, n, erf: y = gelu(g) u, the tanh form (erf 0, in blocks of
+           4096 values) or the erf form */
         const float *g = GP_P(const float, 0);
         const float *u = GP_P(const float, 1);
         float *y = GP_P(float, 2);
         int64_t n = gp_i(r, e, 3);
+        if (GP_I(4)) {
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < n; ++i) {
+                float v = g[i];
+                y[i] = 0.5f * v * (1.0f + erff(v * 0.7071067811865476f)) * u[i];
+            }
+            break;
+        }
         int64_t nb = (n + 4095) / 4096;
         #pragma omp for schedule(static)
         for (int64_t bi = 0; bi < nb; ++bi) {
@@ -1232,6 +1527,647 @@ static void gp_step(const gp_rec *r, int64_t *e)
                 y[(size_t)i * cols + c] = xa[c] / (1.0f + expf(-xa[cols + c]));
             }
         }
+        break;
+    }
+    case GP_ENC_ATTN_BIAS: {
+        /* q, k, v, o, bias (types, heads, g, g), wtype (n / g), n, heads, hd,
+         * g, scale: each query over the g rows of its window, the scores
+         * times scale plus the bias of the window's type; g at most 64 */
+        const float *q = GP_P(const float, 0);
+        const float *k = GP_P(const float, 1);
+        const float *v = GP_P(const float, 2);
+        float *o = GP_P(float, 3);
+        const float *bias = GP_P(const float, 4);
+        const int32_t *wt = GP_P(const int32_t, 5);
+        int n = GP_I(6), heads = GP_I(7), hd = GP_I(8), g = GP_I(9);
+        float scale = (float)gp_f(r, e, 10);
+        int64_t stride = (int64_t)heads * hd;
+        #pragma omp for schedule(static)
+        for (int64_t wh = 0; wh < (int64_t)(n / g) * heads; ++wh) {
+            int64_t w = wh / heads;
+            int h = (int)(wh % heads);
+            const float *bb = bias + ((int64_t)wt[w] * heads + h) * g * g;
+            for (int i = 0; i < g; ++i) {
+                const float *qi = q + (w * g + i) * stride + (int64_t)h * hd;
+                float s[64], mx = -INFINITY, sum = 0.0f;
+                for (int j = 0; j < g; ++j) {
+                    const float *kj = k + (w * g + j) * stride + (int64_t)h * hd;
+                    float acc = 0.0f;
+                    for (int d = 0; d < hd; ++d) {
+                        acc += qi[d] * kj[d];
+                    }
+                    s[j] = acc * scale + bb[(int64_t)i * g + j];
+                    mx = s[j] > mx ? s[j] : mx;
+                }
+                for (int j = 0; j < g; ++j) {
+                    s[j] = expf(s[j] - mx);
+                    sum += s[j];
+                }
+                float inv = 1.0f / sum;
+                float *oi = o + (w * g + i) * stride + (int64_t)h * hd;
+                for (int d = 0; d < hd; ++d) {
+                    oi[d] = 0.0f;
+                }
+                for (int j = 0; j < g; ++j) {
+                    const float *vj = v + (w * g + j) * stride + (int64_t)h * hd;
+                    float p = s[j] * inv;
+                    for (int d = 0; d < hd; ++d) {
+                        oi[d] += p * vj[d];
+                    }
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_GATHER: {
+        /* x, idx (n, blocks) int32, y, n, blocks, cols: y row i, block j =
+         * x row idx[i * blocks + j] (cols values), zeros for an index < 0 */
+        const float *x = GP_P(const float, 0);
+        const int32_t *idx = GP_P(const int32_t, 1);
+        float *y = GP_P(float, 2);
+        int64_t n = gp_i(r, e, 3), blocks = gp_i(r, e, 4), cols = gp_i(r, e, 5);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n * blocks; ++i) {
+            float *dst = y + i * cols;
+            if (idx[i] < 0) {
+                memset(dst, 0, (size_t)cols * sizeof(float));
+            } else {
+                memcpy(dst, x + (int64_t)idx[i] * cols, (size_t)cols * sizeof(float));
+            }
+        }
+        break;
+    }
+    case GP_ENC_GNORM: {
+        /* x, w, b, y, rows, cols, groups, eps, silu: the mean and variance of
+         * each group of channels over all the rows (double sums, from the
+         * threads' parts), then (x - mean) rstd w + b, SiLU if silu */
+        static double *acc = NULL;
+        const float *x = GP_P(const float, 0), *w = GP_P(const float, 1), *b = GP_P(const float, 2);
+        float *y = GP_P(float, 3);
+        int64_t rows = gp_i(r, e, 4);
+        int cols = GP_I(5), groups = GP_I(6), silu = GP_I(8), cg = cols / groups;
+        float eps = gp_f(r, e, 7);
+        #pragma omp single
+        {
+            acc = (double *)calloc((size_t)groups * 2, sizeof(double));
+        }
+        double *mine = (double *)calloc((size_t)groups, sizeof(double));
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            const float *p = x + i * cols;
+            for (int c = 0; c < cols; ++c) {
+                mine[c / cg] += p[c];
+            }
+        }
+        #pragma omp critical
+        for (int g = 0; g < groups; ++g) {
+            acc[g] += mine[g];
+        }
+        #pragma omp barrier
+        for (int g = 0; g < groups; ++g) {
+            mine[g] = 0.0;
+        }
+        double count = (double)rows * cg;
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            const float *p = x + i * cols;
+            for (int c = 0; c < cols; ++c) {
+                double d = p[c] - acc[c / cg] / count;
+                mine[c / cg] += d * d;
+            }
+        }
+        #pragma omp critical
+        for (int g = 0; g < groups; ++g) {
+            acc[groups + g] += mine[g];
+        }
+        #pragma omp barrier
+        free(mine);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            const float *p = x + i * cols;
+            float *q = y + i * cols;
+            for (int c = 0; c < cols; ++c) {
+                int g = c / cg;
+                float mean = (float)(acc[g] / count);
+                float rs = 1.0f / sqrtf((float)(acc[groups + g] / count) + eps);
+                float v = (p[c] - mean) * rs * (w ? w[c] : 1.0f) + (b ? b[c] : 0.0f);
+                q[c] = silu ? v / (1.0f + expf(-v)) : v;
+            }
+        }
+        #pragma omp barrier
+        #pragma omp single
+        {
+            free(acc);
+            acc = NULL;
+        }
+        break;
+    }
+    case GP_ENC_ROPE_TAB: {
+        /* x, cos, sin, n, heads, hd: the pairs (2j, 2j + 1) of each head of
+         * row i turn by the angle of (i, j) (cos and sin: n x hd / 2) */
+        float *x = GP_P(float, 0);
+        const float *cs = GP_P(const float, 1), *sn = GP_P(const float, 2);
+        int64_t n = gp_i(r, e, 3);
+        int heads = GP_I(4), hd = GP_I(5), h2 = hd / 2, neox = GP_I(6);
+        int step = neox ? 1 : 2, other = neox ? h2 : 1;  /* pair j: (j step, j step + other) */
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            const float *ci = cs + i * h2, *si = sn + i * h2;
+            for (int h = 0; h < heads; ++h) {
+                float *p = x + (i * heads + h) * hd;
+                for (int j = 0; j < h2; ++j) {
+                    float a = p[j * step], b = p[j * step + other];
+                    p[j * step] = a * ci[j] - b * si[j];
+                    p[j * step + other] = b * ci[j] + a * si[j];
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_SNAKE: {
+        /* x, alpha, beta, y, rows, cols: y = x + (beta + 1e-9)^-1 sin(alpha x)^2 */
+        const float *x = GP_P(const float, 0), *al = GP_P(const float, 1), *be = GP_P(const float, 2);
+        float *y = GP_P(float, 3);
+        int64_t rows = gp_i(r, e, 4);
+        int cols = GP_I(5);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            for (int c = 0; c < cols; ++c) {
+                float v = x[i * cols + c], s = sinf(al[c] * v);
+                y[i * cols + c] = v + 1.0f / (be[c] + 1e-9f) * (s * s);
+            }
+        }
+        break;
+    }
+    case GP_ENC_ELU: {
+        /* x, y, n: y = x above 0, else expm1(x) (torch's ELU of alpha 1) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            float v = x[i];
+            y[i] = v > 0.0f ? v : expm1f(v);
+        }
+        break;
+    }
+    case GP_ENC_RESIZE: {
+        /* x, y, n, h, w, H, W, C, mode [, xs, xo, ys, yo]: n images of h x w
+         * pixels (C values a pixel: the columns xo.. of rows of xs; by
+         * default xs = C, xo = 0) to H x W (the columns yo.. of rows of ys).
+         * mode 0: bilinear, align_corners False (torch's: src = (d + 0.5) in /
+         * out - 0.5, at least 0); 1: bilinear, align_corners True (src = d
+         * (in - 1) / (out - 1)); the weights and the sum in torch's order,
+         * h0 (w0 x00 + w1 x01) + h1 (w0 x10 + w1 x11). 2: the mean of each
+         * block of h / H x w / W pixels (integer factors), summed row by row. */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2), h = gp_i(r, e, 3), w = gp_i(r, e, 4), H = gp_i(r, e, 5), W = gp_i(r, e, 6);
+        int64_t C = gp_i(r, e, 7);
+        int mode = (int)gp_i(r, e, 8);
+        int strided = r->tag[9] != GP_T_NONE;
+        int64_t xs = strided ? gp_i(r, e, 9) : C, xo = strided ? gp_i(r, e, 10) : 0;
+        int64_t ys = strided ? gp_i(r, e, 11) : C, yo = strided ? gp_i(r, e, 12) : 0;
+        #pragma omp for schedule(static)
+        for (int64_t row = 0; row < n * H; ++row) {
+            int64_t im = row / H, oy = row % H;
+            const float *xi = x + im * h * w * xs + xo;
+            float *yr = y + row * W * ys + yo;
+            if (mode == 2) {
+                int64_t fy = h / H, fx = w / W;
+                for (int64_t ox = 0; ox < W; ++ox) {
+                    for (int64_t c = 0; c < C; ++c) {
+                        float acc = 0.f;
+                        for (int64_t a = 0; a < fy; ++a) {
+                            for (int64_t b = 0; b < fx; ++b) {
+                                acc += xi[((oy * fy + a) * w + ox * fx + b) * xs + c];
+                            }
+                        }
+                        yr[ox * ys + c] = acc / (float)(fy * fx);
+                    }
+                }
+                continue;
+            }
+            int64_t y0, y1;
+            float ly0, ly1;
+            gp_lerp_src(oy, h, H, mode, &y0, &y1, &ly0, &ly1);
+            for (int64_t ox = 0; ox < W; ++ox) {
+                int64_t x0, x1;
+                float lx0, lx1;
+                gp_lerp_src(ox, w, W, mode, &x0, &x1, &lx0, &lx1);
+                const float *p00 = xi + (y0 * w + x0) * xs, *p01 = xi + (y0 * w + x1) * xs;
+                const float *p10 = xi + (y1 * w + x0) * xs, *p11 = xi + (y1 * w + x1) * xs;
+                for (int64_t c = 0; c < C; ++c) {
+                    yr[ox * ys + c] = gp_lerp2(ly0, ly1, lx0, lx1, p00[c], p01[c], p10[c], p11[c]);
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_WARP: {
+        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy: RIFE's
+         * backward warp (vfi_warp_px) a pixel at a time */
+        const float *x = GP_P(const float, 0), *fl = GP_P(const float, 1);
+        float *y = GP_P(float, 2);
+        const float *gx = GP_P(const float, 3), *gy = GP_P(const float, 4);
+        int64_t h = gp_i(r, e, 5), w = gp_i(r, e, 6), C = gp_i(r, e, 7), xs = gp_i(r, e, 8), xo = gp_i(r, e, 9);
+        int64_t fs = gp_i(r, e, 10), fo = gp_i(r, e, 11), ys = gp_i(r, e, 12), yo = gp_i(r, e, 13);
+        float dx = gp_f(r, e, 14), dy = gp_f(r, e, 15);
+        #pragma omp for schedule(static)
+        for (int64_t p = 0; p < h * w; ++p) {
+            vfi_warp_px(x, fl, y, gx, gy, p / w, p % w, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy);
+        }
+        break;
+    }
+    case GP_ENC_PRELU: {
+        /* x, y, rows, cols, a: y = x above 0, else a[col] x (torch's leaky_relu / prelu) */
+        const float *x = GP_P(const float, 0), *a = GP_P(const float, 4);
+        float *y = GP_P(float, 1);
+        int64_t rows = gp_i(r, e, 2), cols = gp_i(r, e, 3);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            vfi_prelu_row(x + i * cols, y + i * cols, a, cols);
+        }
+        break;
+    }
+    case GP_ENC_MIX: {
+        /* x, y, n, xs, ao, bo, mo, C, ys, yo: a s + b (1 - s), s = sigmoid(m) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2), xs = gp_i(r, e, 3), ao = gp_i(r, e, 4), bo = gp_i(r, e, 5), mo = gp_i(r, e, 6);
+        int64_t C = gp_i(r, e, 7), ys = gp_i(r, e, 8), yo = gp_i(r, e, 9);
+        #pragma omp for schedule(static)
+        for (int64_t p = 0; p < n; ++p) {
+            vfi_mix_row(x + p * xs, y + p * ys + yo, ao, bo, mo, C);
+        }
+        break;
+    }
+    case GP_ENC_DIBR: {
+        /* img (H W 3), s (H W), keys (2 H W: uint64), zb (H W), tmp (H W 3),
+         * out, H, W, off, stride, sign, gap, mode, iters, tol: one eye. Source
+         * pixel j of a row lands at j + sign s_j; the segment to j + 1 is drawn
+         * unless it folds or stretches past 1 + gap pixels, its pixels X in
+         * [p_j, p_j+1) interpolated at t = (X - p_j) / (p_j+1 - p_j); each
+         * pixel is also a box [p_j - 0.5, p_j + 0.5). The nearest wins: the
+         * largest key (s made orderable: larger s is nearer in both eyes; the
+         * source index; segment over box). A hole takes its farther side's
+         * colour (the nearest drawn pixel left or right, the one of smaller s;
+         * the only one at an edge); then mode 0: a 5-tap horizontal mean over
+         * the hole pixels; mode 1: iters Jacobi steps, each hole pixel the
+         * mean of its 3 x 3 neighbours that are holes or not nearer than its
+         * background by tol. The eye into out[off + y stride + 3 x + c].
+         * warp_ref.py is this in NumPy, the GPU's kernels the same float
+         * operations. */
+        const float *img = GP_P(const float, 0);
+        const float *s = GP_P(const float, 1);
+        uint64_t *keys = GP_P(uint64_t, 2);
+        float *zb = GP_P(float, 3);
+        float *tmp = GP_P(float, 4);
+        float *out = GP_P(float, 5);
+        int64_t H = gp_i(r, e, 6), W = gp_i(r, e, 7), off = gp_i(r, e, 8), stride = gp_i(r, e, 9);
+        float sign = (float)gp_i(r, e, 10), gap = gp_f(r, e, 11);
+        int mode = (int)gp_i(r, e, 12), iters = (int)gp_i(r, e, 13);
+        float tol = gp_f(r, e, 14);
+        #pragma omp for schedule(static)
+        for (int64_t y = 0; y < H; ++y) {
+            uint64_t *kr = keys + y * W;
+            const float *sr = s + y * W;
+            for (int64_t X = 0; X < W; ++X) {
+                kr[X] = 0;
+            }
+            for (int64_t j = 0; j < W; ++j) {
+                gp_dibr_splat(sr, kr, W, j, sign, gap);
+            }
+        }
+        #pragma omp for schedule(static)
+        for (int64_t y = 0; y < H; ++y) {
+            for (int64_t X = 0; X < W; ++X) {
+                gp_dibr_resolve(img, s, keys, zb, tmp, W, y, X, sign);
+            }
+        }
+        #pragma omp for schedule(static)
+        for (int64_t y = 0; y < H; ++y) {
+            for (int64_t X = 0; X < W; ++X) {
+                gp_dibr_stretch(keys, zb, tmp, W, y, X);
+            }
+        }
+        #pragma omp for schedule(static)
+        for (int64_t y = 0; y < H; ++y) {
+            for (int64_t X = 0; X < W; ++X) {
+                const float *t = tmp + (y * W + X) * 3;
+                float *o = out + off + y * stride + X * 3;
+                o[0] = t[0], o[1] = t[1], o[2] = t[2];
+            }
+        }
+        int steps = mode == 0 ? 1 : iters;
+        for (int it = 0; it < steps; ++it) {
+            #pragma omp for schedule(static)
+            for (int64_t y = 0; y < H; ++y) {
+                for (int64_t X = 0; X < W; ++X) {
+                    if (keys[y * W + X] == 0) {
+                        gp_dibr_fill(keys, zb, tmp, out + off + y * stride + X * 3, H, W, y, X, mode, tol);
+                    }
+                }
+            }
+            if (mode == 1) {
+                #pragma omp for schedule(static)
+                for (int64_t y = 0; y < H; ++y) {
+                    for (int64_t X = 0; X < W; ++X) {
+                        if (keys[y * W + X] == 0) {
+                            const float *o = out + off + y * stride + X * 3;
+                            float *t = tmp + (y * W + X) * 3;
+                            t[0] = o[0], t[1] = o[1], t[2] = o[2];
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_RESIZE_TAPS: {
+        /* x, y, n, h, w, H, W, C, ky, iy (H ky int32), wy (H ky), kx, ix (W kx), wx (W kx): out
+         * pixel (Y, X) channel c = sum over k of wy[Y k] (sum over j of wx[X j] x[iy[Y k],
+         * ix[X j], c]), each sum in order (OpenCV's separable resize: the columns first) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2), h = gp_i(r, e, 3), w = gp_i(r, e, 4), H = gp_i(r, e, 5), W = gp_i(r, e, 6);
+        int64_t C = gp_i(r, e, 7), ky = gp_i(r, e, 8), kx = gp_i(r, e, 11);
+        const int32_t *iy = GP_P(const int32_t, 9), *ix = GP_P(const int32_t, 12);
+        const float *wy = GP_P(const float, 10), *wx = GP_P(const float, 13);
+        (void)h;
+        #pragma omp for schedule(static)
+        for (int64_t row = 0; row < n * H; ++row) {
+            int64_t im = row / H, oy = row % H;
+            const float *xi = x + im * h * w * C;
+            float *yr = y + row * W * C;
+            for (int64_t ox = 0; ox < W; ++ox) {
+                for (int64_t c = 0; c < C; ++c) {
+                    yr[ox * C + c] = gp_taps2(xi, w, C, c, iy + oy * ky, wy + oy * ky, ky, ix + ox * kx, wx + ox * kx, kx);
+                }
+            }
+        }
+        break;
+    }
+    case GP_ENC_UNPACK_U8: {
+        /* x (bytes), y, n, d: y[i] = byte i of x / d */
+        const uint8_t *x = GP_P(const uint8_t, 0);
+        float *y = GP_P(float, 1);
+        int64_t n = gp_i(r, e, 2);
+        float d = gp_f(r, e, 3);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            y[i] = (float)x[i] / d;
+        }
+        break;
+    }
+    case GP_ENC_PACK_U8: {
+        /* x, y, n: byte i of y = x[i] rounded to nearest (even), clamped to 0..255 */
+        const float *x = GP_P(const float, 0);
+        uint8_t *y = GP_P(uint8_t, 1);
+        int64_t n = gp_i(r, e, 2);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            float v = nearbyintf(x[i]);
+            y[i] = (uint8_t)(v < 0.f ? 0.f : v > 255.f ? 255.f : v);
+        }
+        break;
+    }
+    case GP_ENC_DUPUP: {
+        /* x, out, h, w, cin, cout, ft, fs: out (fs h x fs w pixels, cout channels) += x (h x w,
+         * cin): pixel (y, x) channel o reads x's pixel (y / fs, x / fs), channel (o F + (ft - 1)
+         * fs^2 + (y % fs) fs + x % fs) / rep (F = ft fs^2, rep = cout F / cin): diffusers'
+         * DupUp3D of one frame (first_chunk: the last of its temporal copies) */
+        const float *x = GP_P(const float, 0);
+        float *y = GP_P(float, 1);
+        int64_t h = gp_i(r, e, 2), w = gp_i(r, e, 3), cin = gp_i(r, e, 4), cout = gp_i(r, e, 5);
+        int64_t ft = gp_i(r, e, 6), fs = gp_i(r, e, 7);
+        int64_t F = ft * fs * fs, rep = cout * F / cin, W2 = fs * w, rows = fs * h * W2;
+        #pragma omp for schedule(static)
+        for (int64_t p = 0; p < rows; ++p) {
+            int64_t py = p / W2, px = p % W2;
+            const float *src = x + ((py / fs) * w + px / fs) * cin;
+            int64_t ph = (ft - 1) * fs * fs + (py % fs) * fs + px % fs;
+            float *dst = y + p * cout;
+            for (int64_t o = 0; o < cout; ++o) {
+                dst[o] += src[(o * F + ph) / rep];
+            }
+        }
+        break;
+    }
+    case GP_ENC_F20_PACK: {
+        /* x (rows, cols) float32, y (rows, F20 rows), rows, cols: kq_f20_encode_row (the bits of
+         * rc_kq_f32_to_f20's rows) */
+        const float *x = GP_P(const float, 0);
+        uint8_t *y = GP_P(uint8_t, 1);
+        int64_t rows = gp_i(r, e, 2);
+        int cols = (int)gp_i(r, e, 3);
+        size_t rb = kq_row_bytes(KQ_F20, cols);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            kq_f20_encode_row(x + i * cols, cols, y + i * rb);
+        }
+        break;
+    }
+    case GP_ENC_F20_UNPACK: {
+        /* x (rows, F20 rows), y (rows, cols) float32, rows, cols: kq_f20_decode_row */
+        const uint8_t *x = GP_P(const uint8_t, 0);
+        float *y = GP_P(float, 1);
+        int64_t rows = gp_i(r, e, 2);
+        int cols = (int)gp_i(r, e, 3);
+        size_t rb = kq_row_bytes(KQ_F20, cols);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < rows; ++i) {
+            kq_f20_decode_row(x + i * rb, cols, y + i * cols);
+        }
+        break;
+    }
+    case GP_ENC_SCATTER: {
+        /* x, idx (n) int32, y, n, cols: y row idx[i] = x row i (none for an
+         * index < 0); the other rows of y stay */
+        const float *x = GP_P(const float, 0);
+        const int32_t *idx = GP_P(const int32_t, 1);
+        float *y = GP_P(float, 2);
+        int64_t n = gp_i(r, e, 3), cols = gp_i(r, e, 4);
+        #pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            if (idx[i] >= 0) {
+                memcpy(y + (int64_t)idx[i] * cols, x + i * cols, (size_t)cols * sizeof(float));
+            }
+        }
+        break;
+    }
+    case GP_ENC_ATTN_KV: {
+        /* q, k, v, o, lo, hi, n, heads, hd: query i over the rows [lo[i],
+         * hi[i]) of k and v (rows of heads x hd), scale 1. A (query, head)
+         * a task: the scores of a tile of keys, the softmax online. */
+        const float *q = GP_P(const float, 0), *k = GP_P(const float, 1), *v = GP_P(const float, 2);
+        float *o = GP_P(float, 3);
+        const int32_t *lo = GP_P(const int32_t, 4), *hi = GP_P(const int32_t, 5);
+        int n = GP_I(6), heads = GP_I(7), hd = GP_I(8), kvh = GP_I(10) ? GP_I(10) : GP_I(7);
+        int64_t stride = (int64_t)heads * hd, kstride = (int64_t)kvh * hd;
+        #pragma omp for schedule(dynamic, 4)
+        for (int64_t t = 0; t < (int64_t)n * heads; ++t) {
+            enum { KT = 128 };
+            float sc[KT];
+            int i = (int)(t / heads), h = (int)(t % heads);
+            const float *qi = q + i * stride + (int64_t)h * hd;
+            float *oi = o + i * stride + (int64_t)h * hd;
+            float m = -INFINITY, l = 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                oi[d] = 0.0f;
+            }
+            for (int k0 = lo[i]; k0 < hi[i]; k0 += KT) {
+                int nk = hi[i] - k0 < KT ? hi[i] - k0 : KT;
+                float mt = -INFINITY;
+                for (int j = 0; j < nk; ++j) {
+                    const float *kj = k + (int64_t)(k0 + j) * kstride + (int64_t)(h / (heads / kvh)) * hd;
+                    float a = 0.0f;
+                    for (int d = 0; d < hd; ++d) {
+                        a += qi[d] * kj[d];
+                    }
+                    sc[j] = a;
+                    mt = a > mt ? a : mt;
+                }
+                float mn = m > mt ? m : mt;
+                float f = m == -INFINITY ? 0.0f : expf(m - mn);
+                l *= f;
+                for (int d = 0; d < hd; ++d) {
+                    oi[d] *= f;
+                }
+                for (int j = 0; j < nk; ++j) {
+                    float p = expf(sc[j] - mn);
+                    const float *vj = v + (int64_t)(k0 + j) * kstride + (int64_t)(h / (heads / kvh)) * hd;
+                    l += p;
+                    for (int d = 0; d < hd; ++d) {
+                        oi[d] += p * vj[d];
+                    }
+                }
+                m = mn;
+            }
+            float inv = l > 0.0f ? 1.0f / l : 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                oi[d] *= inv;
+            }
+        }
+        break;
+    }
+    case GP_ENC_ATTN_REL: {
+        /* q, k, v, o, lo, hi, rel (heads, 2 span - 1), n, heads, hd, span: query i over the
+         * keys [lo[i], hi[i]), scale 1, each score plus rel[h, j - i + span - 1] (T5's relative
+         * position bias of head h at the distance j - i; |j - i| < span). A task: a block of
+         * QB queries and a head. The keys of the block's ranges transposed (kt: hd rows of
+         * the keys, zeros to a multiple of JC) and their values in rows (vt); the scores of
+         * JC keys of a query in a vector, the sums of v of 4 queries at once. */
+        enum { QB = 32, JC = 64, DMAX = 256 };
+        const float *q = GP_P(const float, 0), *k = GP_P(const float, 1), *v = GP_P(const float, 2);
+        float *o = GP_P(float, 3);
+        const int32_t *lo = GP_P(const int32_t, 4), *hi = GP_P(const int32_t, 5);
+        const float *rel = GP_P(const float, 6);
+        int n = GP_I(7), heads = GP_I(8), hd = GP_I(9), span = GP_I(10);
+        int64_t stride = (int64_t)heads * hd, width = 2 * (int64_t)span - 1;
+        int64_t nqb = (n + QB - 1) / QB, ld = (n + JC - 1) / JC * JC;
+        if (hd > DMAX) {
+            gp_fail = 3;
+            break;
+        }
+        float *kt = (float *)malloc((size_t)ld * hd * sizeof(float));
+        float *vt = (float *)malloc((size_t)n * hd * sizeof(float));
+        float *s = (float *)malloc((size_t)QB * ld * sizeof(float));
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t t = 0; t < nqb * heads; ++t) {
+            int i0 = (int)(t / heads) * QB, h = (int)(t % heads);
+            int i1 = i0 + QB < n ? i0 + QB : n;
+            int k0 = lo[i0], k1 = hi[i0];
+            for (int i = i0 + 1; i < i1; ++i) {
+                k0 = lo[i] < k0 ? lo[i] : k0;
+                k1 = hi[i] > k1 ? hi[i] : k1;
+            }
+            int nk = k1 - k0, nkc = (nk + JC - 1) / JC * JC;
+            for (int j = 0; j < nk; ++j) {
+                const float *kj = k + (int64_t)(k0 + j) * stride + (int64_t)h * hd;
+                memcpy(vt + (int64_t)j * hd, v + (int64_t)(k0 + j) * stride + (int64_t)h * hd,
+                       (size_t)hd * sizeof(float));
+                for (int d = 0; d < hd; ++d) {
+                    kt[(int64_t)d * nkc + j] = kj[d];
+                }
+            }
+            for (int d = 0; d < hd; ++d) {
+                for (int j = nk; j < nkc; ++j) {
+                    kt[(int64_t)d * nkc + j] = 0.0f;
+                }
+            }
+            /* the scores: each query's vector of JC keys over the values of the head */
+            for (int jc = 0; jc < nkc; jc += JC) {
+                for (int i = i0; i < i1; ++i) {
+                    const float *qi = q + (int64_t)i * stride + (int64_t)h * hd;
+                    float acc[JC];
+                    for (int jj = 0; jj < JC; ++jj) {
+                        acc[jj] = 0.0f;
+                    }
+                    for (int d = 0; d < hd; ++d) {
+                        const float qd = qi[d], *kd = kt + (int64_t)d * nkc + jc;
+                        for (int jj = 0; jj < JC; ++jj) {
+                            acc[jj] += qd * kd[jj];
+                        }
+                    }
+                    memcpy(s + (int64_t)(i - i0) * ld + jc, acc, sizeof(acc));
+                }
+            }
+            /* the bias, the softmax: the weights of the keys out of a query's range 0 */
+            float inv[QB];
+            for (int i = i0; i < i1; ++i) {
+                float *si = s + (int64_t)(i - i0) * ld;
+                const float *rb = rel + h * width + (span - 1) - i + k0;
+                int a = lo[i] - k0, z = hi[i] - k0;
+                float mx = -INFINITY, sum = 0.0f;
+                for (int j = a; j < z; ++j) {
+                    si[j] += rb[j];
+                    mx = si[j] > mx ? si[j] : mx;
+                }
+                for (int j = 0; j < a; ++j) {
+                    si[j] = 0.0f;
+                }
+                for (int j = a; j < z; ++j) {
+                    si[j] = expf(si[j] - mx);
+                    sum += si[j];
+                }
+                for (int j = z; j < nk; ++j) {
+                    si[j] = 0.0f;
+                }
+                inv[i - i0] = sum > 0.0f ? 1.0f / sum : 0.0f;
+            }
+            /* the sums of v: 4 queries a pass over vt */
+            for (int i = i0; i < i1; i += 4) {
+                int m = i1 - i < 4 ? i1 - i : 4;
+                float acc[4][DMAX];
+                for (int r = 0; r < 4; ++r) {
+                    for (int d = 0; d < hd; ++d) {
+                        acc[r][d] = 0.0f;
+                    }
+                }
+                const float *s0 = s + (int64_t)(i - i0) * ld;
+                for (int j = 0; j < nk; ++j) {
+                    const float *vj = vt + (int64_t)j * hd;
+                    const float p0 = s0[j], p1 = m > 1 ? s0[ld + j] : 0.0f;
+                    const float p2 = m > 2 ? s0[2 * ld + j] : 0.0f, p3 = m > 3 ? s0[3 * ld + j] : 0.0f;
+                    for (int d = 0; d < hd; ++d) {
+                        acc[0][d] += p0 * vj[d];
+                        acc[1][d] += p1 * vj[d];
+                        acc[2][d] += p2 * vj[d];
+                        acc[3][d] += p3 * vj[d];
+                    }
+                }
+                for (int r = 0; r < m; ++r) {
+                    float *oi = o + (int64_t)(i + r) * stride + (int64_t)h * hd;
+                    for (int d = 0; d < hd; ++d) {
+                        oi[d] = acc[r][d] * inv[i + r - i0];
+                    }
+                }
+            }
+        }
+        free(kt);
+        free(vt);
+        free(s);
         break;
     }
     case GP_ENC_DWCONV: {
@@ -1333,6 +2269,61 @@ static void gp_step(const gp_rec *r, int64_t *e)
                     p[j + q4] = bb * c + a * sn;
                 }
             }
+        }
+        break;
+    }
+    case GP_ENC_ROPE1D: {
+        /* x (n, heads, hd), pos (n) int32, inv (hd / 2), n, heads, hd: the 1D
+         * RoPE of EmbeddingGemma 2 in place, NEOX halves (see k_enc_rope1d). */
+        float *x = GP_P(float, 0);
+        const int32_t *pos = GP_P(const int32_t, 1);
+        const float *inv = GP_P(const float, 2);
+        int n = GP_I(3), heads = GP_I(4), hd = GP_I(5), h2 = hd / 2;
+        int64_t rows = (int64_t)n * heads;
+        #pragma omp for schedule(static)
+        for (int64_t row = 0; row < rows; ++row) {
+            float *p = x + row * hd;
+            float base = (float)pos[row / heads];
+            for (int j = 0; j < h2; ++j) {
+                float ang = base * inv[j];
+                float c = cosf(ang), sn = sinf(ang);
+                float a = p[j], bb = p[j + h2];
+                p[j] = a * c - bb * sn;
+                p[j + h2] = bb * c + a * sn;
+            }
+        }
+        break;
+    }
+    case GP_ENC_ATTN_RANGE: {
+        /* q, k, v, o, lo, hi, n, heads, kv_heads, hd: the attention of query
+         * i over the keys [lo[i], hi[i]), scale 1, query head h on KV head
+         * h / (heads / kv_heads) (see k_enc_attn_range). The prompt kernel
+         * with a limit: key j counts when pos - window < j <= limit, so pos =
+         * lo + window - 1 and limit = hi - 1 for a window of n. lo and hi do
+         * not decrease from a query to the next (the kernel's blocks of
+         * queries read the keys from the lo of their first to the hi of their
+         * last). */
+        static int32_t *pw = NULL, *lim = NULL;
+        int n = GP_I(6);
+        const int32_t *lo = GP_P(const int32_t, 4), *hi = GP_P(const int32_t, 5);
+        #pragma omp single
+        {
+            pw = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+            lim = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+            for (int i = 0; i < n; ++i) {
+                pw[i] = lo[i] + n - 1;
+                lim[i] = hi[i] - 1;
+            }
+        }
+        gemma_attn_prefill_region_lim(GP_P(const float, 0), GP_P(const float, 1),
+                                      GP_P(const float, 2), pw, 0, n, GP_P(float, 3), n, n,
+                                      GP_I(7), GP_I(8), GP_I(9), lim);
+        #pragma omp barrier
+        #pragma omp single
+        {
+            free(pw);
+            free(lim);
+            pw = lim = NULL;
         }
         break;
     }
@@ -1443,7 +2434,11 @@ int rc_run(const int64_t *prog, int limit)
     gp_fail = 0;
     int was = gp_planned;
     gp_planned = 1;
-    #pragma omp parallel
+    /* word 3 of the header: the team of this program (program.Program
+     * threads: a program on the CPU in a process of the GPU, whose
+     * OMP_NUM_THREADS is 1), or 0 for the default */
+    const int n = prog[3] > 0 ? (int)prog[3] : omp_get_max_threads();
+    #pragma omp parallel num_threads(n)
     gp_exec(prog, limit);
     gp_planned = was;
     return gp_fail == 2 ? -4 : gp_fail ? -3 : 0;

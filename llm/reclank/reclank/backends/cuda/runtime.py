@@ -60,7 +60,38 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9, 11), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
         P.CPU_TASK: (0, 1, 2), P.MOE_COMBINE: (5,),     # (MOE_COMBINE: the rows of the CPU, pinned)
         P.DS_COMBINE: (3,), P.DS_EMBED: (0,),     # (DS_EMBED: the table in pinned host memory)
-        P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,)}  # (the CPU's sums of its experts, pinned)
+        P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,),  # (the CPU's sums of its experts, pinned)
+        # the counts of the encoders' records: a count of hundreds of millions (a VAE's pixels
+        # times channels at 2048 x 2048) can fall in the host range of an array of the heap,
+        # which the translation took for its address (a launch of ~2^47 blocks: "invalid argument")
+        P.COPY: (2,), P.KQ_LINEAR: (5, 6, 7, 8), P.ENC_LINEAR: (2, 5, 6, 7), P.ENC_RMS: (3, 4),
+        P.ENC_LNORM: (4, 5, 7), P.ENC_GELU: (2, 3), P.ENC_SILU: (2,), P.ENC_SILU_MUL: (3,),
+        P.ENC_MUL_VEC: (3, 4), P.ENC_ADD: (2,), P.ENC_BIAS_CLAMP: (2, 3), P.ENC_GATHER: (3, 4, 5),
+        P.ENC_ROPE1D: (3, 4, 5), P.ENC_ROPE_TAB: (3, 4, 5, 6), P.ENC_ATTN_RANGE: (6, 7, 8, 9),
+        P.ENC_ATTN_X2: (6, 7, 8), P.ENC_DUPUP: (2, 3, 4, 5, 6, 7), P.ENC_ATTN_WIDE: (6, 7, 8),
+        P.ENC_ATTN_TILE: (6, 7, 8), P.ENC_F20_PACK: (2, 3), P.ENC_F20_UNPACK: (2, 3),
+        P.ENC_ATTN_X2C: (8, 9, 10, 11),
+        P.ENC_RESIZE: tuple(range(2, 13)), P.ENC_DIBR: (6, 7, 8, 9, 10, 12, 13), P.ENC_PACK_U8: (2,),
+        P.ENC_RESIZE_TAPS: (2, 3, 4, 5, 6, 7, 8, 11), P.ENC_UNPACK_U8: (2,),
+        P.ENC_WARP: tuple(range(5, 14)), P.ENC_PRELU: (2, 3), P.ENC_MIX: tuple(range(2, 10)),
+        P.ENC_CONV_MM: (7, 8, 9, 10, 12), P.ENC_RIFE_IN: tuple(range(13, 21)),
+        P.ENC_RIFE_OUT: tuple(range(12, 20)), P.ENC_UNPACK_U8P: (2, 3, 4, 5, 6), P.ENC_PACK_U8C: (2, 3, 4, 5),
+        P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14))}
+
+
+def _no_numpy_hugepages():
+    """numpy's large arrays without transparent huge pages (madvise): their faults compacted memory directly, and the
+    compaction tried to move the host pages the GPU pins (a weightkeeper's of 4 KB pages, registered): each try
+    failed and flushed the TLBs of every CPU (Super on the 3060 + 1070, a prompt of 1024 tokens 121 -> 172 tok/s, the
+    migrations gone). RECLANK_NUMPY_HUGEPAGE=1 keeps them."""
+    if os.environ.get("RECLANK_NUMPY_HUGEPAGE") == "1":
+        return
+    try:
+        from numpy._core import multiarray as ma
+    except ImportError:
+        from numpy.core import multiarray as ma
+    if hasattr(ma, "_set_madvise_hugepage"):
+        ma._set_madvise_hugepage(False)
 
 
 def lib():
@@ -78,6 +109,7 @@ def lib():
     except Exception as exc:  # no nvcc, or the build failed
         _error = "the GPU library is not available: %s" % exc
         raise RuntimeError(_error) from exc
+    _no_numpy_hugepages()
     vp, sz, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
     L.rc_gpu_last_error.restype = ctypes.c_char_p
     L.rc_gpu_lane.argtypes = [i]
@@ -366,6 +398,14 @@ class Mirror:
                 raise KeyError("host array %#x has no device copy: %s" % (
                     start, ("dropped at:\n" + gone) if gone else "never added to the mirror"))
             a = np.ascontiguousarray(self.arrays[start])
+            q4x = P.ops._Q4X_SELF.get(start)
+            if q4x is not None:
+                # an int4 matrix of the weightkeeper's KQ_Q4X (no Q4_0 copy on the
+                # host; the array is the tensor's bytes): the GPU kernels read its
+                # Q4_0 blocks
+                if a.nbytes != q4x[0]:
+                    raise ValueError("a KQ_Q4X matrix of %d bytes in an array of %d" % (q4x[0], a.nbytes))
+                a = P.ops.q4x_to_q40(a.view(np.uint8).reshape(-1, q4x[1], 18))
             # pinned: the programs hold its address in their code
             b = self.bufs[start] = Buffer(a.nbytes, self.kind, keep=self.keep, pinned=True)
             b.upload(a)
@@ -479,7 +519,8 @@ def _check_scales(prog, done=None):
             continue
         for wk, sk, rk, ck in pairs:
             w, s = args[wk][1], args[sk][1]
-            if not w or w in done:
+            if not w or not s or w in done:
+                # (no scales: a matrix of KQ_Q4X bytes, its float16 scales its only ones)
                 continue
             done.add(w)
             rows, cols = args[rk][1], args[ck][1]
@@ -981,8 +1022,13 @@ def expert_host(model, layer):
     gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
     n = gu.shape[0]
     e = P.ops._Q4X_MOE.get(gu.ctypes.data)
-    if e is not None and os.environ.get("RECLANK_GPU_Q4X", "1") != "0" and int8_tiles():
+    only = getattr(model, "_q4x_only", False)
+    if e is not None and (only or os.environ.get("RECLANK_GPU_Q4X", "1") != "0") and int8_tiles():
         return e[0].reshape(n, -1), e[1].reshape(n, -1), True
+    if only:
+        # the weightkeeper's KQ_Q4X experts, no Q4_0 copy: GP_MOE_GPU reads them with int8 products
+        raise RuntimeError("the experts are KQ_Q4X only (the weightkeeper's Q4X): the GPU needs the tensor "
+                           "cores or dp4a (RECLANK_GPU_DP4A); start the weightkeeper with --q4x off for this GPU")
     return gu.reshape(n, -1), dn.reshape(n, -1), False
 
 
@@ -1338,6 +1384,7 @@ class HotCache:
     # (rows x experts) bool, or None: the experts an expert device holds (set in __init__ and by
     # devices.py; here too for the caches made without __init__, as scripts/check_hotcache.py does)
     exclude = None
+    remote = None
 
     def __init__(self, dev, decay=None, max_ins=None, layers=None, top_k=None):
         """layers (or None for a ModelGPU) gives one dict for each layer
@@ -1357,8 +1404,11 @@ class HotCache:
         # (rows x experts) bool, or None: experts another GPU holds (an expert
         # device, devices.py), which the slots do not take: their selections
         # do not count (exclusive caching: the slots go to experts that would
-        # run on the CPU)
+        # run on the CPU). remote: the same experts, for the count of the
+        # pairs on no GPU (cpu_pairs), with exclude or without (the slots
+        # take any expert, and the device runs those of its experts they lack)
         self.exclude = None
+        self.remote = None
         self.top_k = top_k or cfg.top_k_experts
         self.layers = layers if layers is not None else []  # the layers with hot experts
         for layer, (_hot, gu_store, dn_store, slots) in (
@@ -1452,7 +1502,11 @@ class HotCache:
         held = blocks[pool.owner[blocks] >= 0]
         if held.size == 0:
             return
-        self.prepare(wait=True)
+        # the copies that run land (their blocks have owners: in held), and no new ones: prepare's
+        # observe could start a copy into a free block of blocks, which then landed as a warm expert
+        # not in held, its segment went (pool_shrink), and its slot kept the block (the 26B on the RTX
+        # 3060 with an expert device: a prompt's buffers took a segment, GP_MOE_GPU read address 0)
+        self._land(wait=True)
         E = self.score.shape[1]
         changed = set()
         for i in held:
@@ -1644,7 +1698,7 @@ class HotCache:
         R, E = rows.size, self.score.shape[1]
         self.routes[rows] += np.bincount((np.arange(R)[None, :, None] * E + sels)[ok],
                                          minlength=R * E).reshape(R, E)
-        on = self.held[rows] if self.exclude is None else self.held[rows] | self.exclude[rows]
+        on = self.held[rows] if self.remote is None else self.held[rows] | self.remote[rows]
         self.pairs += int(ok.sum())
         self.cpu_pairs += int((ok & ~np.take_along_axis(on[None], np.maximum(sels, 0), axis=2)).sum())
         if self.exclude is not None:

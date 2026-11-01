@@ -618,6 +618,18 @@ static int moe_q40_mode(void)
     return mode;
 }
 
+/* RECLANK_GPU_Q4X_X2=0: the KQ_Q4X experts of GP_MOE_GPU (the tensor cores or dp4a) of a program of float32
+ * products (i8 0, the 26B) on int8 x, not on the int16 form (runner.cu), as before it was their default */
+static int q4x_x2_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_Q4X_X2");
+        on = v == NULL || atoi(v) != 0;
+    }
+    return on;
+}
+
 /* GP_MOE_GPU with KQ_Q4X experts on dp4a (k_moe_gemm_q4x). */
 template <int X2>
 __global__ void __launch_bounds__(256, 2) k_moe_gemm_q4x_dp4a(const gp_rec *r, const int64_t *e,

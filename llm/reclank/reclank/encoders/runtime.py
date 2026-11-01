@@ -1,5 +1,9 @@
 """The image and audio encoders of the Gemma 4 E2B, E4B, and 26B (gemma4v, gemma4a).
 
+Ported from transformers (src/transformers/models/gemma4/modeling_gemma4.py,
+Copyright 2026 the HuggingFace Team; models/gemma4/feature_extraction_gemma4.py,
+Copyright 2026 Google LLC; Apache License 2.0). See THIRD_PARTY_NOTICES.md.
+
 The weights come from the mmproj GGUF (llama.cpp). The graphs follow
 transformers (models/gemma4/modeling_gemma4.py): Gemma4VisionModel and
 Gemma4AudioModel, then Gemma4MultimodalEmbedder (an RMS norm with no weight
@@ -32,8 +36,12 @@ conv_norm is pre_layer_norm of transformers, and norm_conv is conv_norm.
 """
 from __future__ import annotations
 
+import itertools
 import platform as _platform
 import os
+import threading
+import time
+import weakref
 
 import numpy as np
 
@@ -141,6 +149,14 @@ def quantize_q8(lin):
     return True
 
 
+def _shape(lin):
+    """(rows, cols) of a linear's W, also after to_bf12, to_bf12_dev or to_f20 (W dropped)."""
+    if lin.w is not None:
+        return lin.w.shape
+    q = getattr(lin, "kq", None) or getattr(lin, "bf12", None) or lin.f20
+    return (q.rows, q.cols)
+
+
 def to_bf12(lin):
     """Give a linear of bfloat16 W the BF12 rows of W (lin.kq, for a GPU
     program; the bfloat16 values in 12.25 bits) and drop W, under the rule of
@@ -161,9 +177,337 @@ def to_bf12(lin):
     return True
 
 
+def to_bf12_dev(lin, gpu, src=None):
+    """Give a linear of bfloat16 rows (lin.w, uint16; or lin.kq of KQ_BF16 rows, models.qwen3.dense's
+    lin16 on the GPU) their BF12 (the bfloat16 values in 12.25 bits) and drop W: BF12 rows (lin.kq, a
+    GPU program's KQ_LINEAR) or KQ_BF12X16 (lin.bf12, a CPU program's ENC_LINEAR: float32 products of
+    the BF12 values), under the rule of to_bf12 (cols a multiple of 32, more than one row, no Inf or
+    NaN, the largest zeroed value at most 2^-8 of the RMS of the matrix). The pages of the
+    checkpoint's map that W, or src, views are dropped (drop_pages). Return False (W kept) when W does
+    not pass."""
+    from reclank.backends.cpu import cops
+    from reclank.formats.gguf import BF12, BF16
+    from reclank.formats.safetensors import drop_pages
+    from reclank.models.gemma4.e4b import _KQ
+    kq = getattr(lin, "kq", None)
+    if lin.w is not None and lin.w.dtype == np.uint16:
+        w = lin.w
+    elif lin.w is None and kq is not None and kq.type == BF16:
+        w = np.asarray(kq.data).view(np.uint16).reshape(kq.rows, kq.cols)
+    else:
+        return False
+    rows, cols = w.shape
+    if cols % 32 or rows < 2:
+        return False
+    data, rep = cops.kq_bf16_to_bf12(w, cols)
+    if rep["nonfinite"] or rep["largest"] > rep["rms"] / 256:
+        return False
+    if gpu:
+        lin.kq = _KQ(data, BF12, rows, cols)
+    else:
+        lin.kq = None
+        lin.bf12 = _KQ(cops.kq_pack_bf12x16(data, rows, cols), cops.KQ_BF12X16, rows, cols)
+        del data
+    lin.w = None
+    lin.x16 = None
+    drop_pages(w if src is None else src)
+    return True
+
+
+def to_f20(lin, gpu, src=None):
+    """Give a linear of float32 W its F20 (lin.f20: F20 rows for a GPU program, KQ_F20X16 for a CPU
+    program; 16 significant bits a value in 20.25 bits) and drop W, under the rule of to_bf12: cols
+    a multiple of 32, no Inf or NaN, the largest zeroed value at most 2^-8 of the RMS of the matrix.
+    W's memory goes with it: a copy of W is freed (when nothing else holds it), and the pages of
+    the checkpoint's map that W, or src (the tensor W was copied from), views are dropped
+    (drop_pages). Return False (W kept) when W does not pass."""
+    from reclank.backends.cpu import cops
+    from reclank.formats.safetensors import drop_pages
+    from reclank.models.gemma4.e4b import _KQ
+    w = lin.w
+    if w is None or w.dtype != np.float32 or w.ndim != 2 or w.shape[1] % 32:
+        return False
+    rows, cols = w.shape
+    data, rep = cops.kq_f32_to_f20(w, cols)
+    if rep["nonfinite"] or rep["largest"] > rep["rms"] / 256:
+        return False
+    if gpu:
+        lin.f20 = _KQ(data, cops.KQ_F20, rows, cols)
+    else:
+        lin.f20 = _KQ(cops.kq_pack_f20x16(data, rows, cols), cops.KQ_F20X16, rows, cols)
+    del data
+    lin.w = None
+    lin.x16 = None
+    drop_pages(w if src is None else src)
+    return True
+
+
+class F20Lins:
+    """Linears to F20 one at a time, as a model makes them (add: to_f20, so that the float32 W of
+    only one matrix is in memory beside the F20 ones); done prints the count and the memory."""
+
+    def __init__(self, gpu, label):
+        self.gpu, self.label = gpu, label
+        self.done = self.kept = self.before = self.after = 0
+
+    def add(self, lin, src=None):
+        w = lin.w
+        if w is None or getattr(lin, "f20", None) is not None:
+            return
+        nbytes = w.nbytes
+        del w
+        if to_f20(lin, self.gpu, src):
+            self.done += 1
+            self.before += nbytes
+            self.after += lin.f20.data.nbytes
+        else:
+            self.kept += 1
+
+    def report(self):
+        print("%s: %d matrices F20 (%.2f -> %.2f GB)%s" % (
+            self.label, self.done, self.before / 1e9, self.after / 1e9,
+            ", %d stay float32" % self.kept if self.kept else ""), flush=True)
+
+
+def f20_lins(lins, gpu, label):
+    """The float32 matrices of lins in F20 (to_f20, each W dropped after its F20); a matrix that the
+    rule refuses keeps its float32 W."""
+    f = F20Lins(gpu, label)
+    for lin in lins:
+        f.add(lin)
+    f.report()
+
+
+class _Use:
+    """A scope of Residency.use: its runners, pinned from their first GPU run in it (held) until
+    done or its end."""
+
+    def __init__(self, res, runners):
+        self.res = res
+        self.runners = set(r for r in runners if r is not None)
+        self.held, self.finished = set(), set()
+
+    def __enter__(self):
+        self.res._scopes().append(self)
+        return self
+
+    def __exit__(self, *exc):
+        with self.res.lock:
+            stack = self.res._scopes()
+            if self in stack:
+                stack.remove(self)
+            for r in self.held:
+                self.res._unpin(r)
+            self.held.clear()
+        return False
+
+    def hold(self, r):
+        if r in self.runners and r not in self.held and r not in self.finished:
+            self.held.add(r)
+            self.res._pin(r)
+
+    def done(self, *runners):
+        """These runners' part of the request is over (Wan's DiT before its VAE): they may go from
+        now on."""
+        with self.res.lock:
+            for r in runners:
+                if r is None:
+                    continue
+                self.finished.add(r)
+                if r in self.held:
+                    self.held.discard(r)
+                    self.res._unpin(r)
+
+
+class Residency:
+    """Which GPU runners hold device memory: one manager for the process (RESIDENCY).
+
+    Every _Runner registers. A runner's resident bytes (gpu_bytes) are its mirror's Buffers (the
+    weights and the buffers of its programs) and what the C side took for its programs (their
+    scratch, code and graphs: the drop of the free memory at a build, less the mirror's growth).
+    Before a GPU build (_Runner.get), make_room(runner, need) evicts the unpinned runners, the
+    least recently used first, with release(keep_host=True) (the next run uploads the host arrays
+    again), until cudaMemGetInfo's free memory covers need + reserve, and the runners' bytes +
+    need fit budget (None: no budget; over it with nothing left to evict, MemoryError). A
+    cudaMalloc that fails in a build anyway (MemoryError): every other unpinned runner goes, and
+    the build runs once more.
+
+    Pins: pin(runner) keeps a runner for good (the server's --keep, --pin). use(*runners) is a
+    request's scope: each of its runners is pinned from its first GPU run in the scope (its device
+    state, a cache or a text's keys and values, lives from then on) until use.done(runner) or the
+    scope's end; a runner not run yet in the scope can still go. A run outside any scope pins
+    nothing: a part whose state spans several runs (a prefix, then the steps) runs in a scope.
+
+    enabled: the manager acts (evictions, the budget, the retry; a build also records its graphs
+    then, g.prepare). Off by default: a _Runner then runs as it did before, and the registry only
+    counts (the LLM and embedding servers, the scripts). The generation server turns it on, and so
+    do RECLANK_RESIDENCY=1 and always.
+
+    always (RECLANK_EVICT_ALWAYS=1): every unpinned runner goes before every GPU run (and the
+    runner itself, when unpinned: its run uploads again), to check that a swap keeps the bits.
+    verbose (RECLANK_RESIDENCY_LOG=1, the server unless --quiet) prints each eviction and each
+    load with its time; log keeps the last 256 of them (kind, label, bytes, seconds)."""
+
+    def __init__(self, mem_info=None, reserve=None, budget=None, always=None, enabled=None):
+        self._mem_info = mem_info
+        self.reserve = int(float(os.environ.get("RECLANK_GPU_RESERVE", "512e6"))) if reserve is None else reserve
+        self.budget = budget
+        self.always = os.environ.get("RECLANK_EVICT_ALWAYS", "0") == "1" if always is None else always
+        self.enabled = (os.environ.get("RECLANK_RESIDENCY", "0") == "1" or self.always) if enabled is None else enabled
+        self.verbose = os.environ.get("RECLANK_RESIDENCY_LOG", "0") == "1"
+        self.lock = threading.RLock()
+        self.state = weakref.WeakKeyDictionary()    # runner: [last use, pins]
+        self.kept = weakref.WeakSet()               # pinned for good
+        self.evicted = weakref.WeakSet()            # gone since its last load (its next load is a swap)
+        self.ticks = itertools.count(1)
+        self.local = threading.local()              # the scopes of use of this thread
+        self.log = []
+
+    def free(self):
+        if self._mem_info is None:
+            from reclank.backends.cuda.gpumm import mem_info
+            self._mem_info = mem_info
+        return self._mem_info()[0]
+
+    def _scopes(self):
+        s = getattr(self.local, "scopes", None)
+        if s is None:
+            s = self.local.scopes = []
+        return s
+
+    def register(self, r):
+        with self.lock:
+            if r not in self.state:
+                self.state[r] = [0, 0]
+
+    def label(self, r):
+        return getattr(r, "label", None) or type(r).__name__
+
+    def total(self):
+        """The resident bytes of all runners."""
+        return sum(r.gpu_bytes() for r in list(self.state.keys()))
+
+    def pinned(self, r):
+        return r in self.kept or self.state.get(r, (0, 0))[1] > 0
+
+    def pin(self, r):
+        """Keep r on the GPU for good (its memory is never evicted)."""
+        self.register(r)
+        self.kept.add(r)
+
+    def unpin(self, r):
+        self.kept.discard(r)
+
+    def _pin(self, r):
+        self.register(r)
+        self.state[r][1] += 1
+
+    def _unpin(self, r):
+        st = self.state.get(r)
+        if st is not None and st[1] > 0:
+            st[1] -= 1
+
+    def use(self, *runners):
+        """with use(*runners) as u: a request's scope (u.done(runner): an early end of a part)."""
+        return _Use(self, runners)
+
+    def before_run(self, r):
+        """At a GPU run of r (_Runner.get): with always, every unpinned runner goes first (r too);
+        r is held by the scopes that name it; its last use is now."""
+        with self.lock:
+            self.register(r)
+            if self.always and self.enabled:
+                self.evict_unpinned()
+            for s in self._scopes():
+                s.hold(r)
+            self.state[r][0] = next(self.ticks)
+
+    def _note(self, kind, r, nbytes, secs):
+        self.log = self.log[-255:] + [(kind, self.label(r), int(nbytes), secs)]
+        if self.verbose:
+            print("gpu: %s %s (%.2f GB) in %.2f s" % (kind, self.label(r), nbytes / 1e9, secs), flush=True)
+
+    def evict(self, r):
+        """Free r's GPU memory (its host programs stay). Return the bytes it held."""
+        with self.lock:
+            nb = r.gpu_bytes()
+            if nb <= 0:
+                return 0
+            t0 = time.time()
+            r.release(keep_host=True)
+            self.evicted.add(r)
+            self._note("evicted", r, nb, time.time() - t0)
+            return nb
+
+    def victims(self, keep=None):
+        """The unpinned runners that hold memory (not keep), the least recently used first."""
+        with self.lock:
+            out = [(st[0], i, r) for i, (r, st) in enumerate(list(self.state.items()))
+                   if r is not keep and not self.pinned(r) and r.gpu_bytes() > 0]
+        return [r for _t, _i, r in sorted(out, key=lambda x: (x[0], x[1]))]
+
+    def evict_unpinned(self, keep=None):
+        """Evict every unpinned runner but keep. Return the bytes freed."""
+        return sum(self.evict(r) for r in self.victims(keep))
+
+    def short(self, need):
+        """The bytes missing for need: of the free memory (with the reserve), and of the budget."""
+        s = need + self.reserve - self.free()
+        if self.budget is not None:
+            s = max(s, self.total() + need - self.budget)
+        return s
+
+    def make_room(self, runner, need, sure=None):
+        """Evict unpinned runners (not runner), the least recently used first, until need bytes
+        fit (short). MemoryError when sure (the part of need that is not an estimate; None: all of
+        it) does not fit the budget with all of them gone."""
+        sure = need if sure is None else sure
+        with self.lock:
+            for v in self.victims(runner):
+                if self.short(need) <= 0:
+                    break
+                self.evict(v)
+            if self.budget is not None and self.total() + sure > self.budget:
+                raise MemoryError("%s needs %.2f GB: the GPU budget is %.2f GB, %.2f GB of it pinned or in use" % (
+                    self.label(runner), sure / 1e9, self.budget / 1e9, self.total() / 1e9))
+
+    def load(self, runner, need, make, sure=None):
+        """make() (a GPU build of runner's, need bytes, sure of them known) after make_room; when it
+        fails for memory, every other unpinned runner goes and make runs once more. Not enabled:
+        make() alone."""
+        if not self.enabled:
+            return make()
+        self.make_room(runner, need, sure)
+        t0 = time.time()
+        try:
+            out = make()
+        except MemoryError:
+            with self.lock:
+                self.evict_unpinned(keep=runner)
+            t0 = time.time()
+            out = make()
+        self._note("reloaded" if runner in self.evicted else "loaded", runner, getattr(runner, "last_load", need),
+                   time.time() - t0)
+        self.evicted.discard(runner)
+        return out
+
+
+RESIDENCY = Residency()
+
+
+def gpu_runners(gpu, **parts):
+    """{name: the part's _Runner} of the parts that are on the GPU (not None; none on the CPU): a
+    pipeline's runners()."""
+    return {k: p.runner for k, p in parts.items() if p is not None} if gpu else {}
+
+
 class _Runner:
     """The programs of an encoder by size: in C on the CPU, or on the GPU
-    (gpu.GPUProgram, with one mirror of the weights for all sizes)."""
+    (gpu.GPUProgram, with one mirror of the weights for all sizes). Its GPU
+    memory is in RESIDENCY's hands: it may go between runs (release with
+    keep_host) unless pinned."""
+
+    C_EXTRA = 64 << 20      # (_need: the C side's bytes of a first build, past the largest float32 array)
 
     def __init__(self, build, keep=4, keep_gpu=2):
         self.build = build
@@ -171,24 +515,80 @@ class _Runner:
         self.keep_gpu = keep_gpu    # GPU programs hold device memory: fewer of them
         self.progs = {}
         self.mirror = None
+        self.hosts = {}             # release(keep_host): the programs whose GPU copies went
+        self.label = getattr(build, "__qualname__", None) or "runner"
+        self.scratch = {}           # key: the C side's bytes of its GPU program (code, graphs, scratch)
+        self.seen = {}              # key: the same at its last build (the need of the next)
+        self.last_load = 0
+        RESIDENCY.register(self)
+
+    def gpu_bytes(self):
+        """The device memory of the runner: its mirror's and its programs'."""
+        return (self.mirror.nbytes() if self.mirror is not None else 0) + sum(self.scratch.values())
+
+    def _need(self, key, prog):
+        """The device bytes a GPU build of prog takes, and the part of them that is known (not an
+        estimate): the arrays it reads that are not on the device, and the C side's of its last
+        build at this key (the first time an estimate: the largest float32 array, about the float16
+        planes of a product's rows, plus 64 MB)."""
+        mir = self.mirror
+        seen, new, largest = set(), 0, 0
+        for a in prog.keep:
+            if not isinstance(a, np.ndarray):
+                continue
+            while isinstance(a.base, np.ndarray):
+                a = a.base
+            s = a.ctypes.data
+            if s in seen:
+                continue
+            seen.add(s)
+            if a.dtype == np.float32:
+                largest = max(largest, a.nbytes)
+            if mir is None or s not in mir.bufs:
+                new += a.nbytes
+        c = self.seen.get(key)
+        return (new + c, new + c) if c is not None else (new + largest + self.C_EXTRA, new)
+
+    def _load(self, key, prog):
+        """The GPU program of prog: its arrays uploaded, its scratch and graphs made."""
+        from reclank.backends.cuda.gpumm import mem_info
+        from reclank.backends.cuda.runtime import GPUProgram, Mirror
+        if self.mirror is None:
+            self.mirror = Mirror()
+            self.mirror.kind = "encoder"     # GpuMem
+        free0, mir0 = mem_info()[0], self.mirror.nbytes()
+        g = GPUProgram(prog, graph=True, mirror=self.mirror)
+        if RESIDENCY.enabled:
+            try:
+                g.prepare()     # (its graphs now: their memory is the build's)
+            except MemoryError:
+                g.close()
+                raise
+        grew = self.mirror.nbytes() - mir0
+        self.scratch[key] = self.seen[key] = max(0, free0 - mem_info()[0] - grew)
+        self.last_load = grew + self.scratch[key]
+        return g
 
     def get(self, n, gpu):
         key = (n, bool(gpu))
+        if gpu:
+            RESIDENCY.before_run(self)
         entry = self.progs.pop(key, None)
         if entry is None:
-            prog = self.build(n, gpu)
+            prog = self.hosts.pop(key, None)
+            prog = self.build(n, gpu) if prog is None else prog
             g = None
             if gpu:
-                from reclank.backends.cuda.runtime import GPUProgram, Mirror
                 # room first: the GPU programs over keep_gpu - 1 go before the
                 # new one takes its memory (the weights it reads stay)
                 gpu_keys = [k for k in self.progs if k[1]]
                 while gpu_keys and len(gpu_keys) >= self.keep_gpu:
                     self._drop(gpu_keys.pop(0), keep=prog)
-                if self.mirror is None:
-                    self.mirror = Mirror()
-                    self.mirror.kind = "encoder"     # GpuMem
-                g = GPUProgram(prog, graph=True, mirror=self.mirror)
+                if RESIDENCY.enabled:
+                    need, sure = self._need(key, prog)
+                    g = RESIDENCY.load(self, need, lambda: self._load(key, prog), sure)
+                else:
+                    g = self._load(key, prog)
             entry = (prog, g)
         self.progs[key] = entry
         while len(self.progs) > self.keep:
@@ -207,6 +607,7 @@ class _Runner:
         prog, g = self.progs.pop(key)
         if g is None:
             return
+        self.scratch.pop(key, None)
         g.close()
         for b in getattr(g, "named", {}).values():
             b.free()
@@ -234,16 +635,26 @@ class _Runner:
                 del mir.arrays[s]
                 mir.starts.remove(s)
 
-    def release(self):
+    def release(self, keep_host=False):
         """Free the GPU memory of the programs and of the weights (a model
         that needs the room between media requests). The next GPU run
-        builds them again."""
+        builds them again (keep_host: from the programs kept on the host, a
+        VAE's of 2.8 s)."""
+        if RESIDENCY.enabled and (self.mirror is not None or self.scratch):
+            from reclank.backends.cuda.gpumm import mem
+            mem().poll(wait=True)       # (the runs queued before: their memory goes now)
         for key in [k for k in self.progs if k[1]]:
+            if keep_host:
+                self.hosts.pop(key, None)
+                self.hosts[key] = self.progs[key][0]
             self._drop(key)
+        while RESIDENCY.enabled and len(self.hosts) > self.keep:      # (the oldest sizes' host programs)
+            self.hosts.pop(next(iter(self.hosts)))
         if self.mirror is not None:
             for b in self.mirror.bufs.values():
                 b.free()
             self.mirror = None
+        self.scratch.clear()
 
     def run(self, n, gpu, inputs, output):
         """Write the inputs (name: array), run, and return the output."""

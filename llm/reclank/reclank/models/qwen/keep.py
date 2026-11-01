@@ -43,7 +43,7 @@ import time
 import numpy as np
 
 from reclank.backends.cpu import cops
-from reclank.formats.gguf import BF12, BF16, F32, GGUF, Q8_0, RQ8_0, tensor_bytes
+from reclank.formats.gguf import BF12, BF16, F32, GGUF, Q4_0, Q4X, Q8_0, RQ8_0, tensor_bytes
 
 LAYOUT = "tensors-v1"
 MODEL = "qwen4exp"
@@ -497,10 +497,13 @@ class KeptGGUF(GGUF):
     """The GGUF view of the tensors in the weightkeeper (the interface of
     reclank.formats.gguf.GGUF: tensors, meta, raw, dequant): the tensors
     whole on a node are views of the segments; the routed experts and the
-    n-gram table are split by rows between the nodes (rows(): the parts)."""
+    n-gram table are split by rows between the nodes (rows(): the parts);
+    those the weightkeeper left in the GGUF file (place "file") are views of
+    its map (file())."""
 
     use_cache = False
     keep_embedding_bf16 = True
+    _file_g = None      # the GGUF file, for the tensors the weightkeeper left there (place "file")
 
     def __init__(self, ckpt, w=None):
         from reclank.runtime import weightkeeper as W
@@ -530,8 +533,17 @@ class KeptGGUF(GGUF):
             except KeyError:
                 continue
 
+    def file(self):
+        """The GGUF file itself (a map of it): the tensors that the weightkeeper
+        does not hold (layout_gguf without --dense: the dense and small ones)."""
+        if self._file_g is None:
+            self._file_g = GGUF(self.index["file"], stage=False)
+        return self._file_g
+
     def raw(self, gname):
         d = self.index["tensors"][gname]
+        if d["place"] == "file":
+            return self.file().raw(gname)
         dims, t, _o = self.tensors[gname]
         if d["place"] == "experts" and len(d["parts"]) == 1 and list(d["parts"][0][2]) == list(range(d["E"])):
             # one node holds every expert, in order: the stack whole, as the file has it
@@ -585,7 +597,7 @@ class KeptGGUF(GGUF):
 
     def dequant(self, gname, rows=None):
         d = self.index["tensors"][gname]
-        if d["place"] == "node":
+        if d["place"] in ("node", "file"):
             return super().dequant(gname, rows)
         if d["E"] != 1:
             raise ValueError("%s: the experts are read by their parts" % gname)
@@ -596,13 +608,16 @@ class KeptGGUF(GGUF):
         return cops.kq_rows(raw.reshape(-1), t, cols, np.arange(idx.size))
 
     def advise_random(self, gname):
-        pass
+        if self.index["tensors"][gname]["place"] == "file":
+            self.file().advise_random(gname)
 
     def drop_cache(self):
         pass
 
     def close(self):
-        pass
+        if self._file_g is not None:
+            self._file_g.close()
+            self._file_g = None
 
 
 def export_gguf(g, out, log=print):
@@ -619,6 +634,8 @@ def export_gguf(g, out, log=print):
         d = tens[name]
         if d["place"] == "node":
             return lambda: g.w.tensor(name)
+        if d["place"] == "file":
+            return lambda: g.raw(name)[0].view(np.uint8).reshape(-1)
         if d["place"] == "experts":
             def experts():
                 at = {}
@@ -710,12 +727,30 @@ def layout_gguf(path, nodes, share, o):
     """The index of the tensors of a qwen4exp or qwen35moe GGUF file in the weightkeeper: the
     places of layout() (the experts of each layer split between the nodes by
     expert, the n-gram table by rows, the rest on the GPU's node), the types
-    as the file has them (a copy, no conversion)."""
+    as the file has them (a copy, no conversion). A Gemma 4 file (gemma4)
+    with o.q4x "auto" or "on": its Q4_0 matrices as KQ_Q4X (Q4X; fill_gguf
+    packs them after the copy), the only copy of the weights in memory: the
+    runtime reads them as they are on every CPU, where the Q4_0 file made it
+    keep a KQ_Q4X copy beside the Q4_0 one on AVX2 and VNNI (12.9 GB more
+    for the 26B).
+
+    The experts and the n-gram table only, unless o.dense (--dense): the
+    dense and small tensors stay in the file (place "file", the type of the
+    file), and the runtime reads them there (KeptGGUF.raw); the loader makes
+    the KQ_Q4X copies of the dense Q4_0 matrices that the CPU reads
+    (ops.q4x_pack_model). The 26B: 12.8 GB held, not 15.0."""
     g = GGUF(path, stage=False)
     parts = len(nodes)
     dpart = nodes.index(o.dense_node) if o.dense_node in nodes else 0
     counts = np.load(o.counts) if getattr(o, "counts", None) else None
     tens, used, order, homes, offs = {}, [0] * parts, [], {}, {}
+    q4x = getattr(o, "q4x", "auto") != "off" and g.meta.get("general.architecture") == "gemma4"
+    dense = bool(getattr(o, "dense", False))
+
+    def as_q4x(gname, t, cols, rows):
+        # the matrices of the layers (a Q4_0 token table stays: Model.embed and the GPU head read Q4_0)
+        ok = q4x and gname.startswith("blk.") and t == Q4_0 and rows % 16 == 0 and cols % 32 == 0
+        return Q4X if ok else t
 
     def at(p, n):
         off = used[p]
@@ -733,15 +768,19 @@ def layout_gguf(path, nodes, share, o):
             ids = homes.setdefault(i, _homes(i, ne, parts, counts))
             nb = rows * rb
             ps = [[p, at(p, len(ids[p]) * nb), [int(e) for e in ids[p]]] for p in range(parts)]
-            tens[gname] = dict(dims=list(dims), type=int(t), place="experts", E=ne, rows=rows, rb=rb, nb=nb,
-                               parts=ps, kind="experts")
+            tens[gname] = dict(dims=list(dims), type=int(as_q4x(gname, t, cols, rows)), place="experts", E=ne,
+                               rows=rows, rb=rb, nb=nb, parts=ps, kind="experts", src=int(t))
         elif gname == "per_layer_token_embd.weight":
             ple = (gname, dims, t)
             continue
+        elif not dense:
+            tens[gname] = dict(dims=list(dims), type=int(t), place="file", src=int(t),
+                               kind="dense" if _dense_ok(gname, dims) else "small")
         else:
             n = tensor_bytes(dims, t)
-            tens[gname] = dict(dims=list(dims), type=int(t), place="node", seg=dpart, off=at(dpart, n), bytes=n,
-                               kind="dense" if _dense_ok(gname, dims) else "small")
+            t2 = as_q4x(gname, t, dims[0], dims[1]) if len(dims) == 2 else t
+            tens[gname] = dict(dims=list(dims), type=int(t2), place="node", seg=dpart, off=at(dpart, n), bytes=n,
+                               kind="dense" if _dense_ok(gname, dims) else "small", src=int(t))
         order.append(gname)
     if ple is not None:
         gname, dims, t = ple
@@ -759,8 +798,9 @@ def layout_gguf(path, nodes, share, o):
         order.append(gname)
 
     def kind_type(k):
-        ts = sorted({_tname(d["type"]) for d in tens.values() if d["kind"] == k})
-        return "/".join(ts) or "-"
+        ds = [d for d in tens.values() if d["kind"] == k]
+        ts = "/".join(sorted({_tname(d["type"]) for d in ds})) or "-"
+        return ts + " in the file" if ds and all(d["place"] == "file" for d in ds) else ts
     meta = [[k, _plain(v)] for k, v in g.meta.items() if k != "general.alignment"]
     model = g.meta.get("general.architecture", MODEL)
     a = model + "."
@@ -788,6 +828,8 @@ def fill_gguf(sh, index, segs, threads, log):
     for gname in index["order"]:
         d = tens[gname]
         src = base + offs[gname]
+        if d["place"] == "file":
+            continue
         if d["place"] == "node":
             add(src, src + d["bytes"], d["seg"], d["off"])
         elif d["place"] == "experts":
@@ -802,6 +844,38 @@ def fill_gguf(sh, index, segs, threads, log):
         p, dst = h
         segs[p].array(dst, v.nbytes)[:] = v
     _stream(merged, threads, handle, log, "the tensors of %s" % os.path.basename(path))
+    _fill_q4x(index, segs, log)
+
+
+def _q4x_pack_bytes(a, rows, cols):
+    """The Q4_0 bytes a (rows x cols, rows a multiple of 16) to KQ_Q4X in place."""
+    nb = cols // 32
+    packed = a.reshape(rows, nb, 18)
+    scales = np.ascontiguousarray(packed[..., :2]).view(np.float16).reshape(rows, nb).astype(np.float32)
+    a[:] = cops.kq_q4x_pack(packed, scales)
+
+
+def _fill_q4x(index, segs, log):
+    """The tensors of the index of type Q4X (layout_gguf: Q4_0 in the file) to KQ_Q4X, in place in the
+    segments: a stack of experts by its parts (the experts of a part one after the other, each a
+    multiple of 16 rows, pack as one matrix)."""
+    tens = index["tensors"]
+    names = [n for n in index["order"] if tens[n]["type"] == Q4X and tens[n].get("src") == Q4_0]
+    if not names:
+        return
+    t0, n = time.time(), 0
+    for gname in names:
+        d = tens[gname]
+        cols = int(d["dims"][0])
+        if d["place"] == "node":
+            _q4x_pack_bytes(segs[d["seg"]].array(d["off"], d["bytes"]), int(d["dims"][1]), cols)
+            n += d["bytes"]
+        else:
+            for p, off, ids in d["parts"]:
+                if ids:
+                    _q4x_pack_bytes(segs[p].array(off, len(ids) * d["nb"]), len(ids) * d["rows"], cols)
+                    n += len(ids) * d["nb"]
+    log("%d Q4_0 tensors to KQ_Q4X: %.1f GB in %.1f s" % (len(names), n / 1e9, time.time() - t0))
 
 
 class _GGUFPlugin:

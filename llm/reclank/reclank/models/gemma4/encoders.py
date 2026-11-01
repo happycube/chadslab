@@ -1,7 +1,12 @@
 """The media encoders of Gemma 4: vision (Gemma4Vision), audio
 (Gemma4Audio), the embedder of the E4B and the 26B (Gemma4Embedder), and
 load_embedder. The weights, the compiler, and the runner of the encoders
-are in reclank/encoders/runtime.py."""
+are in reclank/encoders/runtime.py.
+
+Ported from transformers (src/transformers/models/gemma4/modeling_gemma4.py,
+Copyright 2026 the HuggingFace Team;
+models/gemma4/feature_extraction_gemma4.py, Copyright 2026 Google LLC; Apache
+License 2.0). See THIRD_PARTY_NOTICES.md."""
 from __future__ import annotations
 
 import math
@@ -12,7 +17,7 @@ import numpy as np
 from reclank.core import ops
 from reclank.formats.gguf import GGUF
 from reclank.encoders.runtime import (  # noqa: F401
-    _ENC_PY, _EncCompiler, _Linear, _Plain, _Runner, _Weights,
+    _ENC_PY, _EncCompiler, _Linear, _Plain, _Runner, _Weights, _shape,
     _bf16_exact, _gelu_tanh, _rms, _silu, _softmax, quantize_q8)
 
 
@@ -128,7 +133,7 @@ class Gemma4Vision:
         inputs "p" (the patches, 2x - 1), "pe" (the rows of the position
         tables), "pos" (x, y); output "x" (n, width), before the pool."""
         w, H, hd = self.width, self.heads, self.hd
-        inter = self.blk[0]["gate"].w.shape[0]
+        inter = _shape(self.blk[0]["gate"])[0]
         kp = self.patch_w.shape[1]
         c = _EncCompiler(self.eps, pack=not gpu, q8=self.q8, rows=n, kmax=max(kp, w, inter))
         z = lambda *shape: np.zeros(shape, np.float32)  # noqa: E731
@@ -340,9 +345,9 @@ class Gemma4Audio:
         inputs "s" (the rows of the subsample convs, T x 1024) and "valid"
         (T int32); output "y" (T, text width)."""
         W, H, hd, span = self.width, self.heads, self.hd, self.LEFT - 1
-        ffi = self.blk[0]["ff1"][1].w.shape[0]
-        mid, outw = self.out_proj.w.shape[0], self.proj.w.shape[0]
-        kin = self.in_proj.w.shape[1]
+        ffi = _shape(self.blk[0]["ff1"][1])[0]
+        mid, outw = _shape(self.out_proj)[0], _shape(self.proj)[0]
+        kin = _shape(self.in_proj)[1]
         c = _EncCompiler(self.eps, pack=not gpu, q8=self.q8, rows=max(T, span + 1),
                          kmax=max(kin, W, ffi, 2 * W, mid))
         z = lambda *shape: np.zeros(shape, np.float32)  # noqa: E731

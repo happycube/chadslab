@@ -77,9 +77,10 @@ REPLAY = os.environ.get("RECLANK_DS_REPLAY", "1") != "0"
 # twice in ROOM_S seconds: then the working set of programs does not fit, and the hot experts give a
 # slot of each layer (RECLANK_DS_ROOM_S)
 ROOM_S = float(os.environ.get("RECLANK_DS_ROOM_S", "60"))
-# relax: the hot experts grow back (up to their slots at the load) while the GPU keeps this much free
-# (the programs of a short sequence, the image encoder; RECLANK_DS_GROW_MARGIN_GB)
-GROW_MARGIN_GB = float(os.environ.get("RECLANK_DS_GROW_MARGIN_GB", "4"))
+# relax: the hot experts grow back (up to n_max) while the GPU keeps this much free beside the reserve (the
+# image encoder's room): the small programs not made yet (a new size of a small group, an image's), the C
+# side's buffers (RECLANK_DS_GROW_MARGIN_GB)
+GROW_MARGIN_GB = float(os.environ.get("RECLANK_DS_GROW_MARGIN_GB", "0.5"))
 # the GPU's share of the cold experts of a prompt group (docs/DS_PREFILL_PLAN.md Phase 1): after a
 # layer's router each half of the group takes the STAGE cold experts of the most pairs (at least
 # STAGE_MINP each; RECLANK_DS_STAGE, 0: off; RECLANK_DS_STAGE_MINP): the GPU copies them from the
@@ -96,6 +97,24 @@ STAGE_BLOCKS = int(os.environ.get("RECLANK_DS_STAGE_BLOCKS", "4"))
 # half's records (the first after its read of the CPU's sums, then its attention's), the rest before the
 # join (RECLANK_DS_STAGE_CHUNK, 0: the whole pull after the signal)
 STAGE_CHUNK = int(os.environ.get("RECLANK_DS_STAGE_CHUNK", "0"))
+# the groups of a prompt of at least BIG_FROM rows are big (docs/PROGRAM_MEMORY.md): their programs and their
+# scratch (big_scratch, made for the largest group) are made at a prompt, one at a time (of either lane), with
+# room the hot experts give (big_room), and freed after it (relax_big: the slots back); the smaller groups'
+# programs stay (a chat's every turn runs them), their scratch made for the largest of them
+# (RECLANK_DS_BIG_FROM; 0: every group big)
+BIG_FROM = int(os.environ.get("RECLANK_DS_BIG_FROM", "512"))
+# the groups of at least STAGE_FROM rows stage (STAGE; RECLANK_DS_STAGE_FROM, default BIG_FROM: the stage is a
+# big group's, freed with its scratch after the prompt, not 0.6 GB for good)
+STAGE_FROM = int(os.environ.get("RECLANK_DS_STAGE_FROM", str(BIG_FROM)))
+# the GPU memory a big program leaves free beside it (the C side's buffers, the allocator's rounding)
+BIG_MARGIN_GB = float(os.environ.get("RECLANK_DS_BIG_MARGIN_GB", "0.5"))
+# a group's lanes in sub-batches of SUB rows (_compile: the attention and the GPU's experts of a sub-batch at
+# a time, their arrays of SUB rows; RECLANK_DS_SUB, 0: the lanes whole)
+SUB = int(os.environ.get("RECLANK_DS_SUB", "512"))
+# the estimates of big_room before the first small group: a group's scratch a row (KB), a big program's own
+# memory beside its scratch (MB)
+GROUP_ROW_KB = float(os.environ.get("RECLANK_DS_GROUP_ROW_KB", "1000"))
+BIG_OWN_MB = float(os.environ.get("RECLANK_DS_BIG_OWN_MB", "300"))
 
 
 def gpu_oom(e):
@@ -213,6 +232,9 @@ class DSV41GPU:
         self.lane_id = 0
         self.max_pos = m.max_len
         self.ends = {}              # lane -> the end of its last fit (relax keeps the cap of each)
+        # the GPU memory the hot experts leave free beside GROW_MARGIN_GB as they grow (the engine: the image
+        # encoder's room)
+        self.reserve_gb = 0.0
         self.on_grow = []           # (DSpark) told when the programs go: cap grew
         self._state()
         self.parts = self._parts()
@@ -223,6 +245,7 @@ class DSV41GPU:
         self._tables()
         self.runs = {}
         self.scratch = {}
+        self.big_scratch = {}
         # bounded replay: the encoder's outputs of the last window of tokens of
         # a prompt (the streams, the raw mixes of its last FFN), the input of
         # the decoder
@@ -361,9 +384,10 @@ class DSV41GPU:
         self.close()
         for f in self.on_grow:
             f()
-        for a in list(self.scratch.values()) + ([a for fr in self.tables for a in fr] if tables else []):
+        for a in (list(self.scratch.values()) + list(self.big_scratch.values()) +
+                  ([a for fr in self.tables for a in fr] if tables else [])):
             self.mirror.forget(a.ctypes.data)
-        self.scratch = {}
+        self.scratch, self.big_scratch = {}, {}
 
     def score_chunk(self, t, sw):
         """The entries of a chunk of the index scores of a program of t rows
@@ -458,6 +482,7 @@ class DSV41GPU:
         """An empty sequence: the state as at the start, on the GPU (the host
         copies of the compressed rows and the index keys are those of the last
         load_state or save_state: 0.9 GB at max_len 1M, not touched)."""
+        self.engram_stop()
         small = self.window + list(self.kstate.values()) + list(self.sstate.values())
         for a in self.state_arrays():
             self.mirror.buffer_of(a).zero()
@@ -516,6 +541,43 @@ class DSV41GPU:
             rows, _rep = cops.kq_bf16_to_bf12(np.ascontiguousarray(b[r0:r0 + chunk]), dim)
             self.embed_tab[r0:r0 + rows.shape[0]] = rows
 
+    def engram_reader(self):
+        """The reader of engram's rows by pread (engram_rows.EngramReader), made at its first use."""
+        rd = self.__dict__.get("_eg_reader")
+        if rd is None:
+            from reclank.models.deepseek41.engram_rows import EngramReader
+            # (its workers off the parts' teams: they read while the teams run a group's cold experts)
+            rd = self._eg_reader = EngramReader(self.w.src, self.m.engram_layers,
+                                                avoid=[int(c) for c in getattr(self.parts, "cpus_arr", ())])
+        return rd
+
+    def engram_ahead(self, tokens, pos, media=None):
+        """The engram rows of a prompt's tokens at pos read ahead on a thread (engram_rows.EngramAhead; its
+        groups take them in _inputs) unless a read of this lane's covers them already; media: its image spans
+        (their tokens' n-grams dead, as _inputs has them)."""
+        from reclank.models.deepseek41 import engram_rows
+        n = len(tokens)
+        if engram_rows.MOST <= 0 or n <= VERIFY_MAX:
+            return
+        ah = self.__dict__.setdefault("_eg_ahead", {})
+        tokens = np.asarray(tokens, np.int64)
+        mr = self.media_rows(media, pos, n, self.m.dim, rows=False)
+        dead = None if mr is None else np.asarray(mr[1]) != 0
+        old = ah.get(self.lane_id)
+        if old is not None:
+            if old.covers(pos, tokens, dead):
+                return
+            old.close()
+        # (the hashes once: Hashes.ids keeps the ids by position for the look-back of the groups after)
+        hashes = self.m.hashes.ids(tokens, pos, dead)
+        ah[self.lane_id] = engram_rows.EngramAhead(self.engram_reader(), hashes, tokens, pos, dead)
+
+    def engram_stop(self):
+        """The read ahead of this lane's prompt stopped (a new sequence)."""
+        old = self.__dict__.get("_eg_ahead", {}).pop(self.lane_id, None)
+        if old is not None:
+            old.close()
+
     def engram_codes(self, layer, hashes):
         """The bytes of the rows of the hashes (codes [n, 256], scales [n, 8])
         from the shards: a gather, no arithmetic (GP_DS_ENGRAM_ROWS decodes
@@ -537,16 +599,39 @@ class DSV41GPU:
         self.n_slots = self.n_max = n
         self.maps = {i: np.full(E, -1, np.int32) for i in range(L)}
         self.slot_expert = {i: np.full(max(n, 1), -1, np.int64) for i in range(L)}
-        self.stores = {}
+        # each layer's store: the device address of each of its slots (GP_DS_HOT_MOE operand 4, a table of E
+        # entries), the slots in segments of one slot of every layer (segs[j]: slot j of layer i at i per), so
+        # the hot experts give slots to a prompt and take them back with no new program (shrink_hot, grow_hot)
+        self.stores = {i: np.zeros(E, np.int64) for i in range(L)}
+        for a in self.stores.values():
+            self.mirror.add(a)
+        self.segs = []
+        self._segs_to(n)
         for i in range(L):
-            ph = _placeholder(max(n, 1) * self.per)
-            self.mirror.add(ph)
-            self.mirror.bufs[ph.ctypes.data] = Buffer(ph.nbytes, "program", pinned=True)
-            self.stores[i] = ph
             first = (np.argsort(-np.asarray(counts[i]), kind="stable")[:n] if counts is not None
                      else np.arange(n))
             for slot, e in enumerate(first):
                 self.load_expert(i, slot, int(e), upload_map=False)
+
+    def _segs_to(self, n):
+        """The segments of the hot experts' slots made or freed to n, the stores' tables uploaded (a
+        MemoryError leaves those made so far)."""
+        L = self.m.L
+        try:
+            while len(self.segs) > n:
+                j = len(self.segs) - 1
+                self.segs.pop().free()
+                for i in range(L):
+                    self.stores[i][j] = 0
+            while len(self.segs) < n:
+                j = len(self.segs)
+                b = Buffer(L * self.per, "program", pinned=True)
+                self.segs.append(b)
+                for i in range(L):
+                    self.stores[i][j] = b.ptr + i * self.per
+        finally:
+            for a in self.stores.values():
+                self.mirror.buffer_of(a).upload(a)
 
     def expert_bytes(self, i, e):
         """Expert e of layer i whole (w1, w3, w2 in KQ_MXX): the rows of the
@@ -570,8 +655,7 @@ class DSV41GPU:
         if old >= 0:
             self.maps[i][old] = -1
         host = self.expert_bytes(i, e)
-        dst = self.mirror.buffer_of(self.stores[i]).ptr + slot * self.per
-        _check(lib().rc_gpu_h2d(dst, host.ctypes.data, self.per))
+        _check(lib().rc_gpu_h2d(int(self.stores[i][slot]), host.ctypes.data, self.per))
         self.slot_expert[i][slot] = e
         self.maps[i][e] = slot
         if upload_map:
@@ -583,7 +667,7 @@ class DSV41GPU:
         z = self.w.z
         ix = z.index
         k = ix["layers"].index(i)
-        dst = self.mirror.buffer_of(self.stores[i]).ptr + slot * self.per
+        dst = int(self.stores[i][slot])
         out = []
         for name in ("w1", "w3", "w2"):
             for p in range(len(ix["segments"])):
@@ -626,17 +710,17 @@ class DSV41GPU:
             return
         self.stage_n, self.stage_tab = min(STAGE, 128), tab
 
-    def stage_buf(self, sets):
+    def stage_buf(self, sets, store):
         """The stage of the groups of a prompt (their programs run one at a time: one for them all): sets
-        of stage_n slots (_compile: stage_s0); a placeholder with its device copy, freed with the programs
-        (free_programs)."""
+        of stage_n slots (_compile: stage_s0); a placeholder with its device copy in store (the scratch of
+        the group: big_scratch or scratch), freed with it (free_programs, free_big)."""
         key = ("stage", sets * self.stage_n)
-        b = self.scratch.get(key)
+        b = store.get(key)
         if b is None:
             b = _placeholder(sets * self.stage_n * self.per)
             self.mirror.add(b)
             self.mirror.bufs[b.ctypes.data] = Buffer(b.nbytes, "program", pinned=True)
-            self.scratch[key] = b
+            store[key] = b
         return b
 
     def hits(self):
@@ -664,12 +748,15 @@ class DSV41GPU:
         # the arrays of a group of a prompt are the scratch that its programs
         # share (_scratch); the outputs that the host reads stay its own (zo)
         share, counts = t > VERIFY_MAX, {}
+        # (a big group's in big_scratch, made for the largest group and freed after the prompt; a smaller
+        # one's in scratch, made for the largest small group: those programs stay)
+        store, most = self.scratch_of(t)
 
         own = []                    # the arrays of this program alone (close forgets them)
 
         def z(*sh, dtype=np.float32, pin=False):
             if share:
-                return self._scratch(t, counts, sh, dtype, pin, most=win if stage == "dec" else None)
+                return self._scratch(t, counts, sh, dtype, pin, store, most)
             own.append(pinned(sh, dtype, free=True) if pin else np.zeros(sh, dtype))
             return own[-1]
 
@@ -693,7 +780,6 @@ class DSV41GPU:
         io.vis = vis
         io.vrows = z(t, dim) if vis and stage != "dec" else None
         io.vmask = z(t, dtype=np.int32) if vis else None
-        io.eg = {i: z(t, 24 * 256) for i in m.engram_layers}
         io.egc = {i: z(t * 24, 256, dtype=np.uint8) for i in m.engram_layers}
         io.egs = {i: z(t * 24, 8, dtype=np.uint8) for i in m.engram_layers}
         io.layers = zo(L, t, hc, dim) if self.keep_layers and t <= 64 else None
@@ -730,67 +816,15 @@ class DSV41GPU:
         lay_set = set(lay)
         host_sum = z(t, dim, dtype=np.float64, pin=True) if hcs else None   # (float64: flag 2048)
         part_d = z(t, dim, dtype=np.float64) if hcs else None                # (the GPU's pairs, float64)
-        hcs_part = z(t, 128, 26) if hcs else None
         hcs_cnt = None
         if hcs:
             own.append(np.zeros(t, np.int32))
             hcs_cnt = own[-1]
-        pend_f, pend_a = {}, {}       # lane -> the layer whose FFN / attention post waits for the next record
+        pend_f = {}                 # lane -> the layer whose FFN post waits for the next record
         # lane -> the flags of its last CPU task: a step's GP_AWAIT does not wait for a task with no
         # cold expert, so the next signal waits for it before it writes the pinned inputs that task
         # reads (hp, vp, ip are one set for all the layers: GP_SIGNAL operand 11, signal_wait)
         last_task = {}
-        hq = dict(qh=z(t, dim, dtype=np.int8), ql=z(t, dim, dtype=np.int8), xs=z(t, dim // 32),
-                  act=z(t * k, 2 * I), act2=z(t * k, I), aqh=z(t * k, I, dtype=np.int8),
-                  aql=z(t * k, I, dtype=np.int8), axs=z(t * k, I // 32), de=z(t * k, dim))
-        qrank = int(m.c["q_lora_rank"])
-        x, xa, qa, qr, q = z(t, dim), z(t, dim), z(t, qrank), z(t, qrank), z(t, H * hd)
-        kvr, kvn, kvq = z(t, hd), z(t, hd), z(t, hd)
-        o, oa, y = z(t, H * hd), z(t, m.groups * m.o_rank), z(t, dim)
-        nmax = {i: (t if m.ratios[i] == 1 else t // m.ratios[i] + 1) for i in m.kv_sources}
-        lat_kv0, lat_sc0 = z(t, hd), z(t, hd)
-        # a verify group keeps the rows of each compressor (restore)
-        lat_kvs = {i: (z(t, hd), z(t, hd)) if i in cmp_bk else (lat_kv0, lat_sc0) for i in m.kv_sources}
-        latent = {i: z(nmax[i], hd) for i in m.kv_sources}
-        kraw = {i: z(nmax[i], m.ix_dim) for i in m.kv_sources}
-        iq, iw = z(t, m.ix_heads * m.ix_dim), z(t, m.ix_heads)
-        logits_r, sg, su, sa, ys = z(t, self.w.src.E), z(t, I), z(t, I), z(t, I), z(t, dim)
-        # the entries of each source below cap; the index scores of every
-        # layer in one array (each layer's are read in that layer): of all
-        # the entries at once, or (chw < sw) of chunks of chw entries, the
-        # top k then over the chunks in turn (DS_TOPK_MERGE: the same choice)
-        maxn = {i: min(self.kcache[i].shape[0], self.cap // m.ratios[i]) for i in self.kcache}
-        sw = max(maxn.values())
-        # (a group's scores are a view of the shared scratch, whose base has the rows of the largest
-        # group (_scratch's most): the chunks fit SCORE_MB for those rows. For its own t rows a small
-        # group took every entry, and its base most / t times SCORE_MB: 4 GB at cap 512K, where the
-        # programs then did not fit beside the hot experts at each request of a long session)
-        chw = self.score_chunk(max(t, win if stage == "dec" else max(self.group, win)) if share else t, sw)
-        scores = dict.fromkeys(self.kcache, z(t, chw))
-        sel = {i: z(t, m.ix_topk, dtype=np.int32) for i in m.index_sources}
-        cnt = {i: z(t, dtype=np.int32) for i in m.index_sources}
-        csrc = m.cand_src
-        nb = maxn[csrc] // m.cand_bs + 1 if csrc in maxn else 0
-        bmax = z(t, nb if chw == sw else chw // m.cand_bs)
-        csel, ccnt = z(t, m.cand_topk, dtype=np.int32), z(t, dtype=np.int32)
-        cmask = z(t, nb, dtype=np.uint8)
-        # the k best so far of the chunks (their scores)
-        svals, cvals = (z(t, m.ix_topk), z(t, m.cand_topk)) if chw < sw else (None, None)
-        # the keys and values of engram, read in their layer: one array for the
-        # layers (each lane its own rows)
-        ekv = dict.fromkeys(m.engram_layers, z(t, (hc + 1) * dim))
-        # a step splits the keys of its attention (DS_ASPLIT ranges of kernels/dsv41/step.cu)
-        apart = z(t, H, 8, hd + 2) if t <= VERIFY_MAX else None
-        wscale = float(np.float32(m.ix_dim ** -0.5 * m.ix_heads ** -0.5))
-        ascale = float(np.float32(hd ** -0.5))
-
-        def lin8(xb, name, out, groups=0):
-            c, s, rows, cols = self.fp8(name)
-            prog.emit(P.DS_FP8_LINEAR, xb, c, s, out, rows, cols, xb.shape[0], groups)
-
-        def lin12(xb, name, out):
-            self.emit_dense16(prog, xb, name, out)
-
         # the lanes: the rows of a run in one lane, or (ab: a group of a prompt,
         # a verify group of DSpark) in two halves A, B whose records
         # interleave, so that the CPU's experts of one half run while the GPU
@@ -803,6 +837,76 @@ class DSV41GPU:
             lanes = [(0, t // 2), (t // 2, t)]
         io.lanes = lanes
         lpos = [pos] + [prog.slot("pos%d" % j) for j in range(1, len(lanes))]
+        # a group's lanes in sub-batches of SUB rows (sub_ranges): the attention and the GPU's experts of one
+        # sub-batch after the other (the window through the ring, the compressed rows and the index keys
+        # through the caches, as half B after A: each row's bits as before), their arrays the size of a
+        # sub-batch and shared by all (zl: R rows; a group's of the scratch, made for loc_most rows); the
+        # CPU's task and the stage still of the whole lane. A step's and a verify group's: their lanes whole,
+        # their arrays of t rows
+        subs = self.sub_ranges(t, lanes) if share else [[r] for r in lanes]
+        spos = [[lpos[j]] + [prog.slot("sub%d_%d" % (j, b)) for b in range(1, len(sj))] for j, sj in enumerate(subs)]
+        io.subs = [("sub%d_%d" % (j, b), r0) for j, sj in enumerate(subs) for b, (r0, _r1) in enumerate(sj) if b]
+        R = max(r1 - r0 for sj in subs for r0, r1 in sj) if share else t
+        loc_most = self.loc_rows(most) if share else t
+
+        def zl(*sh, dtype=np.float32):
+            if share:
+                return self._scratch(R, counts, sh, dtype, False, store, loc_most, tag="sub")
+            return z(*sh, dtype=dtype)
+        # the engram rows of a sub-batch decoded in their layer (GP_DS_ENGRAM_ROWS from the codes of every row)
+        io.eg = {i: zl(R, 24 * 256) for i in m.engram_layers}
+        hcs_part = zl(R, 128, 26) if hcs else None      # (the blocks' sums of a GP_DS_HC_STEP)
+        hq = dict(qh=zl(R, dim, dtype=np.int8), ql=zl(R, dim, dtype=np.int8), xs=zl(R, dim // 32),
+                  act=zl(R * k, 2 * I), act2=zl(R * k, I), aqh=zl(R * k, I, dtype=np.int8),
+                  aql=zl(R * k, I, dtype=np.int8), axs=zl(R * k, I // 32), de=z(t * k, dim))
+        qrank = int(m.c["q_lora_rank"])
+        x, xa, qa, qr, q = z(t, dim), z(t, dim), zl(R, qrank), zl(R, qrank), zl(R, H * hd)
+        kvr, kvn, kvq = zl(R, hd), zl(R, hd), zl(R, hd)
+        o, oa, y = zl(R, H * hd), zl(R, m.groups * m.o_rank), zl(R, dim)
+        nmax = {i: (t if m.ratios[i] == 1 else t // m.ratios[i] + 1) for i in m.kv_sources}
+        lat_kv0, lat_sc0 = z(t, hd), z(t, hd)
+        # a verify group keeps the rows of each compressor (restore)
+        lat_kvs = {i: (z(t, hd), z(t, hd)) if i in cmp_bk else (lat_kv0, lat_sc0) for i in m.kv_sources}
+        latent = {i: z(nmax[i], hd) for i in m.kv_sources}
+        kraw = {i: z(nmax[i], m.ix_dim) for i in m.kv_sources}
+        iq, iw = zl(R, m.ix_heads * m.ix_dim), zl(R, m.ix_heads)
+        logits_r, sg, su, sa, ys = z(t, self.w.src.E), zl(R, I), zl(R, I), zl(R, I), z(t, dim)
+        # the entries of each source below cap; the index scores of every
+        # layer in one array (each layer's are read in that layer): of all
+        # the entries at once, or (chw < sw) of chunks of chw entries, the
+        # top k then over the chunks in turn (DS_TOPK_MERGE: the same choice)
+        maxn = {i: min(self.kcache[i].shape[0], self.cap // m.ratios[i]) for i in self.kcache}
+        sw = max(maxn.values())
+        # (a group's scores are a view of the shared scratch, whose base has the rows of the largest
+        # group (_scratch's most): the chunks fit SCORE_MB for those rows. For its own t rows a small
+        # group took every entry, and its base most / t times SCORE_MB: 4 GB at cap 512K, where the
+        # programs then did not fit beside the hot experts at each request of a long session)
+        chw = self.score_chunk(loc_most, sw)
+        scores = dict.fromkeys(self.kcache, zl(R, chw))
+        sel = {i: z(t, m.ix_topk, dtype=np.int32) for i in m.index_sources}
+        cnt = {i: z(t, dtype=np.int32) for i in m.index_sources}
+        csrc = m.cand_src
+        nb = maxn[csrc] // m.cand_bs + 1 if csrc in maxn else 0
+        bmax = zl(R, nb if chw == sw else chw // m.cand_bs)
+        csel, ccnt = z(t, m.cand_topk, dtype=np.int32), z(t, dtype=np.int32)
+        cmask = z(t, nb, dtype=np.uint8)
+        # the k best so far of the chunks (their scores)
+        svals, cvals = (zl(R, m.ix_topk), zl(R, m.cand_topk)) if chw < sw else (None, None)
+        # the keys and values of engram, read in their layer: one array for the
+        # layers (each sub-batch its own rows)
+        ekv = dict.fromkeys(m.engram_layers, zl(R, (hc + 1) * dim))
+        # a step splits the keys of its attention (DS_ASPLIT ranges of kernels/dsv41/step.cu)
+        apart = z(t, H, 8, hd + 2) if t <= VERIFY_MAX else None
+        wscale = float(np.float32(m.ix_dim ** -0.5 * m.ix_heads ** -0.5))
+        ascale = float(np.float32(hd ** -0.5))
+
+        def lin8(xb, name, out, groups=0):
+            c, s, rows, cols = self.fp8(name)
+            prog.emit(P.DS_FP8_LINEAR, xb, c, s, out, rows, cols, xb.shape[0], groups)
+
+        def lin12(xb, name, out):
+            self.emit_dense16(prog, xb, name, out)
+
         raw_as = {i: z(t, 24) for i in lay}
         raw_fs = {i: z(t, 24) for i in lay}
         # the post's q and comb of each sublayer, made by its GP_DS_HC_PRE (from the sublayer's mixes)
@@ -823,9 +927,9 @@ class DSV41GPU:
         flags = {}
         # the stage of the cold experts of the most pairs (STAGE): each half's map with its stage slots
         # (and A's: B's map starts from A's), its stage slots alone, the experts it copies in
-        nstage = self.stage_n if share else 0
+        nstage = self.stage_n if share and t >= STAGE_FROM else 0
         if nstage:
-            sbuf = self.stage_buf(3 if len(lanes) == 2 else 1)
+            sbuf = self.stage_buf(3 if len(lanes) == 2 else 1, store)
             smaps = [z(self.w.src.E, dtype=np.int32) for _ in lanes]
             omaps = [z(self.w.src.E, dtype=np.int32) for _ in lanes]
             slists = [z(nstage, dtype=np.int32) for _ in lanes]
@@ -860,6 +964,25 @@ class DSV41GPU:
             r0, r1 = lanes[j]
             return r1 - r0, lpos[j], lambda a, per=1: a[r0 * per:r1 * per]
 
+        def sub_rows(j, b):
+            """Sub-batch b of lane j: its rows, its position's slot, the slicer of the arrays of every row
+            (S) and of the sub-batch's own (Lc: their first rows; a step's and a verify group's: S)."""
+            r0, r1 = subs[j][b]
+
+            def S(a, per=1):
+                return a[r0 * per:r1 * per]
+
+            def Lc(a, per=1):
+                return a[:(r1 - r0) * per]
+            return r1 - r0, spos[j][b], S, (Lc if share else S)
+
+        def sub_iter(j):
+            """The sub-batches of lane j (None: all the rows at once, a verify group's merge)."""
+            if j is None:
+                ident = lambda a, per=1: a  # noqa: E731
+                return [(t, None, ident, ident)]
+            return [sub_rows(j, b) for b in range(len(subs[j]))]
+
         def kv_write(i, x, ps, n, S, first=True):
             """The compressed rows and index keys of kv source i from its x
             (first: the first lane, which keeps the compressor's state of the
@@ -889,23 +1012,30 @@ class DSV41GPU:
             return (None, None, None)
 
         def attn(j, i):
-            """The records of layer i up to its attention's output in the streams."""
-            n, ps, S = rows(j)
+            """The records of layer i up to its attention's output in the streams, and with hfuse the post
+            with the FFN's mixes and pre: of each sub-batch of lane j in turn."""
+            pi = pend_f.pop(j, None)
+            for b in range(len(subs[j])):
+                attn_rows(j, i, b, pi)
+
+        def attn_rows(j, i, b, pi):
+            """attn of sub-batch b of lane j (pi: the layer whose FFN post comes first, or None)."""
+            n, ps, S, Lc = sub_rows(j, b)
             hl, p = S(h), "layers.%d." % i
             if i in m.engram_layers:
                 e = p + "engram."
-                lin8(S(io.eg[i]), e + "wkv.weight", S(ekv[i]))
-                prog.emit(P.DS_ENGRAM, S(ekv[i]), hl, self.vec(e + "q_weight", e + "k_weight"), n, dim, hc, eps)
+                prog.emit(P.DS_ENGRAM_ROWS, S(io.egc[i], 24), S(io.egs[i], 24), Lc(io.eg[i]), n * 24, 256)
+                lin8(Lc(io.eg[i]), e + "wkv.weight", Lc(ekv[i]))
+                prog.emit(P.DS_ENGRAM, Lc(ekv[i]), hl, self.vec(e + "q_weight", e + "k_weight"), n, dim, hc, eps)
             fa, sca, ba = self.hcp(p + "hc_attn")
             raw_a = S(raw_as[i])
-            pi = pend_f.pop(j, None)
             if pi is not None:
                 # the FFN of layer pi's post, this layer's mixes and pre
                 _ff, scf_p, bf_p = self.hcp("layers.%d.hc_ffn" % pi)
                 cold = colds[pi][0]
                 prog.emit(P.DS_HC_STEP, S(part_d), S(ys), S(host_sum), cold[k:k + 1] if t == 1 else None, hl,
                           S(coef_fs[pi]), fa, raw_a, S(raw_fs[pi]), scf_p, bf_p, self.vec(p + "attn_norm.weight"),
-                          S(x), sca, ba, S(coef_as[i]), S(hcs_part), S(hcs_cnt), n, dim, eps, hc_eps, iters, 1)
+                          S(x), sca, ba, S(coef_as[i]), Lc(hcs_part), S(hcs_cnt), n, dim, eps, hc_eps, iters, 1)
                 if io.layers is not None:
                     lr = S(io.layers[pi])
                     prog.emit(P.COPY, hl, lr, lr.nbytes)      # (layer pi's streams after its post)
@@ -923,65 +1053,70 @@ class DSV41GPU:
             ratio = m.ratios[i]
             cs = cc if ratio else cw
             pump(1 - j)
-            lin8(S(x), a + "wq_a.weight", S(qa))
-            prog.emit(P.RMS_NORM, S(qa), self.vec(a + "q_norm.weight"), S(qr), n, qrank, eps)
-            lin8(S(qr), a + "wq_b.weight", S(q))
+            lin8(S(x), a + "wq_a.weight", Lc(qa))
+            prog.emit(P.RMS_NORM, Lc(qa), self.vec(a + "q_norm.weight"), Lc(qr), n, qrank, eps)
+            lin8(Lc(qr), a + "wq_b.weight", Lc(q))
             pump(1 - j)
-            prog.emit(P.DS_ROPE, S(q), cs[0], cs[1], ps, n, H, hd, rd, 0, 0)
-            lin8(S(x), a + "wkv.weight", S(kvr))
-            prog.emit(P.RMS_NORM, S(kvr), self.vec(a + "kv_norm.weight"), S(kvn), n, hd, eps)
-            prog.emit(P.DS_WIN_WRITE, S(kvn), cs[0], cs[1], S(kvq), ps, n, win, hd, rd)
+            prog.emit(P.DS_ROPE, Lc(q), cs[0], cs[1], ps, n, H, hd, rd, 0, 0)
+            lin8(S(x), a + "wkv.weight", Lc(kvr))
+            prog.emit(P.RMS_NORM, Lc(kvr), self.vec(a + "kv_norm.weight"), Lc(kvn), n, hd, eps)
+            prog.emit(P.DS_WIN_WRITE, Lc(kvn), cs[0], cs[1], Lc(kvq), ps, n, win, hd, rd)
             ckv = sl = cn = None
             if ratio:
                 kv_src, idx_src = kvs[i], ixs[i]
                 if i == kv_src and not (stage == "dec" and i == E):      # (the encoder groups wrote them)
-                    kv_write(i, S(x), ps, n, S, j == 0)
+                    kv_write(i, S(x), ps, n, S, j == 0 and b == 0)
                 if i in m.index_sources:
                     ix = a + "indexer."
-                    lin8(S(qr), ix + "wq_b.weight", S(iq))
-                    prog.emit(P.DS_ROPE, S(iq), cc[0], cc[1], ps, n, m.ix_heads, m.ix_dim, rd, 0, 0)
-                    prog.emit(P.DS_FP4, S(iq), S(iq).size, 32)
-                    lin12(S(x), ix + "weights_proj.weight", S(iw))
+                    lin8(Lc(qr), ix + "wq_b.weight", Lc(iq))
+                    prog.emit(P.DS_ROPE, Lc(iq), cc[0], cc[1], ps, n, m.ix_heads, m.ix_dim, rd, 0, 0)
+                    prog.emit(P.DS_FP4, Lc(iq), Lc(iq).size, 32)
+                    lin12(S(x), ix + "weights_proj.weight", Lc(iw))
                     mask = S(cmask) if 0 <= csrc < i else None
                     if chw == sw:
-                        prog.emit(P.DS_IDX_SCORE, S(iq), S(iw), wscale, self.kcache[kv_src], ps, ratio, mask,
-                                  m.cand_bs, S(scores[kv_src]), m.ix_heads, m.ix_dim, sw, n, nb, c16)
+                        prog.emit(P.DS_IDX_SCORE, Lc(iq), Lc(iw), wscale, self.kcache[kv_src], ps, ratio, mask,
+                                  m.cand_bs, Lc(scores[kv_src]), m.ix_heads, m.ix_dim, sw, n, nb, c16)
                         if i == csrc:
-                            prog.emit(P.DS_CAND, S(scores[kv_src]), ps, ratio, m.cand_bs, S(bmax), nb, n, sw)
-                            prog.emit(P.DS_TOPK, S(bmax), ps, ratio, m.cand_bs, m.cand_topk, S(csel), S(ccnt),
+                            prog.emit(P.DS_CAND, Lc(scores[kv_src]), ps, ratio, m.cand_bs, Lc(bmax), nb, n, sw)
+                            prog.emit(P.DS_TOPK, Lc(bmax), ps, ratio, m.cand_bs, m.cand_topk, S(csel), S(ccnt),
                                       S(cmask), nb, n)
-                        prog.emit(P.DS_TOPK, S(scores[kv_src]), ps, ratio, 1, m.ix_topk, S(sel[i]), S(cnt[i]), None,
+                        prog.emit(P.DS_TOPK, Lc(scores[kv_src]), ps, ratio, 1, m.ix_topk, S(sel[i]), S(cnt[i]), None,
                                   sw, n)
                     else:
                         nch, cb = -(-maxn[kv_src] // chw), chw // m.cand_bs
                         for c in range(nch):
                             c0, first, last = c * chw, int(c == 0), int(c == nch - 1)
-                            prog.emit(P.DS_IDX_SCORE, S(iq), S(iw), wscale, self.kcache[kv_src], ps, ratio, mask,
-                                      m.cand_bs, S(scores[kv_src]), m.ix_heads, m.ix_dim, chw, n, nb, c16, c0)
+                            prog.emit(P.DS_IDX_SCORE, Lc(iq), Lc(iw), wscale, self.kcache[kv_src], ps, ratio, mask,
+                                      m.cand_bs, Lc(scores[kv_src]), m.ix_heads, m.ix_dim, chw, n, nb, c16, c0)
                             if i == csrc:
-                                prog.emit(P.DS_CAND, S(scores[kv_src]), ps, ratio, m.cand_bs, S(bmax), cb, n, chw, c0)
-                                prog.emit(P.DS_TOPK_MERGE, S(bmax), ps, ratio, m.cand_bs, m.cand_topk, S(csel),
-                                          S(ccnt), S(cvals), cb, n, c0 // m.cand_bs, first, S(cmask) if last else None,
+                                prog.emit(P.DS_CAND, Lc(scores[kv_src]), ps, ratio, m.cand_bs, Lc(bmax), cb, n, chw, c0)
+                                prog.emit(P.DS_TOPK_MERGE, Lc(bmax), ps, ratio, m.cand_bs, m.cand_topk, S(csel),
+                                          S(ccnt), Lc(cvals), cb, n, c0 // m.cand_bs, first, S(cmask) if last else None,
                                           nb, last)
-                            prog.emit(P.DS_TOPK_MERGE, S(scores[kv_src]), ps, ratio, 1, m.ix_topk, S(sel[i]),
-                                      S(cnt[i]), S(svals), chw, n, c0, first, None, 0, 0)
+                            prog.emit(P.DS_TOPK_MERGE, Lc(scores[kv_src]), ps, ratio, 1, m.ix_topk, S(sel[i]),
+                                      S(cnt[i]), Lc(svals), chw, n, c0, first, None, 0, 0)
                 ckv, sl, cn = self.ckv[kv_src], S(sel[idx_src]), S(cnt[idx_src])
             pump(1 - j)
-            prog.emit(P.DS_ATTN, S(q), self.window[i], ps, win, ckv, sl, cn, self.vec(a + "attn_sink"), S(o), H, hd,
-                      ascale, m.ix_topk, S(kvq), n, apart, 2 if stage == "dec" else 0, c16,
+            prog.emit(P.DS_ATTN, Lc(q), self.window[i], ps, win, ckv, sl, cn, self.vec(a + "attn_sink"), Lc(o), H,
+                      hd, ascale, m.ix_topk, Lc(kvq), n, apart, 2 if stage == "dec" else 0, c16,
                       prog.slot("rbase") if stage == "dec" else 0, self.akeys if apart is not None else None)
-            prog.emit(P.DS_RING_PUT, S(kvq), self.window[i], ps, n, win, hd,
+            prog.emit(P.DS_RING_PUT, Lc(kvq), self.window[i], ps, n, win, hd,
                       S(ring_bk[i]) if i in ring_bk else None, c16)
             pump(1 - j)
-            prog.emit(P.DS_ROPE, S(o), cs[0], cs[1], ps, n, H, hd, rd, 1, 0)
-            lin8(S(o), a + "wo_a.weight", S(oa), groups=m.groups)
+            prog.emit(P.DS_ROPE, Lc(o), cs[0], cs[1], ps, n, H, hd, rd, 1, 0)
+            lin8(Lc(o), a + "wo_a.weight", Lc(oa), groups=m.groups)
             pump(1 - j)
-            lin8(S(oa), a + "wo_b.weight", S(y))
+            lin8(Lc(oa), a + "wo_b.weight", Lc(y))
             pump(1 - j)
             if hfuse:
-                pend_a[j] = i           # (the post with the FFN's mixes and pre: ffn_pre)
+                # the attention's post, the FFN's mixes and pre (row by row: the first record of ffn_pre
+                # before; y is the sub-batch's)
+                ff, scf, bf = self.hcp(p + "hc_ffn")
+                prog.emit(P.DS_HC_STEP, Lc(y), None, None, None, hl, S(coef_as[i]), ff, S(raw_fs[i]), raw_a, sca, ba,
+                          self.vec(p + "ffn_norm.weight"), S(xa), scf, bf, S(coef_fs[i]), Lc(hcs_part), S(hcs_cnt),
+                          n, dim, eps, hc_eps, iters, 0)
             else:
-                prog.emit(P.DS_HC_POST, S(y), None, hl, raw_a, sca, ba, hl, n, dim, hc_eps, iters, S(coef_as[i]))
+                prog.emit(P.DS_HC_POST, Lc(y), None, hl, raw_a, sca, ba, hl, n, dim, hc_eps, iters, S(coef_as[i]))
 
         def flag_of(j, i):
             """The flags of layer i's CPU task of lane j (in, out: pinned; made once)."""
@@ -1002,12 +1137,8 @@ class DSV41GPU:
             _fa, sca, ba = self.hcp(p + "hc_attn")
             ff, scf, bf = self.hcp(p + "hc_ffn")
             raw_f = S(raw_fs[i])
-            if pend_a.pop(j, None) is not None:
-                # the attention's post, the FFN's mixes and pre
-                prog.emit(P.DS_HC_STEP, S(y), None, None, None, hl, S(coef_as[i]), ff, raw_f, S(raw_as[i]), sca, ba,
-                          self.vec(p + "ffn_norm.weight"), S(xa), scf, bf, S(coef_fs[i]), S(hcs_part), S(hcs_cnt),
-                          n, dim, eps, hc_eps, iters, 0)
-            else:
+            if not hfuse:
+                # (hfuse: attn ended with the attention's post and the FFN's mixes and pre)
                 prog.emit(P.DS_HC_MIX, hl, ff, raw_f, n, hc * dim, eps)
                 prog.emit(P.DS_HC_PRE, hl, S(raw_as[i]), sca, ba, self.vec(p + "ffn_norm.weight"), S(xa), n, dim,
                           eps, hc_eps, raw_f, scf, bf, iters, S(coef_fs[i]))
@@ -1086,18 +1217,20 @@ class DSV41GPU:
                 # the GPU's pairs summed now, while the CPU's task runs (the CPU sends its own sum)
                 prog.emit(P.DS_COMBINE, ids, mp, S(hq["de"], k), None, S(part_d), k, dim, n, int(t > 1), 1)
             sx = f + "shared_experts."
-            lin8(S(xa), sx + "w1.weight", S(sg))
-            lin8(S(xa), sx + "w3.weight", S(su))
-            prog.emit(P.DS_SWIGLU, S(sg), S(su), S(sa), n * I, float(m.limit))
-            lin8(S(sa), sx + "w2.weight", S(ys))
+            for nb_, _ps, Sb, Lc in sub_iter(j):
+                lin8(Sb(xa), sx + "w1.weight", Lc(sg))
+                lin8(Sb(xa), sx + "w3.weight", Lc(su))
+                prog.emit(P.DS_SWIGLU, Lc(sg), Lc(su), Lc(sa), nb_ * I, float(m.limit))
+                lin8(Lc(sa), sx + "w2.weight", Sb(ys))
 
         def hot_moe(j, i, mp):
-            """DS_HOT_MOE of the pairs of lane j (None: all the rows) whose experts mp gives a slot."""
-            n, _ps, S = rows(j) if j is not None else (t, None, lambda a, per=1: a)
-            prog.emit(P.DS_HOT_MOE, S(xa), S(io.ids[i], k), S(io.vals[i], k), mp, self.stores[i], self.per,
-                      self.off3, self.off2, n, k, dim, I, S(hq["qh"]), S(hq["ql"]), S(hq["xs"]), S(hq["act"], k),
-                      S(hq["act2"], k), S(hq["aqh"], k), S(hq["aql"], k), S(hq["axs"], k), S(hq["de"], k),
-                      self.w.src.E, int(x8), sbuf if nstage else None)
+            """DS_HOT_MOE of the pairs of lane j (None: all the rows) whose experts mp gives a slot, a
+            sub-batch at a time (its de rows; the act and the planes the sub-batch's)."""
+            for n, _ps, S, Lc in sub_iter(j):
+                prog.emit(P.DS_HOT_MOE, S(xa), S(io.ids[i], k), S(io.vals[i], k), mp, self.stores[i], self.per,
+                          self.off3, self.off2, n, k, dim, I, Lc(hq["qh"]), Lc(hq["ql"]), Lc(hq["xs"]), Lc(hq["act"], k),
+                          Lc(hq["act2"], k), Lc(hq["aqh"], k), Lc(hq["aql"], k), Lc(hq["axs"], k), S(hq["de"], k),
+                          self.w.src.E, int(x8), sbuf if nstage else None)
 
         def ffn_post(j, i):
             """The rows of the CPU's task back, the sum of the experts into the streams."""
@@ -1137,8 +1270,6 @@ class DSV41GPU:
             prog.emit(P.DS_EMBED, self.embed_tab, io.tok, h, t, dim, hc)
             if vis:
                 prog.emit(P.DS_EMBED_ROWS, io.vrows, io.vmask, h, t, dim, hc)
-            for i in m.engram_layers:
-                prog.emit(P.DS_ENGRAM_ROWS, io.egc[i], io.egs[i], io.eg[i], t * 24, 256)
         if len(lanes) == 1:
             for i in lay:
                 attn(0, i)
@@ -1209,7 +1340,7 @@ class DSV41GPU:
             raise
         return io
 
-    def _scratch(self, t, counts, shape, dtype, pin, store=None, most=None):
+    def _scratch(self, t, counts, shape, dtype, pin, store=None, most=None, tag=None):
         """An array of the program of a group of t tokens (t > VERIFY_MAX).
         Those programs run one at a time, and no run reads what a run before
         left in these arrays, so they share them: the k-th array with rows of
@@ -1223,7 +1354,7 @@ class DSV41GPU:
         store = self.scratch if store is None else store
         most = max(self.group, self.m.win) if most is None else most
         dt = np.dtype(dtype)
-        key = (pin, dt.str, tuple(shape[1:]))
+        key = (pin, dt.str, tuple(shape[1:])) + ((tag,) if tag else ())
         counts[key] = counts.get(key, -1) + 1
         key += (counts[key],)
         n = int(np.prod(shape))
@@ -1240,13 +1371,116 @@ class DSV41GPU:
         if self.lane_id:
             key = ("lane", self.lane_id) + key
         r = self.runs.get(key)
+        if r is None and self.is_big(t):
+            # (one big program at a time: the others of either lane go, their scratch stays)
+            self.free_big(scratch=False)
+            self.big_room()
         while r is None:
             try:
                 r = self.runs[key] = self._compile_lane(t, part, vis)
             except (MemoryError, RuntimeError) as e:
-                if not gpu_oom(e) or not self.make_room(e):
+                if not gpu_oom(e) or not self.make_room(e, big=self.is_big(t)):
                     raise
         return r
+
+    def is_big(self, t):
+        """A group of t rows is big (BIG_FROM): its program and scratch made at a prompt, freed after."""
+        return t > VERIFY_MAX and t >= BIG_FROM
+
+    def scratch_of(self, t):
+        """The store of the scratch bases of a group of t rows and the rows they are made for: big_scratch
+        and the largest group (or the window) for a big group, else scratch and the largest small group
+        (the multiples of GROUP_STEP and the powers of two below BIG_FROM, at least the window: the decoder
+        of a bounded replay)."""
+        win = self.m.win
+        if self.is_big(t):
+            return self.big_scratch, max(self.group, win)
+        return self.scratch, self.small_most()
+
+    def small_most(self):
+        """The rows of the largest group that is not big (or the window)."""
+        top = min(BIG_FROM - 1, self.group) if BIG_FROM > 0 else 0
+        small = [1 << (top.bit_length() - 1)] if top > 0 else []
+        if GROUP_STEP and top >= GROUP_STEP:
+            small.append(top - top % GROUP_STEP)
+        return max([self.m.win] + small)
+
+    def big_scratch_bytes(self):
+        """The GPU memory of a big group's scratch (not its stage), from the small groups' made so far (the
+        same bases: of every row for small_most rows, of a sub-batch for loc_rows of it), else GROUP_ROW_KB a
+        row."""
+        rows, sub = 0, 0
+        for key, a in self.scratch.items():
+            b = self.mirror.bufs.get(a.ctypes.data)
+            if key[0] != "stage" and b is not None:
+                if key[3:4] == ("sub",):
+                    sub += b.nbytes
+                else:
+                    rows += b.nbytes
+        most, small = max(self.group, self.m.win), self.small_most()
+        if not rows:
+            return GROUP_ROW_KB * 1024 * most
+        return rows / small * most + sub / self.loc_rows(small) * self.loc_rows(most)
+
+    def sub_ranges(self, t, lanes):
+        """The sub-batches of each lane of a group of t rows: pieces of SUB rows, the last the rest."""
+        out = []
+        for r0, r1 in lanes:
+            if SUB <= 0 or r1 - r0 <= SUB:
+                out.append([(r0, r1)])
+            else:
+                out.append([(a, min(a + SUB, r1)) for a in range(r0, r1, SUB)])
+        return out
+
+    def loc_rows(self, most):
+        """The rows of the sub-batch arrays of a scratch made for groups of up to most rows: a lane's (a
+        half, ab), at most SUB, at least those of a group of 9 to 63 (one lane)."""
+        half = most - most // 2 if self.ab and most >= 64 else most
+        return max(min(half, SUB) if SUB > 0 else half, min(most, 63))
+
+    def _big_keys(self):
+        return [key for key in self.runs if self.is_big(key[2] if key[0] == "lane" else key[0])]
+
+    def free_big(self, scratch=True):
+        """The big programs freed (of every lane), with the device copies of their own arrays; scratch: their
+        scratch too (big_scratch, its stage). True when something was freed."""
+        keys = self._big_keys()
+        for key in keys:
+            self.drop_run(self.runs.pop(key))
+        gone = bool(keys)
+        if scratch and self.big_scratch:
+            for a in self.big_scratch.values():
+                self.mirror.forget(a.ctypes.data)
+            self.big_scratch = {}
+            gone = True
+        return gone
+
+    def big_bytes(self):
+        """The GPU memory a big program takes beside what is made already: its scratch (big_scratch, if not
+        made yet: big_scratch_bytes and the stage) and its own (BIG_OWN_MB: its graphs, the C side's)."""
+        scr = 0
+        if not self.big_scratch:
+            scr = self.big_scratch_bytes() + (3 * self.stage_n * self.per if self.stage_n else 0)
+        return scr + BIG_OWN_MB * 1e6
+
+    def big_room(self):
+        """Room for a big program (big_bytes) and BIG_MARGIN_GB: the hot experts give the slots it lacks
+        (relax_big takes them back after the prompt)."""
+        from reclank.backends.cuda.gpumm import mem_info
+        need = self.big_bytes() + BIG_MARGIN_GB * 1e9 - mem_info()[0]
+        slot = self.m.L * self.per
+        k = min(self.n_slots, int(-(-need // slot))) if need > 0 else 0
+        if k > 0:
+            n = self.n_slots
+            self.shrink_hot(k)
+            print("[dsv41] the hot experts %d -> %d a layer (%.1f GB) for a prompt's group" % (
+                n, self.n_slots, self.n_slots * slot / 1e9), file=sys.stderr, flush=True)
+
+    def relax_big(self):
+        """After a prompt (no run half done): the big programs and their scratch freed, the hot experts
+        grow back (grow_hot). The slots added a layer."""
+        self.free_big()
+        return self.grow_hot()
 
     def _compile_lane(self, t, part, vis):
         """_compile; a lane's step or verify group with scratches of the C side of its own:
@@ -1261,12 +1495,23 @@ class DSV41GPU:
         finally:
             lib().rc_gpu_scratch_own(0)
 
-    def make_room(self, err=None):
+    def make_room(self, err=None, big=False):
         """GPU memory for a program that did not fit (its graphs or its arrays: err), at a point where
-        no run is half done: the other programs go (DSpark's too; made again when run), unless they
-        went for room in the last ROOM_S seconds (the programs a session needs do not fit together:
-        each would close the others in turn), then the hot experts give a slot of each layer (for
-        good: the context of a long session keeps growing). False when nothing is left to free."""
+        no run is half done. A big group's (big): the hot experts give a slot of each layer (relax_big
+        takes them back after the prompt). Another: the big programs go first; then the other programs
+        (DSpark's too; made again when run), unless they went for room in the last ROOM_S seconds (the
+        programs a session needs do not fit together: each would close the others in turn), then the
+        hot experts give a slot of each layer (relax gives it back while the GPU has room). False when
+        nothing is left to free."""
+        if big and self.n_slots > 0:
+            n = self.n_slots
+            self.shrink_hot(1)
+            print("[dsv41] the GPU full (%s): the hot experts %d -> %d a layer for a prompt's group" % (
+                err, n, self.n_slots), file=sys.stderr, flush=True)
+            return True
+        if not big and self.free_big():
+            print("[dsv41] the GPU full (%s): the big programs freed" % err, file=sys.stderr, flush=True)
+            return True
         now = time.monotonic()
         have = bool(self.runs) or bool(self.scratch) or any(getattr(getattr(f, "__self__", None), "progs", None)
                                                             for f in self.on_grow)
@@ -1288,7 +1533,8 @@ class DSV41GPU:
     def relax(self, end):
         """Before a sequence of end positions (a request, at a point where no run is half done):
         after a longer one, cap comes back down to what this one needs (the programs and the tables
-        go; smaller ones are made when run), then the hot experts grow back (grow_hot)."""
+        go; smaller ones are made when run), the big programs go (relax_big), then the hot experts grow
+        back (grow_hot)."""
         m = self.m
         # (the other lanes keep theirs: the cap and the programs are shared)
         others = [e for lid, e in self.ends.items() if lid != self.lane_id]
@@ -1301,48 +1547,49 @@ class DSV41GPU:
             self.cap = cap
             self.free_programs(tables=True)
             self._tables()
-        return self.grow_hot()
+        return self.relax_big()
 
     def grow_hot(self):
-        """The slots that make_room took back, while the GPU keeps GROW_MARGIN_GB free: each layer's
-        store made again larger, its experts copied over on the GPU (the programs hold its address:
-        they go); the new slots start free, and DSHot fills them with its best experts as it copies.
-        The slots added a layer."""
-        from reclank.backends.cuda.runtime import _check, lib
+        """The slots that make_room or a prompt took back, up to n_max, while the GPU keeps the reserve
+        and GROW_MARGIN_GB free (room_margin): new segments (the tables give the programs their
+        addresses: they stay), free at first; DSHot fills them with its best experts at once (one copy
+        job, landed by the runs after). The slots added a layer."""
         from reclank.backends.cuda.gpumm import mem_info
         n, L = self.n_slots, self.m.L
         if self.hot is None or n >= self.n_max:
             return 0
         slot = L * self.per
-        k = min(self.n_max - n, int((mem_info()[0] - GROW_MARGIN_GB * 1e9) // slot))
+        k = min(self.n_max - n, int((mem_info()[0] - self.room_margin()) // slot))
         if k <= 0:
             return 0
-        self.hot.land(wait=True)
-        self.free_programs()
-        n2 = n + k
+        try:
+            self._segs_to(n + k)
+        except MemoryError:
+            pass
+        n2 = len(self.segs)
+        if n2 <= n:
+            return 0
         for i in range(L):
-            old = self.stores[i]
-            ph = _placeholder(n2 * self.per)
-            self.mirror.add(ph)
-            b = self.mirror.bufs[ph.ctypes.data] = Buffer(ph.nbytes, "program", pinned=True)
-            if n > 0:
-                _check(lib().rc_gpu_d2d(b.ptr, self.mirror.buffer_of(old).ptr, n * self.per))
-                _check(lib().rc_gpu_sync())
-            self.mirror.forget(old.ctypes.data)
-            self.stores[i] = ph
             se = np.full(n2, -1, np.int64)
             se[:n] = self.slot_expert[i][:n]
             self.slot_expert[i] = se
         self.n_slots = n2
+        self.hot.plan(0, most=(n2 - n) * L)
         print("[dsv41] the hot experts %d -> %d a layer (%.1f GB; the GPU %.1f GB free)" % (
             n, n2, n2 * slot / 1e9, mem_info()[0] / 1e9), file=sys.stderr, flush=True)
-        return k
+        return n2 - n
+
+    def room_margin(self):
+        """The bytes the hot experts leave free as they grow: the reserve (reserve_gb: the image
+        encoder's room) and GROW_MARGIN_GB."""
+        return (GROW_MARGIN_GB + self.reserve_gb) * 1e9
 
     def shrink_hot(self, k=1):
         """k slots of each layer's hot experts back to the GPU: the experts with the lowest scores
-        leave (DSHot; else the last slots), each layer's store made again smaller (the programs hold
-        its address: they go) and the experts that stay copied in from the weightkeeper. The bytes
-        freed (0: none held)."""
+        leave (DSHot; else those of the last slots), those that stay from the last k slots copied on
+        the GPU into the slots below that the leaving ones free, and the last k segments freed (the
+        programs read the slots' addresses from the tables: they stay). The bytes freed (0: none
+        held)."""
         from reclank.backends.cuda.runtime import _check, lib
         n = self.n_slots
         if n <= 0:
@@ -1350,41 +1597,35 @@ class DSV41GPU:
         if self.hot is not None:
             self.hot.land(wait=True)
         n2 = max(0, n - k)
-        self.free_programs()
         L = self.m.L
-        items, ranges = [], []
+        _check(lib().rc_gpu_sync())
         for i in range(L):
-            held = [(s, int(e)) for s, e in enumerate(self.slot_expert[i][:n]) if e >= 0]
+            se = self.slot_expert[i]
+            held = [(s, int(e)) for s, e in enumerate(se[:n]) if e >= 0]
             if self.hot is not None:
-                held.sort(key=lambda se: -self.hot.score[i, se[1]])
-            self.mirror.forget(self.stores[i].ctypes.data)
-            ph = _placeholder(max(n2, 1) * self.per)
-            self.mirror.add(ph)
-            self.mirror.bufs[ph.ctypes.data] = Buffer(ph.nbytes, "program", pinned=True)
-            self.stores[i] = ph
+                held.sort(key=lambda x: -self.hot.score[i, x[1]])
+            stay = held[:n2]
+            kept = {e for _s, e in stay}
+            free = [s for s in range(n2) if se[s] < 0 or int(se[s]) not in kept]
+            up = [(s, e) for s, e in stay if s >= n2]
+            new = np.full(max(n2, 1), -1, np.int64)
+            for s, e in stay:
+                if s < n2:
+                    new[s] = e
+            for (s, e), d in zip(up, free):
+                _check(lib().rc_gpu_d2d(int(self.stores[i][d]), int(self.stores[i][s]), self.per))
+                new[d] = e
             self.maps[i][:] = -1
-            self.slot_expert[i] = np.full(max(n2, 1), -1, np.int64)
-            for slot, (_s, e) in enumerate(held[:n2]):
-                items.append((i, slot, e))
-                if self.hot is not None:
-                    ranges += self.expert_ranges(i, e, slot)
+            for s in range(n2):
+                if new[s] >= 0:
+                    self.maps[i][new[s]] = s
+            self.slot_expert[i] = new
+        _check(lib().rc_gpu_sync())
         self.n_slots = n2
-        if self.hot is not None:
-            self.hot.incoming[:] = False
-            if ranges:
-                ra = np.array(ranges, np.int64)
-                job = lib().rc_gpu_cache_copy(ra.ctypes.data, len(ranges) // 3)
-                if job < 0 or lib().rc_gpu_cache_query(job, 1) < 0:
-                    raise RuntimeError(lib().rc_gpu_last_error().decode())
-        for i, slot, e in items:
-            if self.hot is None and n2 > 0:
-                host = self.expert_bytes(i, e)
-                _check(lib().rc_gpu_h2d(self.mirror.buffer_of(self.stores[i]).ptr + slot * self.per,
-                                        host.ctypes.data, self.per))
-            self.slot_expert[i][slot] = e
-            self.maps[i][e] = slot
+        self._segs_to(n2)
         for i in range(L):
-            self.mirror.buffer_of(self.maps[i]).upload(self.maps[i])
+            if self.mirror.owner(self.maps[i].ctypes.data) is not None:
+                self.mirror.buffer_of(self.maps[i]).upload(self.maps[i])
         return (n - n2) * L * self.per
 
     # ---- the inputs, a step, a prompt
@@ -1423,11 +1664,15 @@ class DSV41GPU:
             r.g.bind(self._slots(r, pos, rbase))
             return
         tokens = np.asarray(tokens, np.int64)
-        hashes = m.hashes.ids(tokens, pos, dead)
         r.tok[:] = tokens
         self.mirror.buffer_of(r.tok).upload(r.tok)
-        for j, i in enumerate(m.engram_layers):
-            r.egc[i][:], r.egs[i][:] = self.engram_codes(i, hashes[:, j])
+        # the rows' bytes: of the prompt's read ahead (engram_ahead: its hashes, the ids by position already
+        # kept), else read now (the step's pool)
+        outs = [(r.egc[i], r.egs[i]) for i in m.engram_layers]
+        ah = self.__dict__.get("_eg_ahead", {}).get(self.lane_id)
+        if ah is None or not ah.covers(pos, tokens, dead) or not ah.take(pos, len(tokens), outs):
+            self.engram_reader().read(m.hashes.ids(tokens, pos, dead), outs)
+        for i in m.engram_layers:
             if dead is not None:
                 r.egc[i].reshape(len(tokens), -1)[dead] = 0
             self.mirror.buffer_of(r.egc[i]).upload(r.egc[i])
@@ -1439,6 +1684,8 @@ class DSV41GPU:
         sl = {"pos": int(pos), "rbase": int(rbase)}
         for j, (r0, _r1) in enumerate(r.lanes[1:], 1):
             sl["pos%d" % j] = int(pos) + r0
+        for name, r0 in getattr(r, "subs", ()):
+            sl[name] = int(pos) + r0
         return sl
 
     def forward(self, tokens, pos, part="full", rbase=0, media=None):
@@ -1551,6 +1798,7 @@ class DSV41GPU:
         tokens = list(tokens)
         n_all, win = len(tokens), self.m.win
         self.fit(pos + n_all)
+        self.engram_ahead(tokens, pos, media)
         rep = self.replay and n_all > win
         base = pos + n_all - win
         at, out = 0, None
@@ -1691,10 +1939,12 @@ class DSHot:
         for i in rows:
             g.mirror.buffer_of(g.maps[i]).upload(g.maps[i])
 
-    def plan(self, t):
+    def plan(self, t, most=None):
         """The copies of this run: for each layer with free slots, its best
         experts not held; for each full layer, its best expert not held where
-        it beats its worst held one by margin (all the layers at once)."""
+        it beats its worst held one by margin (all the layers at once). most:
+        at most that many copies (grow_hot: every new slot), else budget a
+        token up to the cap of a run."""
         from reclank.backends.cuda.runtime import lib
         g = self.g
         L, E = self.score.shape
@@ -1728,7 +1978,7 @@ class DSHot:
         cand.sort(reverse=True)
         items, ranges, rows = [], [], set()
         cap = self.cap_group if t > VERIFY_MAX else self.cap
-        for _gain, i, e, slot in cand[:min(self.budget * t, cap)]:
+        for _gain, i, e, slot in cand[:min(self.budget * t, cap) if most is None else most]:
             old = int(g.slot_expert[i][slot])
             if old >= 0:
                 g.maps[i][old] = -1

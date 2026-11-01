@@ -129,7 +129,7 @@ def sources():
     return sorted(CSRC.rglob("*.cu")) + sorted(CSRC.rglob("*.cuh")) + sorted(INCLUDE.glob("*.h"))
 
 
-def flags(arch, suffix="", ptx=False):
+def flags(arch, suffix="", ptx=False, cc=None):
     # the machine code of the arch alone, not the compute_XY PTX that
     # -arch=sm_XY adds: the driver compiles that PTX at the load for each newer
     # GPU of the process, though this copy never runs there (the M4000's sm_52
@@ -145,8 +145,12 @@ def flags(arch, suffix="", ptx=False):
     out = ["-O3"] + a + ["-shared", "-Xcompiler", "-fPIC", "-Wno-deprecated-gpu-targets",
                          "-I", str(INCLUDE), "-I", str(CSRC)]
     # an older GPU on this one (caps.cu): the kernels of that GPU, so a
-    # tensor-core kernel that runs anyway traps (port.cuh, RC_NO_SM80)
-    cc = os.environ.get("RECLANK_GPU_CC", "")
+    # tensor-core kernel that runs anyway traps (port.cuh, RC_NO_SM80); cc
+    # (an expert device's, devices.py RECLANK_EXPERT_CC) else RECLANK_GPU_CC,
+    # and the library's caps no higher (RC_GPU_CC)
+    cc = str(cc or os.environ.get("RECLANK_GPU_CC", ""))
+    if cc.isdigit() and 0 < int(cc):
+        out.append("-DRC_GPU_CC=%d" % int(cc))
     if cc.isdigit() and 0 < int(cc) < 80:
         out.append("-DRC_NO_SM80")
     # below 61 (Maxwell) the dp4a of port.cuh too: its scalar form, which
@@ -196,9 +200,10 @@ def prebuild(archs):
         t.start()
 
 
-def build(arch=None):
-    """Build the library when needed; return its path."""
-    ptx = False
+def build(arch=None, ptx=False, cc=None):
+    """Build the library when needed; return its path. arch (arch, suffix) with ptx: its PTX too
+    (the driver compiles it for a newer GPU); cc: as flags'."""
+    cc = str(cc or os.environ.get("RECLANK_GPU_CC", ""))
     if arch is None:
         da = device_arch()
         arch, suffix = da if da else (None, "")
@@ -211,13 +216,13 @@ def build(arch=None):
         if t is not threading.current_thread():
             t.join()
     nvcc, version = pick_nvcc(arch)
-    fl = flags(arch, suffix, ptx) + split_flags(version)
+    fl = flags(arch, suffix, ptx, cc) + split_flags(version)
     text = "".join(p.read_text() for p in sources())
     key = hashlib.sha256((text + "|%d.%d|" % version + nvcc + "|" + " ".join(fl))
                          .encode()).hexdigest()[:16]
     tag = ("sm%d%s" % (arch, suffix)) if arch else "native"
     if "-DRC_NO_SM80" in fl:
-        tag += "_cc" + os.environ["RECLANK_GPU_CC"]
+        tag += "_cc" + cc
     prefix = "libreclank_cuda_%s_" % tag
     lib = lib_dir() / (prefix + key + ".so")
     if lib_ready(lib):

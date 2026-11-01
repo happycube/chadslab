@@ -1,5 +1,11 @@
 """The Qwen3.5 / Qwen3.6 mixture-of-experts text model (qwen3_5_moe), in NumPy.
 
+Ported from transformers
+(src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py and
+models/qwen3_5/modeling_qwen3_5.py, Copyright 2025 The Qwen Team and The
+HuggingFace Inc. team; models/lfm2_moe/modeling_lfm2_moe.py, Copyright 2025 The
+HuggingFace Team; Apache License 2.0). See THIRD_PARTY_NOTICES.md.
+
 QWEN_PLAN.md, phase 1. This module reads the MLX files of the model
 (mlx-community, affine 4-bit and 8-bit weights) and runs the text model in
 float32 NumPy. It is the reference of this runtime for this model; the C and

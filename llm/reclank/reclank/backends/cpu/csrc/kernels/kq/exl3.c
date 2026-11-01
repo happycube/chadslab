@@ -1,5 +1,9 @@
 /* ---------- EXL3 (ExLlamaV3, MIT license; EXL3_PLAN.md) ----------
  *
+ * Ported from ExLlamaV3 (turboderp-org/exllamav3,
+ * exllamav3/exllamav3_ext/quant; MIT License; Copyright (c) 2025 Turboderp).
+ * See THIRD_PARTY_NOTICES.md.
+ *
  * The trellis of a k x n matrix: tiles of 16 inputs by 16 outputs, (k / 16)
  * x (n / 16) of them in that order, each 16 K uint16 words (K bits for each
  * weight). The words of a tile, read as uint32 in memory order, are a

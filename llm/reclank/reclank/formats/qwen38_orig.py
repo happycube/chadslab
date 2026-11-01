@@ -3,7 +3,10 @@
 with the fused bfloat16 experts and the bfloat16 n-gram table), the order of
 the value heads of the DeltaNet (tiled), the GGUF metadata. Shared by
 scripts/convert_q8_gguf.py (a GGUF file) and the weightkeeper
-(reclank/runtime/weightkeeper.py: the tensors in memory)."""
+(reclank/runtime/weightkeeper.py: the tensors in memory).
+
+The value-head order ported from llama.cpp (conversion/qwen.py, _reorder_v_heads;
+MIT License; Copyright (c) 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md."""
 from __future__ import annotations
 
 import os

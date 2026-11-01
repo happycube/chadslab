@@ -1,3 +1,8 @@
+/* The A4 quantizer ported from flashinfer's b12x
+ * (local-inference-lab/flashinfer, flashinfer/experimental/b12x; Apache License
+ * 2.0; Copyright (c) 2025 by the b12x authors; Copyright 2023-2026 FlashInfer
+ * community; Copyright 2025-2026 NVIDIA). See THIRD_PARTY_NOTICES.md. */
+
 /* KQ_NVX: -12 times the sum of each 16 int8 values of n rows of x (the
  * term of the codes + 12 of kq_nvx_rows). */
 static void kq_nvx_xsum(const int8_t *xq, int n, int cols, int32_t *xn)

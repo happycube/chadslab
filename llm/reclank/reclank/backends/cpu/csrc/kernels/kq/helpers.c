@@ -21,6 +21,8 @@ static inline size_t kq_row_bytes(int type, int cols)
     case KQ_F32X16: return (size_t)cols * 4;
     case KQ_BF12: return ((size_t)cols + (size_t)cols / 2 + (size_t)cols / 32 + 15) / 16 * 16;
     case KQ_BF12X16: return (size_t)cols / 32 * 49;    /* a group of 16 rows: 16 times this */
+    case KQ_F20: return ((size_t)cols * 2 + (size_t)cols / 2 + (size_t)cols / 32 + 15) / 16 * 16;
+    case KQ_F20X16: return (size_t)cols / 32 * 81;     /* a group of 16 rows: 16 times this */
     case KQ_MXX: return (size_t)cols / 32 * 17;        /* a group of 16 rows: 16 times this */
     case KQ_MXF8: return ((size_t)cols + (size_t)cols / 32 + 15) / 16 * 16;
     }
@@ -51,6 +53,28 @@ static void kq_bf12x16_col(const uint8_t *wg, int c, float *out)
             u = ((uint32_t)(b & 0x80) << 24) | ((uint32_t)((blk[768 + r] - gap) & 255) << 23) |
                 ((uint32_t)(b & 0x7f) << 16);
         }
+        memcpy(out + r, &u, 4);
+    }
+}
+
+/* The float32 bits of an F20 value: lo (sign, mantissa), its gap, its group's E. */
+static inline uint32_t kq_f20_bits(uint32_t lo, int gap, int E)
+{
+    if (gap == 15 && lo == 0x8000) {
+        return 0;
+    }
+    return ((lo & 0x8000u) << 16) | ((uint32_t)((E - gap) & 255) << 23) | ((lo & 0x7fffu) << 8);
+}
+
+/* Column c of a group of 16 rows of KQ_F20X16 as floats (see kq_x16f_col). */
+static void kq_f20x16_col(const uint8_t *wg, int c, float *out)
+{
+    const uint8_t *blk = wg + (size_t)(c >> 5) * 1296;
+    int cc = c & 31;
+    for (int r = 0; r < 16; ++r) {
+        uint32_t lo = ((const uint16_t *)blk)[16 * cc + r];
+        int gap = (blk[1024 + 16 * (cc & 15) + r] >> (4 * (cc >> 4))) & 15;
+        uint32_t u = kq_f20_bits(lo, gap, blk[1280 + r]);
         memcpy(out + r, &u, 4);
     }
 }

@@ -6,7 +6,9 @@
  * (GP_REMOTE_POST, GP_REMOTE_JOIN: backends/cpu/csrc/common/ops_qwen.c): the
  * cold experts it holds run here while the CPU runs the others. The int4
  * experts with the kernels of the hot experts (hot_rows_xr: the same rows),
- * a pair's weights by pointer.
+ * a pair's weights by pointer. The weightkeeper's KQ_Q4X experts of the
+ * Gemma 4 26B (rc_gpu_ex_init's q4x) as they are, with the kernel of the
+ * primary's hot experts in that form (q4x_group_block: float32 x, no dp4a).
  *
  * Qwen (rc_gpu_ex_kq_init): the K-quant experts of each layer by slot (gate, up, down), a job a
  * GP_KQ_HOT_MOE record of its tokens with no shared expert, through gg_launch with a program of
@@ -15,7 +17,9 @@
  * Nemotron (rc_gpu_ex_nm_init; GP_NM_REMOTE_POST): the IQ2_XXS experts of
  * each layer by slot, as NemotronGPU's hot stacks; a job is a GP_NM_HOT_MOE
  * record of one token (its pairs the experts posted) through gg_launch, the
- * kernels of the primary's hot experts. */
+ * kernels of the primary's hot experts. Super's NVFP4 experts (nv4: KQ_NV4
+ * rows, relu^2) the same way by GP_NM_HOT_NV4 (float x, any arch: the 1070
+ * beside the 3060). */
 #define EX_MAXK 16
 #define EX_W 256                 /* the staging: [pairs][2] pointers, then w at 256, then h at 320 */
 #define EX_H 320
@@ -28,6 +32,7 @@
 
 typedef struct {
     int dev, layers, hidden, inner, dn_rows;
+    int q4x;                     /* Gemma: the experts in KQ_Q4X, not Q4_0 */
     uint8_t **gu, **dn;          /* the experts of each layer on this GPU (or null) */
     int32_t **slots;             /* each layer: expert -> its place in gu and dn, or -1 (host) */
     size_t gu_per, dn_per;
@@ -37,8 +42,18 @@ typedef struct {
     int pending;
     /* Nemotron: the latent L, the most pairs and inner of a job, each layer's inner and its
      * slots on this GPU (device), the record of a job and the int8 planes of its x and act */
-    int nm, L, kmax, imax, nout;
+    int nm, nv4, L, kmax, imax, nout;
     int *inner_l, *experts_l;
+    /* Super's extras (rc_gpu_ex_nm_hosts): cold experts this GPU does not hold, which the CPU's task posts too;
+     * a job copies their rows from each layer's stacks in host memory (hup, hdn: the keeper's, registered by
+     * the primary: DMA) into xst (xmax experts), and runs every pair from its job's slots and tables (jt_h,
+     * jt_d: the slots, the up and the down addresses); each layer's slots on the host (hslots) and the bytes
+     * of an expert's rows (upp_l, dnp_l) */
+    const uint8_t **hup, **hdn;
+    int32_t **hslots;
+    size_t *upp_l, *dnp_l;
+    uint8_t *xst, *jt_h, *jt_d;
+    int xmax, jt_e;
     /* Qwen: the up blocks of each layer and the types of its gate (and up) and down */
     int kq;
     uint8_t **up;
@@ -55,9 +70,10 @@ typedef struct {
 } ex_dev;
 #define EXN_TMAX 8               /* a Nemotron job: at most 8 tokens (a verify group), 128 pairs */
 #define EXN_TK 128
+#define EXN_PMAX 256             /* (Super's, top 22: 8 tokens, 176 pairs; ER_MAXP) */
 #define EXN_IDS 256              /* its staging: the record, idx, w, x */
-#define EXN_VAL (EXN_IDS + 4 * EXN_TK)
-#define EXN_X (EXN_VAL + 4 * EXN_TK)
+#define EXN_VAL (EXN_IDS + 4 * EXN_PMAX)
+#define EXN_X (EXN_VAL + 4 * EXN_PMAX)
 
 static ex_dev gg_ex;
 
@@ -164,6 +180,47 @@ __global__ void k_ex_dn(const int64_t *ptrs, const float *act2, int rows, int in
                 de + (size_t)j * rows);
 }
 
+/* k_ex_gu (tok null) and k_ex_gu_t on KQ_Q4X experts: block x a group of 16 rows */
+__global__ void k_ex_gu_q4x(const int64_t *ptrs, const int32_t *tok, const float *x, int rows, int cols,
+                            float *act)
+{
+    int j = blockIdx.y, grp = blockIdx.x;
+    q4x_group_block((const uint8_t *)(intptr_t)ptrs[2 * j] + (size_t)grp * (cols / 32) * 288,
+                    x + (tok != NULL ? (size_t)tok[j] * cols : 0), cols, act + (size_t)j * rows + 16 * grp);
+}
+
+__global__ void k_ex_dn_q4x(const int64_t *ptrs, const float *act2, int rows, int inner, float *de)
+{
+    int j = blockIdx.y, grp = blockIdx.x;
+    q4x_group_block((const uint8_t *)(intptr_t)ptrs[2 * j + 1] + (size_t)grp * (inner / 32) * 288,
+                    act2 + (size_t)j * inner, inner, de + (size_t)j * rows + 16 * grp);
+}
+
+/* The gate and up rows, the GELU and the down rows of n pairs (their pointers pd; td: each pair's
+ * token on the rows hd, or null: all on the one row hd) into act, act2 and de */
+static void ex_rows(ex_dev *x, const int64_t *pd, const int32_t *td, const float *hd, int n)
+{
+    int gu_rows = 2 * x->inner;
+    if (x->q4x) {
+        k_ex_gu_q4x<<<dim3((unsigned)(gu_rows / 16), n), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
+            pd, td, hd, gu_rows, x->hidden, x->act);
+    } else if (td != NULL) {
+        k_ex_gu_t<<<dim3((unsigned)cdiv(gu_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK,
+                    (size_t)x->hidden * 4, gg_stream>>>(pd, td, hd, gu_rows, x->hidden, x->act);
+    } else {
+        k_ex_gu<<<dim3((unsigned)cdiv(gu_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK,
+                  (size_t)x->hidden * 4, gg_stream>>>(pd, hd, gu_rows, x->hidden, x->act);
+    }
+    k_ex_gelu<<<n, 256, 0, gg_stream>>>(x->act, x->inner, x->act2);
+    if (x->q4x) {
+        k_ex_dn_q4x<<<dim3((unsigned)(x->dn_rows / 16), n), 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(
+            pd, x->act2, x->dn_rows, x->inner, x->de);
+    } else {
+        k_ex_dn<<<dim3((unsigned)cdiv(x->dn_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK,
+                  (size_t)x->inner * 4, gg_stream>>>(pd, x->act2, x->dn_rows, x->inner, x->de);
+    }
+}
+
 __global__ void k_ex_sum(const float *w, const float *de, int n, int rows, float *out)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,10 +250,15 @@ __global__ void k_ex_sum_t(const float *w, const int32_t *tok, const float *de, 
     out[(size_t)t * rows + c] = acc;
 }
 
-/* The shapes and the buffers (after rc_gpu_init of this copy's device). */
-static int rc_gpu_ex_init_in(int layers, int hidden, int inner, int dn_rows, size_t gu_per, size_t dn_per)
+/* The shapes and the buffers (after rc_gpu_init of this copy's device); q4x: the experts in KQ_Q4X. */
+static int rc_gpu_ex_init_in(int layers, int hidden, int inner, int dn_rows, size_t gu_per, size_t dn_per,
+                             int q4x)
 {
     ex_dev *x = &gg_ex;
+    if (q4x && ((2 * inner) % 16 != 0 || dn_rows % 16 != 0)) {
+        return -1;
+    }
+    x->q4x = q4x;
     x->layers = layers;
     x->hidden = hidden;
     x->inner = inner;
@@ -235,13 +297,16 @@ static int rc_gpu_ex_store_in(int layer, int count, const void *gu, const void *
 
 /* Nemotron: layers, L (the latent), kmax (top-k) and imax (the largest inner); the buffers of
  * a job of one token. */
-static int rc_gpu_ex_nm_init_in(int layers, int L, int kmax, int imax)
+static int rc_gpu_ex_nm_init_in(int layers, int L, int kmax, int imax, int nv4)
 {
     ex_dev *x = &gg_ex;
-    if (kmax > NM_KMAX || L % 256 != 0 || imax % 256 != 0) {
+    /* (KQ_NV4: NM_HOT_NV4's columns a multiple of 32, Super's inner 2688; top 22) */
+    if (nv4 ? (L % 32 != 0 || imax % 32 != 0 || EXN_TMAX * kmax > EXN_PMAX)
+            : (kmax > NM_KMAX || L % 256 != 0 || imax % 256 != 0)) {
         return -1;
     }
     x->nm = 1;
+    x->nv4 = nv4;
     gg_nm_hg_off = getenv("RECLANK_EX_HG") != NULL && atoi(getenv("RECLANK_EX_HG")) == 0;
     x->layers = layers;
     x->L = L;
@@ -254,6 +319,9 @@ static int rc_gpu_ex_nm_init_in(int layers, int L, int kmax, int imax)
     x->slots_d = (int32_t **)calloc(layers, sizeof(int32_t *));
     x->inner_l = (int *)calloc(layers, sizeof(int));
     x->experts_l = (int *)calloc(layers, sizeof(int));
+    x->hslots = (int32_t **)calloc(layers, sizeof(int32_t *));
+    x->upp_l = (size_t *)calloc(layers, sizeof(size_t));
+    x->dnp_l = (size_t *)calloc(layers, sizeof(size_t));
     const size_t T = EXN_TMAX, P = (size_t)EXN_TMAX * kmax;
     size_t stage = EXN_X + T * L * 4;
     CK(cudaHostAlloc((void **)&x->stage_h, stage, cudaHostAllocDefault));
@@ -451,7 +519,7 @@ static int rc_gpu_ex_nm_store_in(int layer, int count, const void *up, const voi
                                  size_t dn_per, int inner, const int32_t *slots, int experts)
 {
     ex_dev *x = &gg_ex;
-    if (inner > x->imax || inner % 256 != 0) {
+    if (inner > x->imax || inner % (x->nv4 ? 32 : 256) != 0) {
         return -1;
     }
     CK(cudaMalloc((void **)&x->gu[layer], (size_t)count * up_per));
@@ -464,6 +532,44 @@ static int rc_gpu_ex_nm_store_in(int layer, int count, const void *up, const voi
     CK(cudaMemcpy(x->slots_d[layer] + experts, &none, sizeof(int32_t), cudaMemcpyHostToDevice));
     x->inner_l[layer] = inner;
     x->experts_l[layer] = experts;
+    x->upp_l[layer] = up_per;
+    x->dnp_l[layer] = dn_per;
+    x->hslots[layer] = (int32_t *)malloc((size_t)experts * sizeof(int32_t));
+    memcpy(x->hslots[layer], slots, (size_t)experts * sizeof(int32_t));
+    return 0;
+}
+
+/* Super's extras of a layer (see ex_dev): its stacks in host memory (up, dn: experts rows of up_per and dn_per
+ * bytes each), xmax the most extras of a job (the stage, made once, and the job's tables) */
+static int rc_gpu_ex_nm_hosts_in(int layer, const void *up, const void *dn, int xmax)
+{
+    ex_dev *x = &gg_ex;
+    if (!x->nv4 || layer < 0 || layer >= x->layers || x->gu[layer] == NULL || xmax <= 0) {
+        return -1;
+    }
+    if (x->hup == NULL) {
+        x->hup = (const uint8_t **)calloc(x->layers, sizeof(uint8_t *));
+        x->hdn = (const uint8_t **)calloc(x->layers, sizeof(uint8_t *));
+    }
+    const size_t per = x->upp_l[layer] + x->dnp_l[layer];
+    if (x->xst == NULL) {
+        CK(cudaMalloc((void **)&x->xst, (size_t)xmax * per));
+        x->xmax = xmax;
+    } else if (xmax > x->xmax) {
+        return -1;
+    }
+    const int E = x->experts_l[layer];
+    if (x->jt_h == NULL || E > x->jt_e) {
+        if (x->jt_h != NULL) {
+            return -1;
+        }
+        x->jt_e = E < 1024 ? 1024 : E;
+        const size_t jb = (size_t)(x->jt_e + 1) * 4 + 2 * (size_t)x->jt_e * 8 + 64;
+        CK(cudaHostAlloc((void **)&x->jt_h, jb, cudaHostAllocDefault));
+        CK(cudaMalloc((void **)&x->jt_d, jb));
+    }
+    x->hup[layer] = (const uint8_t *)up;
+    x->hdn[layer] = (const uint8_t *)dn;
     return 0;
 }
 
@@ -500,16 +606,21 @@ static int rc_gpu_ex_put_in(int layer, int n, const int32_t *slot, const int64_t
     if (x->slots != NULL && x->slots[layer] != NULL) {
         memcpy(x->slots[layer], slots, (size_t)experts * sizeof(int32_t));
     }
+    if (x->hslots != NULL && x->hslots[layer] != NULL) {
+        memcpy(x->hslots[layer], slots, (size_t)experts * sizeof(int32_t));
+    }
     return 0;
 }
 
 /* Nemotron: t tokens of k pairs each (idx: the expert of each pair, or -1 for those this GPU does
  * not run; weights w) on their latent rows h: one GP_NM_HOT_MOE record (int8 x and act in two
- * planes, as the primary's NM_HOT_MOE; t 2-8 by expert, k_nm_hg_*) */
+ * planes, as the primary's NM_HOT_MOE; t 2-8 by expert, k_nm_hg_*), or (nv4) GP_NM_HOT_NV4's
+ * (float x; the experts by slot in the stacks: no tables) */
 static int rc_gpu_ex_nm_job(int layer, int t, int k, const int32_t *idx, const float *w, const float *h)
 {
     ex_dev *x = &gg_ex;
-    if (t <= 0 || t > EXN_TMAX || k <= 0 || k > x->kmax || t * k > EXN_TK || x->gu[layer] == NULL) {
+    if (t <= 0 || t > EXN_TMAX || k <= 0 || k > x->kmax || t * k > (x->nv4 ? EXN_PMAX : EXN_TK) ||
+        x->gu[layer] == NULL) {
         return -1;
     }
     int32_t *si = (int32_t *)(x->stage_h + EXN_IDS);
@@ -535,7 +646,7 @@ static int rc_gpu_ex_nm_job(int layer, int t, int k, const int32_t *idx, const f
     }
     gp_rec rec;
     memset(&rec, 0, sizeof(rec));
-    rec.op = GP_NM_HOT_MOE;
+    rec.op = x->nv4 ? GP_NM_HOT_NV4 : GP_NM_HOT_MOE;
     uint8_t *sd = x->stage_d;
     int64_t v[19] = {(int64_t)(intptr_t)(sd + EXN_X), (int64_t)(intptr_t)(sd + EXN_IDS),
                      (int64_t)(intptr_t)(sd + EXN_VAL), (int64_t)(intptr_t)x->slots_d[layer],
@@ -544,11 +655,50 @@ static int rc_gpu_ex_nm_job(int layer, int t, int k, const int32_t *idx, const f
                      k, x->L, x->inner_l[layer], t,
                      (int64_t)(intptr_t)x->qx, (int64_t)(intptr_t)x->sx, (int64_t)(intptr_t)x->qa,
                      (int64_t)(intptr_t)x->sa, (int64_t)(intptr_t)x->qxl, (int64_t)(intptr_t)x->qal};
-    /* (no dp4a, Maxwell: operands 0-12 only, NM_HOT_MOE's float form on the float rows of x) */
-    const int nop = gg_caps.dp4a ? 19 : 13;
+    /* (no dp4a, Maxwell: operands 0-12 only, NM_HOT_MOE's float form on the float rows of x; NM_HOT_NV4's
+     * are those) */
+    const int nop = gg_caps.dp4a && !x->nv4 ? 19 : 13;
     for (int i = 0; i < nop; ++i) {
         rec.tag[i] = GP_T_INT;
         rec.v[i] = v[i];
+    }
+    if (x->nv4 && x->hup != NULL && x->hup[layer] != NULL) {
+        /* the job's slots (the layer's, each extra 0) and each expert's addresses (its slot's, an extra's place in
+         * xst): the extras' rows copied from the host's stacks first (DMA, this stream) */
+        const int E = x->experts_l[layer];
+        const size_t upp = x->upp_l[layer], dnp = x->dnp_l[layer];
+        const int32_t *hs = x->hslots[layer];
+        int32_t *js = (int32_t *)x->jt_h;
+        const size_t tu_off = ((size_t)(x->jt_e + 1) * 4 + 63) / 64 * 64, td_off = tu_off + (size_t)x->jt_e * 8;
+        int64_t *tu = (int64_t *)(x->jt_h + tu_off), *td = (int64_t *)(x->jt_h + td_off);
+        memcpy(js, hs, (size_t)E * 4);
+        js[E] = -1;
+        int nx = 0;
+        for (int p = 0; p < t * k; ++p) {
+            const int ex = idx[p];
+            if (ex < 0 || ex >= E) {
+                continue;
+            }
+            if (hs[ex] >= 0) {
+                tu[ex] = (int64_t)(intptr_t)(x->gu[layer] + (size_t)hs[ex] * upp);
+                td[ex] = (int64_t)(intptr_t)(x->dn[layer] + (size_t)hs[ex] * dnp);
+            } else if (js[ex] < 0) {
+                if (nx >= x->xmax) {
+                    return -1;              /* (more extras than the stage: the CPU runs them) */
+                }
+                uint8_t *dst = x->xst + (size_t)nx++ * (upp + dnp);
+                CK(cudaMemcpyAsync(dst, x->hup[layer] + (size_t)ex * upp, upp, cudaMemcpyHostToDevice, gg_stream));
+                CK(cudaMemcpyAsync(dst + upp, x->hdn[layer] + (size_t)ex * dnp, dnp, cudaMemcpyHostToDevice, gg_stream));
+                tu[ex] = (int64_t)(intptr_t)dst;
+                td[ex] = (int64_t)(intptr_t)(dst + upp);
+                js[ex] = 0;
+            }
+        }
+        CK(cudaMemcpyAsync(x->jt_d, x->jt_h, td_off + (size_t)E * 8, cudaMemcpyHostToDevice, gg_stream));
+        rec.v[3] = (int64_t)(intptr_t)x->jt_d;
+        rec.tag[13] = rec.tag[14] = GP_T_INT;
+        rec.v[13] = (int64_t)(intptr_t)(x->jt_d + tu_off);
+        rec.v[14] = (int64_t)(intptr_t)(x->jt_d + td_off);
     }
     memcpy(x->stage_h, &rec, sizeof(rec));
     memcpy(x->stage_h + EXN_VAL, w, (size_t)t * k * 4);
@@ -601,12 +751,7 @@ static int rc_gpu_ex_post_in(int layer, int n, const int32_t *ids, const float *
     CK(cudaMemcpyAsync(x->stage_d, x->stage_h, EX_H + (size_t)x->hidden * 4, cudaMemcpyHostToDevice, gg_stream));
     const int64_t *pd = (const int64_t *)x->stage_d;
     const float *wd = (const float *)(x->stage_d + EX_W), *hd = (const float *)(x->stage_d + EX_H);
-    int gu_rows = 2 * x->inner;
-    k_ex_gu<<<dim3((unsigned)cdiv(gu_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK, (size_t)x->hidden * 4,
-              gg_stream>>>(pd, hd, gu_rows, x->hidden, x->act);
-    k_ex_gelu<<<n, 256, 0, gg_stream>>>(x->act, x->inner, x->act2);
-    k_ex_dn<<<dim3((unsigned)cdiv(x->dn_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK, (size_t)x->inner * 4,
-              gg_stream>>>(pd, x->act2, x->dn_rows, x->inner, x->de);
+    ex_rows(x, pd, NULL, hd, n);
     k_ex_sum<<<(unsigned)cdiv(x->dn_rows, 256), 256, 0, gg_stream>>>(wd, x->de, n, x->dn_rows, x->out_d);
     CK(cudaMemcpyAsync(x->out_h, x->out_d, (size_t)x->dn_rows * 4, cudaMemcpyDeviceToHost, gg_stream));
     CK(cudaEventRecord(x->done, gg_stream));
@@ -652,12 +797,7 @@ static int rc_gpu_ex_group_job(int layer, int t, int k, const int32_t *idx, cons
     const int64_t *pd = (const int64_t *)x->stage_d;
     const int32_t *td = (const int32_t *)(x->stage_d + EXG_TOK);
     const float *wd = (const float *)(x->stage_d + EXG_W), *hd = (const float *)(x->stage_d + EXG_H);
-    int gu_rows = 2 * x->inner;
-    k_ex_gu_t<<<dim3((unsigned)cdiv(gu_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK,
-                (size_t)x->hidden * 4, gg_stream>>>(pd, td, hd, gu_rows, x->hidden, x->act);
-    k_ex_gelu<<<n, 256, 0, gg_stream>>>(x->act, x->inner, x->act2);
-    k_ex_dn<<<dim3((unsigned)cdiv(x->dn_rows, ROWS_PER_BLOCK * HOT_XR), n), 32 * ROWS_PER_BLOCK, (size_t)x->inner * 4,
-              gg_stream>>>(pd, x->act2, x->dn_rows, x->inner, x->de);
+    ex_rows(x, pd, td, hd, n);
     k_ex_sum_t<<<dim3((unsigned)cdiv(x->dn_rows, 256), t), 256, 0, gg_stream>>>(wd, td, x->de, n, x->dn_rows,
                                                                                  x->out_d);
     CK(cudaGetLastError());
@@ -706,10 +846,11 @@ static int rc_gpu_ex_wait_in(float *out)
     return 0;
 }
 
-extern "C" int rc_gpu_ex_init(int layers, int hidden, int inner, int dn_rows, size_t gu_per, size_t dn_per)
+extern "C" int rc_gpu_ex_init(int layers, int hidden, int inner, int dn_rows, size_t gu_per, size_t dn_per,
+                              int q4x)
 {
     void *ctx = ex_enter();
-    return ex_leave(ctx, rc_gpu_ex_init_in(layers, hidden, inner, dn_rows, gu_per, dn_per));
+    return ex_leave(ctx, rc_gpu_ex_init_in(layers, hidden, inner, dn_rows, gu_per, dn_per, q4x));
 }
 
 extern "C" int rc_gpu_ex_store(int layer, int count, const void *gu, const void *dn, const int32_t *slots, int experts)
@@ -718,10 +859,10 @@ extern "C" int rc_gpu_ex_store(int layer, int count, const void *gu, const void 
     return ex_leave(ctx, rc_gpu_ex_store_in(layer, count, gu, dn, slots, experts));
 }
 
-extern "C" int rc_gpu_ex_nm_init(int layers, int L, int kmax, int imax)
+extern "C" int rc_gpu_ex_nm_init(int layers, int L, int kmax, int imax, int nv4)
 {
     void *ctx = ex_enter();
-    return ex_leave(ctx, rc_gpu_ex_nm_init_in(layers, L, kmax, imax));
+    return ex_leave(ctx, rc_gpu_ex_nm_init_in(layers, L, kmax, imax, nv4));
 }
 
 extern "C" int rc_gpu_ex_nm_store(int layer, int count, const void *up, const void *dn, size_t up_per,
@@ -729,6 +870,12 @@ extern "C" int rc_gpu_ex_nm_store(int layer, int count, const void *up, const vo
 {
     void *ctx = ex_enter();
     return ex_leave(ctx, rc_gpu_ex_nm_store_in(layer, count, up, dn, up_per, dn_per, inner, slots, experts));
+}
+
+extern "C" int rc_gpu_ex_nm_hosts(int layer, const void *up, const void *dn, int xmax)
+{
+    void *ctx = ex_enter();
+    return ex_leave(ctx, rc_gpu_ex_nm_hosts_in(layer, up, dn, xmax));
 }
 
 extern "C" int rc_gpu_ex_put(int layer, int n, const int32_t *slot, const int64_t *src, const size_t *per,

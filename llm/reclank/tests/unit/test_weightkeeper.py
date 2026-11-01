@@ -129,7 +129,12 @@ def test_serve_attach(ckpt, tmp_path, layout):
             Z.request("stop", sock).close()
         except OSError:
             pass
-        p.wait(timeout=30)
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()            # (never left behind: a keeper that did not stop)
+            p.wait()
+            raise
     assert not os.path.exists(sock)
 
 

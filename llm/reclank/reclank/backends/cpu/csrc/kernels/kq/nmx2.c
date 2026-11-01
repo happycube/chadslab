@@ -325,6 +325,12 @@ static int kq_nv4_fd(const float *xs, int cols, float *fd)
             }                                                                                                      \
             for (int r = 0; r < R; ++r) {                                                                          \
                 const uint8_t *wr = w + r * rb;                                                                    \
+                /* the rows of the next call (the next R rows): their line of codes of these 4 blocks, of scales   \
+                 * of these 32, ahead (the kernel waited on memory: up rows 22.1 -> 26.1 GB/s on 11 threads) */    \
+                if ((b & 3) == 0)                                                                                  \
+                    _mm_prefetch((const char *)kq_nv4_codes(wr + R * rb, b), _MM_HINT_T0);                         \
+                if ((b & 31) == 0)                                                                                 \
+                    _mm_prefetch((const char *)kq_nv4_scales(wr + R * rb, cols, b), _MM_HINT_T0);                  \
                 const __m256i q = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kq_nv4_codes(wr, b))); \
                 const __m256i v = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srlv_epi32(q, shv), m4));      \
                 const __m256i we = _mm256_slli_epi16(v, 8), wo = _mm256_and_si256(v, hm);                         \

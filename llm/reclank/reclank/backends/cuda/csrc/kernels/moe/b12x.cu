@@ -7,6 +7,10 @@
  * bytes 4-7 of the heads of the KQ_NVX groups (gate and up: gs1, down: gs2; fp4local_st). The shared
  * expert runs outside (KQ_LINEAR, B12X_GLU), and MOE_B12X_OUT adds it to the routed sum.
  *
+ * Ported from flashinfer's b12x (local-inference-lab/flashinfer, flashinfer/experimental/b12x;
+ * Apache License 2.0; Copyright (c) 2025 by the b12x authors; Copyright 2023-2026 FlashInfer
+ * community; Copyright 2025-2026 NVIDIA). See THIRD_PARTY_NOTICES.md.
+ *
  * The scales of x go where k_kq_quant_x puts xs and xsum (a float for each block of 32): the scale
  * of the first 16 of a block in xs, that of the second in xsum. */
 

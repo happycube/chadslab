@@ -1,4 +1,7 @@
 /* ---------- IQ2_XXS on the GPU (the experts of Nemotron 3.5 Bolt) ----------
+ * Ported from ggml (ggml/src/ggml-common.h, ggml/src/ggml-quants.c: IQ2_XXS; MIT License;
+ * Copyright (c) 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+ *
  * ggml's 2.06-bit i-quant (backends/include/iq2_tables.h has the layout; the CPU's
  * kernels/kq/iq2.c). A block of 256 values is 66 bytes, so the stored blocks are only 2-byte
  * aligned (the loads of bytes and halves of nm_iq2_lane, the GGUF form KQ_IQ2_XXS); the Nemotron

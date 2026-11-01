@@ -592,6 +592,8 @@ class DSEngine(Engine):
                 self._fresh()
             else:
                 self._restore(point, k)
+            # engram's rows of the whole prompt read ahead (its parts and groups take them in turn)
+            self.g.engram_ahead(ids[k:], k, media)
             if k < cut < n:
                 yield from self._prefill_co(ids[k:cut], k, media)
                 self._save(keys[:cut])
@@ -612,6 +614,8 @@ class DSEngine(Engine):
             print("[dsv41] %s: the programs freed (GPU %.2f -> %.2f GB free), the prompt again" % (
                 e, free0 / 1e9, mem_info()[0] / 1e9), file=sys.stderr, flush=True)
             lg, main_last = yield from prefill()
+        # the big groups' programs go and the hot experts take their room back for the answer
+        self.g.relax_big()
         dt = time.time() - t0
         self.last_cached = k
         print("[dsv41] cache hit %d of %d prompt tokens; new %d in %.1f s (%.0f tok/s); %s" % (
@@ -697,6 +701,12 @@ def load(opts, meta, worker=None):
     if int(getattr(opts, "lanes", 1) or 1) > 1:
         _lanes_up(eng, warm)
         _lanes_warm(eng, tok, enc)
+    # the hot experts in the room the programs of the loop and of the small groups leave (beside the image
+    # encoder's): the big groups' programs take theirs at a prompt (gpu.py big_room) and give it back after
+    g.reserve_gb = VISION_GB if images else 0.0
+    if opts.hot_gb is None:
+        g.n_max = g.w.src.E
+    g.relax_big()
     from reclank.backends.cpu import cops as _cops
     _cops.team_warn()
     thinking = opts.thinking or "high"

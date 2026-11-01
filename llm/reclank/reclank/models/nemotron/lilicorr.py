@@ -3,6 +3,9 @@ the NumPy reference (docs/NEMOTRON_BOLT_PLAN.md, P8). Bolt has no MTP layer; NVI
 separate checkpoint NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr (1.1B, NVFP4 MLPs, bfloat16 attention).
 The math follows llama.cpp's src/models/dflash.cpp and the DFlash driver of common/speculative.cpp.
 
+Ported from llama.cpp (src/models/dflash.cpp, common/speculative.cpp; MIT License; Copyright (c)
+2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+
 - The context: for each position the target has run, the target's residual stream after blocks
   1, 18, 35, 51, 68 and 85 (config target_layer_ids: the outputs of those blocks), concatenated
   (6 x 4096), through fc (NVFP4) and hidden_norm: g. Each drafter layer keeps K = k_norm(k_proj(g))

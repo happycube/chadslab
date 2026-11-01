@@ -143,7 +143,7 @@ TABLE = [
     # the media encoders (reclank/encoders/runtime.py)
     ("ENC_LINEAR", 133, B, "a matrix of an encoder"),
     ("ENC_RMS", 134, B, "the RMS norm"),
-    ("ENC_GELU_MUL", 135, B, "gelu(gate) * up"),
+    ("ENC_GELU_MUL", 135, B, "gelu(gate) * up (tanh or erf)"),
     ("ENC_ADD", 136, B, "x + s y"),
     ("ENC_ROPE2D", 137, B, "the 2D rope of the vision encoders"),
     ("ENC_ATTN", 138, B, "the attention of an encoder"),
@@ -254,6 +254,53 @@ TABLE = [
     ("DS_STAGE_PICK", 235, G, "a prompt group's heaviest cold experts of a layer to the GPU's stage slots (DeepSeek V4.1)"),
     ("DS_STAGE_PULL", 236, G, "the experts of DS_STAGE_PICK from the registered host memory into the stage, beside the stream"),
     ("DS_STAGE_JOIN", 237, G, "the stream waits for a DS_STAGE_PULL"),
+    # EmbeddingGemma 2 (reclank/models/embedgemma2)
+    ("ENC_ROPE1D", 238, B, "the 1D rope of an encoder (NEOX halves, a position a row)"),
+    ("ENC_ATTN_RANGE", 239, B, "the attention of each query over its range of keys (KV heads shared)"),
+    ("ENC_GATHER", 240, B, "rows of blocks of the rows of x by index (-1: zeros)"),
+    ("ENC_ATTN_BIAS", 241, B, "the attention within groups of rows (windows), plus a bias of each window's type"),
+    ("ENC_GATHER_MM", 242, G, "a product of BF12 rows with the rows of ENC_GATHER, without the gathered rows (MuQ's convs)"),
+    ("ENC_ATTN_X2", 243, G, "ENC_ATTN_RANGE on the tensor cores, q k v and the weights as two bfloat16 planes"),
+    # Whisper's decoder (reclank/models/whisper/decoder.py)
+    ("ENC_SCATTER", 244, B, "the rows of x to the rows of y by index (-1: none): the new rows of a KV cache"),
+    ("ENC_ATTN_KV", 245, B, "the attention of each query over its range of the rows of k and v (a cache of any rows)"),
+    # The generation models (docs/GENERATION_PLAN.md)
+    ("ENC_ROPE_TAB", 246, B, "RoPE of interleaved pairs at a table of each row's cos and sin (a DiT's axes)"),
+    ("ENC_GNORM", 247, B, "GroupNorm over all the rows (an image's pixels) and a group's channels, then SiLU or not"),
+    ("ENC_SNAKE", 248, B, "the Snake of a channel's alpha and beta: x + sin(alpha x)^2 / (beta + 1e-9) (DAC, Oobleck)"),
+    # Higgs TTS 3's voice cloning (the codec's encoder: reclank/models/higgs/codec.py)
+    ("ENC_ELU", 260, B, "the ELU of alpha 1: x above 0, else exp(x) - 1 (the Higgs codec's semantic encoder)"),
+    # Qwen-Image-2.1 (reclank/models/qwen_image)
+    ("ENC_DUPUP", 280, B, "out += the channels of x's pixel by the pixel's phase: the shortcut of DupUp3D (a VAE's up block)"),
+    ("ENC_ATTN_WIDE", 281, G, "the attention of one head of any width, the scores of a part of the queries in a buffer (float32)"),
+    # umT5 (reclank/models/t5: Wan 2.2's text encoder)
+    ("ENC_ATTN_REL", 290, C, "the attention of each query over its range of keys, plus a bias of each head by the distance (T5)"),
+    # The float32 attention of the DiTs (ENC_ATTN_X2's float32 form)
+    ("ENC_ATTN_TILE", 291, G, "ENC_ATTN_RANGE in float32 in register-blocked tiles of 128 queries and 32 keys (heads of at most 128)"),
+    # Qwen-Image-2.1's editing: the DiT's cache of the references' keys and values in F20
+    ("ENC_F20_PACK", 292, B, "float32 rows to F20 rows (the bits of kq_f32_to_f20): an edit's DiT cache of keys and values"),
+    ("ENC_F20_UNPACK", 293, B, "F20 rows to float32 rows (the bits of kq_f20_to_f32)"),
+    ("ENC_ATTN_X2C", 294, G, "ENC_ATTN_X2 of a step's queries over its own keys and a cache's F20 keys (an edit's DiT)"),
+    # 2D to stereo 3D (reclank/models/depth, docs/STEREO_PLAN.md)
+    ("ENC_RESIZE", 300, B, "images of pixel rows resized: bilinear as torch's (align_corners or not), or the area mean of an integer factor"),
+    ("ENC_DIBR", 301, B, "one eye of a stereo pair: the forward warp of a row mesh by each pixel's shift, nearest first, holes filled from behind"),
+    ("ENC_PACK_U8", 302, B, "values rounded and clamped to 0..255, four bytes in each float32 of the output"),
+    ("ENC_RESIZE_TAPS", 303, B, "images of pixel rows resized by each axis's taps (indices and weights): the columns first, then the rows"),
+    ("ENC_UNPACK_U8", 304, B, "bytes to float32 values, each divided by a number (an uploaded 8-bit image)"),
+    # Frame interpolation (reclank/models/vfi: Practical-RIFE 4.25, docs/VFI_PLAN.md)
+    ("ENC_WARP", 320, B, "the backward warp of pixel rows by a flow: bilinear, the border clamped, as torch's grid_sample(align_corners=True)"),
+    ("ENC_PRELU", 321, B, "x above 0, else a x with a of each column (LeakyReLU, PReLU)"),
+    ("ENC_MIX", 322, B, "a s + b (1 - s), s = sigmoid(m), of columns of one buffer of pixel rows (RIFE's merge)"),
+    ("ENC_CONV_MM", 323, G, "float32 W times the rows of ENC_GATHER without the gathered rows (an implicit im2col), + b, + res, PReLU"),
+    ("ENC_RIFE_IN", 324, G, "a RIFE block's input from the frames, the heads and the blocks' tmp, without the full-resolution buffer"),
+    ("ENC_RIFE_OUT", 325, G, "RIFE's output (and the warped frames) from the frames and the blocks' tmp"),
+    ("ENC_UNPACK_U8P", 326, G, "the bytes of an h x w frame to float32 rows of a larger grid, each divided by a number, zeros past the frame"),
+    ("ENC_PACK_U8C", 327, G, "the h x w frame of rows of a larger grid times a number, rounded and clamped to bytes"),
+    ("ENC_RESAMPLE_U8", 328, G, "one pass of PIL's 8-bit resample along an axis of bytes (its bounds and int32 coefficients)"),
+    ("ENC_THUMB_U8", 329, G, "the pixels of rows x columns of a frame's bytes, and its blocks' sums of the three channels"),
+    # Nemotron Super on a small CPU: a step's cold experts split with the GPUs' links (models/nemotron/gpu.py TAKE)
+    ("NM_TAKE", 330, G, "of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked"),
+    ("NM_PULL", 331, G, "NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}

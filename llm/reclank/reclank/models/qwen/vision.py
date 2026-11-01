@@ -1,6 +1,12 @@
 """The image encoder of Qwen3.6 and Qwen3.8 (the Qwen3-VL ViT, projector
 qwen3vl_merger).
 
+Ported from transformers (src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
+and models/qwen3_5_moe/modeling_qwen3_5_moe.py, Copyright 2025 The Qwen Team
+and The HuggingFace Inc. team; models/qwen4_exp/modeling_qwen4_exp.py,
+Copyright 2026 The Qwen Team and The HuggingFace Inc. team; Apache License
+2.0). See THIRD_PARTY_NOTICES.md.
+
 MULTIMODAL_PLAN.md, section 3.4. The weights come from the mmproj GGUF of
 llama.cpp (Qwen3.6), or from the tensors model.visual.* of the safetensors
 checkpoint (Qwen3.8-Flash-Next: the same ViT, with an output of 2560; the
@@ -19,7 +25,13 @@ Qwen3_5MoeVisionModel, and Qwen2VLImageProcessor for the pixels):
     LayerNorm; the FFN with gelu tanh and biases) -> LayerNorm -> each 2 x 2
     block as one row of 4 x 1152 -> mm.0, gelu (erf), mm.2 -> 2048 values.
 
-The model has no deepstack layers (deepstack_visual_indexes is empty).
+Qwen3.6 has no deepstack layers (deepstack_visual_indexes is empty). Qwen3-VL
+(Qwen-Image-2.1's text encoder, models/qwen_image) has three: after its
+blocks 8, 16 and 24 the rows go through a merger of their own each
+(deepstack_merger_list: the LayerNorm of each 2 x 2 block's 4 x 1152 values,
+then mm.0, gelu (erf), mm.2), whose rows the text model adds to its hidden
+states at the image's tokens after its first three layers
+(encode_deepstack; the weights of a checkpoint directory only).
 
 The program reuses the records of gemma4v (ENC_LINEAR, ENC_ROPE2D, ENC_ATTN,
 ...) and adds ENC_LNORM and ENC_GELU. ENC_ROPE2D rotates the pairs (j, j +
@@ -34,7 +46,8 @@ import math
 
 import numpy as np
 
-from reclank.encoders.runtime import _ENC_PY, _EncCompiler, _Runner, _Weights, _gelu_tanh, _softmax, quantize_q8
+from reclank.encoders.runtime import (_ENC_PY, _EncCompiler, _Runner, _Weights, _gelu_tanh, _shape, _softmax,
+                                     quantize_q8)
 
 PATCH = 16
 MERGE = 2
@@ -88,6 +101,10 @@ class _STWeights:
         if name in fixed:
             return fixed[name], None
         _, blk, i, part, kind = name.split(".")
+        if blk == "ds":
+            # v.ds.<j>.{norm,fc1,fc2}.<kind>: the deepstack merger j
+            return "deepstack_merger_list.%s.%s.%s" % (i, {"norm": "norm", "fc1": "linear_fc1",
+                                                           "fc2": "linear_fc2"}[part], kind), None
         return "blocks.%s.%s.%s" % (i, self.NAMES[part], kind), None
 
     def has(self, name):
@@ -190,7 +207,9 @@ class QwenVision:
         if kind != "qwen3vl_merger":
             raise ValueError("not a qwen3vl_merger mmproj (projector %r)" % kind)
         ds = m.get("clip.vision.is_deepstack_layers")
-        if ds is not None and any(int(v) for v in ds):
+        # the layers after which a deepstack merger takes the rows (a checkpoint's names: v.ds.*)
+        self.ds_layers = [i for i, v in enumerate(ds or []) if int(v)]
+        if self.ds_layers and not W.has("v.ds.0.norm.weight"):
             raise ValueError("the mmproj has deepstack layers; this encoder has no deepstack input")
         self.width = int(m["clip.vision.embedding_length"])
         self.layers = int(m["clip.vision.block_count"])
@@ -230,6 +249,12 @@ class QwenVision:
         self.post_ln = (W.f32("v.post_ln.weight").reshape(-1), W.f32("v.post_ln.bias").reshape(-1))
         self.mm0 = _Lin(W.matrix("mm.0.weight"), W.f32("mm.0.bias"))
         self.mm2 = _Lin(W.matrix("mm.2.weight"), W.f32("mm.2.bias"))
+        self.ds = []
+        for j in range(len(self.ds_layers)):
+            p = "v.ds.%d." % j
+            self.ds.append(dict(ln=(W.f32(p + "norm.weight").reshape(-1), W.f32(p + "norm.bias").reshape(-1)),
+                                fc1=_Lin(W.matrix(p + "fc1.weight"), W.f32(p + "fc1.bias")),
+                                fc2=_Lin(W.matrix(p + "fc2.weight"), W.f32(p + "fc2.bias"))))
         # FP4-Local: the forms of the inputs of the linears (enc_linear rounds them, and the outputs)
         self.contract = False
         if hasattr(W, "act"):
@@ -249,6 +274,9 @@ class QwenVision:
         self.runner = _Runner(self.program)
         self.gpu = False
         self.q8 = False
+        # a GPU program's attention: None ENC_ATTN (float16 q, k, v on the tensor cores), "x2"
+        # ENC_ATTN_X2 (two bfloat16 planes each), "f32" ENC_ATTN_TILE (float32; Qwen-Image's editing)
+        self.attn_gpu = None
 
     # ---- the inputs ----
 
@@ -293,6 +321,29 @@ class QwenVision:
         return self.runner.run((n, video) if video else n, self.gpu,
                                {"p": np.asarray(patches, np.float32), "pe": pe, "pos": pos}, "y")
 
+    def encode_deepstack(self, patches, grid):
+        """encode of an image, and the rows of each deepstack merger: (y,
+        [d0, d1, ...]), each (n / 4, hidden)."""
+        gh, gw = grid
+        n = gh * gw
+        assert patches.shape == (n, 3 * PATCH * PATCH)
+        r, c = merge_order(gh, gw)
+        inputs = {"p": np.asarray(patches, np.float32), "pe": self.pos_rows(gh, gw),
+                  "pos": np.stack([r, c], axis=1).astype(np.int32)}
+        prog, g = self.runner.get(n, self.gpu)
+        for name, a in inputs.items():
+            prog.names[name][...] = a
+            if g is not None:
+                g.upload(name)
+        outs = ["y"] + ["d%d" % j for j in range(len(self.ds))]
+        if g is not None:
+            g.run()
+            for name in outs:
+                g.download(name)
+        else:
+            prog.run()
+        return prog.names["y"].copy(), [prog.names[name].copy() for name in outs[1:]]
+
     def encode_video(self, patches, grid):
         """patches (t n, 1536) of a video (video_input), grid (t, gh, gw).
         Each pair of frames is one group: its patches see only each other
@@ -311,7 +362,7 @@ class QwenVision:
             n = n[0]
         patch_lin = self.patch_lin2 if video else self.patch_lin
         w, H, hd = self.width, self.heads, self.hd
-        inter = self.blk[0]["up"].w.shape[0]
+        inter = _shape(self.blk[0]["up"])[0]
         kp = patch_lin.w.shape[1]
         m4 = w * MERGE * MERGE
         n4 = n // (MERGE * MERGE)
@@ -321,8 +372,15 @@ class QwenVision:
                      x=z(n, w), h=z(n, w), q=z(n, w), k=z(n, w), v=z(n, w), o=z(n, w),
                      t=z(n, w), u=z(n, inter), hm=z(n4, m4), g=z(n4, m4), y=z(n4, self.hidden),
                      _scratch=np.zeros(n * max(kp, w, inter), np.float32))
+        for j in range(len(self.ds)):
+            c.env["d%d" % j] = z(n4, self.hidden)
+        attn = ("enc_attn", "q", "k", "v", H, hd)
+        if gpu and self.attn_gpu:
+            c.attn_f32 = self.attn_gpu == "f32"
+            c.env.update(alo=np.zeros(n, np.int32), ahi=np.full(n, n, np.int32))
+            attn = ("enc_attn_range_x2", "q", "k", "v", "alo", "ahi", H, hd)
         forms = [("set", "x", ("enc_linear", patch_lin, "p")), ("enc_add", "x", "pe")]
-        for b in self.blk:
+        for i, b in enumerate(self.blk):
             forms += [
                 ("set", "h", ("enc_lnorm", "x", b["ln1"][0], b["ln1"][1], w)),
                 ("set", "q", ("enc_linear", b["q"], "h")),
@@ -331,7 +389,7 @@ class QwenVision:
                 ("enc_rope2d", "q", "pos", self.inv, H, hd),
                 ("enc_rope2d", "k", "pos", self.inv, H, hd),
                 ("set", "q", ("enc_mul_vec", "q", self.scale)),
-                ("set", "o", ("enc_attn", "q", "k", "v", H, hd)),
+                ("set", "o", attn),
                 ("set", "t", ("enc_linear", b["o"], "o")),
                 ("enc_add", "x", "t"),
                 ("set", "h", ("enc_lnorm", "x", b["ln2"][0], b["ln2"][1], w)),
@@ -340,6 +398,15 @@ class QwenVision:
                 ("set", "t", ("enc_linear", b["down"], "u")),
                 ("enc_add", "x", "t"),
             ]
+            if i in self.ds_layers:
+                # a deepstack merger: the norm of each merge block's 4 x width values (postshuffle)
+                d = self.ds[self.ds_layers.index(i)]
+                forms += [
+                    ("set", "hm", ("enc_lnorm", "x", d["ln"][0], d["ln"][1], m4)),
+                    ("set", "g", ("enc_linear", d["fc1"], "hm")),
+                    ("set", "g", ("enc_gelu", "g", True)),
+                    ("set", "d%d" % self.ds_layers.index(i), ("enc_linear", d["fc2"], "g")),
+                ]
         forms += [
             # The rows of one merge block are next to each other: the norm of
             # the n rows is the n / 4 rows of 4 x width.

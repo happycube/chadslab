@@ -76,7 +76,7 @@ def is_e4b(path):
 REPO = "models--google--gemma-4-12B-it-qat-q4_0-unquantized"
 
 
-def load_model(source, dtype, model_kind="12b", gguf_path=None):
+def load_model(source, dtype, model_kind="12b", gguf_path=None, snapshot=None):
     if model_kind == "e4b":
         from reclank.models.gemma4.e4b import E4B, E4BConfig
         from reclank.formats.gguf import GGUF
@@ -91,7 +91,7 @@ def load_model(source, dtype, model_kind="12b", gguf_path=None):
         cfg = Config({"text_config": g.text_config()})
         return Model(g, cfg).load_all(dtype=dtype), cfg
     from reclank import Config, Model, SafeTensors
-    snap = sorted(glob.glob(os.path.join(HUB, REPO, "snapshots", "*")))[-1]
+    snap = snapshot or sorted(glob.glob(os.path.join(HUB, REPO, "snapshots", "*")))[-1]
     cfg = Config.load(os.path.join(snap, "config.json"))
     st = SafeTensors(os.path.join(snap, "model.safetensors"))
     return Model(st, cfg).load_all(dtype=dtype), cfg
@@ -155,6 +155,9 @@ def main():
     ap.add_argument("--model", choices=("12b", "e4b", "26b"), default="12b")
     ap.add_argument("--gguf", default=None, help="the text GGUF (the default of --model)")
     ap.add_argument("--mmproj", default=None, help="the mmproj GGUF (the default of --model)")
+    ap.add_argument("--snapshot", default=None,
+                    help="--source st: the directory of the unquantized QAT checkpoint "
+                         "(config.json, model.safetensors)")
     ap.add_argument("--dtype", default=None, help="f32 for st, int4 for gguf (the defaults)")
     ap.add_argument("--soft", choices=("ref", "ours"), default="ref")
     ap.add_argument("--kl", type=float, default=None,
@@ -205,7 +208,7 @@ def main():
         M._BIDIR_ALL = False
     dtype = args.dtype or ("f32" if args.source == "st" else "int4")
     t0 = time.time()
-    model, cfg = load_model(args.source, dtype, args.model, gguf_path)
+    model, cfg = load_model(args.source, dtype, args.model, gguf_path, args.snapshot)
     if args.gpu:
         from reclank.models.gemma4 import gpu as gpu
         gpu.offload(model, 0.0)

@@ -1,5 +1,9 @@
 """Run the Gemma 4 E4B text model from the mobile-ct checkpoint.
 
+Ported from transformers (src/transformers/models/gemma4/modeling_gemma4.py,
+Copyright 2026 the HuggingFace Team; Apache License 2.0). See
+THIRD_PARTY_NOTICES.md.
+
 The E4B model is a dense Gemma 4 with 42 layers. It adds one idea that the
 12B and 26B models do not have: Per-Layer Embeddings (PLE). PLE gives each
 decoder layer its own small embedding for every token. The embedding table is

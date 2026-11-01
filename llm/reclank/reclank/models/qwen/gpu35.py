@@ -622,12 +622,14 @@ class QwenGPU(WarmPool, ProgramLRU):
                            for srcs, nb, dst in st["parts"]],
                     ip=st.get("ip"), step=i < L))
             self.hot_cache = HotCache(self, layers=layers, top_k=cfg.top_k)
-            if self.xdev is not None and os.environ.get("RECLANK_EXPERT_EXCLUSIVE", "0") == "1":
-                # (RECLANK_EXPERT_EXCLUSIVE=1: the pool leaves out the experts of the expert device. Else
-                # the pool takes any expert, and the device runs those of its experts the pool lacks: the
-                # text's experts on the 3060 at once; a short prompt's decode 59.5 -> 62.6 tok/s, the 3060
-                # alone 61.7; after 4K the same, 57.5)
-                self.hot_cache.exclude = self.xdev.held[[e["layer"] for e in layers]].astype(bool)
+            if self.xdev is not None:
+                self.hot_cache.remote = self.xdev.held[[e["layer"] for e in layers]].astype(bool)
+                if os.environ.get("RECLANK_EXPERT_EXCLUSIVE", "0") == "1":
+                    # (RECLANK_EXPERT_EXCLUSIVE=1: the pool leaves out the experts of the expert device.
+                    # Else the pool takes any expert, and the device runs those of its experts the pool
+                    # lacks: the text's experts on the 3060 at once; a short prompt's decode 59.5 -> 62.6
+                    # tok/s, the 3060 alone 61.7; after 4K the same, 57.5)
+                    self.hot_cache.exclude = self.hot_cache.remote
             self._ensure_pool()
             row_of = {e["layer"]: r for r, e in enumerate(layers)}
             for i, x, b in self._pool_init:
@@ -654,6 +656,20 @@ class QwenGPU(WarmPool, ProgramLRU):
         self.stores = {}
         self._pool_init = []
 
+    def _warm_on(self, prompt=False):
+        """WarmPool._warm_on; prompt: before a part of a prompt (a split
+        group, the MTP layer's rows of a prompt), where the programs of the
+        prompt stay (warm_short frees them at the first decode step: the MTP
+        layer's rows after each part of 4096 tokens freed the mixed group,
+        made again for the next part)."""
+        if not prompt:
+            return super()._warm_on()
+        short, self.warm_short = self.warm_short, False
+        try:
+            return super()._warm_on()
+        finally:
+            self.warm_short = short
+
     def _run_blocks(self):
         """GpuMem: each run uses the cache and the pool (the kernels read the
         segment table at run time)."""
@@ -670,18 +686,28 @@ class QwenGPU(WarmPool, ProgramLRU):
 
     def _warm_prompt_held(self):
         return bool(self.mix_progs) or self.stage is not None or \
-            any(k[2] or (k[0] > MT and not k[1]) for k in self.groups)
+            any(k[2] or (k[0] > MT and not k[1]) for k in self.groups) or any(t > MT for t in self.mtp_progs)
 
     def _warm_programs(self):
         """WarmPool: the programs of a prompt (the mixed groups, the large
-        groups and the split groups of more than MT rows) and the two buffers
-        of the copies give their memory to the warm experts."""
+        groups, the split groups and the MTP layer's groups of more than MT
+        rows) and the two buffers of the copies give their memory to the warm
+        experts. (The MTP layer's group of 256 rows of a prompt's rows stayed:
+        it held the arena of the large programs and the C scratches made for
+        the mixed group of 4096 rows, 2.9 GB of Qwen3.8 EXL3 through the
+        decode.)"""
         for t in list(self.mix_progs):
             self._lru.pop(("mix_progs", t), None)
             self._free_program(*self.mix_progs.pop(t))
         for key in [k for k in self.groups if k[2] or (k[0] > MT and not k[1])]:
             self._lru.pop(("groups", key), None)
             self._free_program(*self.groups.pop(key))
+        for t in [t for t in self.mtp_progs if t > MT]:
+            self._lru.pop(("mtp_progs", t), None)
+            self._free_program(*self.mtp_progs.pop(t))
+        # the arena of the large programs goes with them (alloc.Arenas kept the largest: a split group
+        # of 64 rows after a long prompt took the 0.97 GB of the mixed group of 4096 rows)
+        self.arenas.by.pop(False, None)
         for bufs in self.stage or ():
             for b in bufs:
                 b.free()
@@ -1656,14 +1682,28 @@ class QwenGPU(WarmPool, ProgramLRU):
         work = self._buf("work", lambda: np.zeros(8 + 2 * (E + 2) + 2 * P_ + 3 * tiles, np.int32))
         z = lambda *sh: P.lazy_zeros(sh)  # noqa: E731
         prog.emit(P.FETCH_WAIT, i)
+        W = self._pair_rows(P_, gm.type, dm.type)
         prog.emit(P.KQ_GROUP_MOE, h, val, idx, t, k, E, hidden, inner, tg, tu, td, gm.type,
                   dm.type, *shared, stype, slog, work,
-                  self._tmp("act", lambda: z(P_, 2 * inner)), self._tmp("act2", lambda: z(P_, inner)),
-                  self._tmp("de", lambda: z(P_, hidden)), out, prog.slot("nreal"))
+                  self._tmp("act", lambda: z(W, 2 * inner)), self._tmp("act2", lambda: z(W, inner)),
+                  self._tmp("de", lambda: z(W, hidden)), out, prog.slot("nreal"))
         prog.emit(P.FETCH_DONE, i % 2)
         if i + 2 < self.L and i + 2 in self.tables:
             ranges = self.tables[i + 2][3]
             prog.emit(P.FETCH, ranges, len(ranges), i + 2, i % 2)
+
+    @staticmethod
+    def _pair_rows(P_, gtype, dtype):
+        """The rows of act, act2 and de of a GP_KQ_GROUP_MOE of P_ pairs: a
+        window of its sort for MUL1 experts (the runner's e3_win,
+        RECLANK_GPU_E3_WIN), else P_."""
+        from reclank.formats.exl3 import KQ_E3_BASE
+        if not all(KQ_E3_BASE < ty <= KQ_E3_BASE + 8 for ty in (gtype, dtype)):
+            return P_
+        import ctypes
+        f = lib().rc_gpu_e3_win
+        f.argtypes, f.restype = [ctypes.c_int64], ctypes.c_int64
+        return int(f(P_))
 
     def _make_tables(self):
         """The two buffers of the copies of a large group, and the tables of
@@ -1750,7 +1790,18 @@ class QwenGPU(WarmPool, ProgramLRU):
         some arrays only by their address in a table) lives as long as it
         does: its pinned arrays are freed with it."""
         prog.pool = self._pool
-        return self._build_program(prog, entry)
+        if (getattr(prog, "tokens", 0) or 0) <= MT:
+            return self._build_program(prog, entry)
+        # A program of a prompt (more than MT rows): the C scratches of the
+        # class of these programs (rc_gpu_scratch_own 2: shared among them,
+        # not with the step, the verify groups and the heads, which took the
+        # newest scratch of a kind and so kept those of the mixed group of
+        # 4096 rows, 1.2 GB of EXL3 products, after it was freed)
+        lib().rc_gpu_scratch_own(2)
+        try:
+            return self._build_program(prog, entry)
+        finally:
+            lib().rc_gpu_scratch_own(0)
 
     def _alloc(self, nbytes, keep=None):
         """A device Buffer of nbytes (GpuMem frees memory for it: the
@@ -1893,9 +1944,11 @@ class QwenGPU(WarmPool, ProgramLRU):
         tiles = -(-P_ // 64) + E + 1
         work = self._buf("work", lambda: np.zeros(8 + 2 * (E + 2) + 2 * P_ + 3 * tiles, np.int32))
         gpu_part = self._tmp("gpu_part", lambda: z(t, hidden))
-        act = self._tmp("act", lambda: z(P_, 2 * inner))
-        act2 = self._tmp("act2", lambda: z(P_, inner))
-        de = self._tmp("de", lambda: z(P_, hidden))
+        # (MUL1 experts: the rows of a window of the sort, _pair_rows)
+        W = self._pair_rows(P_, gm.type, dm.type)
+        act = self._tmp("act", lambda: z(W, 2 * inner))
+        act2 = self._tmp("act2", lambda: z(W, inner))
+        de = self._tmp("de", lambda: z(W, hidden))
         if split:
             # the hot experts and the shared expert while the copies go on
             prog.emit(P.KQ_GROUP_MOE, h, val, gidx_d, t, k, E, hidden, inner, tab_d[:E],
@@ -2485,8 +2538,8 @@ class QwenGPU(WarmPool, ProgramLRU):
         t = len(ids)
         size = next((s for s in (1, 2, 4, 8, 16, 64, 128, 256) if s >= t), None)
         assert size is not None, "a group of the MTP layer has at most 256 rows"
+        self._warm_on(prompt=size > MT)
         prog, g = self._mtp_group(size)
-        self._warm_on()
         if self.hot_cache is not None:
             self.hot_cache.prepare()
         e, h = prog.names["e"], prog.names["h"]
@@ -2675,6 +2728,26 @@ class _DevCache(DeviceCache):
     def to_host(self):
         for a, b in self.bufs.values():
             b.download(a)
+
+    def sync(self, r0, r1, up):
+        """The rows of positions r0..r1 of the position-major arrays and all
+        of the others (the recurrent state) from the device to the host
+        arrays, or with up from the host to the device (a decode on the CPU
+        between the prompts on the GPU: QwenEngine.cpu_decode). The rows to
+        r1 must be the cache's (share_tail), not lent."""
+        for a, b in self.bufs.values():
+            n0 = a.shape[0] if a.ndim else 0
+            per = 1 if n0 == self.max_len else (4 if n0 == self.max_len // 4 + 1 else 0)
+            flat = a.reshape(-1).view(np.uint8)
+            lo, hi = 0, a.nbytes
+            if per:
+                rb = a.nbytes // n0
+                lo, hi = r0 // per * rb, min(n0, -(-r1 // per)) * rb
+            if hi > lo:
+                if up:
+                    b.upload_at(flat[lo:hi], lo)
+                else:
+                    b.download_at(flat[lo:hi], lo)
 
     def release(self):
         self.unshare(self.before)

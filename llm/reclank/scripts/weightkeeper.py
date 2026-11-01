@@ -11,19 +11,31 @@ from its file.
     sudo .venv/bin/python scripts/weightkeeper.py CKPT --lock
                                                         # 1 GB pages, the memory locked in full,
                                                         # then it serves as the invoking user
-    python scripts/weightkeeper.py --status | --stop
+    python scripts/weightkeeper.py --status | --stop    # the default keeper (--name NAME: that one)
+    python scripts/weightkeeper.py --list               # the keepers running: names, models, memory
+    python scripts/weightkeeper.py CKPT --name NAME     # a second keeper beside the default one
     python scripts/weightkeeper.py --check CKPT         # a round: map, compare rows with the shards
     python scripts/weightkeeper.py --gguf OUT CKPT      # Qwen: the tensors held as one GGUF file
 
+Several keepers: --name NAME serves on /tmp/reclank-weightkeeper-<uid>-NAME.sock (without it the
+default socket, as before); a round finds the keeper that holds its checkpoint among all of them,
+or the one RECLANK_WEIGHTKEEPER=NAME names. Before it takes a page a keeper checks what it will hold
+against the memory available (each node and the host) and refuses with what is missing. As root
+a keeper gives back only the pool pages it added; the last root keeper restores the settings.
+Wan 2.2 T2V-A14B (a diffusers directory with two experts: reclank/models/wan/keep.py): both
+experts' F20 rows, 71.4 GB on --dense-node.
+
 Options: --share (the rows of part 0, default 0.5: balanced channels),
 --layers 0-3 (a test), --dense (the dense tensors in a segment too, on
---dense-node), --pages 1g|2m|4k (the largest page), --threads, --socket,
+--dense-node; a GGUF file: its dense and small tensors too, else the rounds
+read them in the file), --pages 1g|2m|4k (the largest page), --threads, --socket,
 --user/--group (the uid to drop to; default SUDO_UID/SUDO_GID), --seal size|write
 (size, the default: the rounds map the segments writable so CUDA page-locks
 them; write: read-only maps, the copies to the GPU stage). Qwen: the least
 type of each kind of tensor, --dense-type, --experts-type, --ngram-type
 (bf12, the default: the bfloat16 values in 12.25 bits; bf16; q8; rq8 for the
-experts).
+experts). A Gemma 4 GGUF file: --q4x auto|on|off (auto, the default: the Q4_0
+matrices as KQ_Q4X, the only copy of them; off: as the file has them).
 """
 from __future__ import annotations
 
@@ -170,7 +182,7 @@ def check_gguf(g, path, n):
         done += 1
         bad += f.raw(name)[0].view(np.uint8).reshape(-1).tobytes() != g.w.tensor(name).tobytes()
     xs = [x for x in d if d[x]["place"] == "experts"]
-    for _ in range(n):
+    for _ in range(n if xs else 0):     # (a dense model: no experts)
         name = rng.choice(xs)
         e = rng.randrange(d[name]["E"])
         ref = f.raw(name)[0].view(np.uint8).reshape(d[name]["E"], -1)[e]
@@ -188,12 +200,42 @@ def check_gguf(g, path, n):
     return 1 if bad else 0
 
 
+def check_wan(ckpt, path, n):
+    """Wan A14B (models/wan/keep.py): n random tensors of each expert (and every block's first and
+    last matrix) against a new conversion of the shards (to_f20's bytes, or the float32 as stored)."""
+    from reclank.backends.cpu import cops
+    from reclank.formats.safetensors import Shards
+    w = Z.attach(path, ckpt=ckpt)
+    d = w.index["tensors"]
+    rng = random.Random(1)
+    bad = done = 0
+    for sub in ("transformer", "transformer_2"):
+        sh = Shards(os.path.join(ckpt, sub), "diffusion_pytorch_model.safetensors.index.json")
+        keys = [k for k in d if k.startswith(sub + "/")]
+        pick = rng.sample(keys, min(n, len(keys))) + [k for k in keys if k.endswith((".attn1.to_q.weight",
+                                                                                     ".ffn.net.2.weight"))][:4]
+        for k in pick:
+            t, name = d[k], k[len(sub) + 1:]
+            a = np.ascontiguousarray(sh.get(name), np.float32)
+            ref = cops.kq_f32_to_f20(a.reshape(t["rows"], t["cols"]), t["cols"])[0] if t["kind"] == "f20" else a
+            done += 1
+            if w.tensor(k).tobytes() != ref.tobytes():
+                bad += 1
+                print("MISMATCH %s" % k)
+        sh.close()
+    print("%d tensors compared with a new conversion: %s" % (done, "all equal" if not bad else "%d differ" % bad))
+    return 1 if bad else 0
+
+
 def check(ckpt, path, n):
     t0 = time.time()
     c = Z.request("status", path)
     with c:
-        if json.loads(Z._recv_msg(c)).get("layout") == Z.LAYOUT_TENSORS:
-            return check_tensors(ckpt, path, n)
+        st = json.loads(Z._recv_msg(c))
+    if st.get("model") == "wan-a14b":
+        return check_wan(ckpt, path, n)
+    if st.get("layout") == Z.LAYOUT_TENSORS:
+        return check_tensors(ckpt, path, n)
     w = Z.attach(path)
     t1 = time.time()
     ix = w.index
@@ -267,6 +309,9 @@ def main():
     ap.add_argument("--ngram-type", choices=("bf12", "bf16", "q8"), default="bf12")
     ap.add_argument("--counts", help="Qwen: the counts of the router (layers x experts, .npy): the "
                     "experts of a layer go to the nodes in snake order of their counts (else in turn)")
+    ap.add_argument("--q4x", choices=("auto", "on", "off"), default="auto",
+                    help="a Gemma 4 GGUF file: its Q4_0 matrices as KQ_Q4X (auto, on), the only copy the "
+                         "runtime keeps, or as the file has them (off)")
     ap.add_argument("--copies", choices=("auto", "split", "both"), default="auto",
                     help="an EXL3 directory: the experts split between the nodes, or whole on every node "
                          "(auto: when they fit)")
@@ -274,6 +319,8 @@ def main():
                     help="the seals of the segments: size (the rounds map them writable, so CUDA page-locks "
                          "them for DMA) or write (read-only maps; the copies to the GPU stage)")
     ap.add_argument("--socket")
+    ap.add_argument("--name", help="the keeper's name (its own socket); --stop / --status: that keeper")
+    ap.add_argument("--list", action="store_true", help="the keepers running (name, model, memory held)")
     ap.add_argument("--user", type=int)
     ap.add_argument("--group", type=int)
     ap.add_argument("--status", action="store_true")
@@ -283,8 +330,18 @@ def main():
                     "CKPT as one GGUF file (their types: BF12 by default), then exit")
     ap.add_argument("--check-n", type=int, default=20)
     a = ap.parse_args()
+    if a.list:
+        ks = Z.keepers()
+        for name, path, st in ks:
+            print("%-16s pid %-8s %-16s %7.1f GB%s  %s  (%s)" % (
+                name or "(default)", st.get("pid"), st.get("model"), sum(x["gb"] for x in st.get("segments", [])),
+                " locked" if st.get("locked") else "", st.get("checkpoint"), path))
+        if not ks:
+            print("no weightkeeper running")
+        return 0
+    sock = a.socket or (Z.socket_path(a.name) if a.name else None)
     if a.status or a.stop:
-        c = Z.request("status" if a.status else "stop", a.socket)
+        c = Z.request("status" if a.status else "stop", sock)
         with c:
             out = Z._recv_msg(c).decode()
         print(json.dumps(json.loads(out), indent=1) if a.status else out)
@@ -292,17 +349,18 @@ def main():
     if not a.ckpt:
         ap.error("the checkpoint directory")
     if a.check:
-        return check(a.ckpt, a.socket, a.check_n)
+        # (no socket or name: the keeper that holds CKPT, else the default one)
+        return check(a.ckpt, sock or Z.find(a.ckpt)[0], a.check_n)
     if a.gguf:
         from reclank.models.qwen import keep
-        keep.export_gguf(keep.KeptGGUF(a.ckpt, Z.attach(a.socket, ckpt=a.ckpt)), a.gguf,
+        keep.export_gguf(keep.KeptGGUF(a.ckpt, Z.attach(sock, ckpt=a.ckpt)), a.gguf,
                          log=lambda m: print(m, flush=True))
         return 0
     o = Z.Options(ckpt=a.ckpt, share=a.share, nodes=a.nodes, layers=a.layers, threads=a.threads,
                   lock=a.lock, dense=a.dense, dense_node=a.dense_node,
                   maxpage={"1g": Z.G1, "2m": Z.M2, "4k": Z.K4}[a.pages], layout=a.layout, sock=a.socket,
                   dense_type=a.dense_type, experts_type=a.experts_type, ngram_type=a.ngram_type, counts=a.counts,
-                  copies=a.copies, seal=a.seal,
+                  copies=a.copies, seal=a.seal, q4x=a.q4x, name=a.name,
                   user=a.user, group=a.group)
     return Z.run(o) or 0
 

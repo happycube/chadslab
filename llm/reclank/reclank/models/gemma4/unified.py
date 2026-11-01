@@ -1,5 +1,10 @@
 """The image and audio input of the Gemma 4 12B (the unified model).
 
+Ported from transformers
+(src/transformers/models/gemma4_unified/modeling_gemma4_unified.py,
+processing_gemma4_unified.py and video_processing_gemma4_unified.py; Apache
+License 2.0; Copyright 2026 the HuggingFace Team). See THIRD_PARTY_NOTICES.md.
+
 The 12B has no vision encoder and no audio encoder (MULTIMODAL_PLAN.md,
 section 3.1). An image becomes patches of 48 x 48 pixels, and each patch
 becomes one soft token:

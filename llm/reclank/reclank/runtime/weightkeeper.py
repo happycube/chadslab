@@ -55,6 +55,20 @@ invoking user (SUDO_UID) before it serves.
     run(Options(ckpt="/path/DeepSeek-V4.1-Flash", lock=True))   # the weightkeeper
     w = attach()                                                # a round
     planes = w.planes(layer=3, part=0)   # dict: name -> uint8 (E, rows, bytes)
+
+**Several keepers.** A keeper with a name (Options.name, --name NAME) serves on a socket of its
+own, socket_path(NAME) = /tmp/reclank-weightkeeper-<uid>-NAME.sock; without one, the default
+socket as before. keepers() lists the ones that answer (--list). A round finds the keeper that
+holds its checkpoint among all of them (find); RECLANK_WEIGHTKEEPER=NAME restricts it (and the
+requests with no socket) to that keeper. What two keepers share: the host's memory (each checks
+what it will hold against the memory available, per node and in all, before it takes a page:
+check_memory), and as root the hugetlb pools and two settings (shmem_enabled,
+compact_unevictable_allowed). A root keeper gives back only the pages it added to a pool (its
+child reports them: the pools of another keeper stay), and the settings go back to the values
+before the first root keeper when the last one exits (a state file /tmp/reclank-weightkeeper-
+<uid>.settings.json under flock: the original values and the pids holding them). The memfds,
+their names and the NUMA binding are per process. RECLANK_WEIGHTKEEPER_DIR: the directory of the
+sockets and the state file (the tests).
 """
 from __future__ import annotations
 
@@ -175,6 +189,9 @@ def identity(path):
     if path.endswith(".gguf"):
         from reclank.models.qwen.keep import gguf_ident
         return gguf_ident(path)
+    from reclank.models.wan import keep as wan_keep
+    if wan_keep.detect(path):
+        return wan_keep.ident(path)     # (Wan A14B: both experts' shards)
     from reclank.models.qwen import keep_exl3
     if keep_exl3.detect(path):
         return keep_exl3.ident(path)    # (an EXL3 directory: every safetensors file)
@@ -306,6 +323,9 @@ def restore_system(st):
             log("%s is %s, not %s" % (path, now(), want))
 
 
+ADDED = {}      # the pages this process added to each pool (root): what its parent gives back
+
+
 def pages(need, node, root, maxpage=G1):
     """The chunks of a segment of need bytes on node: [(page, bytes)], the
     largest pages first. As root it asks the pool of the node for the pages
@@ -331,6 +351,7 @@ def pages(need, node, root, maxpage=G1):
                 _write(d + "/nr_hugepages", nr + want - free)
             except OSError as e:
                 log("node %d: the pool of %s pages: %s" % (node, _pname(pg), e))
+            ADDED[d] = ADDED.get(d, 0) + max(0, _read_int(d + "/nr_hugepages") - nr)
             free = _read_int(d + "/free_hugepages")
         n = min(want, free)
         if n > 0:
@@ -652,6 +673,8 @@ class Options:
     experts_type: str = "bf12"
     ngram_type: str = "bf12"
     counts: str = None          # the counts of the router (layers x experts, .npy): the experts' nodes
+    # a Gemma 4 GGUF file: its Q4_0 matrices as KQ_Q4X ("auto" or "on"), or as the file has them ("off")
+    q4x: str = "auto"
     # an EXL3 directory (reclank/models/qwen/keep_exl3.py): the stacks of
     # experts "split" between the nodes, "both" (whole on every node), or
     # "auto" (both when they fit)
@@ -661,14 +684,136 @@ class Options:
     # rounds map them read-only)
     seal: str = "size"
     sock: str = None
+    name: str = None            # the keeper's name: its socket socket_path(name) (None: the default)
     user: int = None            # the uid to drop to as root (default SUDO_UID)
     group: int = None
     extra: dict = field(default_factory=dict)
 
 
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+MEM_MARGIN = 2 << 30        # what check_memory leaves free on a node
+
+
+def _dir():
+    return os.environ.get("RECLANK_WEIGHTKEEPER_DIR", "/tmp")
+
+
 def default_socket(uid=None):
     uid = os.getuid() if uid is None else uid
-    return "/tmp/reclank-weightkeeper-%d.sock" % uid
+    return os.path.join(_dir(), "reclank-weightkeeper-%d.sock" % uid)
+
+
+def socket_path(name=None, uid=None):
+    """The socket of the keeper named name (None: the default keeper's)."""
+    d = default_socket(uid)
+    if not name:
+        return d
+    if not _NAME.match(name):
+        raise ValueError("a keeper's name: letters, digits, '_', '.', '-' (at most 64), not %r" % name)
+    return d[:-len(".sock")] + "-" + name + ".sock"
+
+
+def env_name():
+    """RECLANK_WEIGHTKEEPER: the keeper a round asks (its name), or None: any of this user's."""
+    return os.environ.get("RECLANK_WEIGHTKEEPER") or None
+
+
+def name_of(path, uid=None):
+    """The name of the keeper of a socket path (None: the default one)."""
+    d = default_socket(uid)
+    if path == d:
+        return None
+    pre = d[:-len(".sock")] + "-"
+    return path[len(pre):-len(".sock")] if path.startswith(pre) and path.endswith(".sock") else path
+
+
+def sockets(uid=None):
+    """The sockets of this user's keepers that exist: the default one first, then the named."""
+    import glob
+    d = default_socket(uid)
+    named = sorted(p for p in glob.glob(glob.escape(d[:-len(".sock")]) + "-*.sock")
+                   if _NAME.match(name_of(p, uid) or ""))
+    return [p for p in [d] + named if os.path.exists(p)]
+
+
+def keepers(uid=None):
+    """[(name, socket, status)] of the keepers that answer (name None: the default)."""
+    out = []
+    for path in sockets(uid):
+        try:
+            c = request("status", path)
+            with c:
+                st = json.loads(_recv_msg(c))
+        except (OSError, ValueError):
+            continue
+        out.append((name_of(path, uid), path, st))
+    return out
+
+
+def _answers(path):
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(path)
+        c.close()
+        return True
+    except OSError:
+        return False
+
+
+def _meminfo(path):
+    out = {}
+    try:
+        for line in open(path):
+            f = line.replace(":", " ").split()
+            # (/proc/meminfo: "Key: n kB"; a node's: "Node 0 Key: n kB")
+            if f and f[0] == "Node":
+                f = f[2:]
+            if len(f) >= 2 and f[1].isdigit():
+                out[f[0]] = int(f[1]) * (1024 if len(f) > 2 and f[2] == "kB" else 1)
+    except OSError:
+        pass
+    return out
+
+
+def _free_huge(node=None):
+    """The bytes of the free hugetlb pages (of a node, or of all)."""
+    n = 0
+    for pg in (G1, M2):
+        if node is None:
+            n += _read_int("/sys/kernel/mm/hugepages/hugepages-%dkB/free_hugepages" % (pg // 1024)) * pg
+        else:
+            n += _read_int(_node_dir(node, pg) + "/free_hugepages") * pg
+    return n
+
+
+def memory_available(node=None):
+    """What a keeper can take: the free memory and the page cache that can go (FilePages less
+    Shmem: another keeper's memfds are Shmem, not available), and the free hugetlb pages; of a
+    node, or of the host (MemAvailable)."""
+    if node is None:
+        m = _meminfo("/proc/meminfo")
+        return m.get("MemAvailable", 0) + _free_huge()
+    m = _meminfo("/sys/devices/system/node/node%d/meminfo" % node)
+    return m.get("MemFree", 0) + max(0, m.get("FilePages", 0) - m.get("Shmem", 0)) + _free_huge(node)
+
+
+def check_memory(need, numa_on=True, margin=MEM_MARGIN):
+    """need: {node: bytes}. Raise SystemExit with what is missing when it does not fit the memory
+    available (each node, and the host)."""
+    bad = []
+    total = sum(need.values())
+    host = memory_available()
+    if total > host - margin:
+        bad.append("the host: %.1f GB to hold, %.1f GB available" % (total / 1e9, host / 1e9))
+    for nd, n in sorted(need.items()) if numa_on else ():
+        a = memory_available(nd)
+        if n > a - margin:
+            bad.append("node %d: %.1f GB to hold, %.1f GB available" % (nd, n / 1e9, a / 1e9))
+    if bad:
+        held = ["%s %.1f GB" % (nm or "default", sum(x["gb"] for x in st.get("segments", [])))
+                for nm, _p, st in keepers()]
+        raise SystemExit("weightkeeper: not enough memory: %s (with %.1f GB left free a node; keepers running: "
+                         "%s)" % ("; ".join(bad), margin / 1e9, ", ".join(held) or "none"))
 
 
 def plugin(ckpt):
@@ -677,6 +822,9 @@ def plugin(ckpt):
     from reclank.models.qwen import keep as qwen_keep
     from reclank.models.qwen import keep_exl3, keep_fp4l
     from reclank.models.nemotron import keep as nemotron_keep
+    from reclank.models.wan import keep as wan_keep
+    if wan_keep.detect(ckpt):
+        return wan_keep.PLUGIN              # Wan 2.2 T2V-A14B (both experts' F20 rows)
     if nemotron_keep.detect(ckpt):
         return nemotron_keep.PLUGIN         # Nemotron 3.5 Bolt (the expert stacks, the KQ_NV4 rows)
     if keep_exl3.detect(ckpt):
@@ -715,7 +863,7 @@ class Weightkeeper:
                 "nodes %s: %s GB a node (%.1f s)" % (
                     o.ckpt, len(self.sh.ident), ix["model"], ix["types"]["dense"], ix["types"]["experts"],
                     ix["types"]["ngram"], "on all the" if ix.get("copies") == "both" else "split between",
-                    nodes, ["%.1f" % (b / 1e9) for b in ix["part_bytes"]], time.time() - t0))
+                    ix["nodes"], ["%.1f" % (b / 1e9) for b in ix["part_bytes"]], time.time() - t0))
             return
         L = int(self.sh.hf["num_hidden_layers"])
         layers = list(o.layers) if o.layers is not None else list(range(L))
@@ -741,6 +889,12 @@ class Weightkeeper:
 
     def load(self):
         o, ix = self.o, self.index
+        need = {}
+        for part, nd in enumerate(ix["nodes"]):
+            need[nd] = need.get(nd, 0) + ix["part_bytes"][part]
+        if ix.get("dense"):
+            need[o.dense_node] = need.get(o.dense_node, 0) + ix["dense"]["bytes"]
+        check_memory(need, self.numa_on)
         t0 = time.time()
         self.segs = []
         name = "%s-n%%d" % ("dsv41-experts" if self.plugin is None else ix["model"])
@@ -912,40 +1066,154 @@ def _pdeathsig():
         pass
 
 
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _settings_path(uid):
+    return os.path.join(_dir(), "reclank-weightkeeper-%d.settings.json" % uid)
+
+
+def _shared_settings(uid, fn):
+    """The state of the root keepers' settings (the values before the first: "orig", the pids
+    holding them: "pids"): fn(state or None) -> the new state (None: the file goes), under flock."""
+    p = _settings_path(uid)
+    fd = os.open(p + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            st = json.load(open(p))
+        except (OSError, ValueError):
+            st = None
+        new = fn(st)
+        if new is None:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        else:
+            with open(p + ".tmp", "w") as f:
+                json.dump(new, f)
+            os.replace(p + ".tmp", p)
+        return new
+    finally:
+        os.close(fd)
+
+
+def settings_join(uid, now, me):
+    """A root keeper (pid me) joins the holders of the settings: the first (no live holder) records
+    now's values as the ones to give back. Returns the state."""
+    def join(st):
+        if st is None or not any(_alive(p) for p in st["pids"]):
+            return dict(orig=dict(shmem=now["shmem"], compact=now["compact"]), pids=[me])
+        st["pids"] = [p for p in st["pids"] if _alive(p)] + [me]
+        return st
+    return _shared_settings(uid, join)
+
+
+def settings_leave(uid, me):
+    """A root keeper (pid me) leaves: the last live holder restores the values the first recorded.
+    Returns True when it restored them."""
+    done = [False]
+
+    def leave(st):
+        if st is None:
+            return None
+        st["pids"] = [p for p in st["pids"] if p != me and _alive(p)]
+        if st["pids"]:
+            log("the settings stay: root keepers %s hold them" % st["pids"])
+            return st
+        restore_settings(st["orig"])
+        done[0] = True
+        return None
+    _shared_settings(uid, leave)
+    return done[0]
+
+
+def restore_settings(orig):
+    """shmem_enabled and compact_unevictable_allowed back to orig, each write checked."""
+    for path, want, now in ((SHMEM_THP, orig["shmem"], lambda: _sysfs_choice(SHMEM_THP)),
+                            (COMPACT_UNEVICT, orig["compact"], lambda: _read_int(COMPACT_UNEVICT, None))):
+        if want is None:
+            continue
+        try:
+            _write(path, want)
+        except OSError as e:
+            log("could not restore %s to %s: %s" % (path, want, e))
+        if str(now()) != str(want):
+            log("%s is %s, not %s" % (path, now(), want))
+
+
+def give_back_pools(added):
+    """The pages a keeper added to each pool (its ADDED), taken out of the pool again (the
+    pages of another keeper stay)."""
+    for d, n in added.items():
+        if n <= 0:
+            continue
+        nr = _read_int(d + "/nr_hugepages")
+        try:
+            _write(d + "/nr_hugepages", max(0, nr - n))
+        except OSError as e:
+            log("could not give back the pool %s: %s" % (d, e))
+
+
 def run(o: Options):
-    """The weightkeeper, as the module text says: as root a parent that stays root
-    and gives back the pools and the settings when the weightkeeper exits."""
+    """The weightkeeper, as the module text says: as root a parent that stays root and gives back
+    the pages it added to the pools and (the last root keeper) the settings when it exits."""
     root = os.geteuid() == 0
     if o.lock and not root:
         raise SystemExit("weightkeeper: --lock needs root (sudo): no partial lock")
+    uid = os.getuid() if not root else o.user if o.user is not None else int(os.environ.get("SUDO_UID", "0"))
+    if root and uid == 0:
+        raise SystemExit("weightkeeper: as root it serves as the invoking user: run it with sudo, or give --user")
+    path = o.sock or socket_path(o.name, uid)
+    if _answers(path):
+        raise SystemExit("weightkeeper: a weightkeeper answers on %s (--list; another --name for a second one)" % path)
     if not root:
         z = Weightkeeper(o)
         z.load()
-        return z.serve(o.sock or default_socket())
-    uid = o.user if o.user is not None else int(os.environ.get("SUDO_UID", "0"))
+        return z.serve(path)
     gid = o.group if o.group is not None else int(os.environ.get("SUDO_GID", "0"))
-    if uid == 0:
-        raise SystemExit("weightkeeper: as root it serves as the invoking user: run it with sudo, or give --user")
-    path = o.sock or default_socket(uid)
     nodes = sorted(set(numa.node_of_cpu().values())) or [0]
-    st = system_state(nodes)
-    log("the settings now: shmem_enabled %s, compact_unevictable_allowed %s (given back at the end)" % (
-        st["shmem"], st["compact"]))
+    now = system_state(nodes)
+    me = os.getpid()
+    shared = settings_join(uid, now, me)
+    log("the settings before the root keepers: shmem_enabled %s, compact_unevictable_allowed %s (given back by "
+        "the last; root keepers now: %d)" % (shared["orig"]["shmem"], shared["orig"]["compact"], len(shared["pids"])))
     try:
-        if st["shmem"] == "never":
+        if now["shmem"] == "never":
             _write(SHMEM_THP, "advise")
         if o.lock:
             _write(COMPACT_UNEVICT, 0)
     except OSError as e:
         log("the settings: %s" % e)
+    rp, wp = os.pipe()
     pid = os.fork()
     if pid == 0:
-        code = 0
+        os.close(rp)
+        code, told = 0, [False]
+
+        def tell():
+            # the pages added to the pools, to the parent (once)
+            if not told[0]:
+                told[0] = True
+                try:
+                    os.write(wp, json.dumps(ADDED).encode())
+                    os.close(wp)
+                except OSError:
+                    pass
         try:
             _pdeathsig()
             resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
             z = Weightkeeper(o)
             z.load()
+            tell()
             _drop(uid, gid)
             log("dropped to uid %d" % uid)
             z.serve(path)
@@ -956,7 +1224,9 @@ def run(o: Options):
         except BaseException as e:      # noqa: BLE001
             log("failed: %r" % e)
             code = 1
+        tell()
         os._exit(code)
+    os.close(wp)
 
     def fwd(sig, _frame):
         try:
@@ -974,29 +1244,41 @@ def run(o: Options):
             break
         except InterruptedError:
             continue
-    restore_system(st)
-    log("the pools and the settings given back")
+    raw = b""
+    while True:
+        b = os.read(rp, 65536)
+        if not b:
+            break
+        raw += b
+    os.close(rp)
+    try:
+        added = json.loads(raw.decode()) if raw else {}
+    except ValueError:
+        added = {}
+    give_back_pools(added)
+
+    settings_leave(uid, me)
+    log("the pages added to the pools given back (%s)" % (
+        ", ".join("%s %d" % (os.path.basename(os.path.dirname(d + "/")), n) for d, n in added.items() if n) or "none"))
     return os.waitstatus_to_exitcode(status)
 
 
 # ---------------------------------------------------------------- a round
 
 def request(op, path=None):
+    """op to the keeper at path (None: RECLANK_WEIGHTKEEPER's, else the default one)."""
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.connect(path or default_socket())
+    c.connect(path or socket_path(env_name()))
     _send_msg(c, op.encode())
     return c
 
 
 def find(ckpt):
-    """(the socket, the status) of the weightkeeper of this user that holds
-    ckpt, or (None, None): the default socket, then those beside it named
-    reclank-weightkeeper-<uid>-<name>.sock (scripts/weightkeeper.py --socket:
-    a keeper for each model, Qwen3.6 and Gemma 26B on one machine)."""
-    import glob
-    d = default_socket()
+    """(the socket, the status) of the weightkeeper of this user that holds ckpt, or (None, None):
+    the default socket, then the named ones (socket_path: a keeper for each model); with
+    RECLANK_WEIGHTKEEPER=NAME, that keeper's only."""
     want = os.path.realpath(ckpt)
-    for path in [d] + sorted(glob.glob(d[:-len(".sock")] + "-*.sock")):
+    for path in [socket_path(env_name())] if env_name() else sockets():
         try:
             c = request("status", path)
             with c:

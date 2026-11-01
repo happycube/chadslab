@@ -39,6 +39,10 @@ GROUPS = tuple(int(v) for v in os.environ.get("RECLANK_NM_GROUPS", "4,16,64,256,
 # Super with the pool: the larger prompt groups, their programs made for a long prompt with memory the
 # pool gives back, freed after it (NemotronGPU.relax); RECLANK_NM_BIG_GROUPS ("" none)
 BIG_GROUPS = tuple(int(v) for v in os.environ.get("RECLANK_NM_BIG_GROUPS", "2048,4096").split(",") if v.strip())
+# with the pool, GROUPS of at least BIG_FROM rows are big too: made from the pool at a prompt, freed after it (their memory
+# the hot experts' while the GPU decodes: the 1024's 0.66 GB on the 3060, about 4% more of a step's pairs on the GPU); the
+# smaller ones stay (a chat's every turn runs them)
+BIG_FROM = int(os.environ.get("RECLANK_NM_BIG_FROM", "1024"))
 ATT_PARTS = 256                 # NM_ATTN2: the most (token, chunk) pairs of a run (backends/cuda nm.cu)
 # Super: the hot experts of runs of at most this many rows on the GPU (NM_HOT_NV4: a warp a row of a pair);
 # a larger group's pairs all on the CPU (RECLANK_NM_NV4_HOT_MAX)
@@ -53,6 +57,11 @@ def load_counts(path):
         return None
     z = np.load(f)
     return {int(k[1:]): z[k] for k in z.files if k.startswith("l")}
+
+
+def cpu_threads():
+    """The threads of the CPU's part of a run (RECLANK_GPU_CPU_THREADS, else task_threads)."""
+    return max(1, int(os.environ.get("RECLANK_GPU_CPU_THREADS") or task_threads()))
 
 
 def task_threads():
@@ -218,11 +227,33 @@ BIG_MARGIN_GB = float(os.environ.get("RECLANK_NM_BIG_MARGIN_GB", "0.4"))
 # against 516 on a group of 4096). A group of 1024 moves the same copies for a quarter of the tokens: there the
 # mapped host memory and the CPU's share stay faster (258 against 227). RECLANK_NM_STAGE=0: the mapped memory
 STAGE = os.environ.get("RECLANK_NM_STAGE", "1") != "0"
-STAGE_MIN = int(os.environ.get("RECLANK_NM_STAGE_MIN", "2048"))
+# (unset: 2048, or 1024 with a small CPU team, SMALL_CPU: the W-2133 + 3060, a prompt of 1024 staged 165 tok/s against
+# 133 mapped with the CPU's share)
+STAGE_MIN = int(os.environ["RECLANK_NM_STAGE_MIN"]) if os.environ.get("RECLANK_NM_STAGE_MIN") else None
+# a CPU team of fewer threads: the experts' rows rather across the links (TAKE, STAGE_MIN)
+SMALL_CPU = int(os.environ.get("RECLANK_NM_SMALL_CPU", "16"))
+# Super's steps and verify groups with the pool on a small CPU (SMALL_CPU): NM_TAKE gives the GPU some of each token's
+# cold experts (those the expert device lacks), NM_PULL copies their rows across the link into a stage while the CPU's
+# task runs the others (the W-2133's 11 threads ~37 GB/s against the 3060's link ~12; its DRAM's 53 GB/s shared:
+# the CPU's pairs slower by ~11% beside the copies, so 2 experts gave +4% on the 3060 alone, +2% with the 1070).
+# RECLANK_NM_TAKE: the experts a token (a group: that times its tokens); unset: the share of the link in the two rates
+# (the CPU's ~TAKE_THREAD_GBPS a thread of its team) of a token's expected cold experts, on a small CPU; 0: none
+TAKE = int(os.environ["RECLANK_NM_TAKE"]) if os.environ.get("RECLANK_NM_TAKE") else None
+TAKE_THREAD_GBPS = float(os.environ.get("RECLANK_NM_TAKE_THREAD_GBPS", "3.2"))
 # the stage buffers in the tiles of the GPU (NV4T: k_nm_tile_pull permutes the KQ_NV4 rows as it copies them,
 # every expert of the layer, the hot ones from their slots; k_nm_gtile_nv4t reads each lane's fragments in
 # one load); RECLANK_NM_TILES=0: the rows as they are (k_nm_gtile_nv4c)
 TILES = os.environ.get("RECLANK_NM_TILES", "1") != "0"
+# the fetches of a run (experts.cu GG_FETCH_MAX: their events, reused round)
+FETCH_MAX = 256
+# the stage in chunks: the act and the outputs of a window of a chunk's pairs at a time (WIN_SLACK times a chunk's share
+# of a group's pairs; a chunk of more runs in more windows), not of all the group's: the 4096's scratch 0.88 -> 0.22 GB
+# in 8 chunks; RECLANK_NM_WIN=0: the group's
+WIN = os.environ.get("RECLANK_NM_WIN", "1") != "0"
+# a big prompt group's per-row work in sub-batches of SUB rows (kq._compile_nemotron_sub: the residual stream and the
+# routed experts' rows of all of them, the rest of SUB): unset, 1024 on a GPU of less than 16 GB; 0: none
+SUB = int(os.environ["RECLANK_NM_SUB"]) if os.environ.get("RECLANK_NM_SUB") else None
+WIN_SLACK = float(os.environ.get("RECLANK_NM_WIN_SLACK", "2"))
 # what the pool gives back when a program finds no room (NemotronGPU._load), GB
 ROOM_GB = float(os.environ.get("RECLANK_NM_ROOM_GB", "0.5"))
 SEG_EXPERTS = int(os.environ.get("RECLANK_NM_SEG", "32"))
@@ -433,7 +464,12 @@ class NmPool:
         held = np.zeros(R * E, bool)
         used = self.own_r >= 0
         held[self.own_r[used] * E + self.own_e[used]] = True
-        cand = np.where(held | self.incoming.ravel() | (sc.ravel() <= 0), -np.inf, sc.ravel())
+        # (an expert device's experts as good as held: its pairs run beside the CPU's, off the critical path;
+        # those the pool holds too leave first)
+        xd = getattr(self.g, "xdev", None)
+        xh = xd.held[np.asarray(self.layers), :E].astype(bool).ravel() if xd is not None else None
+        cand = np.where(held | self.incoming.ravel() | (sc.ravel() <= 0) | (xh if xh is not None else False),
+                        -np.inf, sc.ravel())
         free = np.nonzero(~used)[0]
         limit = len(cand) if n is None else n
         want = min(limit, int(np.isfinite(cand).sum()))
@@ -452,6 +488,8 @@ class NmPool:
             hs = np.nonzero(used & ~self.inc)[0]
             if len(hs):
                 hsc = sc[self.own_r[hs], self.own_e[hs]]
+                if xh is not None:
+                    hsc = np.where(xh[self.own_r[hs] * E + self.own_e[hs]], -np.inf, hsc)
                 m = min(len(rest), len(hs))
                 worst = np.argpartition(hsc, m - 1)[:m] if m < len(hs) else np.arange(len(hs))
                 worst = worst[np.argsort(hsc[worst], kind="stable")]
@@ -614,12 +652,12 @@ class NmEmit:
             else:
                 prog.emit(P.COUNT, idx, pool.cnt[pool.row[i]], k, prog.slot("nreal"))
 
-    def attention(self, prog, i, q, k, v, out, t):
+    def attention(self, prog, i, q, k, v, out, t, pos=None):
         """The keys and values into the bfloat16 rows of the cache (NM_KV), then the attention in
         chunks of positions (NM_ATTN2: each block one KV head, its 16 query heads, a chunk; then
-        the chunks merged)."""
+        the chunks merged). pos: the slot of the rows' first position (a sub-batch's), else pos."""
         cfg = self.dev.cfg
-        K, V, pos = prog.slot("K.%s" % i), prog.slot("V.%s" % i), prog.slot("pos")
+        K, V, pos = prog.slot("K.%s" % i), prog.slot("V.%s" % i), pos if pos is not None else prog.slot("pos")
         prog.emit(P.NM_KV, k, v, K, V, cfg.kv_heads * cfg.head_dim, t, pos)
         prog.emit(P.NM_ATTN2, q, K, V, out, cfg.heads, cfg.kv_heads, cfg.head_dim, t, pos,
                   self.dev.attn_scratch(), float(cfg.head_dim ** -0.5))
@@ -632,7 +670,7 @@ class NmEmit:
             a = self._scr[name] = np.zeros(n, dt)
         return a
 
-    def _hot(self, prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im, tab=False):
+    def _hot(self, prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im, tab=False, tabs=None):
         """NM_HOT_MOE on the pairs of idx: the experts of slots (>= 0) in the stacks up, down; tab: up
         and down are NM_GROUP_MOE's tables (each expert's address: a slot or the mapped host memory),
         every pair of idx >= 0 runs."""
@@ -641,7 +679,8 @@ class NmEmit:
             # (Super's KQ_NV4 experts: float x, docs/NEMOTRON_SUPER_PLAN.md S5; the pool's tables of
             # each expert's address)
             pool = self.dev.pool
-            tabs = (pool.pup[self._layer], pool.pdn[self._layer]) if pool is not None else ()
+            if tabs is None:
+                tabs = (pool.pup[self._layer], pool.pdn[self._layer]) if pool is not None else ()
             prog.emit(P.NM_HOT_NV4, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, *tabs)
             return
         more = [None, None, None, 1] if tab else []
@@ -699,7 +738,7 @@ class NmEmit:
         fplan = not d.i8 and not ZC_FLOAT and PLAN_F and t > ZC_ROWS
         if t >= d.zc_min and (d.i8 or ZC_FLOAT or fplan) and d.zc_tables is not None and i in d.zc_tables:
             pup, pdn = d.zc_tables[i]
-            gidx, gout, xd = idx, out, d.xdev if t <= 8 else None
+            gidx, gout, xd = idx, out, d.xdev if t <= 8 and i in cfg.moe else None
             mix = (d.nv4 and PLAN_CPU > 0 or fplan) and not d.staged(t)
             if mix:
                 # Super's prompt group (S6): NM_PLAN gives the cold experts of few pairs to the CPU (NM_MOE
@@ -737,10 +776,9 @@ class NmEmit:
                           prev[1:2] if prev is not None else None)
             st = d.stage_tabs() if d.staged(t) and d.pool is not None and i in d.pool.row else None
             if st is not None:
-                # (the layer's cold experts in buffer j % 2: wait for their copy; the stage tables' rows)
+                # (the stage tables' rows of the layer)
                 j = d.pool.row[i]
                 pup, pdn = st["pup"][j], st["pdn"][j]
-                prog.emit(P.FETCH_WAIT, j)
                 prog.stage = True
             if t <= ZC_ROWS and not d.nv4:
                 # (a step or a verify group: the step's kernels on the tables, a warp on rows of a pair)
@@ -748,17 +786,36 @@ class NmEmit:
                           gout, k, L, inner, t, Im, tab=True)
             else:
                 # (KQ_NV4: the up tiles quantize the act themselves, no float act)
-                prog.emit(P.NM_GROUP_MOE, lat, gidx, val, pup, pdn, S("qx", t * L, np.int8), S("sx", t * L // 32),
-                          S("act", 32 if d.nv4 else t * k * Im), S("qa", t * k * Im, np.int8), S("sa", t * k * Im // 32),
-                          S("de", t * k * L), gout, S("work", 2 * Em + 1 + t * k, np.int32), k, L, inner, t, E,
-                          prog.slot("nreal"), S("qxl", t * L, np.int8) if X16 else None,
-                          S("qal", t * k * Im, np.int8) if X16 else None, KQ_NV4 if d.nv4 else None,
-                          (2 if TILES else 1) if st is not None else None)   # (22: the experts in the GPU's memory; 2: NV4T)
-            if st is not None:
-                # (the buffer free; the copies of the layer two on into it)
-                prog.emit(P.FETCH_DONE, j % 2)
-                if j + 2 < len(d.pool.layers):
-                    prog.emit(P.FETCH, st["ranges"][j + 2], len(st["ranges"][j + 2]), j + 2, j % 2, *d.stage_mode())
+                # (the pairs' scratch: a window's with the stage in chunks, else the group's; the positions of the pairs
+                # after the sort's order, inv, with windows)
+                win = d.win_cap(t, d.stage_c) if st is not None else None
+                npr = win or t * k
+                gargs = [lat, gidx, val, pup, pdn, S("qx", t * L, np.int8), S("sx", t * L // 32),
+                         S("act", 32 if d.nv4 else npr * Im), S("qa", npr * Im, np.int8), S("sa", npr * Im // 32),
+                         S("de", npr * L), gout, S("work", 2 * Em + 1 + (2 if win else 1) * t * k, np.int32), k, L, inner,
+                         t, E, prog.slot("nreal"), S("qxl", t * L, np.int8) if X16 else None,
+                         S("qal", npr * Im, np.int8) if X16 else None, KQ_NV4 if d.nv4 else None,
+                         (2 if TILES else 1) if st is not None else None]   # (22: the experts in the GPU's memory; 2: NV4T)
+                if st is None:
+                    prog.emit(P.NM_GROUP_MOE, *gargs)
+                else:
+                    # the layer's experts in d.stage_c chunks (q = C j + c in buffer q % 2): wait for a chunk's
+                    # copies, its tiles in windows of its pairs (operand 23: x0 | nx << 16 | pass << 32 | cap << 40, nm.cu
+                    # nm_window; the x and the sort with the first, the sums of each window, or of the last chunk), the
+                    # buffer free, the copies of the chunk two on into it
+                    C = d.stage_c
+                    Ec, nq = E // C, len(st["ranges"])
+                    passes = -(-t * k // win) if win else 1
+                    for c in range(C):
+                        q = j * C + c
+                        prog.emit(P.FETCH_WAIT, q % FETCH_MAX)
+                        for w in range(passes):
+                            prog.emit(P.NM_GROUP_MOE, *(gargs + ([c * Ec | Ec << 16 | w << 32 | (win or 0) << 40]
+                                                                  if C > 1 else [])))
+                        prog.emit(P.FETCH_DONE, q % 2)
+                        if q + 2 < nq:
+                            prog.emit(P.FETCH, st["ranges"][q + 2], len(st["ranges"][q + 2]), (q + 2) % FETCH_MAX, q % 2,
+                                      *d.stage_mode())
             if mix:
                 cc = P.Program()
                 upm, dnm = d.m.experts(i, "up"), d.m.experts(i, "down")
@@ -805,6 +862,18 @@ class NmEmit:
                 _patch(prog, rec, a, v)
         else:
             prog.emit(P.NM_SPLIT, idx, slots, cold, cnt, t * k, k, prog.slot("nreal"))
+        g = d.take(t) if slots_all is None and d.pool is not None and i in d.pool.row else 0
+        tabs = None
+        if g:
+            # (some cold experts the GPU's: out of the CPU's pairs, their rows copied across the link into a stage
+            # beside the CPU's task, marked in gsl and their stage's addresses in gup, gdn for NM_HOT_NV4; the
+            # router's record then runs alone, not with the SIGNAL)
+            pool = d.pool
+            gsl, gup, gdn = S("gsl", E + 1, np.int32), S("gup", E, np.int64), S("gdn", E, np.int64)
+            take = (cold, cnt, slots, d.xmask(i), gsl, t * k, E, g, pool.pup[i], pool.pdn[i], gup, gdn,
+                    S("tstage", g * pool.per, np.uint8), pool.pu, pool.pd, S("tlist", g + 1, np.int32))
+            prog.emit(P.NM_TAKE, *take)
+            slots, tabs = gsl, (gup, gdn)
         fl = pinned((2,), np.int64, free=True)
         fl[:] = 0
         prog.keep.append(fl)
@@ -812,14 +881,18 @@ class NmEmit:
         prev, self._last_fl = self._last_fl, fl
         prog.emit(P.SIGNAL, fl[0:1], seq, lat, bufs["lat"], bufs["lat"].nbytes, val, bufs["val"],
                   bufs["val"].nbytes, cold, bufs["cold"], bufs["cold"].nbytes, prev[1:2] if prev is not None else None)
+        if g:
+            prog.emit(P.NM_PULL, *take)
         if slots_all is None:
-            self._hot(prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im)
+            self._hot(prog, lat, idx, val, slots, up, down, act, de, gout, k, L, inner, t, Im, tabs=tabs)
         # the CPU's part: the cold pairs on the full stacks in host memory, the threads of node 1 on its
         # copy when the weightkeeper has one (a run of up to 8 rows: those of an expert device's experts
         # on it, its sum added after)
         cc = P.Program()
         upm, dnm = d.m.experts(i, "up"), d.m.experts(i, "down")
-        cold_cpu, xd = bufs["cold"], d.xdev if t <= (8 if os.environ.get("RECLANK_NM_XGROUP", "1") != "0" else 1) else None
+        # (not the MTP block's layer: the device holds none of its experts)
+        cold_cpu, xd = bufs["cold"], d.xdev if i in cfg.moe and t <= (
+            8 if os.environ.get("RECLANK_NM_XGROUP", "1") != "0" else 1) else None
         if xd is not None:
             cold_cpu, posted = np.zeros(t * k, np.int32), np.zeros(1, np.int64)
             d._xkeep += [cold_cpu, posted]
@@ -870,6 +943,7 @@ class NemotronGPU:
         self._two_sets()
         self._ascr = None
         self.cache_dev = _NmDevCache()
+        self._mem_total = mem_info()[1]         # (the GPU's memory: sub_rows)
         # the hot experts: the share of every layer's experts that the memory holds
         per = {i: (model.experts(i, "up").data.nbytes + model.experts(i, "down").data.nbytes) // E
                for i, (E, _inner, _k) in cfg.moe.items()}
@@ -937,6 +1011,7 @@ class NemotronGPU:
         self.routes = (np.zeros((cfg.layers, Em), np.int32) if self.xdev is not None and REFRESH
                        or os.environ.get("RECLANK_NM_ROUTES") == "1" else None)
         self._xsplit = {}
+        self._xmask = {}
         self._seen = None if self.routes is None else self.routes.copy()
         self._score = None
         self.progs = {}                 # the programs of a step and of the small groups (this lane's)
@@ -954,6 +1029,8 @@ class NemotronGPU:
                 # (the step's program again, now with the tables: its experts by NM_GROUP_MOE too)
                 self.progs.pop(1, None)
                 self._prog(1)
+        if self.pool is not None:
+            self._fit_big()
 
     # ---- the sizes
 
@@ -975,15 +1052,21 @@ class NemotronGPU:
         return n + self.m.M(LM + "lm_head").data.nbytes
 
     def prompt_bytes(self):
-        """The device memory of the programs of the prompt groups (GROUPS, made at the first
-        prompt; with the pool, BIG_GROUPS's take theirs from it): group_bytes of each."""
-        return int(sum(self.group_bytes(t) for t in GROUPS))
+        """The device memory of the programs of the prompt groups that stay (GROUPS, made at the first
+        prompt; with the pool, the big ones take theirs from it: is_big): group_bytes of each."""
+        return int(sum(self.group_bytes(t) for t in GROUPS if not self.is_big(t)))
 
-    def group_bytes(self, t):
+    def is_big(self, t):
+        """A prompt group's program made from the pool at a prompt and freed after it: BIG_GROUPS's, and GROUPS's of
+        BIG_FROM rows up (Super's pool)."""
+        return bool(self.nv4 and POOL) and (t in BIG_GROUPS or t >= BIG_FROM)
+
+    def group_bytes(self, t, win=None, sub=None):
         """The device memory of the program of a prompt group of t rows: a part that grows with its
         rows (the step's activations, which the layers share; the routed experts' scratch; the int8 x
         of the products) and one that does not (rc_gpu_load's own buffers). The 3060 measured 538 KB a
-        row and 19.5 MB a program for the 74B (824 MB for the five; this gives 552 KB, 853 MB)."""
+        row and 19.5 MB a program for the 74B (824 MB for the five; this gives 552 KB, 853 MB). win: the pairs'
+        scratch of a window of that many pairs (win_cap), not of the group's."""
         c = self.cfg
         hid, L, inner, conv = c.hidden, c.latent, c.m_inner, c.conv_dim
         hq, hk = c.heads * c.head_dim, c.kv_heads * c.head_dim
@@ -993,9 +1076,32 @@ class NemotronGPU:
         wide = max(inner, c.shared_inner, hid)
         act = 4 * (5 * hid + 2 * inner + 2 * conv + c.m_heads + 3 * hq + 2 * hk + Emax + 2 * k + 2 * L +
                    c.shared_inner) + wide * (1 + 4 / 32 + 4 / 16)
-        moe = (2 if self.nv4 else 6) * k * Im + 4 * k * Im / 32 + 4 * k * L + 10 * L + 4 * L / 32 + 4 * k
+        pair = (2 if self.nv4 else 6) * Im + 4 * Im / 32 + 4 * L       # (a pair's act planes, their scales, its outputs)
+        moe = pair * k + 10 * L + 4 * L / 32 + 4 * k
         qx = sum(2 * n + 4 * n / 32 for n in {hid, inner, c.shared_inner, L, hq})
-        return (act + moe + qx) * t + 20e6
+        if win:
+            # (the pairs' scratch of a window of win pairs, and their positions)
+            moe, pairs = moe - pair * k + 4 * k, pair * win
+        else:
+            pairs = 0.0
+        if sub and sub < t:
+            # (sub-batches: the residual stream, the rows after norm_f, the routed experts' rows and their int8 x of
+            # every row; the rest of sub)
+            keep = 4 * (2 * hid + 2 * k + 2 * L)
+            return keep * t + moe * t + (act - keep + qx) * sub + pairs + 20e6
+        return (act + moe + qx) * t + pairs + 20e6
+
+    def sub_rows(self, t):
+        """The rows of a sub-batch of a prompt group of t rows (SUB), or None."""
+        s = SUB if SUB is not None else (1024 if self.pool is not None and getattr(self, "_mem_total", 0) < 16e9 else 0)
+        return s if s and t > s and t % s == 0 else None
+
+    def win_cap(self, t, c):
+        """The pairs of a window of a group of t rows staged in c chunks (WIN), or None (the group's scratch)."""
+        if not (WIN and TILES and c > 1):
+            return None
+        k = max(kk for _E, _n, kk in self.cfg.moe.values())
+        return int(-(-WIN_SLACK * t * k / c // 64)) * 64
 
     def kv_bytes(self, ctx):
         c = self.cfg
@@ -1087,23 +1193,28 @@ class NemotronGPU:
         store = self.progs if t <= NV4_HOT_MAX else self.gprogs
         e = store.get(t)
         if e is None:
-            big = self.pool is not None and t in BIG_GROUPS
+            big = self.pool is not None and self.is_big(t)
             if big:
-                # (the memory of a big group's program from the pool: relax gives it back after the prompt)
-                need = self.group_bytes(t) + BIG_MARGIN_GB * 1e9 - mem_info()[0]
+                # (one big group's program at a time, as _fit_big counts the room: those of other sizes freed first; a
+                # prompt in parts of several sizes (2048 then 4096) ran a 12 GB card out of memory beside the stage,
+                # and kept while the pool could give the next, the two left the MTP block's part none. The memory from
+                # the pool: relax gives it back after the prompt)
+                self._free_big([k for k in self.big if isinstance(k, int)])
+                gb = self.group_bytes(t, self.win_cap(t, self.stage_c) if self.staged(t) else None, self.sub_rows(t))
+                need = gb + BIG_MARGIN_GB * 1e9 - mem_info()[0]
                 if need > 0:
                     n = self.pool.shrink(need)
                     print("NemotronGPU: the hot experts %.1f -> %.1f GB for the program of a group of %d" % (
                         (self.pool.nbytes() + n) / 1e9, self.pool.nbytes() / 1e9, t), flush=True)
                 before = set(self.mirror.arrays)
                 t0 = time.time()
-            prog = compile_nemotron_step(self.m, t, em=NmEmit(self, t))
+            prog = compile_nemotron_step(self.m, t, em=NmEmit(self, t), sub=self.sub_rows(t) if big else None)
             if getattr(prog, "stage", False):
                 # (the copies of the first two MoE layers' cold experts start first)
                 st = self.stage_tabs()
-                prog.recs[:0] = [(P.FETCH, [prog._enc(st["ranges"][j]), prog._enc(len(st["ranges"][j])), prog._enc(j),
-                                            prog._enc(j % 2)] + [prog._enc(v) for v in self.stage_mode()])
-                                 for j in range(min(2, len(self.pool.layers)))]
+                prog.recs[:0] = [(P.FETCH, [prog._enc(st["ranges"][q]), prog._enc(len(st["ranges"][q])), prog._enc(q),
+                                            prog._enc(q % 2)] + [prog._enc(v) for v in self.stage_mode()])
+                                 for q in range(min(2, len(st["ranges"])))]
             # the head on the last real row of the group (slot "last": a group of more rows than tokens)
             head = self.m.M(LM + "lm_head")
             logits = np.zeros((1, head.rows), np.float32)
@@ -1128,7 +1239,53 @@ class NemotronGPU:
 
     def staged(self, t):
         """A group of t rows takes its cold experts by the copies to the stage buffers."""
-        return STAGE and self.pool is not None and self.zc_tables is not None and t >= STAGE_MIN
+        return (STAGE and self.pool is not None and self.zc_tables is not None and t >= self.stage_min() and
+                t in getattr(self, "stage_ok", ()))
+
+    def _fit_big(self):
+        """The big groups the GPU holds, and those it stages. A prompt's room: the free memory and every
+        segment of the pool, less what comes later (the programs of GROUPS, made at the first prompt; the
+        cache, attached by the first run; the reserve) and BIG_MARGIN_GB. A big group's program takes its
+        share of it, a staged group's two stage buffers (2 E experts) the rest; a group without the room
+        for those reads the mapped memory. The RTX 3060 (12 GB): 2048 and 4096 mapped (their programs 1.2
+        and 2.4 GB, the buffers 3.2)."""
+        pool = self.pool
+        kv = 0 if self.cache_dev.bufs else self.kv_bytes(self.ctx)
+        room = (mem_info()[0] + pool.nbytes() - self.prompt_bytes() - kv -
+                (self.reserve_gb + BIG_MARGIN_GB) * 1e9)
+        self.mtp_part = None
+        if self.cfg.mtp and self.reserve_gb > 0:
+            # (the MTP block's prompt parts of more than 256 rows: big programs of their own beside the group's, the
+            # reserve holding the smaller ones; a group's per-row memory as theirs. Its largest part that leaves a big
+            # group room, mtp_part (spec.NemotronMTPSpec.flush): the 3060 with MTP 1024, the groups of 2048 then fit)
+            from reclank.models.nemotron.spec import FLUSH_PARTS
+            parts = sorted((p for p in FLUSH_PARTS if p > 256), reverse=True)
+            for p in parts:
+                r = room - self.group_bytes(p)
+                if any(self.group_bytes(t) <= r for t in BIG_GROUPS if t in self.groups) or p == parts[-1]:
+                    self.mtp_part, room = p, r
+                    break
+        # (the stage of a layer in chunks of its experts when two whole layers do not fit beside a staged program, a
+        # window of a chunk's pairs at a time in its scratch: the 3060's groups of 4096 rows in 4 of 128 experts; the
+        # fewest chunks that stage the most sizes; NV4T only. A big group staged, or unstaged when its whole program fits)
+        def own(t, c):
+            return self.group_bytes(t, self.win_cap(t, c), self.sub_rows(t)) if self.is_big(t) else 0.0
+        cand = [t for t in self.groups if t >= self.stage_min()]
+        self.stage_c, self.stage_ok = 1, set()
+        for c in ((1, 2, 4, 8, 16) if TILES else (1,)):
+            ok = {t for t in cand if pool.E % c == 0 and own(t, c) + 2 * (pool.E // c) * pool.per <= room}
+            if len(ok) > len(self.stage_ok):
+                self.stage_c, self.stage_ok = c, ok
+            if len(ok) == len(cand):
+                break
+        big = [t for t in self.groups if self.is_big(t) and (t in self.stage_ok or own(t, 1) <= room)]
+        if STAGE and self.zc_tables is not None and (len(big) < len([t for t in self.groups if self.is_big(t)]) or
+                                                      self.stage_c > 1 or not self.stage_ok.issuperset(cand)):
+            print("NemotronGPU: a prompt's room %.1f GB: the groups of %s rows, %s staged%s%s" % (
+                room / 1e9, ", ".join(map(str, big)) or "no big", ", ".join(map(str, sorted(self.stage_ok))) or "none",
+                " (in %d chunks of a layer)" % self.stage_c if self.stage_c > 1 and self.stage_ok else "",
+                "; the MTP block's parts of at most %d" % self.mtp_part if self.mtp_part else ""), flush=True)
+        self.groups = tuple(sorted({t for t in GROUPS if not self.is_big(t)} | set(big)))
 
     def stage_tabs(self):
         """The tables of the staged groups (shared by their programs): for each MoE layer j (the pool's
@@ -1137,9 +1294,9 @@ class NemotronGPU:
         range of 0 bytes copies nothing)."""
         st = getattr(self, "_stage", None)
         if st is None:
-            R, E = len(self.pool.layers), self.pool.E
+            R, E, C = len(self.pool.layers), self.pool.E, getattr(self, "stage_c", 1)
             st = self._stage = {"pup": np.zeros((R, E), np.int64), "pdn": np.zeros((R, E), np.int64),
-                                "ranges": [np.zeros((2 * E, 3), np.int64) for _ in range(R)], "bufs": None}
+                                "ranges": [np.zeros((2 * E // C, 3), np.int64) for _ in range(R * C)], "bufs": None}
         return st
 
     def stage_mode(self):
@@ -1155,29 +1312,34 @@ class NemotronGPU:
         from reclank.backends.cuda.gpumm import Buffer
         st, pool = self.stage_tabs(), self.pool
         E, pu, pd = pool.E, pool.pu, pool.pd
+        C = getattr(self, "stage_c", 1)
+        Ec = E // C
         if st["bufs"] is None:
-            need = 2 * E * pool.per
+            need = 2 * Ec * pool.per
             short = need + BIG_MARGIN_GB * 1e9 - mem_info()[0]
             if short > 0:
                 n = pool.shrink(short)
                 print("NemotronGPU: the hot experts -%.1f GB for the stage buffers (%.1f GB)" % (n / 1e9, pool.nbytes() / 1e9),
                       flush=True)
-            st["bufs"] = [Buffer(E * pool.per, "program", pinned=True) for _ in range(2)]
+            st["bufs"] = [Buffer(Ec * pool.per, "program", pinned=True) for _ in range(2)]
         ar = np.arange(E, dtype=np.int64)
         if TILES:
-            # (every expert in the buffer at its own place, in NV4T: the cold ones from the host's rows, the hot ones
-            # from their slots, both through k_nm_tile_pull)
+            # (every expert in the buffer of its chunk at its own place, in NV4T: the cold ones from the host's rows,
+            # the hot ones from their slots, both through k_nm_tile_pull; chunk q = C j + c in buffer q % 2)
+            loc = np.arange(Ec, dtype=np.int64)
             for j, i in enumerate(pool.layers):
-                b = st["bufs"][j % 2].ptr
-                up, dn = b + ar * pu, b + E * pu + ar * pd
-                st["pup"][j], st["pdn"][j] = up, dn
                 held = pool.slots[i] >= 0
                 hu, hd, _du, _dd = pool.host[i]
                 su = np.where(held, pool.pup[i], hu + ar * pu)
                 sd = np.where(held, pool.pdn[i], hd + ar * pd)
-                rg = st["ranges"][j]
-                rg[0::2] = np.stack([su, up, np.full(E, pu)], 1)
-                rg[1::2] = np.stack([sd, dn, np.full(E, pd)], 1)
+                for c in range(C):
+                    q, sl = j * C + c, slice(c * Ec, (c + 1) * Ec)
+                    b = st["bufs"][q % 2].ptr
+                    up, dn = b + loc * pu, b + Ec * pu + loc * pd
+                    st["pup"][j][sl], st["pdn"][j][sl] = up, dn
+                    rg = st["ranges"][q]
+                    rg[0::2] = np.stack([su[sl], up, np.full(Ec, pu)], 1)
+                    rg[1::2] = np.stack([sd[sl], dn, np.full(Ec, pd)], 1)
             for a in (st["pup"], st["pdn"]):
                 if self.mirror.owner(a.ctypes.data) is not None:
                     self.mirror.buffer_of(a).upload(a)
@@ -1215,10 +1377,27 @@ class NemotronGPU:
         self.stage_free()
         if self.pool is None or (not self.big and len(self.pool.segs) >= self.pool_target):
             return
+        self._free_big(list(self.big))
+        # (back to its segments while the GPU keeps BIG_MARGIN_GB, the reserve (the image encoder's room had gone to
+        # the hot experts after a long prompt) and the room of the prompt groups' programs not made yet free: MARGIN_GB
+        # went to what was made after the hot set was sized (the step's programs, the cache at the first run), and
+        # keeping it all free again left the 3060's pool 0.5 GB short after every prompt; a program that finds no room
+        # later makes the pool give some back, _load)
+        unmade = sum(self.group_bytes(t) for t in GROUPS if not self.is_big(t) and t not in self.gprogs and t not in self.progs)
+        room = int((mem_info()[0] - (BIG_MARGIN_GB + self.reserve_gb) * 1e9 - unmade) // self.pool.seg_bytes)
+        k = self.pool.add_segments(max(0, min(self.pool_target - len(self.pool.segs), room)))
+        if k:
+            self.pool.plan(None)
+            print("NemotronGPU: the hot experts back to %.1f GB (%d copies on their way)" % (
+                self.pool.nbytes() / 1e9, sum(len(it) for _j, _r, it in self.pool.pending)), flush=True)
+
+    def _free_big(self, keys):
+        """The big programs of keys (self.big's) freed, with the device copies of their own arrays."""
         keep = {a.ctypes.data for a in (self.pool._slots, self.pool._pup, self.pool._pdn, self.pool.cnt)}
         if getattr(self, "_stage", None) is not None:
             keep |= {self._stage["pup"].ctypes.data, self._stage["pdn"].ctypes.data}
-        for t, own in self.big.items():
+        for t in keys:
+            own = self.big.pop(t)
             _prog, g = self.gprogs.pop(t)
             for b in g.named.values():
                 b.free()
@@ -1226,15 +1405,6 @@ class NemotronGPU:
             g.close()
             for st in own - keep:
                 self.mirror.forget(st)
-        self.big = {}
-        # (back to its segments while the GPU keeps MARGIN_GB and the reserve free: the programs made since may hold
-        # some; the image encoder's room had gone to the hot experts after a long prompt)
-        room = int((mem_info()[0] - (MARGIN_GB + self.reserve_gb) * 1e9) // self.pool.seg_bytes)
-        k = self.pool.add_segments(max(0, min(self.pool_target - len(self.pool.segs), room)))
-        if k:
-            self.pool.plan(None)
-            print("NemotronGPU: the hot experts back to %.1f GB (%d copies on their way)" % (
-                self.pool.nbytes() / 1e9, sum(len(it) for _j, _r, it in self.pool.pending)), flush=True)
 
     def _mtp_prog(self, t, head=True):
         """The MTP block on t rows (kq.compile_nemotron_mtp with NmEmit: its attention on K.mtp / V.mtp
@@ -1243,8 +1413,11 @@ class NemotronGPU:
         store = self.progs if t <= NV4_HOT_MAX else self.gprogs
         e = store.get(("mtp", t, head))
         if e is None:
-            # (the MTP block's prompt parts of more than 256 rows: freed with the big groups after the prompt)
+            # (the MTP block's prompt parts of more than 256 rows: freed with the big groups after the prompt, and one
+            # of them at a time, as _fit_big counts its room (mtp_part))
             big = self.pool is not None and t > 256
+            if big:
+                self._free_big([k for k in self.big if isinstance(k, tuple) and k[0] == "mtp"])
             before = set(self.mirror.arrays) if big else None
             from reclank.models.nemotron.kq import compile_nemotron_mtp
             prog = compile_nemotron_mtp(self.m, t, em=NmEmit(self, t))
@@ -1344,6 +1517,11 @@ class NemotronGPU:
                 x[a - pos:b - pos] = rows[a - s0:b - s0]
         g.upload("H")
         kw = {"pos": pos, "nreal": t, "hs": self.cfg.head_dim, "last": t - 1}
+        nsb, sb = getattr(prog, "sub", (0, 0))
+        for s in range(nsb):
+            # (a sub-batch's first position and its real rows: kq._compile_nemotron_sub)
+            kw["pos.%d" % s] = pos + s * sb
+            kw["nreal.%d" % s] = max(0, min(sb, t - s * sb))
         kw.update(self.cache.params())
         g.bind(kw, self.cache_dev, scratch=("scores",))
         if getattr(prog, "stage", False):
@@ -1491,6 +1669,33 @@ class NemotronGPU:
             self._split_fill(i)
         return e
 
+    def xmask(self, i):
+        """NM_TAKE's held of layer i: 1 for the expert device's experts (its pairs the CPU's task posts), or None."""
+        if self.xdev is None:
+            return None
+        a = self._xmask.get(i)
+        if a is None:
+            a = self._xmask[i] = np.zeros(self.cfg.moe[i][0], np.int32)
+            a[:] = self.xdev.held[i, :a.size]
+        return a
+
+    def take(self, t):
+        """NM_TAKE's g for a run of t rows (TAKE): the cold experts of each token the GPU reads across the link."""
+        if TAKE is not None:
+            return TAKE * t
+        g = getattr(self, "_take1", None)
+        if g is None:
+            k = max(kk for _E, _n, kk in self.cfg.moe.values())
+            th = cpu_threads()
+            link = getattr(self, "link_gbps", None) or h2d_gbps()
+            # (a token's cold experts: those neither the pool nor the expert device holds, about 60% of k here)
+            g = self._take1 = int(0.6 * k * link / (link + TAKE_THREAD_GBPS * th)) if th < SMALL_CPU else 0
+        return g * t
+
+    def stage_min(self):
+        """The least rows of a staged prompt group (STAGE_MIN)."""
+        return STAGE_MIN if STAGE_MIN is not None else 1024 if cpu_threads() < SMALL_CPU else 2048
+
     def _split_fill(self, i):
         mine, rest = self._xsplit[i]
         held = self.xdev.held[i, :mine.size].astype(bool)
@@ -1525,5 +1730,9 @@ class NemotronGPU:
         for i in self._xsplit:
             self._split_fill(i)
             for a in self._xsplit[i]:
+                self.mirror.buffer_of(a).upload(a)
+        for i, a in self._xmask.items():
+            a[:] = self.xdev.held[i, :a.size]
+            if self.mirror.owner(a.ctypes.data) is not None:
                 self.mirror.buffer_of(a).upload(a)
         return n, nbytes, time.time() - t0

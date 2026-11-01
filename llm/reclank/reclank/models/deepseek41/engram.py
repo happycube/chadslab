@@ -2,6 +2,10 @@
 reference's engram.py, DEEPSEEK_V41_PLAN.md 2.3) without torch, tokenizers
 or sympy.
 
+Ported from DeepSeek V4.1 Flash's reference code
+(deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/engram.py; MIT License;
+Copyright (c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+
 - token_map(tokenizer.json): each id to a compressed id; ids whose decoded
   text normalizes alike (NFKC, NFD, the accents stripped, lowercase, runs of
   space, tab and newline to one space, stripped; the accents: every

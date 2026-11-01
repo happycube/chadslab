@@ -321,6 +321,145 @@ __global__ void k_nm_split(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* GP_NM_TAKE (Super on a small CPU: models/nemotron/gpu.py TAKE): cold (in and out: a pair's expert or -1,
+ * GP_NM_SPLIT's), count (in and out), slots (the pool's: the GPU's slot of each expert, or -1), held (or none:
+ * the expert device's experts, 1: left to the CPU's task, which posts them), gsl (out: E + 1 slots, the
+ * pool's with the taken experts 0, the last -1), tk, E, g, pup, pdn (the pool's tables: each expert's
+ * address, the mapped host memory for a cold one), gup, gdn (out: those with the taken experts' in stage),
+ * stage (g experts' rows), pu, pd (the bytes of an expert's up and down rows), list (out: the count taken,
+ * then their experts). Of the cold experts the expert device lacks, the g with the most pairs (on a tie the
+ * one of the first pair) are the GPU's: their pairs leave cold, GP_NM_PULL (k_nm_pull, the same operands, after
+ * the SIGNAL: the CPU's task starts first) copies their rows across the link into stage beside the CPU's task,
+ * and NM_HOT_NV4 runs them on gsl, gup, gdn. One block. */
+#define NM_TAKE_E 1024
+__global__ void __launch_bounds__(1024) k_nm_take(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    int *cold = DP(int, 0), *count = DP(int, 1);
+    const int *slots = DP(const int, 2);
+    const int *held = r->tag[3] != GP_T_NONE ? DP(const int, 3) : NULL;
+    int *gsl = DP(int, 4);
+    const int tk = DI(5), E = DI(6), g = DI(7);
+    __shared__ int cnt[NM_TAKE_E], first[NM_TAKE_E], wk[32], we[32];
+    __shared__ unsigned char taken[NM_TAKE_E];
+    __shared__ int more, sub;
+    for (int x = threadIdx.x; x < E; x += blockDim.x) {
+        cnt[x] = 0;
+        first[x] = tk;
+        taken[x] = 0;
+        gsl[x] = slots[x];
+    }
+    if (threadIdx.x == 0) {
+        gsl[E] = -1;
+        sub = 0;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < tk; p += blockDim.x) {
+        const int c = cold[p];
+        if (c >= 0 && c < E && !(held != NULL && held[c])) {
+            atomicAdd(&cnt[c], 1);
+            atomicMin(&first[c], p);
+        }
+    }
+    __syncthreads();
+    for (int round = 0; round < g; ++round) {
+        /* (the best expert not taken: the most pairs, then the first pair) */
+        int bk = -1, be = -1;
+        for (int x = threadIdx.x; x < E; x += blockDim.x) {
+            const int key = cnt[x] > 0 && !taken[x] ? cnt[x] * 65536 + (65535 - first[x]) : -1;
+            if (key > bk) {
+                bk = key;
+                be = x;
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const int k2 = __shfl_down_sync(RC_FULL_MASK, bk, o), e2 = __shfl_down_sync(RC_FULL_MASK, be, o);
+            if (k2 > bk) {
+                bk = k2;
+                be = e2;
+            }
+        }
+        if (threadIdx.x % 32 == 0) {
+            wk[threadIdx.x / 32] = bk;
+            we[threadIdx.x / 32] = be;
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int nw = blockDim.x / 32;
+            bk = threadIdx.x < nw ? wk[threadIdx.x] : -1;
+            be = threadIdx.x < nw ? we[threadIdx.x] : -1;
+            for (int o = 16; o > 0; o >>= 1) {
+                const int k2 = __shfl_down_sync(RC_FULL_MASK, bk, o), e2 = __shfl_down_sync(RC_FULL_MASK, be, o);
+                if (k2 > bk) {
+                    bk = k2;
+                    be = e2;
+                }
+            }
+            if (threadIdx.x == 0) {
+                more = bk >= 0;
+                if (more) {
+                    taken[be] = 1;
+                    gsl[be] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (!more) {
+            break;
+        }
+    }
+    for (int p = threadIdx.x; p < tk; p += blockDim.x) {
+        const int c = cold[p];
+        if (c >= 0 && c < E && taken[c]) {
+            cold[p] = -1;
+            atomicAdd(&sub, 1);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *count -= sub;
+    }
+    /* the tables: the pool's, the taken experts' rows in stage (in the order taken) */
+    const int64_t *pup = DP(const int64_t, 8), *pdn = DP(const int64_t, 9);
+    int64_t *gup = DP(int64_t, 10), *gdn = DP(int64_t, 11);
+    for (int x = threadIdx.x; x < E; x += blockDim.x) {
+        gup[x] = pup[x];
+        gdn[x] = pdn[x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int64_t stage = (int64_t)(intptr_t)DP(uint8_t, 12), pu = di(r, e, 13), pd = di(r, e, 14);
+        int *list = DP(int, 15), n = 0;
+        for (int x = 0; x < E; ++x) {
+            if (taken[x]) {
+                gup[x] = stage + n * (pu + pd);
+                gdn[x] = stage + n * (pu + pd) + pu;
+                list[1 + n++] = x;
+            }
+        }
+        list[0] = n;
+    }
+}
+
+/* GP_NM_PULL, NM_TAKE's copies: the rows of the experts of list from the pool's tables (operands 8, 9: the mapped host
+ * memory) into stage, 16 bytes a thread, a block an SM (the link's ~12 GB/s on the 3060 and the 1070: more
+ * loads in flight across it fell to 6-7 GB/s) */
+__global__ void __launch_bounds__(256) k_nm_pull(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    const int64_t *pup = DP(const int64_t, 8), *pdn = DP(const int64_t, 9);
+    uint8_t *stage = DP(uint8_t, 12);
+    const size_t pu = (size_t)di(r, e, 13), pd = (size_t)di(r, e, 14), per = (pu + pd) / 16, pu16 = pu / 16;
+    const int *list = DP(const int, 15);
+    const size_t n = (size_t)list[0] * per;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const size_t q = i / per, o = i % per;
+        const int x = list[1 + q];
+        const uint4 *src = o < pu16 ? (const uint4 *)(intptr_t)pup[x] + o : (const uint4 *)(intptr_t)pdn[x] + (o - pu16);
+        ((uint4 *)stage)[q * per + o] = *src;
+    }
+}
+
 /* GP_NM_PLAN (Super's prompt groups, S6 of docs/NEMOTRON_SUPER_PLAN.md; Bolt's on a GPU without dp4a): idx,
  * slots (the GPU's slot of each expert, or -1), cold (out: the CPU's pairs, their expert or -1), count
  * (out: their count), gidx (out: the GPU's pairs), tk, k, nreal, E, a (the CPU's cost of a pair), b (the
@@ -1548,6 +1687,33 @@ __global__ void k_nm_gqx(const gp_rec *r, const int64_t *e)
     }
 }
 
+/* GP_NM_GROUP_MOE's operand 23 (or none): a chunk of the experts and a window of its pairs, x0 | nx << 16 | pass << 32 |
+ * cap << 40 (models/nemotron/gpu.py: Super's stage in chunks on a small GPU). The chunk's tiles are those of the nx
+ * experts from x0; with cap, its pairs (their sorted positions from start[x0]) in windows of cap, pass the one of
+ * this record: the act and the outputs of a window's pairs in the scratch by their position in it (a window's, not
+ * a group's, scratch), added to the tokens' rows after it (k_nm_gsumw). */
+struct nm_win {
+    int x0, nx, w0, w1, cap, first;
+};
+__device__ __forceinline__ nm_win nm_window(const gp_rec *r, const int64_t *e, const int *start, int E)
+{
+    nm_win w = {0, E, 0, 0, 0, 1};
+    if (r->tag[23] != GP_T_NONE) {
+        const int64_t c = di(r, e, 23);
+        w.x0 = (int)(c & 0xffff);
+        w.nx = (int)((c >> 16) & 0xffff);
+        const int pass = (int)((c >> 32) & 0xff);
+        w.cap = (int)(c >> 40);
+        w.first = w.x0 == 0 && pass == 0;
+        if (w.cap > 0) {
+            const int a1 = start[w.x0 + w.nx];
+            w.w0 = start[w.x0] + pass * w.cap;
+            w.w1 = min(w.w0 + w.cap, a1);
+        }
+    }
+    return w;
+}
+
 __global__ void __launch_bounds__(1024) k_nm_gsort(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -1580,6 +1746,29 @@ __global__ void __launch_bounds__(1024) k_nm_gsort(const gp_rec *r, const int64_
         int x = idx[p];
         if (x >= 0) {
             order[start[x] + atomicAdd(&fill[x], 1)] = p;
+        }
+    }
+    if (r->tag[23] != GP_T_NONE && (di(r, e, 23) >> 40) > 0) {
+        /* (the windows: each expert's pairs in the order of their index, the windows the same from run to run, and
+         * each pair's position, inv = order + t k) */
+        __syncthreads();
+        int *inv = order + (size_t)t * k;
+        for (int x = threadIdx.x; x < E; x += blockDim.x) {
+            int *o = order + start[x];
+            const int n = start[x + 1] - start[x];
+            for (int a = 1; a < n; ++a) {
+                const int v = o[a];
+                int b = a - 1;
+                while (b >= 0 && o[b] > v) {
+                    o[b + 1] = o[b];
+                    --b;
+                }
+                o[b + 1] = v;
+            }
+        }
+        __syncthreads();
+        for (int a = threadIdx.x; a < start[E]; a += blockDim.x) {
+            inv[order[a]] = a;
         }
     }
 }
@@ -1703,6 +1892,38 @@ __global__ void __launch_bounds__(256) k_nm_gdown(const gp_rec *r, const int64_t
             }
         }
     }
+}
+
+/* the sums of a window of a chunk's pairs (operand 23 with cap, nm_window) into the tokens' rows (operand 11): each
+ * token's slots in their order, those of the window's pairs (their outputs in the scratch at inv - w0), added to the
+ * rows of the windows before (the first window of the layer starts them at 0) */
+__global__ void k_nm_gsumw(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    const int k = DI(13), L = DI(14), t = DI(16), E = DI(17), j = blockIdx.y;
+    int nreal = DI(18);
+    nreal = nreal > 0 && nreal < t ? nreal : t;
+    const int *start = DP(const int, 12), *inv = start + 2 * E + 1 + (size_t)t * k;
+    const nm_win wn = nm_window(r, e, start, E);
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= L || (wn.w0 >= wn.w1 && !wn.first)) {
+        return;
+    }
+    float *out = DP(float, 11) + (size_t)j * L + c;
+    float s = wn.first ? 0.f : *out;
+    if (j < nreal) {
+        const float *de = DP(const float, 10);
+        const int *idx = DP(const int, 1) + (size_t)j * k;
+        for (int q = 0; q < k; ++q) {
+            if (idx[q] >= 0) {
+                const int a = inv[j * k + q];
+                if (a >= wn.w0 && a < wn.w1) {
+                    s += de[(size_t)(a - wn.w0) * L + c];
+                }
+            }
+        }
+    }
+    *out = s;
 }
 
 __global__ void k_nm_gsum(const gp_rec *r, const int64_t *e)
@@ -3874,7 +4095,7 @@ __global__ void __launch_bounds__(256) k_nm_gtile_nv4c(const gp_rec *r, const in
     __shared__ int prow[GC_BN];
     __shared__ float vt[DOWN ? 1 : GC_BM][DOWN ? 1 : GC_BN + 1];
     const int k = DI(13), L = DI(14), inner = DI(15), E = DI(17), tid = threadIdx.x;
-    const int x = blockIdx.y, r0 = blockIdx.x * GC_BM;
+    const int x = blockIdx.y + (r->tag[23] != GP_T_NONE ? (int)(di(r, e, 23) & 0xffff) : 0), r0 = blockIdx.x * GC_BM;
     const int rows = DOWN ? L : inner, cols = DOWN ? inner : L;
     const int *start = DP(const int, 12), *order = start + 2 * E + 1;
     const int n0 = start[x], n1 = start[x + 1];
@@ -4083,17 +4304,20 @@ __global__ void __launch_bounds__(256) k_nm_gtile_nv4t(const gp_rec *r, const in
     PDL_START();
     /* the stages of x (planes, scales); after the columns, the relu^2 rows of the up tiles in the same room */
     __shared__ __align__(16) uint8_t gsm[GT_ST * (2 * GC_BN * GT_XW * 4 + GC_BN * 8)];
-    __shared__ int prow[GC_BN], xr[GC_BN];
+    __shared__ int prow[GC_BN], xr[GC_BN], srow[GC_BN];
     uint32_t (*xh)[GC_BN][GT_XW] = (uint32_t (*)[GC_BN][GT_XW])gsm;
     uint32_t (*xl)[GC_BN][GT_XW] = (uint32_t (*)[GC_BN][GT_XW])(gsm + GT_ST * GC_BN * GT_XW * 4);
     float2 (*xsc)[GC_BN] = (float2 (*)[GC_BN])(gsm + 2 * GT_ST * GC_BN * GT_XW * 4);
     float (*vt)[GC_BN + 1] = (float (*)[GC_BN + 1])gsm;
     const int k = DI(13), L = DI(14), inner = DI(15), E = DI(17), tid = threadIdx.x;
-    const int x = blockIdx.y, rt = blockIdx.x, r0 = rt * GC_BM;
-    const int rows = DOWN ? L : inner, cols = DOWN ? inner : L, nkt = cols / 64;
     const int *start = DP(const int, 12), *order = start + 2 * E + 1;
-    const int n0 = start[x], n1 = start[x + 1];
-    if (n0 == n1 || r0 >= rows) {
+    /* (operand 23: a chunk of the experts, the grid's y its nx from x0; with cap, the pairs of its window only, their
+     * act and outputs in the scratch by their place in it) */
+    const nm_win wn = nm_window(r, e, start, E);
+    const int x = blockIdx.y + wn.x0, rt = blockIdx.x, r0 = rt * GC_BM;
+    const int rows = DOWN ? L : inner, cols = DOWN ? inner : L, nkt = cols / 64;
+    const int n0 = wn.cap ? max(start[x], wn.w0) : start[x], n1 = wn.cap ? min(start[x + 1], wn.w1) : start[x + 1];
+    if (n0 >= n1 || r0 >= rows) {
         return;
     }
     const uint8_t *wt = (const uint8_t *)(intptr_t)DP(const int64_t, DOWN ? 4 : 3)[x];
@@ -4110,8 +4334,11 @@ __global__ void __launch_bounds__(256) k_nm_gtile_nv4t(const gp_rec *r, const in
         __syncthreads();
         if (tid < GC_BN) {
             const int pr = tid < np ? order[a0 + tid] : -1;
+            /* (srow: the pair's row of the scratch, its place in the window, or the pair) */
+            const int sr = pr < 0 ? -1 : wn.cap ? a0 + tid - wn.w0 : pr;
             prow[tid] = pr;
-            xr[tid] = pr < 0 ? -1 : DOWN ? pr : pr / k;
+            srow[tid] = sr;
+            xr[tid] = pr < 0 ? -1 : DOWN ? sr : pr / k;
         }
         __syncthreads();
         const int xpp = tid >> 2, xpart = tid & 3, xrr = xr[xpp];
@@ -4198,7 +4425,7 @@ __global__ void __launch_bounds__(256) k_nm_gtile_nv4t(const gp_rec *r, const in
                     const int rr = 16 * mg + g + (q >= 2 ? 8 : 0), pp = 32 * ng + 8 * nt + 2 * c4 + (q & 1);
                     if (pp < np) {
                         const int pr = prow[pp];
-                        DP(float, 10)[(size_t)pr * L + r0 + rr] = acc[nt][q] * DP(const float, 2)[pr];
+                        DP(float, 10)[(size_t)srow[pp] * L + r0 + rr] = acc[nt][q] * DP(const float, 2)[pr];
                     }
                 }
         } else {
@@ -4222,7 +4449,7 @@ __global__ void __launch_bounds__(256) k_nm_gtile_nv4t(const gp_rec *r, const in
                 m = fmaxf(m, __shfl_xor_sync(RC_FULL_MASK, m, 1));
                 m = fmaxf(m, __shfl_xor_sync(RC_FULL_MASK, m, 2));
                 if (pp < np) {
-                    const int pr = prow[pp];
+                    const int pr = srow[pp];
                     const size_t at = (size_t)pr * inner + r0 + 32 * grp + 8 * l;
                     if (X2) {
                         const float iv = m > 0.f ? NM_Q16 / m : 0.f;

@@ -93,12 +93,22 @@ def prebuild(primary=False):
     build.prebuild(archs)
 
 
+# RECLANK_EXPERT_CC=52: the expert device as a GPU of that compute capability, the primary as it is: its
+# library built for that arch with its PTX (the driver compiles it for the device: the kernels of that GPU,
+# __CUDA_ARCH__ 520) and its caps no higher (no dp4a, no tensor cores). The Maxwell tier's expert device
+# on a newer card (the 1070 beside the 3060)
+EXPERT_CC = os.environ.get("RECLANK_EXPERT_CC", "").strip()
+
+
 def _lib_copy(arch, primary_path):
     """The path of a build of arch for a second copy in this process: the
     build, or a copy of it under another name when the primary loaded the same
     file (dlopen gives the loaded copy for the same path)."""
     from reclank.backends.cuda import build
-    path = str(build.build((arch, "")))
+    if EXPERT_CC.isdigit() and 0 < int(EXPERT_CC) < arch:
+        path = str(build.build((int(EXPERT_CC), ""), ptx=True, cc=int(EXPERT_CC)))
+    else:
+        path = str(build.build((arch, "")))
     if os.path.realpath(path) == os.path.realpath(str(primary_path)):
         dst = "/dev/shm/reclank-%d-%s" % (os.getpid(), os.path.basename(path))
         shutil.copyfile(path, dst)
@@ -106,11 +116,27 @@ def _lib_copy(arch, primary_path):
     return path
 
 
+def _caps(lib):
+    """The caps of the copy lib (caps.cu: its GPU's, or RECLANK_EXPERT_CC's)."""
+    from reclank.backends.cuda.runtime import CAPS_FIELDS
+    out = (ctypes.c_int * 32)()
+    n = lib.rc_gpu_caps_get(out, 32)
+    return dict(zip(CAPS_FIELDS, out[:n]))
+
+
+def _as_cc(caps, gpu):
+    """", as cc 52 (no dp4a, no tensor cores)" when the copy acts as an older GPU, else ""."""
+    if caps.get("cc", gpu["arch"]) >= gpu["arch"]:
+        return ""
+    return ", as cc %d (%s)" % (caps["cc"], ", ".join(
+        ("dp4a" if caps.get("dp4a") else "no dp4a", "tensor cores" if caps.get("tc") else "no tensor cores")))
+
+
 class ErCtx(ctypes.Structure):
     """er_ctx of backends/cpu/csrc/common/ops_qwen.c."""
     _fields_ = [("post", ctypes.c_void_p), ("wait", ctypes.c_void_p), ("held", ctypes.c_void_p),
                 ("experts", ctypes.c_int64), ("alive", ctypes.c_int64), ("post_t", ctypes.c_void_p),
-                ("cpu_max", ctypes.c_int64)]
+                ("cpu_max", ctypes.c_int64), ("more", ctypes.c_int64)]
 
 
 def _put_api(lib):
@@ -160,8 +186,8 @@ def refresh_hot(xdev, hc, state):
     """Between prompts: the experts of expert device xdev anew by the routing that HotCache hc saw
     since the last call (hc.routes: the steps' selections, the expert device's too, and the prompts'
     GP_COUNT) and before it (half for each REFRESH_HALF tokens since; state keeps the score), among the
-    experts that hc's slots do not hold or take; then hc.exclude follows xdev.held. Return (experts
-    copied, bytes, seconds), or None."""
+    experts that hc's slots do not hold or take; then hc.remote (and hc.exclude) follow xdev.held.
+    Return (experts copied, bytes, seconds), or None."""
     if xdev is None or hc is None or not REFRESH or not hasattr(xdev, "slots"):
         return None
     new = hc.routes.astype(np.float64)
@@ -176,8 +202,9 @@ def refresh_hot(xdev, hc, state):
     busy = {li: hc.held[r] | hc.incoming[r] for r, li in enumerate(rows)}
     t0 = time.time()
     n, nbytes = _refresh(xdev, score, busy)
-    if hc.exclude is not None:
-        hc.exclude[:] = xdev.held[rows].astype(bool)
+    for m in (hc.remote, hc.exclude):
+        if m is not None:
+            m[:] = xdev.held[rows].astype(bool)
     return n, nbytes, time.time() - t0
 
 
@@ -216,7 +243,7 @@ class ExpertDevice:
         vp, i, sz = ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t
         lib.rc_gpu_last_error.restype = ctypes.c_char_p
         lib.rc_gpu_ex_open.argtypes = [i, ctypes.POINTER(sz)]
-        lib.rc_gpu_ex_init.argtypes = [i, i, i, i, sz, sz]
+        lib.rc_gpu_ex_init.argtypes = [i, i, i, i, sz, sz, i]
         lib.rc_gpu_ex_store.argtypes = [i, i, vp, vp, vp, i]
         lib.rc_gpu_ex_post.argtypes = [i, i, vp, vp, vp]
         lib.rc_gpu_ex_wait.argtypes = [vp]
@@ -240,7 +267,10 @@ class ExpertDevice:
             gu_per, dn_per = gu0[0].nbytes, dn0[0].nbytes
             self._per = (gu_per, 0, dn_per)
             dn_rows = dn0.shape[1]
-            check(lib.rc_gpu_ex_init(L, hidden, inner, dn_rows, gu_per, dn_per))
+            # (no scales: the weightkeeper's KQ_Q4X experts, the same bytes an expert, which the
+            # kernels here read as they are)
+            self.q4x = w["experts.gate_up_proj"][1] is None
+            check(lib.rc_gpu_ex_init(L, hidden, inner, dn_rows, gu_per, dn_per, int(self.q4x)))
             budget = gb * 1e9 if gb else free.value - 0.8e9
             counts = hot_counts(model)
             flat = np.asarray(counts, dtype=np.float64).reshape(-1)
@@ -269,9 +299,10 @@ class ExpertDevice:
         # the operand of GP_REMOTE_POST and GP_REMOTE_JOIN: the bytes of ctx
         self.ctx_bytes = np.frombuffer(ctypes.string_at(ctypes.addressof(self.ctx), ctypes.sizeof(self.ctx)),
                                        dtype=np.uint8).copy()
-        print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB) after the first %d" % (
+        print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB%s) after the first %d" % (
             gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(self.held.sum()),
-            self.held.sum() * (gu_per + dn_per) / 1e9, skip), file=sys.stderr, flush=True)
+            self.held.sum() * (gu_per + dn_per) / 1e9, ", KQ_Q4X" if self.q4x else "", skip),
+            file=sys.stderr, flush=True)
 
     def srcs(self, layer, e):
         lw = self.model._layers[layer]
@@ -284,12 +315,19 @@ class ExpertDevice:
         return _refresh(self, score, busy)
 
 
+# Super's expert device: of each token's cold experts it does not hold, RECLANK_EXPERT_MORE more go to it too (the
+# CPU's task posts them; its job copies their rows from the keeper's stacks in host memory, DMA, beside the CPU's
+# work: a small CPU's pairs fewer); 0: its own experts only
+EXPERT_MORE = int(os.environ.get("RECLANK_EXPERT_MORE", "0"))
+
+
 class NmExpertDevice:
     """A GPU of experts for the steps of NemotronGPU g (models/nemotron/gpu.py): of the experts
     g lacks, the most used for their bytes (the routing profile, all layers together) that its
-    memory holds, as g's hot stacks (IQ2_XXS by slot). A step's CPU task posts the cold pairs it
-    holds (GP_NM_REMOTE_POST: a step, or a group of up to 8 tokens, a verify group, at once) and
-    adds its sum after GP_NM_MOE (GP_REMOTE_JOIN)."""
+    memory holds, as g's hot stacks (IQ2_XXS by slot; Super's KQ_NV4 rows, NM_HOT_NV4's float x: its
+    experts after those of g's pool). A step's CPU task posts the cold pairs it holds
+    (GP_NM_REMOTE_POST: a step, or a group of up to 8 tokens, a verify group, at once) and adds its
+    sum after GP_NM_MOE (GP_REMOTE_JOIN)."""
 
     def __init__(self, g, gpu, gb=None):
         from reclank.backends.cuda import runtime
@@ -302,8 +340,9 @@ class NmExpertDevice:
         vp, i, sz = ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t
         lib.rc_gpu_last_error.restype = ctypes.c_char_p
         lib.rc_gpu_ex_open.argtypes = [i, ctypes.POINTER(sz)]
-        lib.rc_gpu_ex_nm_init.argtypes = [i, i, i, i]
+        lib.rc_gpu_ex_nm_init.argtypes = [i, i, i, i, i]
         lib.rc_gpu_ex_nm_store.argtypes = [i, i, vp, vp, sz, sz, i, vp, i]
+        lib.rc_gpu_ex_nm_hosts.argtypes = [i, vp, vp, i]
         _put_api(lib)
 
         def check(rc):
@@ -319,9 +358,10 @@ class NmExpertDevice:
         try:
             free = sz()
             check(lib.rc_gpu_ex_open(gpu["cuda"], ctypes.byref(free)))
+            self.caps = _caps(lib)
             kmax = max(k for _E, _n, k in cfg.moe.values())
             imax = max(n for _E, n, _k in cfg.moe.values())
-            check(lib.rc_gpu_ex_nm_init(cfg.layers, cfg.latent, kmax, imax))
+            check(lib.rc_gpu_ex_nm_init(cfg.layers, cfg.latent, kmax, imax, int(g.nv4)))
             budget = gb * 1e9 if gb else free.value - 0.8e9
             # the candidates: each cold expert's count for its bytes
             per, cand = {}, []
@@ -354,20 +394,26 @@ class NmExpertDevice:
                 self.slots[li] = slots
                 check(lib.rc_gpu_ex_nm_store(li, len(mine), up.ctypes.data, dn.ctypes.data, pu, pd, inner,
                                              slots.ctypes.data, E))
+            # (Super's extras: each layer's stacks in host memory; a job holds the extras of 8 tokens)
+            self.more = EXPERT_MORE if g.nv4 else 0
+            if self.more:
+                for li in self.slots:
+                    upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
+                    check(lib.rc_gpu_ex_nm_hosts(li, upm.data.ctypes.data, dnm.data.ctypes.data, 8 * self.more))
         finally:
             os.sched_setaffinity(0, old)
         self.held = held
         self.ctx = ErCtx(ctypes.cast(lib.rc_gpu_ex_post, ctypes.c_void_p).value,
                          ctypes.cast(lib.rc_gpu_ex_wait, ctypes.c_void_p).value,
                          self.held.ctypes.data, Em, 1,
-                         ctypes.cast(lib.rc_gpu_ex_nm_post_t, ctypes.c_void_p).value)
+                         ctypes.cast(lib.rc_gpu_ex_nm_post_t, ctypes.c_void_p).value, 0, self.more)
         self.ctx_bytes = np.frombuffer(ctypes.string_at(ctypes.addressof(self.ctx), ctypes.sizeof(self.ctx)),
                                        dtype=np.uint8).copy()
         n_all = sum(E for E, _n, _k in cfg.moe.values())
         self.share = float(held.sum()) / n_all
         self.bytes = used
-        print("expert device %d (%s, sm_%d, NUMA node %d): %d experts (%.2f GB, %d%% of all) after the hot %d%%" % (
-            gpu["cuda"], gpu["name"], gpu["arch"], gpu["numa"], int(held.sum()), used / 1e9,
+        print("expert device %d (%s, sm_%d%s, NUMA node %d): %d experts (%.2f GB, %d%% of all) after the hot %d%%" % (
+            gpu["cuda"], gpu["name"], gpu["arch"], _as_cc(self.caps, gpu), gpu["numa"], int(held.sum()), used / 1e9,
             round(100 * self.share), round(100 * g.hot_share)), file=sys.stderr, flush=True)
 
     def srcs(self, li, e):

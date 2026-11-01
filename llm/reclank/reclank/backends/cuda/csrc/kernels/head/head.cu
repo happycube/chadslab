@@ -1,5 +1,8 @@
 /* ---------- the output head ---------- */
 
+/* dequantize_row_q6_K ported from ggml (ggml/src/ggml-quants.c; MIT License; Copyright (c)
+ * 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md. */
+
 /* x (cols), a Q6_K matrix, out (rows). One warp for each row. A Q6_K block
  * holds 256 weights in 210 bytes: ql[128], qh[64], scales[16] (int8), and a
  * float16 scale d. The function dequantize_row_q6_K of ggml gives weight y

@@ -36,6 +36,8 @@ transformers. NumPy is the only outside dependency of the runtime. The
 check scripts and the bench scripts use torch and transformers only to
 build a reference.
 
+Parts of the code come from other open-source projects. `THIRD_PARTY_NOTICES.md` gives their notices.
+
 A C kernel reads the packed weights in place. The file layout is the
 runtime layout. The model builds no float32 copy of a weight. One decode
 step runs as one program: a list of records that the CPU runner and the
@@ -71,11 +73,23 @@ pip install numpy
 export PYTHONPATH=.
 ```
 
-2. Get a GGUF model file. Good first models are Gemma 4 26B-A4B
+2. See which models this machine runs. The setup report lists each
+   model with its download, its memory, and the mode it can take here
+   (GPU, CPU, or not at all). `--model ID` prints the download command,
+   the server command, and a first request. It downloads only after you
+   say yes, and it never starts a server.
+
+```sh
+python -m reclank.setup                    # the report, then the guide of one model
+python -m reclank.setup --model gemma4-26b
+python -m reclank.setup --assume-ram 16 --assume-vram 0    # another machine
+```
+
+3. Get a GGUF model file. Good first models are Gemma 4 26B-A4B
    (the Unsloth UD-Q4_K_XL file) and LFM2.5-24B-A2B (the LiquidAI
    QAD Q4_0 file). Keep model files out of this folder.
 
-3. Start the server:
+4. Start the server:
 
 ```sh
 python -m server --model ~/models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf --port 8080
@@ -88,7 +102,7 @@ python -m server --model ~/models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf --port 
    The first start builds the kernels. The C build takes about a minute.
    The CUDA build takes some minutes.
 
-4. Send a chat request:
+5. Send a chat request:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -344,6 +358,7 @@ lists them. The important ones:
 | `RECLANK_GPU` | off | The switch of the GPU path. 1 turns CUDA on. |
 | `RECLANK_GPU_DEVICE` | 0 | The CUDA device, as nvidia-smi lists it. |
 | `RECLANK_EXPERT_GPUS` | off | A second GPU that holds more experts. See `docs/TWO_GPU.md`. |
+| `RECLANK_QWEN_CPU_DECODE` | auto | Qwen3.6: 1 decodes on the CPU (the prompts on the GPU), 0 on the GPU. Auto: the CPU on a card of fewer than 8 SMs. |
 | `RECLANK_GPU_ARCH` | from nvidia-smi | The CUDA architecture, for example sm_120a. |
 | `RECLANK_CPU` | auto | The C tier: scalar, avx2, avx2_vnni, avx512, avx512_vnni. |
 | `RECLANK_KERNEL` | auto | The NumPy path runner: c, numba, or numpy. |
@@ -355,6 +370,7 @@ lists them. The important ones:
 | `RECLANK_API_KEY` | change-me | The Bearer key of the server. |
 | `RECLANK_QUIET` | 0 | Do not print the load report. |
 | `RECLANK_LIBS_DIR` | ~/.cache/reclank/libs | The folder of the built C and CUDA libraries. |
+| `RECLANK_MODELS` | ~/models | The folder of the downloads of `python -m reclank.setup`. |
 
 ## Hardware
 
@@ -366,7 +382,10 @@ The build picks the CUDA toolkit that can build the arch of the card.
 CUDA 13 stops at sm_75, and Pascal (sm_61) needs CUDA 12.
 `RECLANK_GPU_CC=61` makes a newer GPU act as a Pascal card. Small cards
 run the large MoE models with a split: some experts stay on the GPU, the
-CPU computes the rest.
+CPU computes the rest. On a card of fewer than 8 SMs (a Quadro P1000)
+Qwen3.6 runs its prompts on the GPU and its decode on the CPU: the card's
+dense products are slower than the CPU's (the P1000 decoded 12.5 tok/s,
+the CPU 14.8; the prompts 2-4x the CPU's).
 
 Two GPUs can run one model in one process. The first card holds the dense
 weights, the cache, and the hot experts. The second card holds more
@@ -393,6 +412,37 @@ sudo python scripts/weightkeeper.py CKPT --lock  # also lock 1 GB pages
 python scripts/weightkeeper.py --status
 python scripts/weightkeeper.py --stop
 ```
+
+Several keepers can run at once, one model each: a named keeper serves on
+its own socket (`/tmp/reclank-weightkeeper-<uid>-NAME.sock`); without
+`--name` the default socket, as before. A server or check finds the keeper
+that holds its checkpoint among all of them; `RECLANK_WEIGHTKEEPER=NAME`
+makes it ask that one only (the generation server: `--keeper NAME`).
+Before it takes a page a keeper checks what it will hold against the
+memory available (each node and the host) and refuses with what is missing.
+As root a keeper gives back only the pool pages it added, and the last
+root keeper restores the settings.
+
+```sh
+python scripts/weightkeeper.py /space/models/Wan2.2-T2V-A14B-Diffusers --name wan-a14b
+python scripts/weightkeeper.py --list                 # names, models, memory held
+python scripts/weightkeeper.py --stop --name wan-a14b # that one; --stop alone: the default
+```
+
+Wan 2.2 T2V-A14B's keeper holds both experts' F20 rows (71.4 GB, converted
+once from the float32 shards, read with O_DIRECT); the generation server's
+`--wan` attaches to it and streams the blocks to the GPU from its memory.
+
+For a GGUF file the weightkeeper holds the experts only. The dense and
+small tensors stay in the file, and a run reads them there. `--dense`
+holds them too. For a Gemma 4 file the experts are KQ_Q4X (groups of 16
+rows, the same bytes), packed once after the read. That is the only copy
+of the experts: the runtime no longer keeps a KQ_Q4X copy beside the Q4_0
+one (the 26B: 12.8 GB held). The dense Q4_0 matrices get their KQ_Q4X
+copies in the run, at the first read on the CPU (0.93 GB). A GPU uploads
+their Q4_0 bytes and makes none. An expert device (`RECLANK_EXPERT_GPUS`)
+holds its experts in KQ_Q4X too. `--q4x off` keeps the file's Q4_0, for a
+primary GPU without dp4a or tensor cores (Maxwell).
 
 ## Tests
 
@@ -421,6 +471,7 @@ reference, and about 30 `bench_*.py` scripts.
 | `docs/LEARNING.md` | A guided walk of the dense 12B path. |
 | `docs/PROGRAMS.md` | The program and opcode system. |
 | `docs/GPU_NOTES.md` | How the GPU path became fast, in gain order. |
+| `docs/PROGRAM_MEMORY.md` | Keeping the programs' GPU memory small: measured, and how (Super on 12 GB). |
 | `docs/HANDOFF_QWEN38.md` | The state of the Qwen3.8-Flash-Next work. |
 | `docs/DEEPSEEK_V41_PLAN.md` | DeepSeek V4.1 Flash from its 510 GB checkpoint. |
 | `docs/DEEPSEEK_V4_PLAN.md` | DeepSeek V4 Flash Vision, the next step. |

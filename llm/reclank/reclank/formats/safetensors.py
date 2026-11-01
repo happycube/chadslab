@@ -27,6 +27,28 @@ _NP = {
 }
 
 
+def drop_pages(arr):
+    """Drop from the process's memory the pages of a NumPy view of a SafeTensors map (the map is
+    read-only and shared: a page used again is read again from the file). The pages at its ends
+    may hold the neighbours' data: they are read again too when used. Return the bytes of the view
+    (0: not a view of a map)."""
+    x = arr
+    while isinstance(x, np.ndarray) and x.base is not None:
+        x = x.base
+    if isinstance(x, memoryview):
+        x = x.obj
+    if not isinstance(x, mmap.mmap) or arr.size == 0:
+        return 0
+    bounds = getattr(np.lib, "array_utils", np).byte_bounds(arr)
+    base = np.frombuffer(x, np.uint8).ctypes.data
+    lo = (bounds[0] - base) // mmap.PAGESIZE * mmap.PAGESIZE
+    try:
+        x.madvise(mmap.MADV_DONTNEED, lo, bounds[1] - base - lo)
+    except (AttributeError, OSError, ValueError):
+        return 0
+    return arr.nbytes
+
+
 class SafeTensors:
     """Read a .safetensors file from a read-only memory map.
 
@@ -162,3 +184,33 @@ class SafeTensors:
     def get_row(self, name, row, dtype=np.float32):
         """Return one row of a 2-D tensor as a NumPy array."""
         return self.get_rows(name, row, row + 1, dtype=dtype)[0]
+
+
+class Shards:
+    """The SafeTensors files of a directory as one: the weight map of its
+    model.safetensors.index.json (or the one model.safetensors), each name
+    read from its file (get, get_bf16, get_rows, get_row, shape, dtype)."""
+
+    def __init__(self, path, index="model.safetensors.index.json"):
+        import os
+        ip = os.path.join(path, index)
+        if os.path.exists(ip):
+            where = json.load(open(ip))["weight_map"]
+        else:
+            one = [f for f in sorted(os.listdir(path)) if f.endswith(".safetensors")]
+            assert len(one) == 1, "no index and %d safetensors files in %s" % (len(one), path)
+            where = {n: one[0] for n in SafeTensors(os.path.join(path, one[0])).names()}
+        self.files = {f: SafeTensors(os.path.join(path, f)) for f in sorted(set(where.values()))}
+        self.where = {n: self.files[f] for n, f in where.items()}
+
+    def names(self):
+        return list(self.where)
+
+    def close(self):
+        for f in self.files.values():
+            f.close()
+
+    def __getattr__(self, attr):
+        if attr in ("get", "get_bf16", "get_rows", "get_row", "shape", "dtype"):
+            return lambda name, *a, **kw: getattr(self.where[name], attr)(name, *a, **kw)
+        raise AttributeError(attr)

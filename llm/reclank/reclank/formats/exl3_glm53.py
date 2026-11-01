@@ -1,6 +1,9 @@
 """GLM-5.3-Flash from an EXL3 directory of ExLlamaV3 (turboderp/GLM-5.3-Flash-exl3, e.g. 4.05bpw;
 docs/GLM53_PLAN.md).
 
+Ported from ExLlamaV3 (turboderp-org/exllamav3, exllamav3/modules/quant/exl3_lib; MIT License;
+Copyright (c) 2025 Turboderp). See THIRD_PARTY_NOTICES.md.
+
 GLM53Source is the GGUF view of the directory (the interface of EXL3Source: tensors, raw,
 dequant; GGUF names, ggml order of dims) on its tensors (reclank/formats/exl3.py, EXL3Dir). Nothing
 is converted beyond the forms of the products:

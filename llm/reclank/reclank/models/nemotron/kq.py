@@ -374,10 +374,13 @@ class NemotronKQ:
         return out * np.float32(m.scale) if m.scale is not None else out
 
 
-def compile_nemotron_step(model, t, em=None, upto=None):
+def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
     """A step of t tokens of a NemotronKQ as a program of records. em (the GPU: gpu.NmEmit) gives
     the records of the attention and of the routed experts in its own way (em.attention, em.moe);
-    else those of the CPU. upto (a check): only the blocks before it."""
+    else those of the CPU. upto (a check): only the blocks before it. sub (the GPU, a prompt group of
+    more rows that it divides): the rows in sub-batches of sub (_compile_nemotron_sub)."""
+    if sub and em is not None and upto is None and t > sub and t % sub == 0 and not getattr(model, "capture", None):
+        return _compile_nemotron_sub(model, t, em, int(sub))
     from reclank.ir import program as P
     cfg = model.cfg
     prog = P.Program()
@@ -520,6 +523,114 @@ def compile_nemotron_step(model, t, em=None, upto=None):
         pend = (o, mo if kind not in ("mamba", "attention") else None)
     norm(model.F(BB + "norm_f.weight"), xn)
     prog.keep += [a for a in (dense, sel, mscr) if a is not None]
+    prog.tokens = t
+    return prog.finish()
+
+
+def _compile_nemotron_sub(model, t, em, sb):
+    """compile_nemotron_step's program of t rows on the GPU (em) with the work of each row in sub-batches of sb rows:
+    the residual stream (H), the rows after norm_f (xn), and the routed experts' inputs and outputs (lat, idx, val,
+    lato) of all t rows; the rest (the products' inputs and outputs, the Mamba rows, the attention's, the shared
+    expert's) of sb, reused by each sub-batch. Each block runs a sub-batch after another: the Mamba states carry on
+    in the cache (NM_MAMBA's slots), the attention's keys and values go in at pos.s (the slots pos.s and nreal.s:
+    NemotronGPU._prepare binds them); the routed experts run once for all t rows (em.moe: the group's experts read
+    once), between the router and shared expert of each sub-batch and its fc2. A block's outputs go into H at once
+    (no ADDNORM: H + o + mo in that order, not H + (o + mo)). The 3060's group of 4096 rows in sub-batches of 1024:
+    its program 2.4 -> ~0.8 GB (prog.sub = (count, sb))."""
+    from reclank.ir import program as P
+    cfg = model.cfg
+    prog = P.Program()
+    hid, eps = cfg.hidden, float(cfg.eps)
+    inner, conv, nh = cfg.m_inner, cfg.conv_dim, cfg.m_heads
+    nq, nk, hd, L = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.latent
+    Emax = max(e for e, _, _ in cfg.moe.values())
+    k = max(kk for _, _, kk in cfg.moe.values())
+    f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
+    nsb = t // sb
+    H, xn = f32(t, hid), f32(t, hid)
+    lat, lato, val, idx = f32(t, L), f32(t, L), f32(t, k), np.zeros((t, k), np.int32)
+    hn = f32(sb, hid)
+    wide = max(inner, cfg.shared_inner, hid)
+    xq, xs, xm = np.zeros((sb, wide), np.int8), f32(sb, wide // 32), f32(sb, wide // 16)
+    zxd, y, o, cscr = f32(sb, inner + conv + nh), f32(sb, inner), f32(sb, hid), f32(sb, conv)
+    q, kb, vb, att = f32(sb, nq * hd), f32(sb, nk * hd), f32(sb, nk * hd), f32(sb, nq * hd)
+    logits, sh, mo = f32(sb, Emax), f32(sb, cfg.shared_inner), f32(sb, hid)
+    prog.names.update(H=H, xn=xn, hn=hn, zxd=zxd, y=y, logits=logits, lat=lat, sh=sh)
+    prog.sub = (nsb, sb)
+
+    def rows(a, s):
+        return a[s * sb:(s + 1) * sb]
+
+    def quant(src, cols):
+        em.quant(prog, src, cols)
+        prog.emit(P.KQ_QUANT, src, sb, cols, xq, xs, xm)
+
+    def lin(m, src, out):
+        if em.linear(prog, m, src, out, sb):
+            return
+        if m.type == KQ_MXF8 and m.svec is not None:
+            prog.emit(P.KQ_LINEAR, xq, xs, xm, src, m.data, m.type, m.rows, m.cols, sb, out, float(m.svec[0]))
+            return
+        prog.emit(P.KQ_LINEAR, xq, xs, xm, src, m.data, m.type, m.rows, m.cols, sb, out)
+        if m.svec is not None:
+            prog.emit(P.MUL, out, m.svec, out, sb, m.rows, 0)
+            prog.keep.append(m.svec)
+
+    def add(hs, part):
+        prog.emit(P.ADD, hs, part, hs, sb * hid)
+
+    for i, kind in enumerate(cfg.kinds):
+        b = BB + "layers.%d." % i
+        p = b + "mixer."
+        nw = model.F(b + "norm.weight")
+        if kind in ("mamba", "attention"):
+            for s in range(nsb):
+                hs = rows(H, s)
+                prog.emit(P.RMS_NORM, hs, nw, hn, sb, hid, eps)
+                quant(hn, hid)
+                if kind == "mamba":
+                    lin(model.M(p + "in_proj"), hn, zxd)
+                    prog.emit(P.NM_MAMBA, zxd, prog.slot("conv.%d" % i), model.F(p + "conv1d.weight", (conv, cfg.conv)),
+                              model.F(p + "conv1d.bias"), model.F(p + "A_log"), model.F(p + "D"),
+                              model.F(p + "dt_bias"), model.F(p + "norm.weight"), prog.slot("S.%d" % i), y, cscr,
+                              sb, nh, cfg.m_dim, cfg.m_groups, cfg.m_state, cfg.conv, eps, float(cfg.dt_min),
+                              prog.slot("nreal.%d" % s))
+                    quant(y, inner)
+                    lin(model.M(p + "out_proj"), y, o)
+                else:
+                    lin(model.M(p + "q_proj"), hn, q)
+                    lin(model.M(p + "k_proj"), hn, kb)
+                    lin(model.M(p + "v_proj"), hn, vb)
+                    em.attention(prog, i, q, kb, vb, att, sb, pos=prog.slot("pos.%d" % s))
+                    quant(att, nq * hd)
+                    lin(model.M(p + "o_proj"), att, o)
+                add(hs, o)
+            continue
+        E, I, kk = cfg.moe[i]
+        gate = model.M(p + "gate")
+        for s in range(nsb):
+            hs = rows(H, s)
+            prog.emit(P.RMS_NORM, hs, nw, hn, sb, hid, eps)
+            quant(hn, hid)
+            lin(gate, hn, logits)
+            lin(model.M(p + "fc1_latent_proj"), hn, rows(lat, s))
+            prog.emit(P.ROUTER_SIG, logits, sb, E, kk, rows(val, s), rows(idx, s),
+                      model.F(p + "gate.e_score_correction_bias"), float(cfg.route_scale), 1e-20)
+            # (the shared expert on the same normed rows, xq still theirs; its rows into H now)
+            lin(model.M(p + "shared_experts.up_proj"), hn, sh)
+            prog.emit(P.RELU2, sh, sh, sb * cfg.shared_inner)
+            quant(sh, cfg.shared_inner)
+            lin(model.M(p + "shared_experts.down_proj"), sh, o)
+            add(hs, o)
+        if hasattr(em, "count"):
+            em.count(prog, i, idx, kk)
+        em.moe(prog, i, lat, idx, val, lato, t)
+        for s in range(nsb):
+            ls = rows(lato, s)
+            quant(ls, L)
+            lin(model.M(p + "fc2_latent_proj"), ls, mo)
+            add(rows(H, s), mo)
+    prog.emit(P.RMS_NORM, H, model.F(BB + "norm_f.weight"), xn, t, hid, eps)
     prog.tokens = t
     return prog.finish()
 

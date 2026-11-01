@@ -6,6 +6,10 @@
  * the compressed rows to FP4 with E4M3 scales for each 16, the index keys and
  * queries to FP4 with E8M0 scales for each 32).
  *
+ * The quantizers ported from DeepSeek V4.1 Flash's reference code
+ * (deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/kernel.py; MIT License;
+ * Copyright (c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+ *
  * The records read the position from the environment at run time (a slot),
  * so one graph serves every step; the records of the compressor do nothing
  * on a step that does not end a group of ratio tokens. The grids of the

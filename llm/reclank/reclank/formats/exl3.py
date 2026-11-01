@@ -1,6 +1,10 @@
 """The EXL3 files of ExLlamaV3 (EXL3_PLAN.md): a directory of safetensors
 files with quantization_config.json (quant_method "exl3").
 
+Ported from ExLlamaV3 (turboderp-org/exllamav3,
+exllamav3/modules/quant/exl3_lib and exllamav3/exllamav3_ext/quant; MIT
+License; Copyright (c) 2025 Turboderp). See THIRD_PARTY_NOTICES.md.
+
 An EXL3 matrix of k inputs and n outputs has the tensors <key>.trellis
 (int16, (k / 16, n / 16, 16 K): the codes of the tiles), <key>.suh (float16,
 k), <key>.svh (float16, n), and a marker of its codebook (<key>.mcg or

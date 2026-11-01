@@ -267,7 +267,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(status, {"error": {"message": message, "type": kind, "code": code}})
 
     def _body(self):
-        """The JSON of the body. A Content-Length that is not a number, is
+        """The JSON of the body (_raw_body)."""
+        raw = self._raw_body()
+        return json.loads(raw) if raw.strip() else {}
+
+    def _raw_body(self):
+        """The bytes of the body. A Content-Length that is not a number, is
         negative, or is above the limit (MAX_BODY) gives _BodyError; the
         server does not read such a body and closes the connection."""
         text = self.headers.get("Content-Length")
@@ -282,8 +287,7 @@ class _Handler(BaseHTTPRequestHandler):
         if n > limit:
             self.close_connection = True
             raise _BodyError(413, "the body has %d bytes; the limit is %d" % (n, limit))
-        raw = self.rfile.read(n) if n else b""
-        return json.loads(raw) if raw.strip() else {}
+        return self.rfile.read(n) if n else b""
 
     def _sse_start(self):
         self._sent_at = time.monotonic()        # the keepalive counts from here

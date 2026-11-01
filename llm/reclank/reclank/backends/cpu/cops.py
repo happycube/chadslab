@@ -184,6 +184,12 @@ try:
         _lib.rc_kq_bf12_to_bf16.restype = None
         _lib.rc_kq_pack_bf12x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
         _lib.rc_kq_pack_bf12x16.restype = None
+        _lib.rc_kq_f32_to_f20.argtypes = [_void_p, ctypes.c_int64, _int, _void_p, _void_p]
+        _lib.rc_kq_f32_to_f20.restype = None
+        _lib.rc_kq_pack_f20x16.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.rc_kq_pack_f20x16.restype = None
+        _lib.rc_kq_f20_to_f32.argtypes = [_void_p, _int, ctypes.c_int64, _int, _void_p]
+        _lib.rc_kq_f20_to_f32.restype = None
         _lib.rc_kq_nv4_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
         _lib.rc_kq_nv4_pack.restype = None
         _lib.rc_kq_nvx_pack.argtypes = [_void_p, _void_p, _void_p, _int, _int, _int, _void_p]
@@ -218,6 +224,8 @@ try:
         _lib.rc_kq_pack_x16f.restype = None
         _lib.rc_kq_q4x_pack.argtypes = [_void_p, _void_p, ctypes.c_int64, _int, _void_p]
         _lib.rc_kq_q4x_pack.restype = _int
+        _lib.rc_kq_q4x_unpack.argtypes = [_void_p, ctypes.c_int64, _int, _void_p]
+        _lib.rc_kq_q4x_unpack.restype = None
         _lib.rc_kq_moe_act.argtypes = [_void_p] * 5 + [_int] * 3 + [_void_p, _void_p, _int, _int,
                                                                 _void_p, _void_p, _int, _void_p]
         _lib.rc_kq_moe_act.restype = None
@@ -348,6 +356,12 @@ try:
         _lib.rc_kq_moe_part_scratch.restype = ctypes.c_size_t
         _lib.rc_part_prof.argtypes = [_void_p, _int]
         _lib.rc_ds_spec_stats.argtypes = [_void_p, _int]
+        _lib.rc_rows_pread.argtypes = [_void_p, _void_p, _void_p, _void_p, ctypes.c_int64, _int, _void_p, _int]
+        _lib.rc_rows_pread.restype = _int
+        _lib.rc_rows_pool_new.argtypes = [_int, _int, _int, _void_p, _int, _void_p]
+        _lib.rc_rows_pool_new.restype = _void_p
+        _lib.rc_rows_pool_read.argtypes = [_void_p, _void_p, _void_p, _void_p, _void_p, ctypes.c_int64, _int]
+        _lib.rc_rows_pool_read.restype = _int
         _lib.rc_run_parts.restype = _int
         _lib.rc_run_parts_prof.argtypes = [_void_p, _int, _int, _void_p, _void_p, _int]
         _lib.rc_run_parts_prof.restype = _int
@@ -860,6 +874,9 @@ def kq_bf16_to_bf12(src, cols):
                              float(rep[9 + 4 * i])) for i in range(k)])
 
 
+KQ_BF12, KQ_BF12X16 = 57, 63
+
+
 def kq_pack_bf12x16(src, rows, cols):
     """BF12 rows as KQ_BF12X16 (groups of 16 rows, the last one padded; csrc/
     kquants.c kq_x16f_col): 784 bytes a block of 32 columns of a group."""
@@ -874,6 +891,49 @@ def kq_bf12_to_bf16(src, rows, cols):
     src = np.ascontiguousarray(src).view(np.uint8)
     out = np.empty((rows, cols), dtype=np.uint16)
     _lib.rc_kq_bf12_to_bf16(src.ctypes.data, rows, cols, out.ctypes.data)
+    return out
+
+
+KQ_F20, KQ_F20X16 = 68, 69
+
+
+def f20_row_bytes(cols):
+    """The bytes of an F20 row of cols values (formats.gguf F20)."""
+    return (2 * cols + cols // 2 + cols // 32 + 15) // 16 * 16
+
+
+def kq_f32_to_f20(src, cols):
+    """float32 rows (cols a multiple of 32) to F20 rows (uint8, rows x
+    f20_row_bytes(cols)), and the report: a dict of zeroed (the nonzero values
+    that decode to 0: more than 15 binades under the largest of their group of
+    32, after the rounding to 16 significant bits), collisions (-2^(E-15),
+    which decode to 0), nonfinite (Inf, NaN, or a rounding to Inf), largest
+    (the largest zeroed value in absolute value), rms (of the finite values)."""
+    assert cols % 32 == 0, cols
+    src = np.ascontiguousarray(src, dtype=np.float32)
+    rows = src.size // cols
+    out = np.empty((rows, f20_row_bytes(cols)), dtype=np.uint8)
+    rep = np.zeros(6, np.float64)
+    _lib.rc_kq_f32_to_f20(src.ctypes.data, rows, cols, out.ctypes.data, rep.ctypes.data)
+    n = rows * cols - int(rep[2])
+    return out, dict(zeroed=int(rep[0]), collisions=int(rep[1]), nonfinite=int(rep[2]),
+                     largest=float(rep[3]), rms=float(np.sqrt(rep[4] / max(n, 1))))
+
+
+def kq_pack_f20x16(src, rows, cols):
+    """F20 rows as KQ_F20X16 (groups of 16 rows, the last one padded;
+    kernels/kq/x16f.c kq_x16f_col): 1296 bytes a block of 32 columns of a group."""
+    src = np.ascontiguousarray(src).view(np.uint8)
+    out = np.empty(((rows + 15) // 16) * (cols // 32) * 1296, dtype=np.uint8)
+    _lib.rc_kq_pack_f20x16(src.ctypes.data, rows, cols, out.ctypes.data)
+    return out
+
+
+def kq_f20_to_f32(src, rows, cols, x16=False):
+    """The float32 values (rows x cols) of F20 rows, or of KQ_F20X16 (x16)."""
+    src = np.ascontiguousarray(src).view(np.uint8)
+    out = np.empty((rows, cols), dtype=np.float32)
+    _lib.rc_kq_f20_to_f32(src.ctypes.data, KQ_F20X16 if x16 else KQ_F20, rows, cols, out.ctypes.data)
     return out
 
 
@@ -892,6 +952,16 @@ KQ_BF16X16, KQ_F32X16 = 61, 62
 KQ_Q4X = 54
 
 
+def _empty_paged(n):
+    """n uint8 from the start of a page. np.empty of a large array is 16 bytes
+    past one: the 64-byte loads of a KQ_Q4X copy then each straddle two cache
+    lines (the 26B's decode on AVX-512 from the loader's dense copies 11.34
+    tok/s, from the weightkeeper's page-aligned ones 11.60)."""
+    raw = np.empty(n + 4096, dtype=np.uint8)
+    off = (-raw.ctypes.data) % 4096
+    return raw[off:off + n]
+
+
 def kq_q4x_pack(packed, scales):
     """The int4 matrix of the Gemma 4 26B (Q4_0 blocks of 18 bytes, rows x
     blocks x 18; float32 scales, rows x blocks) to KQ_Q4X: groups of 16 rows
@@ -902,9 +972,20 @@ def kq_q4x_pack(packed, scales):
     nb = packed.shape[-2]
     rows = packed.size // (nb * 18)
     assert rows % 16 == 0
-    out = np.empty(rows * nb * 18, dtype=np.uint8)
+    out = _empty_paged(rows * nb * 18)
     if _lib.rc_kq_q4x_pack(packed.ctypes.data, scales.ctypes.data, rows, nb * 32, out.ctypes.data):
         raise ValueError("a scale is not exact in float16")
+    return out
+
+
+def kq_q4x_unpack(a):
+    """The Q4_0 blocks of the KQ_Q4X bytes a (rows x blocks x 18, rows a multiple of 16), in that shape
+    (kq_q4x_pack backwards)."""
+    a = np.ascontiguousarray(a).view(np.uint8)
+    nb = a.shape[-2]
+    rows = a.size // (nb * 18)
+    out = np.empty(a.shape, np.uint8)
+    _lib.rc_kq_q4x_unpack(a.ctypes.data, rows, nb * 32, out.ctypes.data)
     return out
 
 
@@ -1854,6 +1935,46 @@ def place_cpus():
     out = np.zeros(4096, np.int32)
     n = _lib.rc_place_cpus(out.ctypes.data, out.size)
     return set(out[:n].tolist())
+
+
+def rows_pread(fd, off, length, dst, threads, cpus=None):
+    """n reads by pread, threads of them in flight (csrc/common/rowread.c): length[k] bytes of file
+    descriptor fd[k] at off[k] into the address dst[k] (int arrays of n); the workers on cpus (the
+    process's, default; the calling thread reads its share where it is). The GIL is free meanwhile."""
+    import errno as _errno
+    fd = np.ascontiguousarray(fd, np.int32)
+    off, length, dst = (np.ascontiguousarray(a, np.int64) for a in (off, length, dst))
+    c = np.array(sorted(cpus if cpus is not None else os.sched_getaffinity(0)), np.int32)
+    rc = _lib.rc_rows_pread(fd.ctypes.data, off.ctypes.data, length.ctypes.data, dst.ctypes.data, len(fd),
+                            int(threads), c.ctypes.data, len(c))
+    if rc:
+        raise OSError(rc, "rows_pread: %s" % _errno.errorcode.get(rc, rc))
+
+
+class RowsPool:
+    """A pool of workers made once that read lists of rows (csrc/common/rowread.c rc_rows_pool_new): workers on
+    cpus, each with an io_uring of qd entries when uring (else, or when io_uring cannot be set up, pread one read
+    after another); uring: whether every worker has its ring."""
+
+    def __init__(self, workers, uring=True, qd=64, cpus=None):
+        c = np.array(sorted(cpus if cpus is not None else os.sched_getaffinity(0)), np.int32)
+        mode = np.zeros(1, np.int32)
+        self._h = _lib.rc_rows_pool_new(int(workers), int(bool(uring)), int(qd), c.ctypes.data, len(c),
+                                        mode.ctypes.data)
+        if not self._h:
+            raise OSError("RowsPool: no worker started")
+        self.workers, self.qd, self.uring, self.cpus = int(workers), int(qd), bool(mode[0]), [int(v) for v in c]
+
+    def read(self, fd, off, length, dst, workers=None):
+        """The reads of rows_pread (fd[k], off[k], length[k] into the address dst[k]) by the first workers of the
+        pool (default all); the GIL is free meanwhile."""
+        import errno as _errno
+        fd = np.ascontiguousarray(fd, np.int32)
+        off, length, dst = (np.ascontiguousarray(a, np.int64) for a in (off, length, dst))
+        rc = _lib.rc_rows_pool_read(self._h, fd.ctypes.data, off.ctypes.data, length.ctypes.data, dst.ctypes.data,
+                                    len(fd), int(workers or self.workers))
+        if rc:
+            raise OSError(rc, "RowsPool.read: %s" % _errno.errorcode.get(rc, rc))
 
 
 def ds_spec_stats(reset=True):

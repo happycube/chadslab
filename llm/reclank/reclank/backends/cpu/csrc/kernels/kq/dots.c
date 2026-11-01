@@ -1,3 +1,7 @@
+/* The block formats ported from ggml (ggml/src/ggml-common.h,
+ * ggml/src/ggml-quants.c; MIT License; Copyright (c) 2023-2026 The ggml
+ * authors). See THIRD_PARTY_NOTICES.md. */
+
 /* The 6-bit scale and min of part j of a Q4_K or Q5_K block (ggml,
  * get_scale_min_k4). */
 static inline void kq_scale_min(const uint8_t *q, int j, int *sc, int *m)

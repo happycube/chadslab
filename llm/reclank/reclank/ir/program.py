@@ -110,8 +110,8 @@ class Program:
         # the buffers the compiler made for results (Compiler.buffer): the
         # temporaries that ir/alloc.pack may give the bytes of one arena
         self.temps = []
-        # the team of gemma_run_task for this program (word 3 of the header),
-        # or 0 for its default
+        # the team of this program (word 3 of the header) for rc_run and
+        # gemma_run_task, or 0 for their default
         self.threads = 0
         self.bound = {}            # the arrays that a bind points to
         self.buf = None            # the int64 array that C runs; see finish
@@ -503,7 +503,11 @@ def _py_step(op, a, e):
     elif op == ENC_LINEAR:
         n, m, k = V(5), V(6), V(7)
         x = np.clip(_arr(V(0), n * k).reshape(n, k), _f(a, e, 8), _f(a, e, 9))
-        if V(2):
+        if V(2) == 3:
+            x16 = bool(V(13))
+            nb = (m + 15) // 16 * (k // 32) * 1296 if x16 else m * cops.f20_row_bytes(k)
+            w = cops.kq_f20_to_f32(_arr(V(1), nb, ctypes.c_uint8), m, k, x16=x16)
+        elif V(2):
             w = ops.bf16_to_f32(_arr(V(1), m * k, ctypes.c_uint16).reshape(m, k).copy())
         else:
             w = _arr(V(1), m * k).reshape(m, k)
@@ -538,7 +542,13 @@ def _py_step(op, a, e):
             _arr(V(1), n)[:] = ops.gelu_tanh(x)
     elif op == ENC_GELU_MUL:
         n = V(3)
-        _arr(V(2), n)[:] = ops.gelu_tanh(_arr(V(0), n).copy()) * _arr(V(1), n)
+        g = _arr(V(0), n).copy()
+        if V(4):
+            from math import erf
+            g = 0.5 * g * (1.0 + np.vectorize(erf)(g / np.sqrt(2.0)))
+        else:
+            g = ops.gelu_tanh(g)
+        _arr(V(2), n)[:] = g * _arr(V(1), n)
     elif op == ENC_ADD:
         n = V(2)
         _arr(V(0), n)[:] += np.float32(_f(a, e, 3)) * _arr(V(1), n)
@@ -603,6 +613,176 @@ def _py_step(op, a, e):
             a0, b0 = p[..., :q4].copy(), p[..., q4:].copy()
             p[..., :q4] = a0 * c - b0 * s
             p[..., q4:] = b0 * c + a0 * s
+    elif op == ENC_ATTN_BIAS:
+        n, heads, hd, g = V(6), V(7), V(8), V(9)
+        nw = n // g
+        q, k, v, o = (_arr(V(i), n * heads * hd).reshape(nw, g, heads, hd) for i in (0, 1, 2, 3))
+        wt = _arr(V(5), nw, ctypes.c_int32).astype(np.int64)
+        types = int(wt.max()) + 1
+        bias = _arr(V(4), types * heads * g * g).reshape(types, heads, g, g)
+        s_ = np.einsum("wihd,wjhd->whij", q, k) * np.float32(_f(a, e, 10)) + bias[wt]
+        s_ -= s_.max(-1, keepdims=True)
+        p_ = np.exp(s_)
+        p_ /= p_.sum(-1, keepdims=True)
+        o[:] = np.einsum("whij,wjhd->wihd", p_, v)
+    elif op == ENC_GATHER:
+        n, blocks, cols = V(3), V(4), V(5)
+        idx = _arr(V(1), n * blocks, ctypes.c_int32).astype(np.int64)
+        src = _arr(V(0), (int(idx.max()) + 1 if idx.size and idx.max() >= 0 else 1) * cols).reshape(-1, cols)
+        y = np.where((idx >= 0)[:, None], src[np.maximum(idx, 0)], 0).astype(np.float32)
+        _arr(V(2), n * blocks * cols)[:] = y.reshape(-1)
+    elif op == ENC_SCATTER:
+        n, cols = V(3), V(4)
+        idx = _arr(V(1), n, ctypes.c_int32).astype(np.int64)
+        x = _arr(V(0), n * cols).reshape(n, cols)
+        y = _arr(V(2), (int(idx.max()) + 1 if n and idx.max() >= 0 else 1) * cols).reshape(-1, cols)
+        y[idx[idx >= 0]] = x[idx >= 0]
+    elif op == ENC_ATTN_KV:
+        n, heads, hd = V(6), V(7), V(8)
+        kvh = V(10) or heads
+        lo, hi = _arr(V(4), n, ctypes.c_int32), _arr(V(5), n, ctypes.c_int32)
+        q = _arr(V(0), n * heads * hd).reshape(n, heads, hd)
+        o = _arr(V(3), n * heads * hd).reshape(n, heads, hd)
+        m = int(hi.max()) if n else 0
+        k, v = (np.repeat(_arr(V(i), m * kvh * hd).reshape(m, kvh, hd), heads // kvh, axis=1) for i in (1, 2))
+        for i in range(n):
+            s_ = np.einsum("hd,khd->hk", q[i], k[lo[i]:hi[i]])
+            s_ = np.exp(s_ - s_.max(-1, keepdims=True))
+            s_ /= s_.sum(-1, keepdims=True)
+            o[i] = np.einsum("hk,khd->hd", s_, v[lo[i]:hi[i]])
+    elif op == ENC_GNORM:
+        rows, cols, groups, silu = V(4), V(5), V(6), V(8)
+        x = _arr(V(0), rows * cols).reshape(rows, groups, cols // groups).astype(np.float64)
+        m = x.mean(axis=(0, 2), keepdims=True)
+        d = x - m
+        y = d / np.sqrt((d * d).mean(axis=(0, 2), keepdims=True) + _f(a, e, 7))
+        y = y.reshape(rows, cols).astype(np.float32)
+        if V(1):
+            y = y * _arr(V(1), cols)
+        if V(2):
+            y = y + _arr(V(2), cols)
+        if silu:
+            y = y / (1 + np.exp(-y))
+        _arr(V(3), rows * cols)[:] = y.reshape(-1)
+    elif op == ENC_ROPE_TAB:
+        n, heads, hd = V(3), V(4), V(5)
+        x = _arr(V(0), n * heads * hd).reshape(n, heads, 2, hd // 2) if V(6) else \
+            _arr(V(0), n * heads * hd).reshape(n, heads, hd // 2, 2).transpose(0, 1, 3, 2)
+        c, s = (_arr(V(i), n * hd // 2).reshape(n, 1, hd // 2) for i in (1, 2))
+        a0, b0 = x[..., 0, :].copy(), x[..., 1, :].copy()
+        x[..., 0, :] = a0 * c - b0 * s
+        x[..., 1, :] = b0 * c + a0 * s
+    elif op == ENC_SNAKE:
+        rows, cols = V(4), V(5)
+        x = _arr(V(0), rows * cols).reshape(rows, cols)
+        al, be = _arr(V(1), cols), _arr(V(2), cols)
+        _arr(V(3), rows * cols).reshape(rows, cols)[:] = x + (1 / (be + np.float32(1e-9))) * np.sin(al * x) ** 2
+    elif op == ENC_ELU:
+        n = V(2)
+        x = _arr(V(0), n)
+        _arr(V(1), n)[:] = np.where(x > 0, x, np.expm1(x))
+    elif op == ENC_RESIZE:
+        from reclank.models.depth import ref
+        n, h, w, H, W, C, mode = (V(i) for i in range(2, 9))
+        xs, xo, ys, yo = ((V(i) for i in range(9, 13)) if len(a) > 9 and a[9][0] != T_NONE else (C, 0, C, 0))
+        x = _arr(V(0), n * h * w * xs).reshape(n, h, w, xs)[..., xo:xo + C]
+        _arr(V(1), n * H * W * ys).reshape(n, H, W, ys)[..., yo:yo + C] = ref.resize(x, H, W, mode)
+    elif op == ENC_WARP:
+        from reclank.models.vfi import ref as vref
+        h, w, C, xs, xo, fs, fo, ys, yo = (V(i) for i in range(5, 14))
+        x = _arr(V(0), h * w * xs).reshape(h, w, xs)[..., xo:xo + C]
+        fl = _arr(V(1), h * w * fs).reshape(h, w, fs)[..., fo:fo + 2]
+        y = _arr(V(2), h * w * ys).reshape(h, w, ys)
+        y[..., yo:yo + C] = vref.warp(x, fl, _arr(V(3), w), _arr(V(4), h), _f(a, e, 14), _f(a, e, 15))
+    elif op == ENC_PRELU:
+        rows, cols = V(2), V(3)
+        x = _arr(V(0), rows * cols).reshape(rows, cols)
+        _arr(V(1), rows * cols).reshape(rows, cols)[:] = np.where(x > 0, x, x * _arr(V(4), cols))
+    elif op == ENC_MIX:
+        from reclank.models.vfi import ref as vref
+        n, xs, ao, bo, mo, C, ys, yo = (V(i) for i in range(2, 10))
+        x = _arr(V(0), n * xs).reshape(n, xs)
+        _arr(V(1), n * ys).reshape(n, ys)[:, yo:yo + C] = vref.mix(x[:, ao:ao + C], x[:, bo:bo + C], x[:, mo])
+    elif op == ENC_RESIZE_TAPS:
+        from reclank.models.depth import ref
+        n, h, w, H, W, C, ky, kx = (V(i) for i in (2, 3, 4, 5, 6, 7, 8, 11))
+        x = _arr(V(0), n * h * w * C).reshape(n, h, w, C)
+        iy, wy = _arr(V(9), H * ky, ctypes.c_int32).reshape(H, ky), _arr(V(10), H * ky).reshape(H, ky)
+        ix, wx = _arr(V(12), W * kx, ctypes.c_int32).reshape(W, kx), _arr(V(13), W * kx).reshape(W, kx)
+        _arr(V(1), n * H * W * C).reshape(n, H, W, C)[:] = ref.resize_taps(x, iy, wy, ix, wx)
+    elif op == ENC_DIBR:
+        from reclank.models.depth import ref
+        H, W, off, stride, sign, mode, iters = V(6), V(7), V(8), V(9), V(10), V(12), V(13)
+        img = _arr(V(0), H * W * 3).reshape(H, W, 3)
+        sv = _arr(V(1), H * W).reshape(H, W)
+        eye, _hole, _keys = ref.dibr(img, sv, sign, _f(a, e, 11), mode, iters, _f(a, e, 14))
+        o = _arr(V(5), off + (H - 1) * stride + 3 * W)
+        for y in range(H):
+            o[off + y * stride:off + y * stride + 3 * W] = eye[y].ravel()
+    elif op == ENC_UNPACK_U8:
+        n = V(2)
+        _arr(V(1), n)[:] = _arr(V(0), n, ctypes.c_uint8).astype(np.float32) / np.float32(_f(a, e, 3))
+    elif op == ENC_PACK_U8:
+        from reclank.models.depth import ref
+        n = V(2)
+        _arr(V(1), n, ctypes.c_uint8)[:] = ref.pack_u8(_arr(V(0), n))
+    elif op == ENC_DUPUP:
+        h, w, cin, cout, ft, fs = (V(i) for i in range(2, 8))
+        x = _arr(V(0), h * w * cin).reshape(h, w, cin)
+        y = _arr(V(1), fs * h * fs * w * cout).reshape(fs * h, fs * w, cout)
+        F = ft * fs * fs
+        rep = cout * F // cin
+        for a_ in range(fs):
+            for b_ in range(fs):
+                ch = (np.arange(cout) * F + (ft - 1) * fs * fs + a_ * fs + b_) // rep
+                y[a_::fs, b_::fs] += x[:, :, ch]
+    elif op == ENC_F20_PACK:
+        rows, cols = V(2), V(3)
+        rb = cops.f20_row_bytes(cols)
+        _arr(V(1), rows * rb, ctypes.c_uint8)[:] = cops.kq_f32_to_f20(_arr(V(0), rows * cols), cols)[0].reshape(-1)
+    elif op == ENC_F20_UNPACK:
+        rows, cols = V(2), V(3)
+        x = _arr(V(0), rows * cops.f20_row_bytes(cols), ctypes.c_uint8)
+        _arr(V(1), rows * cols)[:] = cops.kq_f20_to_f32(x, rows, cols).reshape(-1)
+    elif op == ENC_ATTN_REL:
+        n, heads, hd, span = V(7), V(8), V(9), V(10)
+        q, k, v, o = (_arr(V(i), n * heads * hd).reshape(n, heads, hd) for i in range(4))
+        lo, hi = _arr(V(4), n, ctypes.c_int32), _arr(V(5), n, ctypes.c_int32)
+        rel = _arr(V(6), heads * (2 * span - 1)).reshape(heads, 2 * span - 1)
+        for i in range(n):
+            j = np.arange(lo[i], hi[i])
+            s_ = np.einsum("hd,khd->hk", q[i], k[j]) + rel[:, j - i + span - 1]
+            s_ = np.exp(s_ - s_.max(-1, keepdims=True))
+            s_ /= s_.sum(-1, keepdims=True)
+            o[i] = np.einsum("hk,khd->hd", s_, v[j])
+    elif op == ENC_ATTN_WIDE:
+        n, hd = V(6), V(7)
+        q, k, v, o = (_arr(V(i), n * hd).reshape(n, hd) for i in range(4))
+        s_ = q @ k.T
+        s_ = np.exp(s_ - s_.max(-1, keepdims=True))
+        o[:] = (s_ / s_.sum(-1, keepdims=True)) @ v
+    elif op == ENC_ROPE1D:
+        n, heads, hd = V(3), V(4), V(5)
+        x = _arr(V(0), n * heads * hd).reshape(n, heads, hd)
+        pos = _arr(V(1), n, ctypes.c_int32)
+        inv = _arr(V(2), hd // 2)
+        ang = pos[:, None].astype(np.float32) * inv[None, :]
+        c, s = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]
+        a0, b0 = x[..., :hd // 2].copy(), x[..., hd // 2:].copy()
+        x[..., :hd // 2] = a0 * c - b0 * s
+        x[..., hd // 2:] = b0 * c + a0 * s
+    elif op == ENC_ATTN_RANGE:
+        n, heads, kvh, hd = V(6), V(7), V(8), V(9)
+        q = _arr(V(0), n * heads * hd).reshape(n, kvh, heads // kvh, hd)
+        k, v = (_arr(V(i), n * kvh * hd).reshape(n, kvh, hd) for i in (1, 2))
+        lo, hi = _arr(V(4), n, ctypes.c_int32), _arr(V(5), n, ctypes.c_int32)
+        j = np.arange(n)
+        ok = (j[None, :] >= lo[:, None]) & (j[None, :] < hi[:, None])          # (query, key)
+        s = np.einsum("qgrd,kgd->grqk", q, k)
+        s = np.where(ok[None, None], s, -np.inf)
+        s = np.exp(s - s.max(-1, keepdims=True))
+        s /= s.sum(-1, keepdims=True)
+        _arr(V(3), n * heads * hd).reshape(n, kvh, heads // kvh, hd)[:] = np.einsum("grqk,kgd->qgrd", s, v)
     elif op == ENC_ATTN:
         n, heads, hd = V(4), V(5), V(6)
         q, k, v = (_arr(V(i), n * heads * hd).reshape(n, heads, hd) for i in range(3))
@@ -1654,7 +1834,7 @@ def k_attn_e4b(c, layer, q):
 
 def k_enc_linear(c, lin, x, out=None):
     """(enc_linear lin x): a linear of an encoder (gemma4_encoders._Linear):
-    the clamps of its input, W (bfloat16 or float32), the bias, the clamps
+    the clamps of its input, W (bfloat16, float16 or float32), the bias, the clamps
     of its output. The buffer "_scratch" of the compiler holds the clamped
     input."""
     n = x.shape[0]
@@ -1664,7 +1844,19 @@ def k_enc_linear(c, lin, x, out=None):
     kq = getattr(lin, "kq", None) if not getattr(c, "pack", False) else None
     if kq is None and getattr(c, "q8", False):
         kq = getattr(lin, "q8", None)
-    m = lin.w.shape[0] if kq is None else kq.rows
+    # lin.f20: W in F20 (encoders.runtime.to_f20): F20 rows (a GPU program) or KQ_F20X16 (a CPU
+    # program), ENC_LINEAR's wbf 3
+    f20 = getattr(lin, "f20", None)
+    if f20 is not None:
+        kq = None
+        assert (f20.type == cops.KQ_F20X16) == bool(getattr(c, "pack", False)), "F20 of the other device"
+    # lin.bf12: W in BF12 as KQ_BF12X16 (encoders.runtime.to_bf12_dev, a CPU program: float32 products
+    # of the BF12 values), ENC_LINEAR's wbf 4 (a GPU program takes BF12 rows as lin.kq)
+    bf12 = getattr(lin, "bf12", None)
+    if bf12 is not None:
+        assert getattr(c, "pack", False), "KQ_BF12X16 is a CPU program's"
+        f20 = bf12
+    m = f20.rows if f20 is not None else lin.w.shape[0] if kq is None else kq.rows
     out = c.buffer((n, m)) if out is None else out
     # FP4-Local's vision (models/qwen/vision.py): the input of the linear in bfloat16 values or as
     # dynamic MXFP8 (in place: the inputs of the encoder's linears are buffers of their own), the
@@ -1679,19 +1871,24 @@ def k_enc_linear(c, lin, x, out=None):
         if act is not None:
             c.p.emit(BF16_ROUND, out, n * m)
         return out
-    wbf = 1 if lin.w.dtype == np.uint16 else 0
+    # W: float32 (0), bfloat16 rows (1, uint16), float16 rows (2: a checkpoint's own, GPU programs),
+    # F20 (3) or BF12 (4: KQ_BF12X16)
+    w = f20.data if f20 is not None else lin.w
+    wbf = 4 if bf12 is not None else 3 if f20 is not None else 1 if w.dtype == np.uint16 else \
+        2 if w.dtype == np.float16 else 0
+    assert wbf != 2 or not getattr(c, "pack", False), "float16 W of enc_linear is for GPU programs"
     inf = float("inf")
     scratch = None
     if lin.imin is not None:
         scratch = c.env["_scratch"]
         assert scratch.size >= n * k, "the scratch of enc_linear is too small"
-    x16 = None
-    if getattr(c, "pack", False) and os.environ.get("RECLANK_ENC_X16", "1") != "0":
+    x16 = f20.data if f20 is not None and f20.type in (cops.KQ_F20X16, cops.KQ_BF12X16) else None
+    if x16 is None and getattr(c, "pack", False) and os.environ.get("RECLANK_ENC_X16", "1") != "0":
         # A CPU program: W in groups of 16 rows (kq_x16f_body), made once.
         x16 = getattr(lin, "x16", None)
         if x16 is None:
             x16 = lin.x16 = cops.kq_pack_x16f(lin.w, wbf, m, k)
-    c.p.emit(ENC_LINEAR, x, lin.w, wbf, lin.b, out, n, m, k,
+    c.p.emit(ENC_LINEAR, x, w, wbf, lin.b, out, n, m, k,
              -inf if lin.imin is None else float(lin.imin),
              inf if lin.imax is None else float(lin.imax),
              -inf if lin.omin is None else float(lin.omin),
@@ -1732,19 +1929,22 @@ def _k_enc_linear_kq(c, lin, q8, x, n, m, k, out):
     return out
 
 
-def k_enc_rms(c, x, w, cols, out=None):
-    """(enc_rms x w cols): the RMS norm of each row of cols values (w None:
-    no weight)."""
+def k_enc_rms(c, x, w, cols, eps=None, out=None):
+    """(enc_rms x w cols [eps]): the RMS norm of each row of cols values (w
+    None: no weight; eps None: the compiler's)."""
     out = c.buffer(x.shape) if out is None else out
-    c.p.emit(ENC_RMS, x, w, out, x.size // cols, cols, float(c.eps))
+    c.p.emit(ENC_RMS, x, w, out, x.size // cols, cols, float(c.eps if eps is None else eps))
     return out
 
 
-def k_enc_lnorm(c, x, w, b, cols, out=None):
-    """(enc_lnorm x w b cols): the LayerNorm of each row of cols values (w
-    and b may be None)."""
+def k_enc_lnorm(c, x, w, b, cols, eps=None, out=None):
+    """(enc_lnorm x w b cols [eps]): the LayerNorm of each row of cols values
+    (w and b may be None; eps None: the compiler's). A compiler with
+    lnorm_rows (a decoder's step: few rows) gives the GPU a block a row (its
+    sums in another order)."""
     out = c.buffer(x.shape) if out is None else out
-    c.p.emit(ENC_LNORM, x, w, b, out, x.size // cols, cols, float(c.eps))
+    c.p.emit(ENC_LNORM, x, w, b, out, x.size // cols, cols, float(c.eps if eps is None else eps),
+             1 if getattr(c, "lnorm_rows", False) else 0)
     return out
 
 
@@ -1755,10 +1955,10 @@ def k_enc_gelu(c, x, erf=False, out=None):
     return out
 
 
-def k_enc_gelu_mul(c, g, u, out=None):
-    """(enc_gelu_mul g u): gelu_tanh(g) u."""
+def k_enc_gelu_mul(c, g, u, erf=False, out=None):
+    """(enc_gelu_mul g u [erf]): gelu(g) u, the tanh form or the erf form."""
     out = c.buffer(g.shape) if out is None else out
-    c.p.emit(ENC_GELU_MUL, g, u, out, g.size)
+    c.p.emit(ENC_GELU_MUL, g, u, out, g.size, 1 if erf else 0)
     return out
 
 
@@ -1829,8 +2029,472 @@ def k_enc_attn(c, q, k, v, heads, hd, out=None):
     return out
 
 
+def k_enc_gather(c, x, idx, cols, out=None):
+    """(enc_gather x idx cols): out row i, block j (cols values each) = row
+    idx[i, j] of x (rows of cols values), or zeros where idx[i, j] < 0. idx
+    is (rows, blocks) int32: a window partition, a shift, a patch merge, or
+    the im2col of a convolution."""
+    n, blocks = idx.shape
+    out = c.buffer((n, blocks * cols)) if out is None else out
+    c.p.emit(ENC_GATHER, x, idx, out, n, blocks, cols)
+    return out
+
+
+def k_enc_gather_linear(c, lin, x, idx, cols, out=None):
+    """(enc_gather_linear lin x idx cols): (enc_linear lin (enc_gather x idx
+    cols)). In a GPU program with lin's BF12 rows (lin.kq), cols a multiple
+    of 32 and more than 16 rows, ENC_GATHER_MM: the product reads the
+    rows of x by idx, without the gathered rows (the im2col of a conv: 9
+    times x), the same bits; a product after another of the same x and
+    blocks (the conv1 and conv3 of a MuQ block) takes its bfloat16 rows of x.
+    Else ENC_GATHER into a buffer of the compiler, then enc_linear."""
+    from reclank.formats.gguf import BF12
+    n, blocks = idx.shape
+    kq = getattr(lin, "kq", None) if not getattr(c, "pack", False) else None
+    env = os.environ
+    if (kq is None or kq.type != BF12 or cols % 32 or kq.cols != blocks * cols or n <= 16 or
+            lin.imin is not None or env.get("RECLANK_GPU_BF16_TC", "1") == "0" or
+            env.get("RECLANK_GPU_BF12_FUSED", "1") == "0"):
+        return k_enc_linear(c, lin, k_enc_gather(c, x, idx, cols), out)
+    out = c.buffer((n, kq.rows)) if out is None else out
+    src = x.size // cols
+    # the bfloat16 rows of x are in the scratch from the record before (past its bias)
+    last = [r for r in c.p.recs[-2:] if r[0] != ENC_BIAS_CLAMP][-1:]
+    ready = int(bool(last) and last[0][0] == ENC_GATHER_MM and last[0][1][0][1] == x.ctypes.data and
+                last[0][1][8][1] == cols and last[0][1][9][1] == src)
+    c.p.emit(ENC_GATHER_MM, x, idx, out, kq.data, kq.rows, kq.cols, n, blocks, cols, src, ready)
+    if lin.b is not None or lin.omin is not None:
+        inf = float("inf")
+        c.p.emit(ENC_BIAS_CLAMP, out, lin.b, n, kq.rows,
+                 -inf if lin.omin is None else float(lin.omin),
+                 inf if lin.omax is None else float(lin.omax))
+    return out
+
+
+def k_enc_attn_bias(c, q, k, v, bias, wtype, heads, hd, g, scale, out=None):
+    """(enc_attn_bias q k v bias wtype heads hd g scale): the attention of
+    each query over the g rows of its group (a window: rows i // g), the
+    scores times scale plus bias[wtype[window], head] (types, heads, g, g)
+    (Swin's relative position bias, and the mask of a shifted window). g at
+    most 64."""
+    n = q.shape[0]
+    assert n % g == 0 and g <= 64 and len(wtype) == n // g
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_BIAS, q, k, v, out, bias, wtype, n, heads, hd, g, float(scale))
+    return out
+
+
+def k_enc_clamp(c, x, lo, hi, out=None):
+    """(enc_clamp x lo hi): x clamped to [lo, hi] (lo 0, hi inf: the ReLU)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_CLAMP, x, out, x.size, float(lo), float(hi))
+    return out
+
+
+def k_enc_bias(c, x, b, lo=float("-inf"), hi=float("inf")):
+    """(enc_bias x b [lo hi]): x += b on each row in place, then the clamp.
+    Return x."""
+    c.p.emit(ENC_BIAS_CLAMP, x, b, x.shape[0], x.size // x.shape[0], float(lo), float(hi))
+    return x
+
+
+def k_enc_rope1d(c, x, pos, inv, heads, hd):
+    """(enc_rope1d x pos inv heads hd): the 1D RoPE in place, NEOX halves
+    (value j turns with j + hd / 2) at the angles pos[row] inv[j]. Return x."""
+    c.p.emit(ENC_ROPE1D, x, pos, inv, x.shape[0], heads, hd)
+    return x
+
+
+def k_enc_gnorm(c, x, w, b, groups, eps=None, silu=False, out=None):
+    """(enc_gnorm x w b groups [eps silu]): GroupNorm of x (rows: the pixels
+    of one image, cols: its channels): the mean and the variance of each
+    group of cols / groups channels over all the rows (double sums), times w
+    plus b (either may be None), then SiLU if silu."""
+    rows, cols = x.shape
+    assert cols % groups == 0
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_GNORM, x, w, b, out, rows, cols, groups, float(c.eps if eps is None else eps), 1 if silu else 0)
+    return out
+
+
+def k_enc_rope_tab(c, x, cos, sin, heads, hd, neox=False):
+    """(enc_rope_tab x cos sin heads hd [neox]): RoPE in place on the pairs
+    (2j, 2j + 1) of each head of a row (neox: the pairs (j, j + hd / 2)), at
+    the angle of table entry (row, j): cos and sin (rows, hd / 2), the same
+    for every head (the axes of a DiT: FLUX's four, Wan's three; diffusers'
+    repeat_interleave_real; a decoder's positions with a table of its own
+    rounding, Higgs's bfloat16). Return x."""
+    n = x.shape[0]
+    assert cos.size == n * hd // 2 and sin.size == n * hd // 2 and hd % 2 == 0
+    c.p.emit(ENC_ROPE_TAB, x, cos, sin, n, heads, hd, 1 if neox else 0)
+    return x
+
+
+def k_enc_attn_range(c, q, k, v, lo, hi, heads, kv_heads, hd, out=None):
+    """(enc_attn_range q k v lo hi heads kv_heads hd): the attention of query
+    i over the keys [lo[i], hi[i]), scale 1; query head h reads KV head
+    h / (heads / kv_heads). lo and hi must not decrease from a query to the
+    next (the CPU kernel's blocks)."""
+    n = q.shape[0]
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_RANGE, q, k, v, out, lo, hi, n, heads, kv_heads, hd)
+    return out
+
+
+def k_enc_attn_range_x2(c, q, k, v, lo, hi, heads, hd, out=None):
+    """(enc_attn_range_x2 q k v lo hi heads hd): enc_attn_range (no shared KV
+    heads), in a GPU program as ENC_ATTN_X2: the tensor cores with q, k, v and
+    the weights as two bfloat16 planes each (about 16 bits; Whisper's encoder,
+    FLUX.2's DiT). A compiler with attn_f32 (Wan's, Z-Image's DiT) or
+    RECLANK_GPU_ENC_X2=0 (every program): float32, ENC_ATTN_TILE (hd a multiple
+    of 4 of at most 128; RECLANK_GPU_ENC_TILE=0: ENC_ATTN_RANGE). A CPU
+    program, hd past 128, or another hd: ENC_ATTN_RANGE."""
+    x2 = os.environ.get("RECLANK_GPU_ENC_X2", "1") != "0" and not getattr(c, "attn_f32", False)
+    if getattr(c, "pack", False) or hd > 128 or hd % (8 if x2 else 4) or \
+            not x2 and os.environ.get("RECLANK_GPU_ENC_TILE", "1") == "0":
+        return k_enc_attn_range(c, q, k, v, lo, hi, heads, heads, hd, out)
+    n = q.shape[0]
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_X2 if x2 else ENC_ATTN_TILE, q, k, v, out, lo, hi, n, heads, hd)
+    return out
+
+
+def k_enc_attn_x2c(c, q, k, v, kc, vc, lo, hi, nc, heads, hd, out=None):
+    """(enc_attn_x2c q k v kc vc lo hi nc heads hd): ENC_ATTN_X2 of the nq queries q (a step's
+    rows) over the keys [k; kc] and values [v; vc] (rows of heads x hd): k and v nq rows of float32,
+    kc and vc nc F20 rows (uint8: a cache of keys and values, ENC_F20_PACK's), decoded into the
+    bfloat16 planes as they come (no float32 rows of them); query i reads the keys [lo[i], hi[i])
+    of that order, scale 1. The same bits as ENC_ATTN_X2 of [q; any] over [k; kc's float32] of the
+    first nq rows (an edit's DiT: models/qwen_image/dit.py). A GPU record (the tensor cores)."""
+    nq = q.shape[0]
+    cols = heads * hd
+    assert k.shape[0] == nq and v.shape[0] == nq and kc.dtype == np.uint8 and vc.dtype == np.uint8
+    assert kc.size == nc * cops.f20_row_bytes(cols) and vc.size == kc.size and hd % 8 == 0 and hd <= 128
+    assert not getattr(c, "pack", False), "enc_attn_x2c is a record of GPU programs"
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_X2C, q, k, v, kc, vc, out, lo, hi, nq, nc, heads, hd)
+    return out
+
+
+def k_enc_attn_wide(c, q, k, v, chunk=None, out=None):
+    """(enc_attn_wide q k v): the attention of one head of any width (q, k, v
+    (n, hd)) over all the keys, scale 1 (the mid block of a VAE: hd 1152). A
+    GPU program: ENC_ATTN_WIDE, the scores of chunk queries at a time (default:
+    a buffer of at most 2^26 scores) and v transposed in buffers of the
+    compiler, float32. A CPU program: ENC_ATTN_RANGE."""
+    n, hd = q.shape[0], q.size // q.shape[0]
+    out = c.buffer(q.shape) if out is None else out
+    if getattr(c, "pack", False):
+        return k_enc_attn_range(c, q, k, v, np.zeros(n, np.int32), np.full(n, n, np.int32), 1, 1, hd, out)
+    chunk = int(chunk or max(1, min(n, (1 << 26) // n)))
+    c.p.emit(ENC_ATTN_WIDE, q, k, v, out, c.buffer((chunk, n)), c.buffer((hd, n)), n, hd, chunk)
+    return out
+
+
+def k_enc_dupup(c, x, out, h, w, cin, cout, ft, fs):
+    """(enc_dupup x out h w cin cout ft fs): out (fs h x fs w pixels, cout
+    channels) += x (h x w pixels, cin channels) as diffusers' DupUp3D of one
+    frame (the channels of x repeated to ft fs^2 copies of each output channel:
+    the time copy ft - 1, the space copy of the output pixel's phase). Return
+    out."""
+    assert (cout * ft * fs * fs) % cin == 0
+    c.p.emit(ENC_DUPUP, x, out, h, w, cin, cout, ft, fs)
+    return out
+
+
+def k_enc_f20_pack(c, x, out):
+    """(enc_f20_pack x out): out (rows, F20 row bytes of cols, uint8) the F20 rows of x (rows, cols
+    float32; cols a multiple of 32): the bits of cops.kq_f32_to_f20 (an edit's DiT cache of keys and
+    values, models/qwen_image/dit.py). Return out."""
+    rows = x.shape[0]
+    cols = x.size // rows
+    assert cols % 32 == 0 and out.dtype == np.uint8 and out.size == rows * cops.f20_row_bytes(cols)
+    c.p.emit(ENC_F20_PACK, x, out, rows, cols)
+    return out
+
+
+def k_enc_f20_unpack(c, x, cols, out=None):
+    """(enc_f20_unpack x cols): the float32 rows (rows, cols) of F20 rows x (uint8): the bits of
+    cops.kq_f20_to_f32."""
+    rows = x.shape[0]
+    assert x.dtype == np.uint8 and x.size == rows * cops.f20_row_bytes(cols)
+    out = c.buffer((rows, cols)) if out is None else out
+    c.p.emit(ENC_F20_UNPACK, x, out, rows, cols)
+    return out
+
+
+def k_enc_resize(c, x, out, n, h, w, H, W, C, mode=1, xs=None, xo=0, ys=None, yo=0):
+    """(enc_resize x out n h w H W C [mode xs xo ys yo]): n images of h x w pixels (rows of C
+    values) resized into out (n of H x W): mode 0 bilinear as torch's with
+    align_corners False, 1 with align_corners True, 2 the mean of each block
+    of an integer factor. A pixel's C values may be the columns xo.. of rows of
+    xs values in x and go to the columns yo.. of rows of ys in out (the channels
+    of a wider buffer: a concatenation); by default xs = ys = C. Return out."""
+    if mode == 2:
+        assert h % H == 0 and w % W == 0
+    xs, ys = C if xs is None else int(xs), C if ys is None else int(ys)
+    assert 0 <= xo and xo + C <= xs and 0 <= yo and yo + C <= ys
+    c.p.emit(ENC_RESIZE, x, out, n, h, w, H, W, C, mode, xs, int(xo), ys, int(yo))
+    return out
+
+
+def k_enc_resize_taps(c, x, out, n, h, w, H, W, C, iy, wy, ix, wx):
+    """(enc_resize_taps x out n h w H W C iy wy ix wx): n images of h x w pixels
+    (rows of C) resized into out (n of H x W) by each axis's taps: iy, wy (H,
+    ky) the rows and weights of each output row, ix, wx (W, kx) of each
+    column (int32, float32); the columns' sum first (models/depth/ref.py's
+    resize_taps). Return out."""
+    iy, wy = np.ascontiguousarray(iy, np.int32), np.ascontiguousarray(wy, np.float32)
+    ix, wx = np.ascontiguousarray(ix, np.int32), np.ascontiguousarray(wx, np.float32)
+    assert iy.shape == wy.shape == (H, iy.shape[1]) and ix.shape == wx.shape == (W, ix.shape[1])
+    c.p.emit(ENC_RESIZE_TAPS, x, out, n, h, w, H, W, C, iy.shape[1], iy, wy, ix.shape[1], ix, wx)
+    return out
+
+
+def k_enc_dibr(c, img, s, keys, zb, tmp, out, H, W, off, stride, sign, gap=1.0, mode=1, iters=8, tol=0.5):
+    """(enc_dibr img s keys zb tmp out H W off stride sign [gap mode iters tol]):
+    one eye of a stereo pair (models/depth/ref.dibr) of img (H x W pixels of
+    3) and the left eye's shift s (H W; sign -1: the right eye, -s) into
+    out[off + y stride + 3 x + c]. keys (2 H W), zb (H W), tmp (H W 3):
+    buffers of the record. Return out."""
+    assert keys.size >= 2 * H * W and zb.size >= H * W and tmp.size >= 3 * H * W
+    c.p.emit(ENC_DIBR, img, s, keys, zb, tmp, out, H, W, off, stride, int(sign), float(gap), int(mode),
+             int(iters), float(tol))
+    return out
+
+
+def k_enc_unpack_u8(c, x, out, div=1.0):
+    """(enc_unpack_u8 x out [div]): out[i] = byte i of x (x.size * 4 bytes of
+    float32s, or uint8) / div. Return out."""
+    assert x.size * x.itemsize >= out.size
+    c.p.emit(ENC_UNPACK_U8, x, out, out.size, float(div))
+    return out
+
+
+def k_enc_pack_u8(c, x, out):
+    """(enc_pack_u8 x out): byte i of out = x[i] rounded and clamped to
+    0..255 (out: x.size / 4 float32s). Return out."""
+    assert out.size * 4 >= x.size
+    c.p.emit(ENC_PACK_U8, x, out, x.size)
+    return out
+
+
+def k_enc_scatter(c, x, idx, out):
+    """(enc_scatter x idx): row i of x to row idx[i] of out (none where
+    idx[i] < 0); the other rows of out stay. idx (n,) int32: the places of a
+    step's keys and values in a cache. Return out (the buffer of a set)."""
+    n = x.shape[0]
+    c.p.emit(ENC_SCATTER, x, idx, out, n, x.size // n)
+    return out
+
+
+def k_enc_attn_kv(c, q, k, v, lo, hi, heads, hd, span, kv_heads=None, out=None):
+    """(enc_attn_kv q k v lo hi heads hd span [kv_heads]): the attention of
+    query i (a row of q) over the rows [lo[i], hi[i]) of k and v, which have
+    any number of rows (a cache of keys: a decoder's own, or the encoder's),
+    scale 1; query head h reads KV head h / (heads / kv_heads) (default
+    kv_heads = heads). lo and hi in any order; a range must not be empty, nor
+    longer than span (the GPU kernel's parts of keys)."""
+    n = q.shape[0]
+    kv = heads if kv_heads is None else int(kv_heads)
+    assert heads % kv == 0
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_KV, q, k, v, out, lo, hi, n, heads, hd, int(span), kv)
+    return out
+
+
+def k_enc_attn_rel(c, q, k, v, lo, hi, rel, heads, hd, span, out=None):
+    """(enc_attn_rel q k v lo hi rel heads hd span): the attention of query i
+    over the keys [lo[i], hi[i]), scale 1, each score of key j plus rel[h, j -
+    i + span - 1] (rel (heads, 2 span - 1): T5's relative position bias by the
+    distance j - i, which must be under span: the caller's lo and hi). A CPU
+    program (ENC_ATTN_REL)."""
+    assert getattr(c, "pack", False), "enc_attn_rel is a record of CPU programs"
+    n = q.shape[0]
+    assert rel.shape == (heads, 2 * span - 1) and rel.dtype == np.float32
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(ENC_ATTN_REL, q, k, v, out, lo, hi, rel, n, heads, hd, int(span))
+    return out
+
+
+def k_enc_snake(c, x, alpha, beta=None, out=None):
+    """(enc_snake x alpha [beta]): x + sin(alpha x)^2 (beta + 1e-9)^-1, alpha
+    and beta a channel's (the columns of x; beta None: alpha): DAC's Snake1d,
+    Oobleck's (exp of its log-scale parameters)."""
+    out = c.buffer(x.shape) if out is None else out
+    cols = alpha.size
+    c.p.emit(ENC_SNAKE, x, alpha, alpha if beta is None else beta, out, x.size // cols, cols)
+    return out
+
+
+def k_enc_elu(c, x, out=None):
+    """(enc_elu x): the ELU of alpha 1, x above 0 and exp(x) - 1 else (the
+    Higgs codec's semantic encoder)."""
+    out = c.buffer(x.shape) if out is None else out
+    c.p.emit(ENC_ELU, x, out, x.size)
+    return out
+
+
+def k_enc_warp(c, x, flow, out, gx, gy, h, w, C, xs=None, xo=0, fs=2, fo=0, ys=None, yo=0):
+    """(enc_warp x flow out gx gy h w C [xs xo fs fo ys yo]): the h x w image x (C values a pixel:
+    the columns xo.. of rows of xs) sampled at each pixel plus its flow (the columns fo, fo + 1 of
+    rows of fs: x, y in pixels), bilinear with the border clamped: torch's grid_sample(bilinear,
+    padding_mode="border", align_corners=True) at the grid gx, gy (models/vfi/ref.grid:
+    torch.linspace(-1, 1)) plus the flow over (size - 1) / 2, RIFE's warp. Into the columns yo..
+    of rows of ys of out. Return out."""
+    xs, ys = C if xs is None else int(xs), C if ys is None else int(ys)
+    gx, gy = np.ascontiguousarray(gx, np.float32), np.ascontiguousarray(gy, np.float32)
+    assert gx.size == w and gy.size == h and xo + C <= xs and fo + 2 <= fs and yo + C <= ys
+    c.p.emit(ENC_WARP, x, flow, out, gx, gy, h, w, C, xs, int(xo), int(fs), int(fo), ys, int(yo),
+             float(np.float32((w - 1.0) / 2.0)), float(np.float32((h - 1.0) / 2.0)))
+    return out
+
+
+def k_enc_prelu(c, x, slope, out=None):
+    """(enc_prelu x slope): x above 0, else slope[col] x (slope: a vector of the columns, all
+    0.2 for LeakyReLU(0.2)): torch's bits."""
+    slope = np.ascontiguousarray(slope, np.float32)
+    out = c.buffer(x.shape) if out is None else out
+    cols = slope.size
+    assert x.size % cols == 0
+    c.p.emit(ENC_PRELU, x, out, x.size // cols, cols, slope)
+    return out
+
+
+def k_enc_mix(c, x, out, n, xs, ao, bo, mo, C, ys=None, yo=0):
+    """(enc_mix x out n xs ao bo mo C [ys yo]): of n rows of xs values in x, a s + b (1 - s) of
+    a = the columns ao.., b = the columns bo.. (C each), s = sigmoid(column mo): RIFE's merge of
+    the two warped frames by its mask. Into the columns yo.. of rows of ys of out. Return out."""
+    ys = C if ys is None else int(ys)
+    c.p.emit(ENC_MIX, x, out, n, xs, ao, bo, mo, C, ys, int(yo))
+    return out
+
+
+def k_enc_conv_mm(c, lin, x, idx, cin, slope=None, res=None, scat=None, blk=0, out=None):
+    """(enc_conv_mm lin x idx cin [slope [res [scat blk]]]): a conv as ENC_GATHER (idx (rows, taps) of x's
+    rows of cin values, -1 zeros) then ENC_LINEAR of lin (float32 W (m, taps cin), its bias), without the
+    gathered rows; then + res (an array of the output's shape: ENC_ADD's) and PReLU of slope (m values)
+    when given: the same bits as those records in a GPU program (ENC_CONV_MM, GPU only). scat: the
+    output in place of an ENC_GATHER of its rows of blk values (out's row q = the products' block
+    gather[q], scat the inverse of that gather: block j to out's row scat[j], -1 none)."""
+    assert not getattr(c, "pack", False), "enc_conv_mm is a record of GPU programs"
+    n, taps = idx.shape
+    m = lin.shape[0]
+    assert lin.shape[1] == taps * cin and lin.w.dtype == np.float32
+    if scat is not None:
+        scat = np.ascontiguousarray(scat, np.int32)
+        assert m % blk == 0 and scat.size == n * (m // blk) and res is None and out is not None
+    out = c.buffer((n, m)) if out is None else out
+    c.p.emit(ENC_CONV_MM, x, np.ascontiguousarray(idx, np.int32), lin.w, lin.b, res,
+             None if slope is None else np.ascontiguousarray(slope, np.float32), out, n, m, taps, cin, scat,
+             int(blk) if scat is not None else 0)
+    return out
+
+
+def k_enc_rife_in(c, x0, x1, f0, f1, tmps, scales, xs, m, tb, gx, gy, Hp, Wp, s, dx, dy):
+    """(enc_rife_in x0 x1 f0 f1 tmps scales xs m tb gx gy Hp Wp s dx dy): RIFE's block len(tmps)'s input
+    xs (Hp / s x Wp / s pixels of 28) without its full-resolution buffer: the flow of the blocks' tmp
+    (13 values a pixel at Hp / scale), the frames and heads warped by it, the last block's mask and
+    features, resized to 1 / s, times m, plus tb (models/vfi/rife.py; GPU only: k_enc_rife_in)."""
+    n = len(tmps)
+    assert 1 <= n <= 4 and len(scales) == n
+    t = list(tmps) + [None] * (4 - n)
+    sc = [int(v) for v in scales] + [1] * (4 - n)
+    c.p.emit(ENC_RIFE_IN, x0, x1, f0, f1, *t, xs, np.ascontiguousarray(m, np.float32), tb,
+             np.ascontiguousarray(gx, np.float32), np.ascontiguousarray(gy, np.float32), Hp, Wp, int(s), n, *sc,
+             float(dx), float(dy))
+    return xs
+
+
+def k_enc_rife_out(c, x0, x1, tmps, scales, out, w0, w1, gx, gy, Hp, Wp, dx, dy):
+    """(enc_rife_out x0 x1 tmps scales out w0 w1 gx gy Hp Wp dx dy): RIFE's output (Hp Wp, 3) of the
+    five blocks' tmp: the frames warped by the flow, merged by the last mask (ENC_MIX); w0, w1 (or None)
+    the warped frames (GPU only: k_enc_rife_out)."""
+    assert len(tmps) == 5 and len(scales) == 5
+    c.p.emit(ENC_RIFE_OUT, x0, x1, *tmps, out, w0, w1, np.ascontiguousarray(gx, np.float32),
+             np.ascontiguousarray(gy, np.float32), Hp, Wp, 5, *[int(v) for v in scales], float(dx), float(dy))
+    return out
+
+
+def k_enc_unpack_u8p(c, x, out, h, w, Hp, Wp, C, div=1.0):
+    """(enc_unpack_u8p x out h w Hp Wp C [div]): out (Hp Wp, C) the bytes of x's h x w frame of C
+    channels / div, 0 past it: the bits of ENC_UNPACK_U8 of the frame padded with zero bytes (GPU
+    only)."""
+    assert x.size * x.itemsize >= h * w * C and out.size == Hp * Wp * C and h <= Hp and w <= Wp
+    c.p.emit(ENC_UNPACK_U8P, x, out, int(h), int(w), int(Hp), int(Wp), int(C), float(div))
+    return out
+
+
+def k_enc_pack_u8c(c, x, out, h, w, Wp, C, mul=1.0):
+    """(enc_pack_u8c x out h w Wp C [mul]): the bytes of out the h x w frame of x's rows (a grid Wp
+    wide, C values a pixel) times mul, rounded and clamped to 0..255: ENC_MUL_VEC and ENC_PACK_U8 of
+    the rows, cropped (GPU only)."""
+    assert out.size * out.itemsize >= h * w * C and x.size >= ((h - 1) * Wp + w) * C
+    c.p.emit(ENC_PACK_U8C, x, out, int(h), int(w), int(Wp), int(C), float(mul))
+    return out
+
+
+def k_enc_resample_u8(c, x, out, bounds, k, outer, n, inner, sa, so, off=0):
+    """(enc_resample_u8 x out bounds k outer n inner sa so [off]): one pass of PIL's 8-bit resample:
+    out's byte (a, o, b) (a < outer, o < n, b < inner) of x's bytes from off on, a at a stride of sa,
+    the axis at so: bounds (n, 2) int32 (the first and the count), k (n, ks) int32 (Pillow's
+    normalize_coeffs_8bpc). GPU only."""
+    bounds = np.ascontiguousarray(bounds, np.int32)
+    k = np.ascontiguousarray(k, np.int32)
+    assert bounds.shape == (n, 2) and k.shape[0] == n
+    c.p.emit(ENC_RESAMPLE_U8, x, out, bounds, k, int(outer), int(n), int(inner), int(sa), int(so), k.shape[1],
+             int(off))
+    return out
+
+
+def k_enc_thumb_u8(c, x, taps, rows, cols, sums, ry0, ry1, rx0, rx1, w):
+    """(enc_thumb_u8 x taps rows cols sums ry0 ry1 rx0 rx1 w): of x's bytes (a frame w pixels wide, 3
+    channels): taps the pixels of rows x cols (bytes), sums (int32) the three channels' sum over each
+    block of rows ry0[i] .. ry1[i] - 1 and columns rx0[j] .. rx1[j] - 1 (GPU only)."""
+    a = [np.ascontiguousarray(v, np.int32) for v in (rows, cols, ry0, ry1, rx0, rx1)]
+    assert sums.size == a[2].size * a[4].size
+    c.p.emit(ENC_THUMB_U8, x, taps, a[0], a[1], sums, a[2], a[3], a[4], a[5], a[0].size, a[1].size, a[2].size,
+             a[4].size, int(w))
+    return taps
+
+
 KERNELS = {
+    "enc_unpack_u8p": k_enc_unpack_u8p,
+    "enc_pack_u8c": k_enc_pack_u8c,
+    "enc_resample_u8": k_enc_resample_u8,
+    "enc_thumb_u8": k_enc_thumb_u8,
+    "enc_rife_in": k_enc_rife_in,
+    "enc_rife_out": k_enc_rife_out,
+    "enc_conv_mm": k_enc_conv_mm,
+    "enc_warp": k_enc_warp,
+    "enc_prelu": k_enc_prelu,
+    "enc_mix": k_enc_mix,
     "enc_linear": k_enc_linear,
+    "enc_elu": k_enc_elu,
+    "enc_scatter": k_enc_scatter,
+    "enc_f20_pack": k_enc_f20_pack,
+    "enc_f20_unpack": k_enc_f20_unpack,
+    "enc_attn_x2c": k_enc_attn_x2c,
+    "enc_attn_wide": k_enc_attn_wide,
+    "enc_dupup": k_enc_dupup,
+    "enc_resize": k_enc_resize,
+    "enc_resize_taps": k_enc_resize_taps,
+    "enc_dibr": k_enc_dibr,
+    "enc_pack_u8": k_enc_pack_u8,
+    "enc_unpack_u8": k_enc_unpack_u8,
+    "enc_attn_kv": k_enc_attn_kv,
+    "enc_attn_rel": k_enc_attn_rel,
+    "enc_snake": k_enc_snake,
+    "enc_attn_range_x2": k_enc_attn_range_x2,
+    "enc_rope1d": k_enc_rope1d,
+    "enc_rope_tab": k_enc_rope_tab,
+    "enc_gnorm": k_enc_gnorm,
+    "enc_gather": k_enc_gather,
+    "enc_gather_linear": k_enc_gather_linear,
+    "enc_attn_bias": k_enc_attn_bias,
+    "enc_clamp": k_enc_clamp,
+    "enc_bias": k_enc_bias,
+    "enc_attn_range": k_enc_attn_range,
     "enc_rms": k_enc_rms,
     "enc_gelu_mul": k_enc_gelu_mul,
     "enc_lnorm": k_enc_lnorm,

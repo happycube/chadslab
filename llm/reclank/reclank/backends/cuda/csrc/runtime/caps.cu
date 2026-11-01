@@ -7,8 +7,10 @@
  *
  * RECLANK_GPU_CC=61 makes the GPU act as one of that compute capability
  * (the kernels of a Pascal GPU on a newer one), to test those paths; 52 the
- * Maxwell tier (no dp4a either: MAXWELL_PLAN.md). RECLANK_GPU_DP4A_EMU=1 lets
- * the scalar dp4a of port.cuh run where there is no dp4a (else it traps). */
+ * Maxwell tier (no dp4a either: MAXWELL_PLAN.md). A library built for one
+ * (build.py's cc: RC_GPU_CC; an expert device's RECLANK_EXPERT_CC) acts as it
+ * on any GPU. RECLANK_GPU_DP4A_EMU=1 lets the scalar dp4a of port.cuh run
+ * where there is no dp4a (else it traps). */
 typedef struct {
     int cc;              /* the compute capability: 86 for 8.6 (or RECLANK_GPU_CC) */
     int tc;              /* mma.sync (f16, bf16, s8, tf32), ldmatrix, cp.async: sm_80 */
@@ -39,6 +41,11 @@ static void gg_caps_init(int device)
     if (v && atoi(v) > 0 && atoi(v) < cc) {
         cc = atoi(v);
     }
+#if defined(RC_GPU_CC)
+    if (RC_GPU_CC < cc) {
+        cc = RC_GPU_CC;
+    }
+#endif
     gg_caps.cc = cc;
     gg_caps.tc = cc >= 80;
     gg_caps.fp8_mma = cc >= 89;

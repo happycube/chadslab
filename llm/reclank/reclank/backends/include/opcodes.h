@@ -114,7 +114,7 @@ enum {
     GP_SOFTCAP         = 132,   /* gpu     x = tanh(x / cap) cap, the soft cap of the logits */
     GP_ENC_LINEAR      = 133,   /* cpu+gpu a matrix of an encoder */
     GP_ENC_RMS         = 134,   /* cpu+gpu the RMS norm */
-    GP_ENC_GELU_MUL    = 135,   /* cpu+gpu gelu(gate) * up */
+    GP_ENC_GELU_MUL    = 135,   /* cpu+gpu gelu(gate) * up (tanh or erf) */
     GP_ENC_ADD         = 136,   /* cpu+gpu x + s y */
     GP_ENC_ROPE2D      = 137,   /* cpu+gpu the 2D rope of the vision encoders */
     GP_ENC_ATTN        = 138,   /* cpu+gpu the attention of an encoder */
@@ -217,6 +217,42 @@ enum {
     GP_DS_STAGE_PICK   = 235,   /* gpu     a prompt group's heaviest cold experts of a layer to the GPU's stage slots (DeepSeek V4.1) */
     GP_DS_STAGE_PULL   = 236,   /* gpu     the experts of DS_STAGE_PICK from the registered host memory into the stage, beside the stream */
     GP_DS_STAGE_JOIN   = 237,   /* gpu     the stream waits for a DS_STAGE_PULL */
+    GP_ENC_ROPE1D      = 238,   /* cpu+gpu the 1D rope of an encoder (NEOX halves, a position a row) */
+    GP_ENC_ATTN_RANGE  = 239,   /* cpu+gpu the attention of each query over its range of keys (KV heads shared) */
+    GP_ENC_GATHER      = 240,   /* cpu+gpu rows of blocks of the rows of x by index (-1: zeros) */
+    GP_ENC_ATTN_BIAS   = 241,   /* cpu+gpu the attention within groups of rows (windows), plus a bias of each window's type */
+    GP_ENC_GATHER_MM   = 242,   /* gpu     a product of BF12 rows with the rows of ENC_GATHER, without the gathered rows (MuQ's convs) */
+    GP_ENC_ATTN_X2     = 243,   /* gpu     ENC_ATTN_RANGE on the tensor cores, q k v and the weights as two bfloat16 planes */
+    GP_ENC_SCATTER     = 244,   /* cpu+gpu the rows of x to the rows of y by index (-1: none): the new rows of a KV cache */
+    GP_ENC_ATTN_KV     = 245,   /* cpu+gpu the attention of each query over its range of the rows of k and v (a cache of any rows) */
+    GP_ENC_ROPE_TAB    = 246,   /* cpu+gpu RoPE of interleaved pairs at a table of each row's cos and sin (a DiT's axes) */
+    GP_ENC_GNORM       = 247,   /* cpu+gpu GroupNorm over all the rows (an image's pixels) and a group's channels, then SiLU or not */
+    GP_ENC_SNAKE       = 248,   /* cpu+gpu the Snake of a channel's alpha and beta: x + sin(alpha x)^2 / (beta + 1e-9) (DAC, Oobleck) */
+    GP_ENC_ELU         = 260,   /* cpu+gpu the ELU of alpha 1: x above 0, else exp(x) - 1 (the Higgs codec's semantic encoder) */
+    GP_ENC_DUPUP       = 280,   /* cpu+gpu out += the channels of x's pixel by the pixel's phase: the shortcut of DupUp3D (a VAE's up block) */
+    GP_ENC_ATTN_WIDE   = 281,   /* gpu     the attention of one head of any width, the scores of a part of the queries in a buffer (float32) */
+    GP_ENC_ATTN_REL    = 290,   /* cpu     the attention of each query over its range of keys, plus a bias of each head by the distance (T5) */
+    GP_ENC_ATTN_TILE   = 291,   /* gpu     ENC_ATTN_RANGE in float32 in register-blocked tiles of 128 queries and 32 keys (heads of at most 128) */
+    GP_ENC_F20_PACK    = 292,   /* cpu+gpu float32 rows to F20 rows (the bits of kq_f32_to_f20): an edit's DiT cache of keys and values */
+    GP_ENC_F20_UNPACK  = 293,   /* cpu+gpu F20 rows to float32 rows (the bits of kq_f20_to_f32) */
+    GP_ENC_ATTN_X2C    = 294,   /* gpu     ENC_ATTN_X2 of a step's queries over its own keys and a cache's F20 keys (an edit's DiT) */
+    GP_ENC_RESIZE      = 300,   /* cpu+gpu images of pixel rows resized: bilinear as torch's (align_corners or not), or the area mean of an integer factor */
+    GP_ENC_DIBR        = 301,   /* cpu+gpu one eye of a stereo pair: the forward warp of a row mesh by each pixel's shift, nearest first, holes filled from behind */
+    GP_ENC_PACK_U8     = 302,   /* cpu+gpu values rounded and clamped to 0..255, four bytes in each float32 of the output */
+    GP_ENC_RESIZE_TAPS = 303,   /* cpu+gpu images of pixel rows resized by each axis's taps (indices and weights): the columns first, then the rows */
+    GP_ENC_UNPACK_U8   = 304,   /* cpu+gpu bytes to float32 values, each divided by a number (an uploaded 8-bit image) */
+    GP_ENC_WARP        = 320,   /* cpu+gpu the backward warp of pixel rows by a flow: bilinear, the border clamped, as torch's grid_sample(align_corners=True) */
+    GP_ENC_PRELU       = 321,   /* cpu+gpu x above 0, else a x with a of each column (LeakyReLU, PReLU) */
+    GP_ENC_MIX         = 322,   /* cpu+gpu a s + b (1 - s), s = sigmoid(m), of columns of one buffer of pixel rows (RIFE's merge) */
+    GP_ENC_CONV_MM     = 323,   /* gpu     float32 W times the rows of ENC_GATHER without the gathered rows (an implicit im2col), + b, + res, PReLU */
+    GP_ENC_RIFE_IN     = 324,   /* gpu     a RIFE block's input from the frames, the heads and the blocks' tmp, without the full-resolution buffer */
+    GP_ENC_RIFE_OUT    = 325,   /* gpu     RIFE's output (and the warped frames) from the frames and the blocks' tmp */
+    GP_ENC_UNPACK_U8P  = 326,   /* gpu     the bytes of an h x w frame to float32 rows of a larger grid, each divided by a number, zeros past the frame */
+    GP_ENC_PACK_U8C    = 327,   /* gpu     the h x w frame of rows of a larger grid times a number, rounded and clamped to bytes */
+    GP_ENC_RESAMPLE_U8 = 328,   /* gpu     one pass of PIL's 8-bit resample along an axis of bytes (its bounds and int32 coefficients) */
+    GP_ENC_THUMB_U8    = 329,   /* gpu     the pixels of rows x columns of a frame's bytes, and its blocks' sums of the three channels */
+    GP_NM_TAKE         = 330,   /* gpu     of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked */
+    GP_NM_PULL         = 331,   /* gpu     NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -270,7 +306,17 @@ static inline int gp_op_known(int op)
     case GP_NM_LTOPK: case GP_NM_LATT: case GP_NM_LROWS: case GP_NM_LCAT:
     case GP_NM_LSCORE: case GP_REMOTE_POST: case GP_REMOTE_JOIN: case GP_NM_REMOTE_POST:
     case GP_DS_HC_STEP: case GP_NM_HOT_NV4: case GP_NM_PLAN: case GP_DS_STAGE_PICK:
-    case GP_DS_STAGE_PULL: case GP_DS_STAGE_JOIN:
+    case GP_DS_STAGE_PULL: case GP_DS_STAGE_JOIN: case GP_ENC_ROPE1D:
+    case GP_ENC_ATTN_RANGE: case GP_ENC_GATHER: case GP_ENC_ATTN_BIAS:
+    case GP_ENC_GATHER_MM: case GP_ENC_ATTN_X2: case GP_ENC_SCATTER: case GP_ENC_ATTN_KV:
+    case GP_ENC_ROPE_TAB: case GP_ENC_GNORM: case GP_ENC_SNAKE: case GP_ENC_ELU:
+    case GP_ENC_DUPUP: case GP_ENC_ATTN_WIDE: case GP_ENC_ATTN_REL: case GP_ENC_ATTN_TILE:
+    case GP_ENC_F20_PACK: case GP_ENC_F20_UNPACK: case GP_ENC_ATTN_X2C: case GP_ENC_RESIZE:
+    case GP_ENC_DIBR: case GP_ENC_PACK_U8: case GP_ENC_RESIZE_TAPS: case GP_ENC_UNPACK_U8:
+    case GP_ENC_WARP: case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM:
+    case GP_ENC_RIFE_IN: case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P:
+    case GP_ENC_PACK_U8C: case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE:
+    case GP_NM_PULL:
         return 1;
     default:
         return 0;

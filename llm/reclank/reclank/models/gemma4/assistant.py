@@ -1,5 +1,9 @@
 """Run the Gemma 4 assistant model, the MTP drafter, and the MTP decode.
 
+Ported from transformers
+(src/transformers/models/gemma4_assistant/modeling_gemma4_assistant.py; Apache
+License 2.0; Copyright 2026 the HuggingFace Team). See THIRD_PARTY_NOTICES.md.
+
 Gemma 4 gives multi-token prediction as a separate small model, the
 assistant. The assistant proposes the next few tokens. The target model then
 checks them in one batch. See MTP_PLAN.md.
@@ -79,6 +83,19 @@ def _gguf_getter(path):
     return get
 
 
+def gguf_config(path):
+    """Return the config.json dict of the assistant from a drafter GGUF (arch
+    gemma4-assistant): the text config of its metadata and the width of the
+    target (embedding_length_out). The GGUF has no centroid head."""
+    from reclank.formats.gguf import GGUF
+    g = GGUF(path)
+    if g.meta.get("general.architecture") != "gemma4-assistant":
+        raise ValueError("%s is not a drafter GGUF (arch %r)" % (path, g.meta.get("general.architecture")))
+    return {"text_config": g.text_config(),
+            "backbone_hidden_size": int(g.meta["gemma4-assistant.embedding_length_out"]),
+            "use_ordered_embeddings": False}
+
+
 def shared_layers(cfg):
     """Return the target layers that the assistant reads.
 
@@ -102,12 +119,17 @@ class Assistant:
     dtype "int4" and "int8" quantize every matrix, the output head too.
     weights, a drafter GGUF (the MTP files of unsloth, arch
     gemma4-assistant), gives the weights in place of model.safetensors; the
-    snapshot still gives config.json.
+    snapshot still gives config.json. path may be that GGUF itself: then its
+    metadata gives the config (gguf_config).
     """
 
     def __init__(self, path, dtype="int4", q8_attn=True, weights=None):
-        with open(os.path.join(path, "config.json")) as fh:
-            raw = json.load(fh)
+        if os.path.isfile(path) and path.endswith(".gguf"):
+            raw = gguf_config(path)
+            weights = weights or path
+        else:
+            with open(os.path.join(path, "config.json")) as fh:
+                raw = json.load(fh)
         self.raw = raw
         self.cfg = Config({"text_config": raw["text_config"]})
         self.backbone = raw["backbone_hidden_size"]

@@ -313,8 +313,9 @@ class NemotronMTPSpec(NemotronGPUSpec):
         c = 0
         # (in parts of at most FLUSH_PARTS[0] rows, with no head: their keys and values only; a part reads all the
         # block's experts once, across the link: 256-row parts gave a prompt of 9387 tokens 3.6 s more)
+        top = getattr(self.g, "mtp_part", None) or FLUSH_PARTS[0]      # (NemotronGPU._fit_big: a GPU of 12 GB 1024)
         while c < n:
-            size = next((s for s in FLUSH_PARTS if s <= n - c), 1)
+            size = next((s for s in FLUSH_PARTS if s <= n - c and s <= top), 1)
             self.g.mtp([ids[p0 + c + 1 + j] for j in range(size)], h[c:c + size], p0 + c, head=False)
             c += size
         self.pend = (p0 + n, h[n:])

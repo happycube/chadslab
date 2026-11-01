@@ -1,5 +1,8 @@
 """IQ2_XXS (ggml's 2.06-bit i-quant) in NumPy: the decoder of the reference and of the checks.
 
+Ported from ggml (ggml/src/ggml-quants.c, dequantize_row_iq2_xxs; MIT License; Copyright (c)
+2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+
 The tables are those of reclank/backends/include/iq2_tables.h (from ggml), read from that file. A
 block of 256 values is 66 bytes (the layout is in the header). A value is
 d * (2s + 1) / 8 * g * sign, g one of 8, 25, 43: so each group of 32 values is an int8 vector

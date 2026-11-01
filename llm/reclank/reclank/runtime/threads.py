@@ -37,6 +37,14 @@ def _default_threads():
     return allowed
 
 
+def team_threads():
+    """The team of a CPU program that sets its own (program header word 3):
+    the CPUs of the taskset (cops.place_cpus; OMP_PROC_BIND binds the main
+    thread to one of them, and OMP_NUM_THREADS is 1 beside a GPU)."""
+    from reclank.backends.cpu import cops
+    return len(cops.place_cpus()) or len(_os.sched_getaffinity(0))
+
+
 def _no_numa_balancing():
     """numa.no_numa_balancing before NumPy and OpenMP make their threads (a
     thread takes the memory policy of the thread that makes it)."""

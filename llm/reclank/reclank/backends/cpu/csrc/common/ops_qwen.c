@@ -354,6 +354,9 @@ typedef struct {
      * K-quant experts: Qwen's MTP verify groups); 0: the device's always go. (A step's do go: one
      * token's job is quicker than the CPU on them.) */
     int64_t cpu_max;
+    /* GP_NM_REMOTE_POST: of each token's cold experts the device does not hold, this many more go to it too
+     * (Super's extras: it copies their rows from the host's stacks; a group: this times its tokens) */
+    int64_t more;
 } er_ctx;
 #define ER_MAXK 16
 #define ER_MAXP 256
@@ -468,6 +471,25 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
                 fprintf(stderr, "[cpu] post layer %d: %d rows, %d of %d pairs to the device (thread %d)\n",
                         layer, np / k, n, np, omp_get_thread_num());
             }
+            if (ctx->more > 0 && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP) {
+                /* (Super's extras: whole experts, in the order of their first pair) */
+                int extra = 0;
+                const int want = (int)ctx->more * (np / k);
+                for (int p = 0; p < np && extra < want; ++p) {
+                    const int c = lcold[p];
+                    if (c < 0 || c >= ctx->experts || gidx[p] >= 0) {
+                        continue;
+                    }
+                    ++extra;
+                    for (int q = p; q < np; ++q) {
+                        if (lcold[q] == c) {
+                            gidx[q] = c;
+                            lcold[q] = -1;
+                            ++n;
+                        }
+                    }
+                }
+            }
             if (n > 0) {
                 if (ctx->post_t(layer, np / k, k, gidx, val, x) == 0) {
                     *posted = 1;
@@ -493,6 +515,18 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
                 at[n] = p;
                 lcold[p] = -1;
                 ++n;
+            }
+        }
+        /* (Super's extras: the first of the cold experts the device lacks) */
+        for (int p = 0, extra = 0; p < np && extra < ctx->more && ctx->alive && n < ER_MAXK; ++p) {
+            const int c = lcold[p];
+            if (c >= 0 && c < ctx->experts) {
+                ids[n] = c;
+                w[n] = val[p];
+                at[n] = p;
+                lcold[p] = -1;
+                ++n;
+                ++extra;
             }
         }
         if (n > 0) {

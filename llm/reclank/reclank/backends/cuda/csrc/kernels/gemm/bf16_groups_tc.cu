@@ -76,10 +76,39 @@ __device__ __forceinline__ uint32_t bf12_frag(uint32_t lo, uint32_t hi, int sh, 
     return v & ~__vcmpeq2(b | gap << 8, 0x0f800f80u);
 }
 
-template <int X2, int W12 = 0>
+/* NF: blockIdx.x is the tile of rows of w (else of tokens), so the blocks that
+ * read the same tokens run together and x comes from DRAM one time: for many
+ * more tokens than rows (MuQ's convs, 32000 x 4608 into 512: 8.45 -> 7.28 ms;
+ * the bits are the same). */
+/* GX: the rows of x are gathered (ENC_GATHER_MM, an im2col without its
+ * copy): row m of x is gnb blocks of cols / gnb values, block j row gidx[m gnb
+ * + j] of the bfloat16 rows x (and xlo) of cols / gnb values, or zeros where it
+ * is < 0; cols / gnb a multiple of BHK, so a step reads one block. */
+/* F16: x and w are float16 values (mma16816 in place of mma16816_bf16: the
+ * checkpoint's own float16 matrices of ENC_LINEAR wbf 2), each product from
+ * zero; the rest as is. */
+template <int F16>
+__device__ __forceinline__ void mma_x(float *c, const uint32_t *a, const uint32_t *b)
+{
+    if (F16) {
+        /* from zero, then added rounded to nearest: the tensor cores truncate as
+         * they add into c, a bias of about -1e-7 a product (Whisper's fc2) */
+        float z[4] = {0.f, 0.f, 0.f, 0.f};
+        mma16816(z, a, b);
+        c[0] += z[0];
+        c[1] += z[1];
+        c[2] += z[2];
+        c[3] += z[3];
+    } else {
+        mma16816_bf16(c, a, b);
+    }
+}
+
+template <int X2, int W12 = 0, int NF = 0, int GX = 0, int F16 = 0>
 __global__ void __launch_bounds__(256) k_gemm_bf16_tc(const uint16_t *x, const uint16_t *w, float *out,
                                                       size_t ldo, const int *orow0, int t, int rows,
-                                                      int cols, const uint16_t *xlo)
+                                                      int cols, const uint16_t *xlo, const int *gidx = NULL,
+                                                      int gnb = 1, const float *xinv = NULL)
 {
     PDL_START();
     extern __shared__ __align__(16) uint16_t bfsm[];
@@ -92,24 +121,47 @@ __global__ void __launch_bounds__(256) k_gemm_bf16_tc(const uint16_t *x, const u
     uint8_t *w12s = (uint8_t *)bs;
     const uint8_t *w8 = (const uint8_t *)w;
     const size_t rb12 = ((size_t)cols + cols / 2 + cols / 32 + 15) / 16 * 16;
-    int m0 = blockIdx.x * T2M, n0 = blockIdx.y * T2N;
+    int m0 = (NF ? blockIdx.y : blockIdx.x) * T2M, n0 = (NF ? blockIdx.x : blockIdx.y) * T2N;
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int wm = (warp / 4) * 64, wn = (warp % 4) * 32;
     int g = lane / 4, c = lane % 4;
     int steps = (cols + BHK - 1) / BHK;
     float acc[4][4][4];
+    /* F16: x's blocks of BHK columns are scaled (k_to_f16_blocks), so the sums of
+     * each step go into tot times 1 / the block's scale (xinv), rounded to
+     * nearest: the float32 sums of the float16 products truncate, which over
+     * thousands of columns drifts */
+    float tot[4][4][4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+            tot[i][j][0] = tot[i][j][1] = tot[i][j][2] = tot[i][j][3] = 0.f;
         }
     }
+    const int gc = cols / gnb;      /* GX: the values of a block */
     auto load = [&](int st, int b) {
         int k0 = st * BHK;
         for (int e = threadIdx.x; e < T2M * BHK / 8; e += blockDim.x) {
             int m = e / (BHK / 8), kk = (e % (BHK / 8)) * 8;
             int q = min(m0 + m, t - 1);
+            if (GX) {
+                int blk = k0 / gc, src = gidx[(size_t)q * gnb + blk];
+                if (src >= 0) {
+                    size_t o = (size_t)src * gc + (k0 - blk * gc) + kk;
+                    cp_async16(&as_[b][m][kk], x + o);
+                    if (X2) {
+                        cp_async16(&al_[b][m][kk], xlo + o);
+                    }
+                } else {
+                    *(uint4 *)&as_[b][m][kk] = make_uint4(0, 0, 0, 0);
+                    if (X2) {
+                        *(uint4 *)&al_[b][m][kk] = make_uint4(0, 0, 0, 0);
+                    }
+                }
+                continue;
+            }
             if (k0 + kk < cols) {
                 cp_async16(&as_[b][m][kk], x + (size_t)q * cols + k0 + kk);
                 if (X2) {
@@ -204,7 +256,7 @@ __global__ void __launch_bounds__(256) k_gemm_bf16_tc(const uint16_t *x, const u
                 a[3] = *(const uint32_t *)&as_[b][r0 + g + 8][kk + 2 * c + 8];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    mma16816_bf16(acc[i][j], a, bf[j]);
+                    mma_x<F16>(acc[i][j], a, bf[j]);
                 }
                 if (X2) {
                     a[0] = *(const uint32_t *)&al_[b][r0 + g][kk + 2 * c];
@@ -213,12 +265,40 @@ __global__ void __launch_bounds__(256) k_gemm_bf16_tc(const uint16_t *x, const u
                     a[3] = *(const uint32_t *)&al_[b][r0 + g + 8][kk + 2 * c + 8];
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        mma16816_bf16(acc[i][j], a, bf[j]);
+                        mma_x<F16>(acc[i][j], a, bf[j]);
                     }
                 }
             }
         }
+        if (F16) {
+            /* the step's sums of each row, times 1 / the scale of the row's block of x */
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int ra = min(m0 + wm + i * 16 + g, t - 1), rb = min(m0 + wm + i * 16 + g + 8, t - 1);
+                float ia = __ldg(&xinv[(size_t)ra * steps + st]), ib = __ldg(&xinv[(size_t)rb * steps + st]);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    tot[i][j][0] += acc[i][j][0] * ia;
+                    tot[i][j][1] += acc[i][j][1] * ia;
+                    tot[i][j][2] += acc[i][j][2] * ib;
+                    tot[i][j][3] += acc[i][j][3] * ib;
+                    acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+                }
+            }
+        }
         __syncthreads();
+    }
+    if (F16) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    acc[i][j][u] = tot[i][j][u];
+                }
+            }
+        }
     }
     size_t o0 = orow0 != NULL ? (size_t)*orow0 : 0;
     #pragma unroll
@@ -268,6 +348,8 @@ static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uin
                              (int)BF_SMEM(1));
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
+        cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)BF_SMEM(1));
         attr = 1;
     }
     int x2 = bf16_tc_on() != 8 && !x1;
@@ -276,7 +358,12 @@ static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uin
         k_to_bf16<<<(unsigned)(((int64_t)t * cols + 255) / 256), 256, 0, s>>>(x, ldx, xrow0, xb, t, cols, xl);
     }
     dim3 grid((unsigned)((t + T2M - 1) / T2M), (unsigned)((rows + T2N - 1) / T2N));
-    if (x2 && w12) {
+    /* many more tokens than rows (x far past the L2, w in it): the tiles of
+     * rows of w fastest (NF); at 1500 x 1024 the order of tokens is faster */
+    if (x2 && w12 && t >= 16 * rows) {
+        k_gemm_bf16_tc<1, 1, 1><<<dim3(grid.y, grid.x), 256, BF_SMEM(1), s>>>(xb, w, out, ldo, orow0, t, rows,
+                                                                            cols, xl);
+    } else if (x2 && w12) {
         k_gemm_bf16_tc<1, 1><<<grid, 256, BF_SMEM(1), s>>>(xb, w, out, ldo, orow0, t, rows, cols, xl);
     } else if (w12) {
         k_gemm_bf16_tc<0, 1><<<grid, 256, BF_SMEM(0), s>>>(xb, w, out, ldo, orow0, t, rows, cols, NULL);
@@ -284,6 +371,120 @@ static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uin
         k_gemm_bf16_tc<1><<<grid, 256, BF_SMEM(1), s>>>(xb, w, out, ldo, orow0, t, rows, cols, xl);
     } else {
         k_gemm_bf16_tc<0><<<grid, 256, BF_SMEM(0), s>>>(xb, w, out, ldo, orow0, t, rows, cols, NULL);
+    }
+}
+
+/* Each block of BHK columns of each row of x (rows of cols float32), clamped
+ * to [imin, imax], times a power of two s that takes its largest value to
+ * [2^13, 2^14), as two float16 planes: hi, and lo = x s - hi (about 22 bits of
+ * x; a block's small values stay clear of the float16 subnormals, though a
+ * few channels of the row are far larger), and inv[row steps + block] = 1 /
+ * s. A warp a block (BHK = 32 columns: a column a lane). The F16 form of
+ * k_gemm_bf16_tc. */
+__global__ void k_to_f16_blocks(const float *x, int rows, int cols, __half *hi, __half *lo, float *inv,
+                                float imin, float imax)
+{
+    PDL_START();
+    int steps = (cols + BHK - 1) / BHK;
+    size_t wb = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (wb >= (size_t)rows * steps) {
+        return;
+    }
+    size_t r = wb / steps;
+    int c = (int)(wb % steps) * BHK + lane;
+    float v = c < cols ? fminf(fmaxf(x[r * cols + c], imin), imax) : 0.f;
+    float m = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(RC_FULL_MASK, m, off));
+    }
+    int e = 0;
+    if (m > 0.f && isfinite(m)) {
+        frexpf(m, &e);                       /* m = f 2^e, f in [0.5, 1) */
+    }
+    v *= ldexpf(1.f, 14 - e);
+    if (c < cols) {
+        __half h = __float2half_rn(v);
+        hi[r * cols + c] = h;
+        lo[r * cols + c] = __float2half_rn(v - __half2float(h));
+    }
+    if (lane == 0) {
+        inv[wb] = ldexpf(1.f, e - 14);
+    }
+}
+
+__global__ void k_enc_bias_clamp(float *y, const float *b, int rows, int cols, float lo, float hi);
+
+/* ENC_LINEAR of float16 rows w (wbf 2: a checkpoint's own float16 matrices):
+ * x (t rows of cols float32) to its two float16 planes in xb (2 t cols
+ * halves, then the t steps floats of the blocks' 1 / s: k_to_f16_blocks),
+ * k_gemm_bf16_tc<1, 0, NF, 0, 1> (two products a fragment in float32 sums)
+ * into out (t, rows), then the bias (or NULL) and the clamps omin, omax
+ * (k_enc_bias_clamp). cols a multiple of 8. */
+static void gg_gemm_f16(const float *x, const uint16_t *w, const float *bias, float *out, int t, int rows,
+                        int cols, uint16_t *xb, float imin, float imax, float omin, float omax, cudaStream_t s)
+{
+    static int attr = 0;
+    if (!attr) {
+        cudaFuncSetAttribute(k_gemm_bf16_tc<1, 0, 0, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)BF_SMEM(1));
+        cudaFuncSetAttribute(k_gemm_bf16_tc<1, 0, 1, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)BF_SMEM(1));
+        attr = 1;
+    }
+    size_t nk = (size_t)t * cols;
+    int steps = (cols + BHK - 1) / BHK;
+    uint16_t *xl = xb + nk;
+    float *inv = (float *)(xb + 2 * nk);
+    size_t warps = (size_t)t * steps;
+    k_to_f16_blocks<<<(unsigned)((warps + 7) / 8), 256, 0, s>>>(x, t, cols, (__half *)xb, (__half *)xl, inv, imin,
+                                                                imax);
+    dim3 grid((unsigned)((t + T2M - 1) / T2M), (unsigned)((rows + T2N - 1) / T2N));
+    if (t >= 16 * rows) {
+        k_gemm_bf16_tc<1, 0, 1, 0, 1><<<dim3(grid.y, grid.x), 256, BF_SMEM(1), s>>>(xb, w, out, rows, NULL, t,
+                                                                                   rows, cols, xl, NULL, 1, inv);
+    } else {
+        k_gemm_bf16_tc<1, 0, 0, 0, 1><<<grid, 256, BF_SMEM(1), s>>>(xb, w, out, rows, NULL, t, rows, cols, xl,
+                                                                    NULL, 1, inv);
+    }
+    size_t nm = (size_t)t * rows;
+    k_enc_bias_clamp<<<(unsigned)((nm + 255) / 256), 256, 0, s>>>(out, bias, t, rows, omin, omax);
+}
+
+/* ENC_GATHER_MM: the product of the KQ_BF12 rows w with the rows of
+ * ENC_GATHER of x (src rows of gc values, idx (t, nb), -1 zeros), without the
+ * gathered rows: x (src x gc, 9 times fewer values than the im2col of a conv
+ * 3x3) to its bfloat16 planes in xb (xready: an earlier record did, the same
+ * x), then k_gemm_bf16_tc<X2, 1, NF, 1>. The bits of ENC_GATHER then the
+ * product (MuQ's convs: 4.4 ms of 32 a clip, and 1.3 GB, went to the copies). */
+static void gg_gemm_bf12_gather(const float *x, int src, int gc, const int *idx, int nb, const uint8_t *w,
+                                float *out, int t, int rows, uint16_t *xb, cudaStream_t s, int xready)
+{
+    static int attr = 0;
+    if (!attr) {
+        cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)BF_SMEM(1));
+        cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)BF_SMEM(1));
+        attr = 1;
+    }
+    int x2 = bf16_tc_on() != 8;
+    int cols = nb * gc;
+    uint16_t *xl = x2 ? xb + (size_t)src * gc : NULL;
+    if (!xready) {
+        k_to_bf16<<<(unsigned)(((int64_t)src * gc + 255) / 256), 256, 0, s>>>(x, gc, NULL, xb, src, gc, xl);
+    }
+    dim3 grid((unsigned)((t + T2M - 1) / T2M), (unsigned)((rows + T2N - 1) / T2N));
+    const uint16_t *w16 = (const uint16_t *)w;
+    if (x2 && t >= 16 * rows) {
+        k_gemm_bf16_tc<1, 1, 1, 1><<<dim3(grid.y, grid.x), 256, BF_SMEM(1), s>>>(xb, w16, out, rows, NULL, t, rows,
+                                                                                cols, xl, idx, nb);
+    } else if (x2) {
+        k_gemm_bf16_tc<1, 1, 0, 1><<<grid, 256, BF_SMEM(1), s>>>(xb, w16, out, rows, NULL, t, rows, cols, xl,
+                                                                 idx, nb);
+    } else {
+        k_gemm_bf16_tc<0, 1, 0, 1><<<grid, 256, BF_SMEM(0), s>>>(xb, w16, out, rows, NULL, t, rows, cols, NULL,
+                                                                 idx, nb);
     }
 }
 

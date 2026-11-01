@@ -128,7 +128,21 @@ def main():
             pad = torch.zeros((1, full.shape[1] - n_prompt), dtype=f2["mm_token_type_ids"].dtype)
             f2["mm_token_type_ids"] = torch.cat([f2["mm_token_type_ids"], pad], dim=1)
         t0 = time.time()
-        logits = model(**f2).logits[0, n_prompt - 1:].float()
+        inner = model.model.get_video_features
+        if "num_frames_per_video" in feats:
+            # transformers 5.19: Gemma4UnifiedModel.forward calls
+            # get_video_features without num_frames_per_video, which that
+            # function requires (generate() passes the features in); give
+            # it the frames of the processor for this one pass
+            def get_video_features(pv, pos=None, num_frames_per_video=None, **kw):
+                if num_frames_per_video is None:
+                    num_frames_per_video = feats["num_frames_per_video"]
+                return inner(pv, pos, num_frames_per_video, **kw)
+            model.model.get_video_features = get_video_features
+        try:
+            logits = model(**f2).logits[0, n_prompt - 1:].float()
+        finally:
+            model.model.get_video_features = inner
         print("forward %.0f s" % (time.time() - t0), flush=True)
         fwd_logz = torch.logsumexp(logits, dim=-1).numpy()
         fwd_val, fwd_idx = torch.topk(logits, TOP, dim=-1)
@@ -140,9 +154,14 @@ def main():
                                                  feats["image_position_ids"]).pooler_output
             soft += [t.float().numpy() for t in imf]
         if "pixel_values_videos" in feats:
+            # transformers 5.19 wants the frames of each video (the frames of
+            # all videos are one axis); its pooler_output is then one tensor
+            # for each video, earlier ones one for each frame
+            extra = ({"num_frames_per_video": feats["num_frames_per_video"]}
+                     if "num_frames_per_video" in feats else {})
             vf = model.model.get_video_features(feats["pixel_values_videos"],
-                                                feats["video_position_ids"]).pooler_output
-            soft += [t.float().numpy() for t in vf]
+                                                feats["video_position_ids"], **extra).pooler_output
+            soft += [t.float().numpy().reshape(-1, t.shape[-1]) for t in vf]
         if "input_features" in feats:
             ao = model.model.get_audio_features(feats["input_features"],
                                                 feats.get("input_features_mask"))

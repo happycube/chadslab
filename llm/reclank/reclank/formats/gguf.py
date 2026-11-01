@@ -1,5 +1,9 @@
 """Read GGUF files with NumPy only.
 
+The block formats ported from ggml (ggml/src/ggml-common.h,
+ggml/src/ggml-quants.c; MIT License; Copyright (c) 2023-2026 The ggml authors).
+See THIRD_PARTY_NOTICES.md.
+
 The GGUF format holds quantized blocks. This module does four tasks:
 
 1. Read the metadata and the tensor directory.
@@ -63,14 +67,25 @@ ROT_BASE = {RQ8_0: 8, RQ6_K: 14, RQ4_K: 12, RQ5_K: 13}
 # the group (4 bits), and that largest exponent (a byte); the row padded to
 # 16 bytes. Sign 1, gap 15, mantissa 0 is the zero code. cops.kq_bf16_to_bf12.
 BF12 = 57
+# F20 (backends/cpu/csrc/kernels/kq/formats.c KQ_F20): float32 values to 16 significant bits
+# (to nearest, even) in BF12's groups of 32: a uint16 of the sign and 15 bits of the mantissa a
+# value, its exponent gap (4 bits) and the group's largest exponent (a byte), 20.25 bits a value;
+# zero more than 15 binades under the largest of the group. cops.kq_f32_to_f20.
+F20 = 68
 # MXF8 (FP4-Local, docs/FP4LOCAL_PLAN.md): an MXFP8 row, its E4M3 codes, then an E8M0 scale for
 # each 32 (e4m3 2^(s - 127)), zeros to 16 bytes (backends/cpu/csrc/kernels/kq KQ_MXF8)
 MXF8 = 66
+# Q4X (KQ_Q4X of backends/cpu/csrc/kernels/kq/formats.c): Q4_0 in groups of 16 rows, the same 18 bytes
+# for each 32 values; for each block of 32 columns of a group 288 bytes (the codes of the 16 rows in 8
+# steps, then their float16 scales). Not in a file: the weightkeeper holds the Q4_0 matrices of a Gemma 4
+# file so (reclank/models/qwen/keep.py layout_gguf), the only copy of them in memory.
+Q4X = 54
 _ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
               MXF8: lambda cols: (cols + cols // 32 + 15) // 16 * 16,
               E4M3_ROWS: lambda cols: cols,
               NVX: lambda cols: cols // 32 * 18 + 1,
-              BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16}
+              BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16,
+              F20: lambda cols: (2 * cols + cols // 2 + cols // 32 + 15) // 16 * 16}
 
 
 def _e4m3_values():
@@ -92,13 +107,13 @@ _BLOCK = {
     Q4_0: (32, 18), Q4_1: (32, 20), Q5_0: (32, 22), Q5_1: (32, 24),
     Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210), Q4_K: (256, 144), Q5_K: (256, 176),
     IQ4_NL: (32, 18), IQ4_XS: (256, 136), RQ8_0: (32, 34), RQ6_K: (256, 210),
-    RQ4_K: (256, 144), RQ5_K: (256, 176),
+    RQ4_K: (256, 144), RQ5_K: (256, 176), Q4X: (32, 18),
 }
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
     Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", IQ4_XS: "IQ4_XS", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
-    RQ8_0: "RQ8_0", RQ6_K: "RQ6_K", RQ4_K: "RQ4_K", RQ5_K: "RQ5_K", BF12: "BF12",
+    RQ8_0: "RQ8_0", RQ6_K: "RQ6_K", RQ4_K: "RQ4_K", RQ5_K: "RQ5_K", BF12: "BF12", F20: "F20", Q4X: "Q4X",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -124,6 +139,7 @@ _BLOCK_DT = {
 }
 _BLOCK_DT[RQ4_K] = _BLOCK_DT[Q4_K]
 _BLOCK_DT[RQ5_K] = _BLOCK_DT[Q5_K]
+_BLOCK_DT[Q4X] = np.dtype([("b", "u1", (18,))])     # (the bytes of a group's rows: no block of its own)
 
 
 def _k_scales(sc):
@@ -835,9 +851,12 @@ class GGUF:
         18 bytes: a float16 scale and 16 nibble bytes. The value of a nibble is
         the nibble minus 8. The layout is the same. Thus the function copies no
         data. packed is a view into the file map.
+
+        A Q4X tensor (the weightkeeper's) gives its KQ_Q4X bytes in the same
+        shape and None for the scales (they are in the groups).
         """
         dims, t, _o = self.tensors[self._gguf(hf_name)]
-        if t != Q4_0:
+        if t not in (Q4_0, Q4X):
             raise ValueError("%s is %s, not Q4_0" % (hf_name, _TYPE_NAME.get(t, t)))
         shape = tuple(reversed(dims))
         count = int(np.prod(dims))
@@ -845,6 +864,8 @@ class GGUF:
         raw = self._blocks(hf_name, 0, nblk)
         groups = shape[-1] // 32
         packed = raw.view(np.uint8).reshape(shape[:-1] + (groups, 18))
+        if t == Q4X:
+            return packed, None
         scales = raw["d"].astype(np.float32).reshape(shape[:-1] + (groups,))
         return packed, np.ascontiguousarray(scales)
 
@@ -855,21 +876,27 @@ class GGUF:
         large for the memory.
         """
         dims, t, _o = self.tensors[self._gguf(hf_name)]
-        if t != Q4_0 or len(dims) != 3:
+        if t not in (Q4_0, Q4X) or len(dims) != 3:
             raise ValueError("%s is not a 3-D Q4_0 tensor" % hf_name)
         shape = tuple(reversed(dims))          # (experts, out, in)
         nblk_row = shape[-1] // 32
         first = start * shape[1] * nblk_row
         raw = self._blocks(hf_name, first, (stop - start) * shape[1] * nblk_row)
         packed = raw.view(np.uint8).reshape((stop - start, shape[1], nblk_row, 18))
+        if t == Q4X:
+            # (an expert's rows are whole groups of 16: its bytes are its own)
+            return packed, None
         scales = raw["d"].astype(np.float32).reshape((stop - start, shape[1], nblk_row))
         return packed, np.ascontiguousarray(scales)
 
     # ---- the configuration ------------------------------------------------
 
     def text_config(self):
-        """Return a Hugging Face text_config dict from the GGUF metadata."""
-        m = self.meta
+        """Return a Hugging Face text_config dict from the GGUF metadata (the
+        keys of the file's architecture: gemma4, or gemma4-assistant for a
+        drafter)."""
+        a = self.meta.get("general.architecture", "gemma4")
+        m = {("gemma4." + k[len(a) + 1:] if k.startswith(a + ".") else k): v for k, v in self.meta.items()}
         head_kv = np.asarray(m["gemma4.attention.head_count_kv"])
         if head_kv.ndim == 0:
             # The E4B file gives one value for every layer.
@@ -898,7 +925,8 @@ class GGUF:
             "vocab_size": 262144,
             "max_position_embeddings": int(m["gemma4.context_length"]),
             "sliding_window": int(m["gemma4.attention.sliding_window"]),
-            "final_logit_softcapping": float(m["gemma4.final_logit_softcapping"]),
+            "final_logit_softcapping": (float(m["gemma4.final_logit_softcapping"])
+                                        if "gemma4.final_logit_softcapping" in m else None),
             "attention_k_eq_v": not has_v,
             "num_kv_shared_layers": int(m.get("gemma4.attention.shared_kv_layers", 0) or 0),
             "hidden_size_per_layer_input": int(
