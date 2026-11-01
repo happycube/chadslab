@@ -201,26 +201,26 @@ MODELS = [
                  "GPU's peak 16.9 GB with one reference at 1024 x 1024, 17.9 GB with two"]),
     Model("sd-1.5", "Stable Diffusion 1.5", "image",
           "sd-legacy/stable-diffusion-v1-5", "sd-1.5", 4.27, "CreativeML OpenRAIL-M", files=SD_FILES,
-          gpu=Need(6, 5, "commit e7e3831 (a GPU run's host peak 5.8 GB, 2.5 GB with --f20; the card's peak is "
+          gpu=Need(6, 5, "docs/GENERATION_PLAN.md 8, F20 (a GPU run's host peak 5.8 GB, 2.5 GB with --f20; the card's peak is "
                    "not recorded)", est=True),
-          cpu=Need(11, 0, "commit e7e3831 (the CPU's peak 10.2 GB, 3.6 GB with --f20)"),
+          cpu=Need(11, 0, "docs/GENERATION_PLAN.md 8, F20 (the CPU's peak 10.2 GB, 3.6 GB with --f20)"),
           server="generate", args="--sd sd-1.5={d}", cpu_args="--cpu", model_id="sd-1.5",
           notes=["OpenRAIL: use restrictions (no regional ones)",
                  "--f20 keeps the UNet in F20: the CPU's peak 3.6 GB, a GPU run's host 2.5 GB (the image within "
                  "about 0.1 level of 255)"]),
     Model("sd-2.0-base", "Stable Diffusion 2.0 (512)", "image",
           "sd2-community/stable-diffusion-2-base", "sd-2.0-base", 5.16, "CreativeML OpenRAIL++-M", files=SD_FILES,
-          gpu=Need(6, 5, "as SD 1.5 (commit e7e3831)", est=True),
-          cpu=Need(11, 0, "as SD 1.5 (commit e7e3831)", est=True),
+          gpu=Need(6, 5, "as SD 1.5 (docs/GENERATION_PLAN.md 8, F20)", est=True),
+          cpu=Need(11, 0, "as SD 1.5 (docs/GENERATION_PLAN.md 8, F20)", est=True),
           server="generate", args="--sd sd-2.0-base={d}", cpu_args="--cpu", model_id="sd-2.0-base"),
     Model("sd-2.0-768", "Stable Diffusion 2.0 (768, v-prediction)", "image",
           "sd2-community/stable-diffusion-2", "sd-2.0-768", 5.16, "CreativeML OpenRAIL++-M", files=SD_FILES,
-          gpu=Need(6, 6, "as SD 1.5 with a larger UNet input (commit e7e3831)", est=True),
-          cpu=Need(12, 0, "as SD 1.5 (commit e7e3831)", est=True),
+          gpu=Need(6, 6, "as SD 1.5 with a larger UNet input (docs/GENERATION_PLAN.md 8, F20)", est=True),
+          cpu=Need(12, 0, "as SD 1.5 (docs/GENERATION_PLAN.md 8, F20)", est=True),
           server="generate", args="--sd sd-2.0-768={d}", cpu_args="--cpu", model_id="sd-2.0-768"),
     Model("qwen-image-2.1", "Qwen-Image-2.1 (RGBA)", "image",
           "Qwen/Qwen-Image-2.1", "qwen-image-2.1", 33.13, "Qwen Research License", commercial=False,
-          gpu=Need(32, 15, "commit 43b877c (the GPU 14.6 GB at 1024 x 1024, 16.4 GB at 2048; the text encoder "
+          gpu=Need(32, 15, "docs/GENERATION_PLAN.md 8, Qwen-Image-2.1 (the GPU 14.6 GB at 1024 x 1024, 16.4 GB at 2048; the text encoder "
                    "on the CPU, 12 GB: its matrices in BF12)"),
           cpu=Need(48, 0, "the 14 GB DiT in float32 (--cpu) and the 12 GB text encoder (BF12)", est=True),
           server="generate", args="--qwen-image {d}", cpu_args="--cpu", model_id="qwen-image-2.1",
