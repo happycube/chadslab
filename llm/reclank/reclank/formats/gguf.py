@@ -128,6 +128,7 @@ _BLOCK_DT = {
     RQ8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
     RQ6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
                      ("sc", "i1", (16,)), ("d", "<f2")]),
+    Q5_0: np.dtype([("d", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
     Q5_1: np.dtype([("d", "<f2"), ("m", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
     IQ4_NL: np.dtype([("d", "<f2"), ("qs", "u1", (16,))]),
     # ggml block_iq4_xs: d, the high 2 bits of the 8 scales, their low 4 bits
@@ -261,6 +262,15 @@ def _dequant(raw, t, count):
         hi = (q >> 4).astype(np.float32) - 8.0
         out = np.concatenate([lo, hi], axis=1) * d[:, None]
         return out.reshape(-1)[:count]
+    if t == Q5_0:
+        # As Q5_1 with no offset: the 5-bit value minus 16, times d.
+        q = raw["qs"]
+        qh = raw["qh"].astype(np.uint32)[:, None]
+        bits = np.arange(16, dtype=np.uint32)[None, :]
+        lo = (q & 0x0F).astype(np.uint32) | (((qh >> bits) & 1) << 4)
+        hi = (q >> 4).astype(np.uint32) | (((qh >> (bits + 16)) & 1) << 4)
+        v = np.concatenate([lo, hi], axis=1).astype(np.float32) - 16.0
+        return (v * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
     if t == Q5_1:
         # Value j (j < 16): the low 4 bits of byte j and bit j of qh; value
         # j + 16: the high 4 bits of byte j and bit j + 16 of qh. d q + m.

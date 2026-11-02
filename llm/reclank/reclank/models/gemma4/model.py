@@ -551,8 +551,9 @@ class Model:
             flat = arr.reshape(-1, arr.shape[-1])
             quant = ops.quantize_int8 if dtype == "int8" else ops.quantize_int4
             q, s = quant(flat)
-            parts = (q.reshape(arr.shape[:-1] + (q.shape[-1],)),
-                     s.reshape(arr.shape[:-1] + (s.shape[-1],)))
+            # (int4: q is (rows, groups, 18), the blocks of the GGUF layout)
+            parts = (q.reshape(arr.shape[:-1] + q.shape[1:]),
+                     s.reshape(arr.shape[:-1] + s.shape[1:]))
             if self._cache_write is not None:
                 self._cache_write.write(src + suffix, parts[0])
                 self._cache_write.write(src + ".scale", parts[1])

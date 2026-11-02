@@ -80,7 +80,7 @@ are not code notices: they are the models' own (reclank/setup/catalog.py lists t
   - Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved. (models/qwen3_5_moe/modeling_qwen3_5_moe.py, models/qwen3_5/modeling_qwen3_5.py, models/qwen3_vl/modeling_qwen3_vl.py)
   - Copyright 2025 The HuggingFace Team. All rights reserved. (models/lfm2_moe/modeling_lfm2_moe.py)
   - Copyright 2026 The Qwen Team and The HuggingFace Inc. team. All rights reserved. (models/qwen4_exp/modeling_qwen4_exp.py)
-  - Copyright 2026 the HuggingFace Team. All rights reserved. (models/gemma4/modeling_gemma4.py, processing_gemma4.py, video_processing_gemma4.py; models/gemma4_unified/*; models/gemma4_assistant/modeling_gemma4_assistant.py; models/embedding_gemma2/modeling_embedding_gemma2.py; models/glm5_next/modeling_glm5_next.py)
+  - Copyright 2026 the HuggingFace Team. All rights reserved. (models/gemma4/modeling_gemma4.py, processing_gemma4.py, video_processing_gemma4.py; models/gemma4_unified/*; models/gemma4_assistant/modeling_gemma4_assistant.py; models/embedding_gemma2/modeling_embedding_gemma2.py; models/glm5_next/modeling_glm5_next.py; models/diffusion_gemma/modeling_diffusion_gemma.py, generation_diffusion_gemma.py)
   - Copyright 2026 Google LLC (models/gemma4/feature_extraction_gemma4.py)
 
 - reclank files derived from it:
@@ -108,6 +108,8 @@ are not code notices: they are the models' own (reclank/setup/catalog.py lists t
   - `reclank/models/gemma4/unified.py`: gemma4_unified (modeling, processing, video_processing)
   - `reclank/models/gemma4/encoders.py`: modeling_gemma4.py, feature_extraction_gemma4.py
   - `reclank/models/gemma4/assistant.py`: modeling_gemma4_assistant.py
+  - `reclank/models/dgemma/model.py`, `runtime.py`: modeling_diffusion_gemma.py
+  - `reclank/models/dgemma/sampler.py`: generation_diffusion_gemma.py
   - `reclank/encoders/runtime.py`: modeling_gemma4.py, feature_extraction_gemma4.py
   - `reclank/encoders/media.py`: processing_gemma4.py, video_processing_gemma4.py, modeling_qwen3_vl.py
   - `reclank/models/embedgemma2/model.py`: modeling_embedding_gemma2.py
