@@ -834,6 +834,7 @@ def _py_step(op, a, e):
     elif op == DG_SAMPLE:
         t, vocab, neos = V(9), V(10), V(11)
         z = _arr(V(0), t * vocab).reshape(t, vocab)
+        raw = z.copy() if len(a) > 13 and V(13) else None
         z *= np.float32(1.0) / np.float32(_arr(V(2), 1)[0])
         ban = _arr(V(3), t, ctypes.c_int32)
         eos = _arr(V(4), neos, ctypes.c_int32) if neos else np.zeros(0, np.int32)
@@ -847,6 +848,11 @@ def _py_step(op, a, e):
         d = np.where(e > 0, z - M, 0)
         _arr(V(6), t)[:] = (np.log(S) - (e * d).sum(-1, keepdims=True) / S)[:, 0]
         _arr(V(7), t, ctypes.c_int32)[:] = z.argmax(-1)
+        if len(a) > 12 and V(12):
+            _arr(V(12), t)[:] = (1.0 / S)[:, 0]
+        if raw is not None:
+            rl = raw - raw.max(-1, keepdims=True)
+            _arr(V(13), t)[:] = np.exp(rl[np.arange(t), z.argmax(-1)]) / np.exp(rl).sum(-1)
         u = _arr(V(5), t)
         # the order of the GPU's chunks: thread j has j, j + 1024, ...
         order = np.arange(vocab).reshape(-1, 1024).T.reshape(-1) if vocab % 1024 == 0 else np.arange(vocab)
@@ -2474,7 +2480,8 @@ def k_dg_attn(c, q, K, V, lo, hi, heads, kvh, hd, out=None):
     h / (heads / kvh); float32 (DiffusionGemma's decoder and encoder; a GPU record)."""
     t = q.shape[0]
     out = c.buffer(q.shape) if out is None else out
-    c.p.emit(DG_ATTN, q, K, V, out, lo, hi, t, heads, kvh, hd)
+    # (operand 10: the scratch of the tiled kernel: 4 parts of the keys, each O and m, l of a row)
+    c.p.emit(DG_ATTN, q, K, V, out, lo, hi, t, heads, kvh, hd, c.buffer((4 * t * heads * (hd + 2),)))
     return out
 
 
@@ -2506,12 +2513,14 @@ def k_dg_split(c, idx, map, out=None):
     return out
 
 
-def k_dg_sample(c, z, probs, temp, ban, eos, u, ent, am, draw):
+def k_dg_sample(c, z, probs, temp, ban, eos, u, ent, am, draw, pmax=None, praw=None):
     """(dg_sample z probs temp ban eos u ent am draw): DiffusionGemma's step on the rows of logits
     z (t x vocab, in place: z / temp, the end tokens eos -inf where ban): their softmax into
-    probs, and each row's entropy, argmax and the sample of the uniform u (a GPU record)."""
+    probs, and each row's entropy, argmax and the sample of the uniform u (a GPU record); pmax (or
+    None): each row's probability of its argmax; praw (or None): its probability under the raw
+    logits (the model's: no temperature, no ban)."""
     t, vocab = z.shape
-    c.p.emit(DG_SAMPLE, z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, eos.size)
+    c.p.emit(DG_SAMPLE, z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, eos.size, pmax, praw)
 
 
 def k_enc_conv3(c, lin, x, groups, H, W, up=0, slope=None, res=None, rs=1.0, out=None):

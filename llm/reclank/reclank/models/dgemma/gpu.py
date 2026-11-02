@@ -67,11 +67,12 @@ def _gguf_file(path):
 class DGemmaGPU:
     """The model on the GPU (the experts on the CPU). The cache holds max_len positions."""
 
-    # the device bytes besides the experts' (the dense BF12 matrices, the transposed table, the
-    # cache, the logits and probabilities, the programs' scratch: 8.6 GB measured) and a margin
-    RESERVE = 10.0e9
+    # the device bytes besides the experts' and the cache's (the dense BF12 matrices, the
+    # transposed table, the logits and probabilities, the programs' scratch: 6.6 GB measured)
+    # and a margin
+    RESERVE = 8.0e9
 
-    def __init__(self, path, max_len=8192, slide_rows=4096, gpu_experts=None, count=False):
+    def __init__(self, path, max_len=32768, slide_rows=2048, gpu_experts=None, count=False):
         from reclank.backends.cuda.gpumm import pinned
         from reclank.backends.cuda.runtime import Mirror
         gpath, d = _gguf_file(path)
@@ -145,6 +146,9 @@ class DGemmaGPU:
             rows = self.S if plan.is_sliding else self.max_len + self.C
             self.K.append(np.zeros((rows, plan.kv_dim), np.float32))
             self.V.append(np.zeros((rows, plan.kv_dim), np.float32))
+        self.count = count
+        self.counts = np.zeros((self.L, self.E), np.int64)
+        self._place(d, gpu_experts)
         C = self.C
         self.z = np.zeros((C, self.vocab), np.float32)
         self.probs = np.zeros((C, self.vocab), np.float32)
@@ -157,9 +161,6 @@ class DGemmaGPU:
         self.hq = np.zeros((C, self.H), np.int8)
         self.hs = np.zeros((C, self.H // 32), np.float32)
         self.hm = np.zeros((C, self.H // 16), np.float32)
-        self.count = count
-        self.counts = np.zeros((self.L, self.E), np.int64)
-        self._place(d, gpu_experts)
         self.mirror = Mirror()
         self.mirror.kind = "dgemma"
         self.progs = {}
@@ -185,7 +186,8 @@ class DGemmaGPU:
                 slots = int(env)
             else:
                 from reclank.backends.cuda.gpumm import mem_info
-                slots = int(max(0, mem_info()[0] - self.RESERVE) // per)
+                cache = sum(a.nbytes for a in self.K + self.V)
+                slots = int(max(0, mem_info()[0] - self.RESERVE - cache) // per)
         slots = max(0, min(self.L * self.E, int(slots)))
         cp = os.path.join(d, "expert_counts.npz")
         if os.path.exists(cp):
@@ -227,6 +229,27 @@ class DGemmaGPU:
         """An empty cache: n positions, the windowed buffers from position base."""
         self.n = 0
         self.base = 0
+        self.held = []      # the tokens of the cache's positions
+
+    def reuse(self, ids):
+        """Keep the positions of the cache that hold the start of ids (the turns of a chat: the
+        prompt before, and the answer as far as the prompt has it again); the rest go. Return how
+        many ids the cache holds. A cut before the windowed buffers' first position + window - 1
+        (their rows of the cut are gone) empties the cache."""
+        n = 0
+        for a, b in zip(self.held, ids):
+            if a != int(b):
+                break
+            n += 1
+        if n < len(self.held):
+            if n and n - (self.window - 1) < self.base:
+                n = 0
+            if n == 0:
+                self.reset()
+            else:
+                self.n = n
+                self.held = self.held[:n]
+        return n
 
     def _room(self):
         """Before a block at n: the windowed layers' last window - 1 rows to the front when the
@@ -266,7 +289,8 @@ class DGemmaGPU:
                      los=i32(C), his=i32(C), lof=i32(C), hif=i32(C), rows=i32(1), rowf=i32(1),
                      _scratch=z(C * max(H, 8192)))
         if kind != "enc":
-            c.env.update(temp=z(1), ban=i32(C), u=z(C), ent=z(C), am=i32(C), draw=i32(C))
+            c.env.update(temp=z(1), ban=i32(C), u=z(C), ent=z(C), am=i32(C), draw=i32(C), pmax=z(C),
+                         praw=z(C))
         e = c.env
         x = e["x"]
         if kind == "dec1":
@@ -330,7 +354,8 @@ class DGemmaGPU:
             xn = P.k_enc_rms(c, x, self.norm, H)
             P.k_enc_linear(c, self.head, xn, out=self.z)
             c.p.emit(P.SOFTCAP, self.z, self.z.size, float(self.cfg.final_logit_softcapping))
-            P.k_dg_sample(c, self.z, self.probs, e["temp"], e["ban"], self.eos, e["u"], e["ent"], e["am"], e["draw"])
+            P.k_dg_sample(c, self.z, self.probs, e["temp"], e["ban"], self.eos, e["u"], e["ent"], e["am"], e["draw"],
+                          pmax=e["pmax"], praw=e["praw"])
         prog = c.p.finish()
         from reclank.ir import alloc
         alloc.pack(prog)     # the temporaries by liveness
@@ -412,6 +437,7 @@ class DGemmaGPU:
             g.run()
             self._tally(g, m)
             self.n += m
+            self.held.extend(int(v) for v in part)
 
     def steps(self):
         """A step function for a new canvas (sampler.denoise's step): the decoder at positions
@@ -438,9 +464,9 @@ class DGemmaGPU:
             state["set"] = kind
             g.run()
             self._tally(g, C)
-            for k in ("ent", "am", "draw"):
+            for k in ("ent", "am", "draw", "pmax", "praw"):
                 g.download(k)
             state["first"] = False
             pr = g.prog_.names
-            return pr["ent"].copy(), pr["am"].copy(), pr["draw"].copy()
+            return pr["ent"].copy(), pr["am"].copy(), pr["draw"].copy(), pr["pmax"].copy(), pr["praw"].copy()
         return step

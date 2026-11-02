@@ -50,3 +50,20 @@ def test_template_and_generate():
     # the pinned token after it keeps its place (canvas offset 3)
     assert out[2 + 3] == 22
     assert len(st.steps) >= 1
+
+
+def test_draft_events():
+    s = _settings()
+    want = (np.arange(s.canvas) * 3 + 2) % s.vocab      # (no end token: 1)
+    items = list(S.generate_iter(lambda ids: None, _decoder(s, want), [2], 16, s, np.random.default_rng(3),
+                                 events=True))
+    evs = [x for x in items if isinstance(x, dict)]
+    toks = [x for x in items if not isinstance(x, dict)]
+    assert evs and len(toks) == 1
+    e = evs[-1]
+    assert e["canvas"] == 0 and e["draft"].shape == (s.canvas,) and e["kept"].dtype == bool
+    assert np.all((e["prob"] > 0) & (e["prob"] <= 1)) and np.array_equal(e["draft"], want)
+    # the raw logits (12 against 63 of -4): the same probability at every step's temperature
+    p = 1 / (1 + (s.vocab - 1) * np.exp(-16.0))
+    assert all(np.allclose(v["raw"], p, rtol=1e-5) for v in evs)
+    assert toks[0] == want.tolist()

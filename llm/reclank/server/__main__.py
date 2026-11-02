@@ -1,7 +1,7 @@
 """The server of reclank: python -m server --model PATH [options] (see
 server/options.py). The family of the model comes from the file (the GGUF
-general.architecture): Gemma 4, Qwen3.6, or Qwen3.8; or of a checkpoint directory
-(its config.json): DeepSeek V4.1 Flash."""
+general.architecture): Gemma 4, DiffusionGemma (its BF12 GGUF), Qwen3.6, or Qwen3.8; or of a
+checkpoint directory (its config.json): DeepSeek V4.1 Flash."""
 from __future__ import annotations
 
 import os
@@ -15,7 +15,7 @@ from server.backend import Backend  # noqa: E402
 from server.options import parser  # noqa: E402
 from server.worker import ModelWorker  # noqa: E402
 
-FAMILIES = ("gemma4", "qwen", "deepseek41", "nemotron")
+FAMILIES = ("dgemma", "gemma4", "qwen", "deepseek41", "nemotron")
 
 
 def family_module(name):
@@ -25,6 +25,8 @@ def family_module(name):
         from reclank.models.deepseek41 import engine
     elif name == "nemotron":
         from reclank.models.nemotron import engine
+    elif name == "dgemma":
+        from reclank.models.dgemma import engine
     else:
         from reclank.models.qwen import engine
     return engine

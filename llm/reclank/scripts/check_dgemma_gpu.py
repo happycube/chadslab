@@ -146,23 +146,35 @@ def main():
     if a.logits:
         z0 = np.ascontiguousarray(np.load(a.logits)["l1"], np.float32)
         t, vocab = z0.shape
+        # the raw logits' log-probabilities in float64 (z0 itself is the program's z: overwritten)
+        zl = z0.astype(np.float64)
+        zl -= zl.max(-1, keepdims=True)
+        zl -= np.log(np.exp(zl).sum(-1, keepdims=True))
         c = _EncCompiler(1e-6)
         c.env.update(z=z0, probs=np.zeros((t, vocab), np.float32), temp=np.array([0.8], np.float32),
                      ban=(np.arange(t) < 100).astype(np.int32), eos=np.array([1, 106, 50], np.int32),
                      u=rng.random(t).astype(np.float32), ent=np.zeros(t, np.float32),
-                     am=np.zeros(t, np.int32), draw=np.zeros(t, np.int32))
+                     am=np.zeros(t, np.int32), draw=np.zeros(t, np.int32), pmax=np.zeros(t, np.float32),
+                     praw=np.zeros(t, np.float32))
         e = c.env
-        P.k_dg_sample(c, e["z"], e["probs"], e["temp"], e["ban"], e["eos"], e["u"], e["ent"], e["am"], e["draw"])
-        outs = ("z", "probs", "ent", "am", "draw")
+        P.k_dg_sample(c, e["z"], e["probs"], e["temp"], e["ban"], e["eos"], e["u"], e["ent"], e["am"], e["draw"],
+                      pmax=e["pmax"], praw=e["praw"])
+        outs = ("z", "probs", "ent", "am", "draw", "pmax", "praw")
         ref, got = run_both(c.p.finish(), tuple(c.env), outs)
+        want_raw = np.exp(zl[np.arange(t), got["am"]])
         fin = np.isfinite(ref["z"])
         zs = np.array_equal(np.where(fin, got["z"], 0), np.where(fin, ref["z"], 0))
         good = (zs and rel(got["probs"], ref["probs"]) < 1e-5 and np.array_equal(got["am"], ref["am"])
                 and (got["draw"] == ref["draw"]).mean() > 0.98 and np.abs(got["ent"] - ref["ent"]).max() < 1e-4
-                and not np.isin(got["draw"][:100], [1, 106, 50]).any())
+                and not np.isin(got["draw"][:100], [1, 106, 50]).any()
+                and rel(got["pmax"], ref["pmax"]) < 1e-5
+                and np.allclose(got["pmax"], got["probs"][np.arange(t), got["am"]], rtol=1e-5)
+                and rel(got["praw"], ref["praw"]) < 1e-5 and rel(got["praw"], want_raw) < 1e-5)
         ok &= good
-        print("DG_SAMPLE: z the same %s; probs %.2e; entropy %.1e; argmax %d/%d; samples %d/%d%s" % (
-            zs, rel(got["probs"], ref["probs"]), np.abs(got["ent"] - ref["ent"]).max(),
+        print("DG_SAMPLE: z the same %s; probs %.2e; entropy %.1e; the argmax's probability %.1e, raw %.1e "
+              "(%.1e against float64); argmax %d/%d; samples %d/%d%s" % (
+            zs, rel(got["probs"], ref["probs"]), np.abs(got["ent"] - ref["ent"]).max(), rel(got["pmax"], ref["pmax"]),
+            rel(got["praw"], ref["praw"]), rel(got["praw"], want_raw),
             (got["am"] == ref["am"]).sum(), t, (got["draw"] == ref["draw"]).sum(), t, "" if good else "  FAIL"))
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

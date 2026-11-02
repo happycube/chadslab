@@ -95,30 +95,31 @@ def accept_mask(ent, bound):
 
 def cpu_steps(decode, s):
     """The step of a canvas from the raw logits of decode(canvas, sc_logits): a function
-    step(canvas, temp, ban, u) -> (entropy, argmax, sample) of each position, that keeps the
-    processed logits for the self-conditioning of the next step (none at the first)."""
+    step(canvas, temp, ban, u) -> (entropy, argmax, sample, the argmax's probability, its
+    probability under the raw logits: no temperature, no ban) of each position, that keeps the processed logits for the self-conditioning of the next step (none at
+    the first)."""
     eos = np.asarray(s.eos)
     state = {"sc": None}
 
     def step(cur, temp, ban, u):
-        z = decode(cur, state["sc"]) / np.float32(temp)
+        raw = decode(cur, state["sc"])
+        z = raw / np.float32(temp)
         if ban.any():
             z[np.ix_(np.nonzero(ban)[0], eos)] = -np.inf
         logp = log_softmax(z)
         state["sc"] = z
-        return entropy(logp), z.argmax(-1), sample_rows(logp, u)
+        am = z.argmax(-1)
+        praw = np.exp(log_softmax(raw)[np.arange(len(am)), am])
+        return entropy(logp), am, sample_rows(logp, u), np.exp(logp.max(-1)), praw
     return step
 
 
-def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None):
-    """Denoise one canvas. Returns (the argmax canvas, the steps run).
-
-    decode(canvas, sc_logits) gives the raw logits (cpu_steps); or step, a function of a
-    canvas (cpu_steps' form: the GPU's DG_SAMPLE gives the three rows itself).
-    fixed: None, or the canvas's pinned tokens (-1 where free): they start in
-    place, are never renoised, and are the result there; the entropy bound and
-    the stopping test count only the free positions. no_end: the end tokens
-    cannot be chosen at positions before it (the last pinned token is after)."""
+def denoise_iter(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None, events=False):
+    """denoise as a generator: with events, a dict after each step (step: the steps left; draft: the
+    argmax canvas; prob: each position's probability of its draft token, of the processed logits
+    (None when the step function gives none); raw: its probability under the raw logits (the
+    model's: no temperature, no ban; or None); pinned positions have 1 for both; entropy; kept: the positions the sampler kept);
+    its return value (StopIteration) is (the argmax canvas, the steps run)."""
     if step is None:
         step = cpu_steps(decode, s)
     cur = rng.integers(0, s.vocab, s.canvas)
@@ -136,7 +137,10 @@ def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None):
     am = cur
     for k in range(s.max_steps, 0, -1):
         temp = s.t_min + (s.t_max - s.t_min) * (k / s.max_steps)
-        ent, am, draw = step(cur, temp, ban, rng.random(s.canvas))
+        res = step(cur, temp, ban, rng.random(s.canvas))
+        ent, am, draw = res[:3]
+        pmax = res[3] if len(res) > 3 else None
+        praw = res[4] if len(res) > 4 else None
         am, draw = np.array(am), np.array(draw)
         steps += 1
         if free is None:
@@ -153,9 +157,33 @@ def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None):
         prev = am
         if on_step is not None:
             on_step(k, am, keep, ent)
+        if events:
+            pm, pr = (None if v is None else np.array(v, dtype=np.float32) for v in (pmax, praw))
+            for v in (pm, pr):
+                if v is not None and pin is not None:
+                    v[pin] = 1.0
+            yield {"step": k, "draft": am.copy(), "prob": pm, "raw": pr, "entropy": np.array(ent, dtype=np.float32),
+                   "kept": keep.copy()}
         if stable and conf < s.confidence:
             break
     return am, steps
+
+
+def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None):
+    """Denoise one canvas. Returns (the argmax canvas, the steps run).
+
+    decode(canvas, sc_logits) gives the raw logits (cpu_steps); or step, a function of a
+    canvas (cpu_steps' form: the GPU's DG_SAMPLE gives the rows itself).
+    fixed: None, or the canvas's pinned tokens (-1 where free): they start in
+    place, are never renoised, and are the result there; the entropy bound and
+    the stopping test count only the free positions. no_end: the end tokens
+    cannot be chosen at positions before it (the last pinned token is after)."""
+    g = denoise_iter(decode, s, rng, on_step, fixed, no_end, step)
+    while True:
+        try:
+            next(g)
+        except StopIteration as e:
+            return e.value
 
 
 def parse_template(text, encode):
@@ -171,6 +199,64 @@ def parse_template(text, encode):
     return np.asarray(out, dtype=np.int64)
 
 
+def generate_iter(encode, decode, prompt, max_new, s, rng, on_step=None, fixed=None, steps=None, stats=None,
+                  events=False):
+    """generate's canvases one at a time: yield the tokens of the answer as each canvas is done (a
+    pinned start first: the prefix), at most max_new tokens unless pinned tokens come later (they
+    are all kept). stats (or None): a Stats that gets each canvas's passes and the tokens. events:
+    also a dict after each denoising step (denoise_iter's, with "canvas": its index), before the
+    canvas's tokens."""
+    st = stats if stats is not None else Stats()
+    fixed = None if fixed is None else np.asarray(fixed, dtype=np.int64)
+    prompt = np.asarray(prompt, dtype=np.int64)
+    head = []
+    if fixed is not None:
+        k = 0
+        while k < fixed.size and fixed[k] >= 0:
+            k += 1
+        head = fixed[:k].tolist()
+        prompt = np.concatenate([prompt, fixed[:k]])
+        fixed = fixed[k:]
+        if not (fixed >= 0).any():
+            fixed = None
+    last = -1 if fixed is None else int(np.nonzero(fixed >= 0)[0][-1])
+    encode(prompt)
+    n_out = len(head)
+    if head:
+        st.tokens += len(head)
+        yield head
+    canvases = -(-max(0, max_new - n_out) // s.canvas)
+    canvases = max(canvases, -(-(last + 1) // s.canvas))
+    for c in range(canvases):
+        f = None
+        if fixed is not None and c * s.canvas <= last:
+            f = np.full(s.canvas, -1, dtype=np.int64)
+            seg = fixed[c * s.canvas:(c + 1) * s.canvas]
+            f[:seg.size] = seg
+        no_end = min(s.canvas, max(0, last - c * s.canvas))
+        it = denoise_iter(decode, s, rng, on_step, fixed=f, no_end=no_end,
+                          step=None if steps is None else steps(), events=events)
+        while True:
+            try:
+                ev = next(it)
+            except StopIteration as e:
+                am, n = e.value
+                break
+            ev["canvas"] = c
+            yield ev
+        st.steps.append(n)
+        ends = np.nonzero(np.isin(am[no_end:], s.eos))[0] + no_end
+        got = am[:ends[0] + 1].tolist() if ends.size else am.tolist()
+        if last < 0 and n_out + len(got) > max_new:
+            got = got[:max(0, max_new - n_out)]
+        n_out += len(got)
+        st.tokens += len(got)
+        yield got
+        if ends.size or (n_out >= max_new and c * s.canvas >= last):
+            return
+        encode(am.astype(np.int64))
+
+
 def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=None, fixed=None,
              steps=None):
     """Encode the prompt, then canvases until an end token or max_new tokens.
@@ -183,45 +269,11 @@ def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=No
     others are pinned in their canvases (denoise), and no end token comes
     before the last of them. steps: None (decode's logits, cpu_steps), or a function that gives
     a new step function (denoise's step) for each canvas."""
-    out = []
-    fixed = None if fixed is None else np.asarray(fixed, dtype=np.int64)
-    prompt = np.asarray(prompt, dtype=np.int64)
-    if fixed is not None:
-        k = 0
-        while k < fixed.size and fixed[k] >= 0:
-            k += 1
-        out = fixed[:k].tolist()
-        prompt = np.concatenate([prompt, fixed[:k]])
-        fixed = fixed[k:]
-        if not (fixed >= 0).any():
-            fixed = None
-    last = -1 if fixed is None else int(np.nonzero(fixed >= 0)[0][-1])
-    encode(prompt)
     st = Stats()
-    canvases = -(-max(0, max_new - len(out)) // s.canvas)
-    canvases = max(canvases, -(-(last + 1) // s.canvas))
-    for c in range(canvases):
-        f = None
-        if fixed is not None and c * s.canvas <= last:
-            f = np.full(s.canvas, -1, dtype=np.int64)
-            seg = fixed[c * s.canvas:(c + 1) * s.canvas]
-            f[:seg.size] = seg
-        no_end = min(s.canvas, max(0, last - c * s.canvas))
-        am, n = denoise(decode, s, rng, on_step, fixed=f, no_end=no_end,
-                        step=None if steps is None else steps())
-        st.steps.append(n)
-        ends = np.nonzero(np.isin(am[no_end:], s.eos))[0] + no_end
-        if ends.size:
-            got = am[:ends[0] + 1].tolist()
-        else:
-            got = am.tolist()
+    out = []
+    pinned_start = fixed is not None and len(fixed) and fixed[0] >= 0
+    for c, got in enumerate(generate_iter(encode, decode, prompt, max_new, s, rng, on_step, fixed, steps, st)):
         out.extend(got)
-        if on_canvas is not None:
-            on_canvas(c, got)
-        if ends.size or (len(out) >= max_new and c * s.canvas >= last):
-            break
-        encode(am.astype(np.int64))
-    if last < 0:
-        out = out[:max_new]
-    st.tokens = len(out)
+        if on_canvas is not None and not (pinned_start and c == 0):
+            on_canvas(len(st.steps) - 1, got)
     return out, st

@@ -410,11 +410,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_DG_ATTN: {
-        /* q, K, V, out, lo, hi, t, heads, kvh, hd */
+        /* q, K, V, out, lo, hi, t, heads, kvh, hd, part (or null: the scratch of the tiled kernel,
+         * dg_attn_part_floats) */
         int t = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad);
         int kvh = (int)hlit(r, 8, &bad), hd = (int)hlit(r, 9, &bad);
+        float *part = r->tag[10] != GP_T_NONE ? (float *)(intptr_t)hi(r, g->henv, 10) : NULL;
         if (hd != 256 && hd != 512) {
             bad = 1;
+        } else if (t > 0 && part != NULL && dg_attn_tile_on()) {
+            dg_attn_tiled((const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                          (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3), part,
+                          (const int *)(intptr_t)hi(r, g->henv, 4), (const int *)(intptr_t)hi(r, g->henv, 5),
+                          t, heads, kvh, hd, s);
         } else if (t > 0) {
             dg_attn((const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
                     (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3),
@@ -453,14 +460,17 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_DG_SAMPLE: {
-        /* z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, neos */
+        /* z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, neos, pmax (or null: the argmax's
+         * probability of each row), praw (or null: the argmax's probability under the raw logits) */
         int t = (int)hlit(r, 9, &bad), vocab = (int)hlit(r, 10, &bad), neos = (int)hlit(r, 11, &bad);
         if (t > 0) {
             dg_sample((float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), t, vocab,
                       (const float *)(intptr_t)hi(r, g->henv, 2), (const int *)(intptr_t)hi(r, g->henv, 3),
                       (const int *)(intptr_t)hi(r, g->henv, 4), neos, (const float *)(intptr_t)hi(r, g->henv, 5),
                       (float *)(intptr_t)hi(r, g->henv, 6), (int *)(intptr_t)hi(r, g->henv, 7),
-                      (int *)(intptr_t)hi(r, g->henv, 8), s);
+                      (int *)(intptr_t)hi(r, g->henv, 8),
+                      r->tag[12] != GP_T_NONE ? (float *)(intptr_t)hi(r, g->henv, 12) : NULL,
+                      r->tag[13] != GP_T_NONE ? (float *)(intptr_t)hi(r, g->henv, 13) : NULL, s);
         }
         break;
     }

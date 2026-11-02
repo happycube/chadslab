@@ -19,7 +19,7 @@ def parser():
     g = ap.add_argument_group("the model")
     g.add_argument("--model", "-m", "--gguf", dest="model", required=True,
                    help="the GGUF file of the model, or a checkpoint directory (DeepSeek V4.1)")
-    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41", "nemotron"), default="auto")
+    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41", "nemotron", "dgemma"), default="auto")
     g.add_argument("--tokenizer", "--tok", dest="tokenizer", default=None,
                    help="tokenizer.json (Gemma: the GGUF data by default; Qwen: next to the model)")
     g.add_argument("--template", default=None,

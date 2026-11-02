@@ -134,12 +134,25 @@ static void dg_attn(const float *q, const float *K, const float *V, float *out, 
 
 /* One block (1024 threads) a row. Thread j has the values j, j + 1024, ... (its chunk, in that
  * order); the sample is the first value of the cumulative sum, in the order of the chunks, past
- * u (the thread whose chunk holds it then walks it). */
+ * u (the thread whose chunk holds it then walks it). praw (or null): each row's probability of
+ * its argmax under the raw logits (the model's: no temperature, no ban), an online softmax of
+ * the raw values in the first pass. */
 #define DG_ST 1024
+
+/* The merge of two online softmax sums (max m, sum s of exp(v - m)) into (m, s). */
+__device__ __forceinline__ void dg_osm_merge(float &m, float &s, float om, float os)
+{
+    const float n = fmaxf(m, om);
+    if (n == -INFINITY) {
+        return;
+    }
+    s = (m == -INFINITY ? 0.f : s * expf(m - n)) + (om == -INFINITY ? 0.f : os * expf(om - n));
+    m = n;
+}
 
 __global__ void __launch_bounds__(DG_ST) k_dg_sample(float *z, float *probs, int vocab, const float *temp,
                                                      const int *ban, const int *eos, int neos, const float *u,
-                                                     float *ent, int *am, int *draw)
+                                                     float *ent, int *am, int *draw, float *pmax, float *praw)
 {
     const int i = blockIdx.x, tid = threadIdx.x;
     float *zr = z + (size_t)i * vocab;
@@ -150,12 +163,24 @@ __global__ void __launch_bounds__(DG_ST) k_dg_sample(float *z, float *probs, int
     __shared__ float s_max, s_sum, s_ez;
     __shared__ float scan[DG_ST];
     __shared__ int s_pick;
-    /* 1: the processed logits, their max and its first index */
-    float mx = -INFINITY;
+    __shared__ float rawm[DG_ST / 32], raws[DG_ST / 32], rawa[DG_ST / 32];
+    /* 1: the processed logits, their max and its first index (and its raw value); the raw
+     * logits' online softmax sum */
+    float mx = -INFINITY, ma = -INFINITY, rm = -INFINITY, rs = 0.f;
     int mi = 0;
     const int banned = ban[i];
+    const int raw = praw != NULL;
     for (int c = tid; c < vocab; c += DG_ST) {
-        float v = zr[c] * inv_t;
+        const float r = zr[c];
+        if (raw) {
+            if (r > rm) {
+                rs = (rm == -INFINITY ? 0.f : rs * expf(rm - r)) + 1.f;
+                rm = r;
+            } else {
+                rs += expf(r - rm);
+            }
+        }
+        float v = r * inv_t;
         if (banned) {
             for (int e = 0; e < neos; ++e) {
                 if (c == eos[e]) {
@@ -167,32 +192,45 @@ __global__ void __launch_bounds__(DG_ST) k_dg_sample(float *z, float *probs, int
         if (v > mx) {
             mx = v;
             mi = c;
+            ma = r;
         }
     }
     for (int w = 16; w > 0; w >>= 1) {
         float om = __shfl_xor_sync(0xffffffffu, mx, w);
         int oi = __shfl_xor_sync(0xffffffffu, mi, w);
+        float oa = __shfl_xor_sync(0xffffffffu, ma, w);
+        float orm = __shfl_xor_sync(0xffffffffu, rm, w), ors = __shfl_xor_sync(0xffffffffu, rs, w);
         if (om > mx || (om == mx && oi < mi)) {
             mx = om;
             mi = oi;
+            ma = oa;
         }
+        dg_osm_merge(rm, rs, orm, ors);
     }
     if ((tid & 31) == 0) {
         red[tid >> 5] = mx;
         redi[tid >> 5] = mi;
+        rawa[tid >> 5] = ma;
+        rawm[tid >> 5] = rm;
+        raws[tid >> 5] = rs;
     }
     __syncthreads();
     if (tid == 0) {
-        float b = red[0];
+        float b = red[0], ba = rawa[0], bm = rawm[0], bs = raws[0];
         int bi = redi[0];
         for (int k = 1; k < DG_ST / 32; ++k) {
             if (red[k] > b || (red[k] == b && redi[k] < bi)) {
                 b = red[k];
                 bi = redi[k];
+                ba = rawa[k];
             }
+            dg_osm_merge(bm, bs, rawm[k], raws[k]);
         }
         s_max = b;
         am[i] = bi;
+        if (raw) {
+            praw[i] = expf(ba - bm) / bs;
+        }
     }
     __syncthreads();
     const float M = s_max;
@@ -224,8 +262,11 @@ __global__ void __launch_bounds__(DG_ST) k_dg_sample(float *z, float *probs, int
         }
         s_sum = sa;
         s_ez = sb;
-        /* the entropy: log S - sum e (z - M) / S */
+        /* the entropy: log S - sum e (z - M) / S; the argmax's probability 1 / S (or null) */
         ent[i] = logf(sa) - sb / sa;
+        if (pmax != NULL) {
+            pmax[i] = 1.f / sa;
+        }
         /* the chunk of the sample: the inclusive prefix of the threads' sums past u S */
         const float target = u[i] * sa;
         float acc = 0.f;
@@ -269,9 +310,10 @@ __global__ void __launch_bounds__(DG_ST) k_dg_sample(float *z, float *probs, int
 }
 
 static void dg_sample(float *z, float *probs, int t, int vocab, const float *temp, const int *ban, const int *eos,
-                      int neos, const float *u, float *ent, int *am, int *draw, cudaStream_t s)
+                      int neos, const float *u, float *ent, int *am, int *draw, float *pmax, float *praw,
+                      cudaStream_t s)
 {
-    k_dg_sample<<<(unsigned)t, DG_ST, 0, s>>>(z, probs, vocab, temp, ban, eos, neos, u, ent, am, draw);
+    k_dg_sample<<<(unsigned)t, DG_ST, 0, s>>>(z, probs, vocab, temp, ban, eos, neos, u, ent, am, draw, pmax, praw);
 }
 
 /* DG_MOE: the routed experts of a layer on the GPU (BF12 rows; models/dgemma/gpu.py, the
@@ -834,4 +876,265 @@ __global__ void k_dg_split(const int *idx, const int *map, int *cidx, int P)
         const int e = idx[p];
         cidx[p] = e >= 0 && map[e] >= 0 ? -1 : e;
     }
+}
+
+/* DG_ATTN, tiled (the default; RECLANK_DG_ATTN_TILE=0: k_dg_attn above): float32 on the CUDA
+ * cores, the same sums but in another order. A block: BR rows of (query, head) that read one KV
+ * head (row r: query q0 + r / rep, head g rep + r % rep), one of DGA_NS parts of their keys
+ * (split-K: the block's keys [least lo, largest hi) in DGA_NS equal parts; k_dg_attn_comb joins
+ * the parts). 256 threads; keys in tiles of DGA_BK = 32:
+ *   S = Q K^T, 32 dims a stage (Q's rows and K's keys in shared memory, read as float4): thread
+ *     (ry, kx) the rows ry RPT .. + RPT - 1 and the keys 2 kx, 2 kx + 1 (RPT = BR / 16)
+ *   the online softmax of each row (its 16 threads by shuffles), P into shared memory
+ *   O += P V: the thread's rows and the dims kx 4 + 64 j (V's tile of 32 keys in shared memory)
+ * D 256: BR 64; D 512: BR 32 (the 64 sums of O a thread either way). */
+#define DGA_BK 32
+#define DGA_DC 32
+#define DGA_NS 4
+#define DGA_LD (DGA_DC + 4)
+
+template <int D, int BR>
+__global__ void __launch_bounds__(256) k_dg_attn_t(const float *q, const float *K, const float *V, float *part,
+                                                   const int *lo, const int *hi, int t, int heads, int kvh)
+{
+    constexpr int RPT = BR / 16, NJ = D / 64;
+    extern __shared__ __align__(16) float dga_sm[];
+    float *qs = dga_sm;                         /* [BR][DGA_LD] */
+    float *ks = qs + BR * DGA_LD;               /* [DGA_BK][DGA_LD] */
+    float *vs = ks + DGA_BK * DGA_LD;           /* [DGA_BK][D] */
+    float *ps = vs + DGA_BK * D;                /* [DGA_BK][BR] */
+    __shared__ int rlo[BR], rhi[BR], blk[2];
+    const int g = blockIdx.y, sp = blockIdx.z, rep = heads / kvh;
+    const int tid = threadIdx.x, ry = tid >> 4, kx = tid & 15;
+    const int row0 = blockIdx.x * BR, nrows = t * rep;
+    if (tid < BR) {
+        const int rr = row0 + tid;
+        rlo[tid] = rr < nrows ? lo[rr / rep] : 0;
+        rhi[tid] = rr < nrows ? hi[rr / rep] : 0;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int a = INT_MAX, b = 0;
+        for (int r = 0; r < BR; ++r) {
+            if (row0 + r < nrows) {
+                a = min(a, rlo[r]);
+                b = max(b, rhi[r]);
+            }
+        }
+        if (a == INT_MAX) {
+            a = 0;
+        }
+        const int len = max(0, b - a), ch = (len + DGA_NS - 1) / DGA_NS;
+        blk[0] = min(b, a + sp * ch);
+        blk[1] = min(b, a + (sp + 1) * ch);
+    }
+    __syncthreads();
+    const int ks0 = blk[0], ke = blk[1];
+    float o[RPT][NJ][4], m[RPT], l[RPT];
+    #pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+        m[i] = -INFINITY;
+        l[i] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            o[i][j][0] = o[i][j][1] = o[i][j][2] = o[i][j][3] = 0.f;
+        }
+    }
+    const size_t kst = (size_t)kvh * D;
+    for (int k0 = ks0; k0 < ke; k0 += DGA_BK) {
+        const int nk = min(DGA_BK, ke - k0);
+        float s[RPT][2];
+        #pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+            s[i][0] = s[i][1] = 0.f;
+        }
+        for (int d0 = 0; d0 < D; d0 += DGA_DC) {
+            __syncthreads();
+            for (int e = tid; e < BR * (DGA_DC / 4); e += 256) {
+                const int r = e / (DGA_DC / 4), c = (e % (DGA_DC / 4)) * 4, rr = row0 + r;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (rr < nrows) {
+                    v = *(const float4 *)(q + ((size_t)(rr / rep) * heads + g * rep + rr % rep) * D + d0 + c);
+                }
+                *(float4 *)(qs + r * DGA_LD + c) = v;
+            }
+            for (int e = tid; e < DGA_BK * (DGA_DC / 4); e += 256) {
+                const int r = e / (DGA_DC / 4), c = (e % (DGA_DC / 4)) * 4;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (r < nk) {
+                    v = *(const float4 *)(K + (size_t)(k0 + r) * kst + (size_t)g * D + d0 + c);
+                }
+                *(float4 *)(ks + r * DGA_LD + c) = v;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int d = 0; d < DGA_DC; d += 4) {
+                const float4 k0v = *(const float4 *)(ks + (2 * kx) * DGA_LD + d);
+                const float4 k1v = *(const float4 *)(ks + (2 * kx + 1) * DGA_LD + d);
+                #pragma unroll
+                for (int i = 0; i < RPT; ++i) {
+                    const float4 qv = *(const float4 *)(qs + (ry * RPT + i) * DGA_LD + d);
+                    s[i][0] = fmaf(qv.x, k0v.x, s[i][0]);
+                    s[i][0] = fmaf(qv.y, k0v.y, s[i][0]);
+                    s[i][0] = fmaf(qv.z, k0v.z, s[i][0]);
+                    s[i][0] = fmaf(qv.w, k0v.w, s[i][0]);
+                    s[i][1] = fmaf(qv.x, k1v.x, s[i][1]);
+                    s[i][1] = fmaf(qv.y, k1v.y, s[i][1]);
+                    s[i][1] = fmaf(qv.z, k1v.z, s[i][1]);
+                    s[i][1] = fmaf(qv.w, k1v.w, s[i][1]);
+                }
+            }
+        }
+        /* V's tile, then the softmax of the tile's scores and P */
+        for (int e = tid; e < DGA_BK * (D / 4); e += 256) {
+            const int r = e / (D / 4), c = (e % (D / 4)) * 4;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (r < nk) {
+                v = *(const float4 *)(V + (size_t)(k0 + r) * kst + (size_t)g * D + c);
+            }
+            *(float4 *)(vs + r * D + c) = v;
+        }
+        #pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+            const int r = ry * RPT + i;
+            float sv[2];
+            float mx = -INFINITY;
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int key = k0 + 2 * kx + u;
+                const int ok = 2 * kx + u < nk && key >= rlo[r] && key < rhi[r];
+                sv[u] = ok ? s[i][u] : -INFINITY;
+                mx = fmaxf(mx, sv[u]);
+            }
+            for (int w = 8; w > 0; w >>= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, w));
+            }
+            const float mn = fmaxf(m[i], mx);
+            float p[2] = {0.f, 0.f}, sc = 1.f;
+            if (mn != -INFINITY) {
+                sc = m[i] == -INFINITY ? 0.f : expf(m[i] - mn);
+                p[0] = sv[0] == -INFINITY ? 0.f : expf(sv[0] - mn);
+                p[1] = sv[1] == -INFINITY ? 0.f : expf(sv[1] - mn);
+            }
+            float ps_ = p[0] + p[1];
+            for (int w = 8; w > 0; w >>= 1) {
+                ps_ += __shfl_xor_sync(0xffffffffu, ps_, w);
+            }
+            l[i] = l[i] * sc + ps_;
+            m[i] = mn;
+            #pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                o[i][j][0] *= sc;
+                o[i][j][1] *= sc;
+                o[i][j][2] *= sc;
+                o[i][j][3] *= sc;
+            }
+            ps[(2 * kx) * BR + r] = p[0];
+            ps[(2 * kx + 1) * BR + r] = p[1];
+        }
+        __syncthreads();
+        for (int j = 0; j < nk; ++j) {
+            float pv[RPT];
+            #pragma unroll
+            for (int i = 0; i < RPT; ++i) {
+                pv[i] = ps[j * BR + ry * RPT + i];
+            }
+            #pragma unroll
+            for (int jj = 0; jj < NJ; ++jj) {
+                const float4 v = *(const float4 *)(vs + j * D + kx * 4 + 64 * jj);
+                #pragma unroll
+                for (int i = 0; i < RPT; ++i) {
+                    o[i][jj][0] = fmaf(pv[i], v.x, o[i][jj][0]);
+                    o[i][jj][1] = fmaf(pv[i], v.y, o[i][jj][1]);
+                    o[i][jj][2] = fmaf(pv[i], v.z, o[i][jj][2]);
+                    o[i][jj][3] = fmaf(pv[i], v.w, o[i][jj][3]);
+                }
+            }
+        }
+    }
+    /* the part: O (not divided), then m and l, of each row (query, head) */
+    const size_t rows_all = (size_t)t * heads;
+    #pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+        const int rr = row0 + ry * RPT + i;
+        if (rr >= nrows) {
+            continue;
+        }
+        const size_t row = (size_t)(rr / rep) * heads + g * rep + rr % rep;
+        float *po = part + ((size_t)sp * rows_all + row) * D;
+        #pragma unroll
+        for (int jj = 0; jj < NJ; ++jj) {
+            *(float4 *)(po + kx * 4 + 64 * jj) = make_float4(o[i][jj][0], o[i][jj][1], o[i][jj][2], o[i][jj][3]);
+        }
+        if (kx == 0) {
+            float *ml = part + (size_t)DGA_NS * rows_all * D + ((size_t)sp * rows_all + row) * 2;
+            ml[0] = m[i];
+            ml[1] = l[i];
+        }
+    }
+}
+
+/* the parts of each row joined: O = sum_s e^(m_s - M) O_s / sum_s e^(m_s - M) l_s */
+__global__ void k_dg_attn_comb(const float *part, float *out, int rows, int D)
+{
+    const int row = blockIdx.x;
+    const float *ml = part + (size_t)DGA_NS * rows * D;
+    float M = -INFINITY;
+    for (int s = 0; s < DGA_NS; ++s) {
+        M = fmaxf(M, ml[((size_t)s * rows + row) * 2]);
+    }
+    float w[DGA_NS], L = 0.f;
+    for (int s = 0; s < DGA_NS; ++s) {
+        const float ms = ml[((size_t)s * rows + row) * 2];
+        w[s] = ms == -INFINITY ? 0.f : expf(ms - M);
+        L += w[s] * ml[((size_t)s * rows + row) * 2 + 1];
+    }
+    const float inv = L > 0.f ? 1.f / L : 0.f;
+    for (int c = threadIdx.x; c < D; c += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < DGA_NS; ++s) {
+            if (w[s] != 0.f) {
+                a = fmaf(w[s], part[((size_t)s * rows + row) * D + c], a);
+            }
+        }
+        out[(size_t)row * D + c] = a * inv;
+    }
+}
+
+static int dg_attn_tile_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_DG_ATTN_TILE");
+        on = v == NULL ? 1 : atoi(v) != 0;
+    }
+    return on;
+}
+
+/* the bytes of DG_ATTN's scratch (operand 10) for t queries of heads x hd: DGA_NS parts of O, m, l */
+static size_t dg_attn_part_floats(int t, int heads, int hd)
+{
+    return (size_t)DGA_NS * t * heads * (hd + 2);
+}
+
+static void dg_attn_tiled(const float *q, const float *K, const float *V, float *out, float *part, const int *lo,
+                          const int *hi, int t, int heads, int kvh, int hd, cudaStream_t s)
+{
+    static int attr = 0;
+    const int smem256 = (64 * DGA_LD + DGA_BK * DGA_LD + DGA_BK * 256 + DGA_BK * 64) * 4;
+    const int smem512 = (32 * DGA_LD + DGA_BK * DGA_LD + DGA_BK * 512 + DGA_BK * 32) * 4;
+    if (!attr) {
+        cudaFuncSetAttribute(k_dg_attn_t<256, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem256);
+        cudaFuncSetAttribute(k_dg_attn_t<512, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem512);
+        attr = 1;
+    }
+    const int rep = heads / kvh;
+    if (hd == 256) {
+        dim3 grid((unsigned)((t * rep + 63) / 64), (unsigned)kvh, DGA_NS);
+        k_dg_attn_t<256, 64><<<grid, 256, smem256, s>>>(q, K, V, part, lo, hi, t, heads, kvh);
+    } else {
+        dim3 grid((unsigned)((t * rep + 31) / 32), (unsigned)kvh, DGA_NS);
+        k_dg_attn_t<512, 32><<<grid, 256, smem512, s>>>(q, K, V, part, lo, hi, t, heads, kvh);
+    }
+    k_dg_attn_comb<<<(unsigned)(t * heads), 128, 0, s>>>(part, out, t * heads, hd);
 }

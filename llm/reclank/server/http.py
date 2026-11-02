@@ -385,6 +385,9 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._error(400, "prompt failed: %s" % exc)
             return
+        if hasattr(prompt_ids, "options"):
+            # an engine that reads fields of the request (DiffusionGemma: diffusion_drafts)
+            prompt_ids.options = req
         self._run(req, prompt_ids, chat=True)
 
     def _completions(self):
@@ -505,7 +508,12 @@ class _Handler(BaseHTTPRequestHandler):
         tok = backend.tokenizer
         out = []
         finish = "length"
+        self._drafts = []
         for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos):
+            if isinstance(token, dict):
+                # a record between the tokens (DiffusionGemma's drafts): not a token
+                self._drafts.append(token)
+                continue
             out.append(token)
             if token in eos:
                 finish = "stop"
@@ -577,8 +585,11 @@ class _Handler(BaseHTTPRequestHandler):
             obj = "text_completion"
             choice = {"index": 0, "text": text, "logprobs": None,
                       "finish_reason": "stop" if cut else finish}
-        self._json(200, {"id": cid, "object": obj, "created": created,
-                         "model": model_id, "choices": [choice], "usage": usage})
+        body = {"id": cid, "object": obj, "created": created,
+                "model": model_id, "choices": [choice], "usage": usage}
+        if getattr(self, "_drafts", None):
+            body["diffusion_drafts"] = self._drafts
+        self._json(200, body)
 
     def _stream(self, req, prompt_ids, max_tokens, sampler, stops, eos, model_id, chat):
         backend = self.server.backend
@@ -666,6 +677,11 @@ class _Handler(BaseHTTPRequestHandler):
                 if kind == "error":
                     raise value
                 token = value
+                if isinstance(token, dict):
+                    # a record between the tokens (DiffusionGemma's drafts): an event of its own
+                    self._sse({"id": cid, "object": "diffusion.draft", "created": created,
+                               "model": model_id, "draft": token})
+                    continue
                 out.append(token)
                 if token in eos:
                     finish = "stop"

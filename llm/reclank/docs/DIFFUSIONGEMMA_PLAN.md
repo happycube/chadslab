@@ -230,4 +230,46 @@ default; `scripts/check_dgemma_gpu.py` for the records):
     - the router's float32 product: 11 ms.
   - A warm answer of 246 tokens took 4.5 s (12 passes).
   - Against transformers, short prompt: l1 KL 0.0000, l2 0.0050, l3 0.0000.
-- Next: DG_ATTN on the tensor cores; the router's product.
+- DG_ATTN tiled (the default; RECLANK_DG_ATTN_TILE=0: the old kernel). It is
+  float32 on the CUDA cores, without the tensor cores: at head dims of 256
+  and 512 the planes of both q and k would take 6 products each, and O would
+  not fit in registers.
+  - A block takes 64 or 32 rows of (query, head) that read one KV head.
+  - The keys are split 4 ways (split-K) and a combine kernel joins the parts.
+  - S in register tiles from Q and K chunks of 32 in shared memory (float4).
+  - The online softmax by shuffles over a row's 16 threads; P V from V's tile.
+  - 5e-7 against NumPy (the old kernel 9e-7).
+  - At 2.3K of context: 113 -> 47 ms a pass, and a pass 0.40 -> 0.33 s.
+- Next: the router's float32 product (11 ms a pass); the dense products.
+
+D4, the server (`engine.py`; family dgemma, GGUF architecture
+diffusion-gemma; `python -m server -m ...-BF12.gguf`, a cache of `--ctx`
+positions, 32768 by default):
+
+- The chat is Gemma 4's renderer with no empty thought block, the same ids
+  as transformers'. The thought channel and the tool calls parse as Gemma
+  4's.
+- At 32K the window layers' buffer is 2048 rows (it must be at least 1535),
+  and 1611 experts fit on the GPU.
+- A response template: when the last message of a chat request is the
+  assistant's, its text is the answer's template (pinned text, [[n]]
+  holes). The content holds the whole answer.
+- The answer streams a canvas at a time.
+- The cache between requests: the engine keeps the positions that the last
+  request left and that the new prompt starts with (`DGemmaGPU.reuse`). A
+  second turn of 1407 tokens read 190 (1217 from the cache).
+- `"diffusion_drafts": true`: a record after each denoising step:
+  - the canvas and step, the draft ids, its text and each token's text;
+  - each position's probability of its draft token (`prob`, DG_SAMPLE's pmax:
+    1 / the softmax's sum of the processed logits, the step's temperature and
+    the end ban) and its raw probability (`raw_prob`, praw: the softcapped
+    logits at temperature 1, an online softmax in the same pass), its entropy;
+  - the kept positions.
+
+  A stream sends each record as an event of its own (object
+  "diffusion.draft"); a response without a stream holds them in
+  "diffusion_drafts".
+- `scripts/dgemma_prompt.py`: a prompt (or a file) and a response template
+  (or a file). `--drafts` prints the steps, the tokens under `--low`
+  probability in brackets (`--by raw`: of the raw one); `--drafts-json` writes the records. `--chat`
+  keeps a conversation from stdin.
