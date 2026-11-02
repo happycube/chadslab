@@ -303,6 +303,11 @@ TABLE = [
     ("NM_PULL", 331, G, "NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL"),
     # Real-ESRGAN's convs (models/realesrgan)
     ("ENC_CONV3", 332, G, "a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU"),
+    # DiffusionGemma (models/dgemma/gpu.py)
+    ("DG_KV_PUT", 333, G, "t rows of k and v into a layer's cache at the row in device memory"),
+    ("DG_ATTN", 334, G, "t queries over rows of a layer's cache, query i the rows [lo[i], hi[i]), GQA, scale 1, float32"),
+    ("DG_MOE", 336, G, "the routed experts of a layer on the GPU: BF12 rows, float32 products; the pairs sorted by expert, act = gelu(gate) up, de, the sum of each token over its slots"),
+    ("DG_SAMPLE", 335, G, "per row of logits: the temperature, the end-token ban, the entropy, the argmax, an inverse-CDF sample; the processed logits kept, their softmax out"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}

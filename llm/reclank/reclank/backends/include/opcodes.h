@@ -254,6 +254,10 @@ enum {
     GP_NM_TAKE         = 330,   /* gpu     of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked */
     GP_NM_PULL         = 331,   /* gpu     NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL */
     GP_ENC_CONV3       = 332,   /* gpu     a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU */
+    GP_DG_KV_PUT       = 333,   /* gpu     t rows of k and v into a layer's cache at the row in device memory */
+    GP_DG_ATTN         = 334,   /* gpu     t queries over rows of a layer's cache, query i the rows [lo[i], hi[i]), GQA, scale 1, float32 */
+    GP_DG_MOE          = 336,   /* gpu     the routed experts of a layer on the GPU: BF12 rows, float32 products; the pairs sorted by expert, act = gelu(gate) up, de, the sum of each token over its slots */
+    GP_DG_SAMPLE       = 335,   /* gpu     per row of logits: the temperature, the end-token ban, the entropy, the argmax, an inverse-CDF sample; the processed logits kept, their softmax out */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -317,7 +321,8 @@ static inline int gp_op_known(int op)
     case GP_ENC_WARP: case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM:
     case GP_ENC_RIFE_IN: case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P:
     case GP_ENC_PACK_U8C: case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE:
-    case GP_NM_PULL: case GP_ENC_CONV3:
+    case GP_NM_PULL: case GP_ENC_CONV3: case GP_DG_KV_PUT: case GP_DG_ATTN: case GP_DG_MOE:
+    case GP_DG_SAMPLE:
         return 1;
     default:
         return 0;

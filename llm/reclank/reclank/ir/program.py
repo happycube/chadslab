@@ -783,6 +783,65 @@ def _py_step(op, a, e):
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
         _arr(V(3), n * heads * hd).reshape(n, kvh, heads // kvh, hd)[:] = np.einsum("grqk,kgd->qgrd", s, v)
+    elif op == DG_KV_PUT:
+        t, kc, vc = V(5), V(6), V(7)
+        row = int(_arr(V(4), 1, ctypes.c_int32)[0])
+        _arr(V(2) + 4 * row * kc, t * kc)[:] = _arr(V(0), t * kc)
+        _arr(V(3) + 4 * row * vc, t * vc)[:] = _arr(V(1), t * vc)
+    elif op == DG_ATTN:
+        t, heads, kvh, hd = V(6), V(7), V(8), V(9)
+        lo, hi = _arr(V(4), t, ctypes.c_int32), _arr(V(5), t, ctypes.c_int32)
+        n = int(hi.max()) if t else 0
+        q = _arr(V(0), t * heads * hd).reshape(t, kvh, heads // kvh, hd)
+        K, Vv = (_arr(V(i), n * kvh * hd).reshape(n, kvh, hd) for i in (1, 2))
+        j = np.arange(n)
+        ok = (j[None, :] >= lo[:, None]) & (j[None, :] < hi[:, None])
+        sc = np.einsum("qgrd,kgd->grqk", q, K)
+        sc = np.where(ok[None, None], sc, -np.inf)
+        sc = np.exp(sc - sc.max(-1, keepdims=True))
+        sc /= sc.sum(-1, keepdims=True)
+        _arr(V(3), t * heads * hd).reshape(t, kvh, heads // kvh, hd)[:] = np.einsum("grqk,kgd->qgrd", sc, Vv)
+    elif op == DG_MOE:
+        t, k, E, hidden, inner = V(11), V(12), V(13), V(14), V(15)
+        h = _arr(V(0), t * hidden).reshape(t, hidden)
+        idx = _arr(V(1), t * k, ctypes.c_int32).reshape(t, k)
+        val = _arr(V(2), t * k).reshape(t, k)
+        rgu, rdn = cops.bf12_row_bytes(hidden), cops.bf12_row_bytes(inner)
+        gu = _arr(V(3), E * 2 * inner * rgu, ctypes.c_uint8)
+        dn = _arr(V(4), E * hidden * rdn, ctypes.c_uint8)
+        out = _arr(V(5), t * hidden).reshape(t, hidden)
+        out[:] = 0
+        for e in np.unique(idx):
+            tok, slot = np.nonzero(idx == e)
+            w1 = cops.kq_bf12_to_bf16(gu[e * 2 * inner * rgu:(e + 1) * 2 * inner * rgu], 2 * inner, hidden)
+            w2 = cops.kq_bf12_to_bf16(dn[e * hidden * rdn:(e + 1) * hidden * rdn], hidden, inner)
+            w1 = (w1.astype(np.uint32) << 16).view(np.float32)
+            w2 = (w2.astype(np.uint32) << 16).view(np.float32)
+            a = h[tok] @ w1.T
+            a = ops.gelu_tanh(a[:, :inner]) * a[:, inner:]
+            out[tok] += (a @ w2.T) * val[tok, slot, None]
+    elif op == DG_SAMPLE:
+        t, vocab, neos = V(9), V(10), V(11)
+        z = _arr(V(0), t * vocab).reshape(t, vocab)
+        z *= np.float32(1.0) / np.float32(_arr(V(2), 1)[0])
+        ban = _arr(V(3), t, ctypes.c_int32)
+        eos = _arr(V(4), neos, ctypes.c_int32) if neos else np.zeros(0, np.int32)
+        for i in np.nonzero(ban)[0]:
+            z[i, eos] = -np.inf
+        M = z.max(-1, keepdims=True)
+        e = np.exp(z - M)
+        S = e.sum(-1, keepdims=True)
+        p = e / S
+        _arr(V(1), t * vocab).reshape(t, vocab)[:] = p
+        d = np.where(e > 0, z - M, 0)
+        _arr(V(6), t)[:] = (np.log(S) - (e * d).sum(-1, keepdims=True) / S)[:, 0]
+        _arr(V(7), t, ctypes.c_int32)[:] = z.argmax(-1)
+        u = _arr(V(5), t)
+        # the order of the GPU's chunks: thread j has j, j + 1024, ...
+        order = np.arange(vocab).reshape(-1, 1024).T.reshape(-1) if vocab % 1024 == 0 else np.arange(vocab)
+        c = np.cumsum(e[:, order], axis=-1)
+        k = (c <= (u[:, None] * S)).sum(-1).clip(0, vocab - 1)
+        _arr(V(8), t, ctypes.c_int32)[:] = order[k]
     elif op == ENC_ATTN:
         n, heads, hd = V(4), V(5), V(6)
         q, k, v = (_arr(V(i), n * heads * hd).reshape(n, heads, hd) for i in range(3))
@@ -2391,6 +2450,49 @@ def k_enc_conv_mm(c, lin, x, idx, cin, slope=None, res=None, scat=None, blk=0, o
     return out
 
 
+def k_dg_kv_put(c, k, v, K, V, row):
+    """(dg_kv_put k v K V row): the t rows of k and v into the cache arrays K and V (rows of the
+    same widths) from the row in the int32 array row (device memory; a GPU record)."""
+    t = k.shape[0]
+    c.p.emit(DG_KV_PUT, k, v, K, V, row, t, k.size // t, v.size // t)
+
+
+def k_dg_attn(c, q, K, V, lo, hi, heads, kvh, hd, out=None):
+    """(dg_attn q K V lo hi heads kvh hd): query i (a row of heads x hd) over the rows [lo[i],
+    hi[i]) of the cache arrays K and V (rows of kvh x hd), scale 1, query head h on KV head
+    h / (heads / kvh); float32 (DiffusionGemma's decoder and encoder; a GPU record)."""
+    t = q.shape[0]
+    out = c.buffer(q.shape) if out is None else out
+    c.p.emit(DG_ATTN, q, K, V, out, lo, hi, t, heads, kvh, hd)
+    return out
+
+
+def k_dg_moe(c, h, idx, val, gu, dn, E, inner, out=None):
+    """(dg_moe h idx val gu dn E inner): the routed experts of t rows h (the pairs idx, val of t x
+    k) with BF12 weights on the GPU: gu (each expert's gate rows then its up rows), dn (its down
+    rows); out = the sum over each row's slots of val (gelu_tanh(gate h) up h) down (a GPU
+    record; float32 products)."""
+    t, hidden = h.shape
+    k = idx.shape[1]
+    P = t * k
+    out = c.buffer((t, hidden)) if out is None else out
+    i32 = lambda n: c.buffer((n,), np.int32)  # noqa: E731
+    # (operand 6: the experts' starts, then the table of the tiles of 16 pairs: (expert, first)
+    # of each, at most P / 16 + E of them)
+    c.p.emit(DG_MOE, h, idx, val, gu, dn, out, i32(E + 1 + 2 * (-(-P // 16) + E)), i32(P), i32(P),
+             c.buffer((P, inner)),
+             c.buffer((P, hidden)), t, k, E, hidden, inner)
+    return out
+
+
+def k_dg_sample(c, z, probs, temp, ban, eos, u, ent, am, draw):
+    """(dg_sample z probs temp ban eos u ent am draw): DiffusionGemma's step on the rows of logits
+    z (t x vocab, in place: z / temp, the end tokens eos -inf where ban): their softmax into
+    probs, and each row's entropy, argmax and the sample of the uniform u (a GPU record)."""
+    t, vocab = z.shape
+    c.p.emit(DG_SAMPLE, z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, eos.size)
+
+
 def k_enc_conv3(c, lin, x, groups, H, W, up=0, slope=None, res=None, rs=1.0, out=None):
     """(enc_conv3 lin x groups H W [up [slope [res [rs]]]]): a 3 x 3 conv, zero padding, of the H x W image
     whose input channels are groups ((offset, row stride, channels) triples into x, in order; each a
@@ -2486,6 +2588,10 @@ KERNELS = {
     "enc_rife_out": k_enc_rife_out,
     "enc_conv_mm": k_enc_conv_mm,
     "enc_conv3": k_enc_conv3,
+    "dg_kv_put": k_dg_kv_put,
+    "dg_attn": k_dg_attn,
+    "dg_sample": k_dg_sample,
+    "dg_moe": k_dg_moe,
     "enc_warp": k_enc_warp,
     "enc_prelu": k_enc_prelu,
     "enc_mix": k_enc_mix,

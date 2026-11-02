@@ -49,6 +49,7 @@
 #include "kernels/nemotron/nm.cu"
 #include "kernels/nemotron/iq2_f32.cu"
 #include "kernels/nemotron/lattice.cu"
+#include "kernels/dgemma/dg.cu"
 #include "runtime/host_cpu.cu"
 #include "runtime/experts.cu"
 #include "runtime/memory.cu"

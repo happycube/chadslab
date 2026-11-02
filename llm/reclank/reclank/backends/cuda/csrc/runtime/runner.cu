@@ -398,6 +398,59 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         break;
     }
+    case GP_DG_KV_PUT: {
+        /* k, v, K, V, row (device int), t, kcols, vcols */
+        int t = (int)hlit(r, 5, &bad), kc = (int)hlit(r, 6, &bad), vc = (int)hlit(r, 7, &bad);
+        if (t > 0) {
+            k_dg_kv_put<<<(unsigned)t, 256, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                (float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3),
+                (const int *)(intptr_t)hi(r, g->henv, 4), t, kc, vc);
+        }
+        break;
+    }
+    case GP_DG_ATTN: {
+        /* q, K, V, out, lo, hi, t, heads, kvh, hd */
+        int t = (int)hlit(r, 6, &bad), heads = (int)hlit(r, 7, &bad);
+        int kvh = (int)hlit(r, 8, &bad), hd = (int)hlit(r, 9, &bad);
+        if (hd != 256 && hd != 512) {
+            bad = 1;
+        } else if (t > 0) {
+            dg_attn((const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                    (const float *)(intptr_t)hi(r, g->henv, 2), (float *)(intptr_t)hi(r, g->henv, 3),
+                    (const int *)(intptr_t)hi(r, g->henv, 4), (const int *)(intptr_t)hi(r, g->henv, 5),
+                    t, heads, kvh, hd, s);
+        }
+        break;
+    }
+    case GP_DG_MOE: {
+        /* h, idx, val, gu, dn, out, start, ptok, ppos, act, de, t, k, E, hidden, inner */
+        int t = (int)hlit(r, 11, &bad), k = (int)hlit(r, 12, &bad), E = (int)hlit(r, 13, &bad);
+        int hidden = (int)hlit(r, 14, &bad), inner = (int)hlit(r, 15, &bad);
+        if (hidden % 128 != 0 || inner % 64 != 0) {
+            bad = 1;
+        } else if (t > 0) {
+            dg_moe((const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
+                   (const float *)(intptr_t)hi(r, g->henv, 2), (const uint8_t *)(intptr_t)hi(r, g->henv, 3),
+                   (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (float *)(intptr_t)hi(r, g->henv, 5),
+                   (int *)(intptr_t)hi(r, g->henv, 6), (int *)(intptr_t)hi(r, g->henv, 7),
+                   (int *)(intptr_t)hi(r, g->henv, 8), (float *)(intptr_t)hi(r, g->henv, 9),
+                   (float *)(intptr_t)hi(r, g->henv, 10), t, k, E, hidden, inner, s);
+        }
+        break;
+    }
+    case GP_DG_SAMPLE: {
+        /* z, probs, temp, ban, eos, u, ent, am, draw, t, vocab, neos */
+        int t = (int)hlit(r, 9, &bad), vocab = (int)hlit(r, 10, &bad), neos = (int)hlit(r, 11, &bad);
+        if (t > 0) {
+            dg_sample((float *)(intptr_t)hi(r, g->henv, 0), (float *)(intptr_t)hi(r, g->henv, 1), t, vocab,
+                      (const float *)(intptr_t)hi(r, g->henv, 2), (const int *)(intptr_t)hi(r, g->henv, 3),
+                      (const int *)(intptr_t)hi(r, g->henv, 4), neos, (const float *)(intptr_t)hi(r, g->henv, 5),
+                      (float *)(intptr_t)hi(r, g->henv, 6), (int *)(intptr_t)hi(r, g->henv, 7),
+                      (int *)(intptr_t)hi(r, g->henv, 8), s);
+        }
+        break;
+    }
     case GP_ENC_RIFE_IN:
         enc_rife_in(r, g->henv, &bad, s);
         break;

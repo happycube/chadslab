@@ -76,12 +76,11 @@ def entropy(logp):
     return -(p * np.where(p > 0, logp, 0)).sum(-1)
 
 
-def sample_rows(logp, rng):
-    """One sample of each row by the inverse of the cumulative sum."""
+def sample_rows(logp, u):
+    """One sample of each row by the inverse of the cumulative sum, at the uniforms u."""
     p = np.exp(logp.astype(np.float64))
     c = np.cumsum(p, axis=-1)
-    u = rng.random(p.shape[0]) * c[:, -1]
-    return np.minimum((c < u[:, None]).sum(-1), p.shape[1] - 1)
+    return np.minimum((c < (u * c[:, -1])[:, None]).sum(-1), p.shape[1] - 1)
 
 
 def accept_mask(ent, bound):
@@ -94,13 +93,34 @@ def accept_mask(ent, bound):
     return mask
 
 
-def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0):
+def cpu_steps(decode, s):
+    """The step of a canvas from the raw logits of decode(canvas, sc_logits): a function
+    step(canvas, temp, ban, u) -> (entropy, argmax, sample) of each position, that keeps the
+    processed logits for the self-conditioning of the next step (none at the first)."""
+    eos = np.asarray(s.eos)
+    state = {"sc": None}
+
+    def step(cur, temp, ban, u):
+        z = decode(cur, state["sc"]) / np.float32(temp)
+        if ban.any():
+            z[np.ix_(np.nonzero(ban)[0], eos)] = -np.inf
+        logp = log_softmax(z)
+        state["sc"] = z
+        return entropy(logp), z.argmax(-1), sample_rows(logp, u)
+    return step
+
+
+def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0, step=None):
     """Denoise one canvas. Returns (the argmax canvas, the steps run).
 
+    decode(canvas, sc_logits) gives the raw logits (cpu_steps); or step, a function of a
+    canvas (cpu_steps' form: the GPU's DG_SAMPLE gives the three rows itself).
     fixed: None, or the canvas's pinned tokens (-1 where free): they start in
     place, are never renoised, and are the result there; the entropy bound and
     the stopping test count only the free positions. no_end: the end tokens
     cannot be chosen at positions before it (the last pinned token is after)."""
+    if step is None:
+        step = cpu_steps(decode, s)
     cur = rng.integers(0, s.vocab, s.canvas)
     pin = None if fixed is None else np.asarray(fixed) >= 0
     if pin is not None and not pin.any():
@@ -110,21 +130,15 @@ def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0):
         if pin.all():
             return np.asarray(fixed).copy(), 0
     free = None if pin is None else ~pin
-    eos = np.asarray(s.eos)
-    sc = None
+    ban = np.arange(s.canvas) < no_end
     prev = None
     steps = 0
     am = cur
-    for step in range(s.max_steps, 0, -1):
-        raw = decode(cur, sc)
+    for k in range(s.max_steps, 0, -1):
+        temp = s.t_min + (s.t_max - s.t_min) * (k / s.max_steps)
+        ent, am, draw = step(cur, temp, ban, rng.random(s.canvas))
+        am, draw = np.array(am), np.array(draw)
         steps += 1
-        z = raw / np.float32(s.t_min + (s.t_max - s.t_min) * (step / s.max_steps))
-        if no_end > 0:
-            z[:no_end, eos] = -np.inf
-        logp = log_softmax(z)
-        ent = entropy(logp)
-        draw = sample_rows(logp, rng)
-        am = z.argmax(-1)
         if free is None:
             keep = accept_mask(ent, s.entropy_bound)
             conf = ent.mean()
@@ -137,9 +151,8 @@ def denoise(decode, s, rng, on_step=None, fixed=None, no_end=0):
         cur = np.where(keep, draw, rng.integers(0, s.vocab, s.canvas))
         stable = s.stability == 0 or (prev is not None and np.array_equal(prev, am))
         prev = am
-        sc = z
         if on_step is not None:
-            on_step(step, am, keep, ent)
+            on_step(k, am, keep, ent)
         if stable and conf < s.confidence:
             break
     return am, steps
@@ -158,7 +171,8 @@ def parse_template(text, encode):
     return np.asarray(out, dtype=np.int64)
 
 
-def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=None, fixed=None):
+def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=None, fixed=None,
+             steps=None):
     """Encode the prompt, then canvases until an end token or max_new tokens.
     Returns (the new tokens, Stats). The end token is kept, as transformers'
     generate keeps it (the pad tokens after it are dropped).
@@ -167,7 +181,8 @@ def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=No
     its end every token is free; parse_template). A pinned start is a prefix:
     it goes to the encoder with the prompt and is the start of the result. The
     others are pinned in their canvases (denoise), and no end token comes
-    before the last of them."""
+    before the last of them. steps: None (decode's logits, cpu_steps), or a function that gives
+    a new step function (denoise's step) for each canvas."""
     out = []
     fixed = None if fixed is None else np.asarray(fixed, dtype=np.int64)
     prompt = np.asarray(prompt, dtype=np.int64)
@@ -192,8 +207,9 @@ def generate(encode, decode, prompt, max_new, s, rng, on_canvas=None, on_step=No
             seg = fixed[c * s.canvas:(c + 1) * s.canvas]
             f[:seg.size] = seg
         no_end = min(s.canvas, max(0, last - c * s.canvas))
-        am, steps = denoise(decode, s, rng, on_step, fixed=f, no_end=no_end)
-        st.steps.append(steps)
+        am, n = denoise(decode, s, rng, on_step, fixed=f, no_end=no_end,
+                        step=None if steps is None else steps())
+        st.steps.append(n)
         ends = np.nonzero(np.isin(am[no_end:], s.eos))[0] + no_end
         if ends.size:
             got = am[:ends[0] + 1].tolist()

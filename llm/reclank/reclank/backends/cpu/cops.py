@@ -990,17 +990,17 @@ def kq_q4x_unpack(a):
 
 
 def kq_moe_act(hq, hs, hm, ids, val, experts, mats, shared_logit, hidden, inner, scratch, out,
-               gelu=True, hf=None, x16=False):
+               gelu=True, hf=None, x16=False, flags=0):
     """kq_moe with the tanh GELU of the gate (gelu) in place of SiLU. hf (the
     float32 rows of h; KQ_Q4X matrices): float32 activations, no
     quantization; with x16, the int16 rows of hf and of the GELU (act bit 2;
-    hq, hs, hm not read)."""
+    hq, hs, hm not read). flags: more act bits (128: the BF12 rows in register tiles)."""
     t, k = ids.shape
     _lib.rc_kq_moe_act(hq.ctypes.data, hs.ctypes.data, hm.ctypes.data, ids.ctypes.data,
                     val.ctypes.data, t, k, experts, mats.ctypes.data,
                     None if shared_logit is None else shared_logit.ctypes.data, hidden, inner,
                     scratch.ctypes.data, out.ctypes.data,
-                    (1 if gelu else 0) | (4 if x16 else (2 if hf is not None else 0)),
+                    (1 if gelu else 0) | (4 if x16 else (2 if hf is not None else 0)) | int(flags),
                     None if hf is None else hf.ctypes.data)
 
 

@@ -7,9 +7,11 @@ denoised by the checkpoint's sampler, optionally around pinned text.
 
 --response is a template of the answer: its text is pinned where it stands and each [[n]] is n
 free tokens the model writes; after the template the answer goes on freely to an end token or
---max-tokens. Text at the start of the template is a plain prefix. --engine bf16 (the default) runs
-the CPU runtime on the checkpoint's bf16 weights (about 55 GB), q4 on our Q4_0 (KL 0.2-0.7 against
-float32 on the canvas checks: not for use), ref the float32 NumPy reference (about 103 GB).
+--max-tokens. Text at the start of the template is a plain prefix. --engine gpu (the default) runs
+the BF12 GGUF on the GPU (MODEL_DIR: convert_dgemma_bf12.py's directory; the experts of the layers
+that do not fit on the CPU); bf16 the CPU runtime on the checkpoint's bf16 weights (about 55 GB),
+q4 on our Q4_0 (KL 0.2-0.7 against float32 on the canvas checks: not for use), ref the float32
+NumPy reference (about 103 GB).
 """
 import argparse
 import os
@@ -43,8 +45,10 @@ def main():
     ap.add_argument("--response", help="a template of the answer: pinned text and [[n]] free tokens")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--engine", choices=("q4", "bf16", "ref"), default="bf16")
+    ap.add_argument("--engine", choices=("gpu", "q4", "bf16", "ref"), default="gpu")
     ap.add_argument("--steps", action="store_true", help="print each step's argmax canvas")
+    ap.add_argument("--bench", action="store_true",
+                    help="generate twice and time the second (the first builds the programs, reads the weights)")
     a = ap.parse_args()
 
     tok = Tokenizer(os.path.join(a.model, "tokenizer.json"))
@@ -53,7 +57,13 @@ def main():
     cfg = json.load(open(os.path.join(a.model, "config.json")))
     s = S.Settings.from_config(gen, cfg)
     t0 = time.time()
-    if a.engine == "ref":
+    steps = None
+    if a.engine == "gpu":
+        from reclank.models.dgemma.gpu import DGemmaGPU
+        m = DGemmaGPU(a.model)
+        m.reset()
+        encode, decode, steps = m.encode, None, m.steps
+    elif a.engine == "ref":
         from reclank.models.dgemma.model import DGemmaRef
         m = DGemmaRef(a.model)
         cache = m.cache()
@@ -79,10 +89,17 @@ def main():
         def on_step(step, am, keep, ent):
             print("[step %2d, %3d kept, entropy %.3f] %s" % (step, keep.sum(), ent.mean(),
                   tok.decode(am.tolist())[:160].replace("\n", " ")), file=sys.stderr, flush=True)
-    t0 = time.time()
-    out, st = S.generate(encode, decode, prompt, a.max_tokens, s, np.random.default_rng(a.seed),
-                         on_step=on_step, fixed=fixed)
-    dt = time.time() - t0
+    for run in range(2 if a.bench else 1):
+        if a.engine == "gpu":
+            m.reset()
+        else:
+            cache = m.cache()
+            if a.engine != "ref":
+                pos[0] = 0
+        t0 = time.time()
+        out, st = S.generate(encode, decode, prompt, a.max_tokens, s, np.random.default_rng(a.seed),
+                             on_step=on_step, fixed=fixed, steps=steps)
+        dt = time.time() - t0
     print(tok.decode(out))
     print("\n%d tokens in %.1f s; %d decoder passes (%s), %.1f tokens a pass" % (
         st.tokens, dt, sum(st.steps), " ".join(map(str, st.steps)), st.per_pass), file=sys.stderr)

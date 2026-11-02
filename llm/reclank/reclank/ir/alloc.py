@@ -174,6 +174,19 @@ WRITES[P.DS_CONF] = (3,)
 WRITES[P.DS_EMBED] = (2,)
 WRITES[P.DS_ENGRAM_ROWS] = (2,)
 WRITES[P.DS_ROWS_AT] = (1,)
+# the records of DiffusionGemma's programs (models/dgemma/gpu.py): the encoder records of a
+# layer (their outputs; ENC_ADD and ENC_ROPE_TAB in place), its attention (DG_ATTN's out; the
+# cache and the sampler's rows are arrays of the model, not temporaries)
+WRITES[P.ENC_RMS] = (2,)
+WRITES[P.ENC_GELU_MUL] = (2,)
+WRITES[P.ENC_MUL_VEC] = (2,)
+WRITES[P.ENC_ADD] = ()
+WRITES[P.ENC_ROPE_TAB] = ()
+WRITES[P.SOFTCAP] = ()
+WRITES[P.DG_KV_PUT] = ()
+WRITES[P.DG_ATTN] = (3,)
+WRITES[P.DG_SAMPLE] = ()
+WRITES[P.DG_MOE] = (5, 6, 7, 8, 9, 10)
 
 # opcode -> (operand, flag operand): the operand is written wholly when the
 # flag operand is set (not 0). TQ_ROT with a source (operand 3; gpu35.

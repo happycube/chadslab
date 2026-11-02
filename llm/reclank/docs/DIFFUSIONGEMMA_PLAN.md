@@ -92,6 +92,40 @@ card gives 15 to 20 tokens a pass.
   thinking via `<|think|>`) and a CLI.
 - D5: the Q4_K_M forms, and vision.
 
+## 5b. D3: the GPU on BF12
+
+One RTX 3090 (24 GB, PCIe gen3 x16). The BF12 file is 38.85 GB: the token
+table, attention and the shared MLPs come to about 4.9 GB with a transposed
+table for the soft embedding; the experts are 34.9 GB. A canvas pass of 256
+tokens routes 2048 pairs a layer, so nearly every expert has some.
+
+- Programs (records of reclank/ir/program.py, one CUDA graph each):
+  - the encoder over a block of up to 256 rows, which writes the cache;
+  - the decoder over the canvas, in two forms: the first step (no
+    self-conditioning) and later steps (the soft embedding of the last
+    step's probabilities).
+- The KV cache: float32 arrays of each layer, shared by the programs (the
+  Mirror's device copies, written on the device). The windowed layers keep
+  a buffer of 2048 rows that moves its last rows to the front when full.
+  The global layers hold the context.
+- New records:
+  - DG_KV_PUT: t rows of k and v into a layer's cache at a row from device
+    memory.
+  - DG_ATTN: t queries over a layer's cache rows, each query its own
+    [lo, hi) of rows, GQA, head dims 256 and 512, scale 1, float32.
+  - DG_SAMPLE: per row, the temperature, the EOS ban, the log-softmax, the
+    entropy, the argmax and an inverse-CDF sample of a given uniform. The
+    processed logits are kept, and the probabilities go to the soft
+    embedding.
+- The soft embedding: `KQ_LINEAR` of the probabilities on the transposed
+  BF12 table (2816 rows of 262144). The host gets 3 values a row per step
+  (entropy, argmax, sample), runs the acceptance and the renoising, and
+  sends the canvas's embedding rows back.
+- Experts, milestone 1: all on the CPU (`KQ_MOE` with the tanh GELU on
+  float rows of BF12 experts, run through `CPU_JOIN` within the graph).
+  Milestone 2: the most-used experts resident on the GPU (BF12 grouped
+  products), the rest on the CPU at the same time (`CPU_START`/`CPU_WAIT`).
+
 ## 6. Status
 
 D1, the reference (`model.py`), against transformers 5.20.2 in the sandbox
@@ -142,5 +176,29 @@ are never renoised and stand in the result. The entropy bound and the stop
 test count only the free positions, and no end token comes before the last
 pinned one. Tests: `tests/unit/test_dgemma_sampler.py`.
 
-Speed so far is the CPU's only: a canvas pass takes 12 s in bf16 mode and 7
-s in int4. D3 (the GPU on BF12) is next.
+D3, the GPU on BF12 (`gpu.py`; `scripts/dgemma_generate.py --engine gpu`, the
+default; `scripts/check_dgemma_gpu.py` for the records):
+
+- The records against their NumPy cases on real data:
+  - DG_ATTN: 0.8e-6 to 1.4e-6, at both head dims and both range forms.
+  - DG_KV_PUT: the same bits.
+  - DG_SAMPLE on transformers' logits: the processed logits the same,
+    probabilities 2.7e-7, argmax 256 of 256.
+  - DG_MOE: 1.4e-6, against NumPy and against the CPU's KQ_MOE alike.
+- Against transformers (short prompt): l1 KL 0.0000, l2 0.0050, l3 0.0000,
+  as the float32 reference. Long prompt: l1 0.025 (the router ties of the
+  reference).
+- The experts:
+  - On the CPU: KQ_MOE with the BF12 rows in register tiles (act bit 7, only
+    this model's): 23.7 ms a layer of 256 rows, against 31.3 for the rows
+    path, at 3.8e-7 against it. The fused gate/up stack of the file needs no
+    copy.
+  - On the GPU (DG_MOE, CUDA cores, float32 products): 10.5 ms a layer.
+  - With the dense weights, the cache and the programs on the device, 12
+    layers' experts fit (14 GB; 2.6 GB left). The other 18 run on the CPU.
+- Speed (one 3090): a canvas pass 0.62 s, an encoder block 0.69 s. A warm
+  answer of 247 tokens took 11.5 s: 19 passes, 13.0 tokens a pass, 21.5
+  tokens/s. The CPU's 18 layers of experts are about 0.43 s of each pass.
+- Next: a tensor-core DG_MOE; more of the experts on the GPU (a smaller
+  cache in bfloat16); the CPU's experts at the same time as the GPU's
+  (CPU_START), with the shared MLP in between.
