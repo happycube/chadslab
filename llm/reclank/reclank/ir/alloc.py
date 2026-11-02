@@ -186,7 +186,8 @@ WRITES[P.SOFTCAP] = ()
 WRITES[P.DG_KV_PUT] = ()
 WRITES[P.DG_ATTN] = (3,)
 WRITES[P.DG_SAMPLE] = ()
-WRITES[P.DG_MOE] = (5, 6, 7, 8, 9, 10)
+WRITES[P.DG_SPLIT] = (2,)
+WRITES[P.DG_MOE] = (5, 6, 7, 8, 9, 10)      # (17, cidx, when given: wholly too, an array of the model)
 
 # opcode -> (operand, flag operand): the operand is written wholly when the
 # flag operand is set (not 0). TQ_ROT with a source (operand 3; gpu35.

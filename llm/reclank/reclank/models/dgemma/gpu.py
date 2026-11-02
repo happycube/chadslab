@@ -71,7 +71,7 @@ class DGemmaGPU:
     # cache, the logits and probabilities, the programs' scratch: 8.6 GB measured) and a margin
     RESERVE = 10.0e9
 
-    def __init__(self, path, max_len=8192, slide_rows=4096, gpu_layers=None):
+    def __init__(self, path, max_len=8192, slide_rows=4096, gpu_experts=None, count=False):
         from reclank.backends.cuda.gpumm import pinned
         from reclank.backends.cuda.runtime import Mirror
         gpath, d = _gguf_file(path)
@@ -157,19 +157,9 @@ class DGemmaGPU:
         self.hq = np.zeros((C, self.H), np.int8)
         self.hs = np.zeros((C, self.H // 32), np.float32)
         self.hm = np.zeros((C, self.H // 16), np.float32)
-        # the layers whose experts the GPU holds (DG_MOE): as many as fit after RESERVE (or
-        # RECLANK_DG_GPU_LAYERS); the others' experts run on the CPU
-        if gpu_layers is None:
-            env = os.environ.get("RECLANK_DG_GPU_LAYERS")
-            if env is not None:
-                gpu_layers = int(env)
-            else:
-                from reclank.backends.cuda.gpumm import mem_info
-                per = sum(a.nbytes for a in self.blk[0]["experts"])
-                gpu_layers = max(0, min(self.L, int((mem_info()[0] - self.RESERVE) // per)))
-        self.gpu_layers = set(range(int(gpu_layers)))
-        print("dgemma gpu: the experts of %d layers on the GPU, %d on the CPU" % (
-            len(self.gpu_layers), self.L - len(self.gpu_layers)), flush=True)
+        self.count = count
+        self.counts = np.zeros((self.L, self.E), np.int64)
+        self._place(d, gpu_experts)
         self.mirror = Mirror()
         self.mirror.kind = "dgemma"
         self.progs = {}
@@ -177,6 +167,60 @@ class DGemmaGPU:
                     False: inv_freq_f32(cfg.global_head_dim, cfg.rope_parameters["full_attention"]["rope_theta"],
                                         cfg.rope_parameters["full_attention"].get("partial_rotary_factor", 1.0))}
         self.reset()
+
+    # ---- the experts' places -------------------------------------------------------------------
+    def _place(self, d, slots):
+        """The experts the GPU holds: the most used ones of all the layers (expert_counts.npz beside
+        the model: the routers' counts on real text, scripts/dgemma_generate.py --count), as many
+        as fit after RESERVE (or slots, or RECLANK_DG_GPU_EXPERTS); with no counts, whole layers
+        from the first. Each layer: hot (its experts on the GPU, in order), map (each expert's slot,
+        -1 for the CPU's), and the GPU's packed rows of them (gu, dn: the arrays of the file when
+        it holds them all)."""
+        per = sum(a.nbytes for a in self.blk[0]["experts"]) // self.E
+        if self.count:
+            slots = 0
+        elif slots is None:
+            env = os.environ.get("RECLANK_DG_GPU_EXPERTS")
+            if env is not None:
+                slots = int(env)
+            else:
+                from reclank.backends.cuda.gpumm import mem_info
+                slots = int(max(0, mem_info()[0] - self.RESERVE) // per)
+        slots = max(0, min(self.L * self.E, int(slots)))
+        cp = os.path.join(d, "expert_counts.npz")
+        if os.path.exists(cp):
+            counts = np.load(cp)["counts"].astype(np.float64)
+            # the global order: the count (most first), then the layer, then the expert
+            order = np.lexsort((np.tile(np.arange(self.E), self.L), np.repeat(np.arange(self.L), self.E),
+                                -counts.reshape(-1)))[:slots]
+            src = "counts"
+        else:
+            order = np.arange(slots)
+            src = "whole layers (no expert_counts.npz)"
+        hot = [[] for _ in range(self.L)]
+        for j in order:
+            hot[j // self.E].append(int(j % self.E))
+        n_gpu = 0
+        for i, b in enumerate(self.blk):
+            hs = sorted(hot[i])
+            b["hot"] = hs
+            n_gpu += len(hs)
+            b["map"] = None
+            if 0 < len(hs) < self.E:
+                m = np.full(self.E, -1, np.int32)
+                m[hs] = np.arange(len(hs), dtype=np.int32)
+                b["map"] = m
+                gu, dn = b["experts"]
+                b["gpu_experts"] = (np.ascontiguousarray(gu.reshape(self.E, -1)[hs]).reshape(-1),
+                                    np.ascontiguousarray(dn.reshape(self.E, -1)[hs]).reshape(-1))
+            elif len(hs) == self.E:
+                b["gpu_experts"] = b["experts"]
+        print("dgemma gpu: %d experts on the GPU (%.1f GB; %s), %d on the CPU" % (
+            n_gpu, n_gpu * per / 1e9, src, self.L * self.E - n_gpu), flush=True)
+
+    def save_counts(self, d):
+        """The routers' counts so far (count=True) into expert_counts.npz of directory d."""
+        np.savez(os.path.join(d, "expert_counts.npz"), counts=self.counts)
 
     # ---- the cache -------------------------------------------------------------------------
     def reset(self):
@@ -253,19 +297,31 @@ class DGemmaGPU:
             o = P.k_dg_attn(c, q, self.K[i], self.V[i], lo, hi, nh, kvh, hd)
             a = P.k_enc_rms(c, P.k_enc_linear(c, b["o"], o), b["post_attn"], H)
             P.k_enc_add(c, x, a)
-            # the shared MLP and the experts, both on the residual x
-            h = P.k_enc_rms(c, x, b["pre_ff"], H)
-            gm = P.k_enc_gelu_mul(c, P.k_enc_linear(c, b["gate"], h), P.k_enc_linear(c, b["up"], h))
-            h1 = P.k_enc_rms(c, P.k_enc_linear(c, b["down"], gm), b["post_ff1"], H)
+            # the router and the experts' rows first, so that the CPU starts on its pairs; then
+            # the shared MLP (on the GPU, at the same time), the GPU's experts, the CPU's back
             val, idx = c.buffer((C, self.topk)), c.buffer((C, self.topk), np.int32)
+            if self.count:
+                idx = e.setdefault("ridx%d" % i, np.zeros((C, self.topk), np.int32))
             c.p.emit(P.ROUTER_MT, x, b["r_scale"], b["r_proj"], b["r_pes"], H, self.E, self.topk,
                      float(self.eps), float(H ** -0.5), val, idx, C, c.buffer((C, H)), c.buffer((C, self.E)), 0)
             h2 = P.k_enc_rms(c, x, b["pre_ff2"], H)
-            if i in self.gpu_layers:
-                mo = P.k_dg_moe(c, h2, idx, val, b["experts"][0], b["experts"][1], self.E, self.inner)
-            else:
-                mo = self._moe_cpu(c, b, h2, val, idx, n_ev, cpu_progs)
+            nh_ = len(b["hot"])
+            if nh_ < self.E:
+                cidx = idx if nh_ == 0 else P.k_dg_split(c, idx, b["map"])
+                self._cpu_start(c, b, h2, val, cidx, n_ev, cpu_progs)
                 n_ev += 1
+            h = P.k_enc_rms(c, x, b["pre_ff"], H)
+            gm = P.k_enc_gelu_mul(c, P.k_enc_linear(c, b["gate"], h), P.k_enc_linear(c, b["up"], h))
+            h1 = P.k_enc_rms(c, P.k_enc_linear(c, b["down"], gm), b["post_ff1"], H)
+            mo = None
+            if nh_ > 0:
+                gu_, dn_ = b["gpu_experts"]
+                mo = P.k_dg_moe(c, h2, idx, val, gu_, dn_, nh_, self.inner, map=b["map"])
+            if nh_ < self.E:
+                c.p.emit(P.CPU_WAIT)
+                part = c.buffer((C, H))
+                c.p.emit(P.TO_DEV, self.po, part, self.po.nbytes)
+                mo = part if mo is None else P.k_enc_add(c, mo, part)
             h2 = P.k_enc_rms(c, mo, b["post_ff2"], H)
             P.k_enc_add(c, h1, h2)
             P.k_enc_add(c, x, P.k_enc_rms(c, h1, b["post_ff"], H))
@@ -282,10 +338,11 @@ class DGemmaGPU:
         prog.keep.extend(cpu_progs)
         return prog
 
-    def _moe_cpu(self, c, b, h2, val, idx, ev, cpu_progs):
-        """The routed experts of a layer on the CPU: the rows to pinned memory, KQ_MOE, back."""
+    def _cpu_start(self, c, b, h2, val, cidx, ev, cpu_progs):
+        """The CPU's pairs of a layer (cidx: -1 for the GPU's) on the CPU's helper thread: the rows
+        to pinned memory, CPU_START of KQ_MOE (into self.po); the caller's CPU_WAIT joins it."""
         C, H = self.C, self.H
-        c.p.emit(P.TO_HOST, h2, self.hp, self.hp.nbytes, val, self.vp, self.vp.nbytes, idx, self.ip,
+        c.p.emit(P.TO_HOST, h2, self.hp, self.hp.nbytes, val, self.vp, self.vp.nbytes, cidx, self.ip,
                  self.ip.nbytes, ev)
         cp = P.Program()
         cp.emit(P.KQ_MOE, self.hq, self.hs, self.hm, self.ip, self.vp, C, self.topk, self.E, b["mats"], None,
@@ -293,10 +350,7 @@ class DGemmaGPU:
         cpu = cp.finish()
         cpu.keep.extend([b["mats"]] + list(b["experts"]))
         cpu_progs.append(cpu)
-        c.p.emit(P.CPU_JOIN, cpu.buf, ev)
-        out = c.buffer((C, H))
-        c.p.emit(P.TO_DEV, self.po, out, self.po.nbytes)
-        return out
+        c.p.emit(P.CPU_START, cpu.buf, ev)
 
     def _get(self, kind):
         g = self.progs.get(kind)
@@ -324,6 +378,14 @@ class DGemmaGPU:
             prog.names[k][...] = a
             g.upload(k)
 
+    def _tally(self, g, rows):
+        """count=True: the routers' choices of the first rows of the run, into self.counts."""
+        if not self.count:
+            return
+        for i in range(self.L):
+            g.download("ridx%d" % i)
+            np.add.at(self.counts[i], g.prog_.names["ridx%d" % i][:rows].reshape(-1), 1)
+
     def embed(self, ids):
         return cops.kq_rows(self.table, BF12, self.H, ids) * self.embed_scale
 
@@ -348,6 +410,7 @@ class DGemmaGPU:
             g = self._get("enc")
             self._set(g, d)
             g.run()
+            self._tally(g, m)
             self.n += m
 
     def steps(self):
@@ -374,6 +437,7 @@ class DGemmaGPU:
             self._set(g, d)
             state["set"] = kind
             g.run()
+            self._tally(g, C)
             for k in ("ent", "am", "draw"):
                 g.download(k)
             state["first"] = False

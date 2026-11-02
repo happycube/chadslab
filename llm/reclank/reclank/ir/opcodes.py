@@ -307,6 +307,7 @@ TABLE = [
     ("DG_KV_PUT", 333, G, "t rows of k and v into a layer's cache at the row in device memory"),
     ("DG_ATTN", 334, G, "t queries over rows of a layer's cache, query i the rows [lo[i], hi[i]), GQA, scale 1, float32"),
     ("DG_MOE", 336, G, "the routed experts of a layer on the GPU: BF12 rows, float32 products; the pairs sorted by expert, act = gelu(gate) up, de, the sum of each token over its slots"),
+    ("DG_SPLIT", 337, G, "the CPU's ids of a layer's pairs: the expert, or -1 for an expert the GPU holds (its slot in map)"),
     ("DG_SAMPLE", 335, G, "per row of logits: the temperature, the end-token ban, the entropy, the argmax, an inverse-CDF sample; the processed logits kept, their softmax out"),
 ]
 

@@ -117,6 +117,31 @@ def main():
     ok &= good
     print("DG_MOE (%d experts used): %.2e against NumPy, %.2e against the CPU's KQ_MOE%s" % (
         len(np.unique(idx)), r1, r2, "" if good else "  FAIL"))
+    # the split: the even experts packed as the GPU's slots, the others the CPU's (cidx); the two
+    # parts' sum against the whole
+    hot = np.arange(0, E, 2)
+    gmap = np.full(E, -1, np.int32)
+    gmap[hot] = np.arange(len(hot), dtype=np.int32)
+    gu_h = np.ascontiguousarray(gu.reshape(E, -1)[hot]).reshape(-1)
+    dn_h = np.ascontiguousarray(dn.reshape(E, -1)[hot]).reshape(-1)
+    c = _EncCompiler(1e-6)
+    c.env.update(h=x.copy(), idx=idx, val=val, out=np.zeros((t, H), np.float32), map=gmap,
+                 cidx=np.zeros((t, K), np.int32))
+    P.k_dg_moe(c, c.env["h"], c.env["idx"], c.env["val"], gu_h, dn_h, len(hot), I, out=c.env["out"],
+               map=c.env["map"], cidx=c.env["cidx"])
+    ref, got = run_both(c.p.finish(), ("h", "idx", "val", "map"), ("out", "cidx"))
+    cold = np.zeros((t, H), np.float32)
+    cops.kq_moe_act(np.zeros((t, H), np.int8), np.zeros((t, H // 32), np.float32),
+                    np.zeros((t, H // 16), np.float32), got["cidx"], val, E,
+                    cops.kq_moe_mats((gu, 57), None, (dn, 57), None), None, H, I,
+                    cops.kq_moe_scratch(t, K, E, H, I), cold, gelu=True, hf=x, flags=128)
+    want_cidx = np.where(gmap[idx] >= 0, -1, idx)
+    r1, r2 = rel(got["out"], ref["out"]), rel(got["out"] + cold, cpu)
+    same = np.array_equal(got["cidx"], want_cidx)
+    good = r1 < 1e-5 and r2 < 1e-5 and same
+    ok &= good
+    print("DG_MOE split (%d of %d experts on the GPU): %.2e against NumPy; with the CPU's part %.2e against "
+          "the whole; the CPU's ids right: %s%s" % (len(hot), E, r1, r2, same, "" if good else "  FAIL"))
 
     if a.logits:
         z0 = np.ascontiguousarray(np.load(a.logits)["l1"], np.float32)

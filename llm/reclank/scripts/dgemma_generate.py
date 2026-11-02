@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--engine", choices=("gpu", "q4", "bf16", "ref"), default="gpu")
     ap.add_argument("--steps", action="store_true", help="print each step's argmax canvas")
+    ap.add_argument("--count", action="store_true",
+                    help="(gpu) every expert on the CPU; add the routers' counts of this run to MODEL_DIR/expert_counts.npz "
+                         "(the GPU's experts are the most used ones)")
     ap.add_argument("--bench", action="store_true",
                     help="generate twice and time the second (the first builds the programs, reads the weights)")
     a = ap.parse_args()
@@ -60,7 +63,9 @@ def main():
     steps = None
     if a.engine == "gpu":
         from reclank.models.dgemma.gpu import DGemmaGPU
-        m = DGemmaGPU(a.model)
+        m = DGemmaGPU(a.model, count=a.count)
+        if a.count and os.path.exists(os.path.join(a.model, "expert_counts.npz")):
+            m.counts += np.load(os.path.join(a.model, "expert_counts.npz"))["counts"]
         m.reset()
         encode, decode, steps = m.encode, None, m.steps
     elif a.engine == "ref":
@@ -101,6 +106,9 @@ def main():
                              on_step=on_step, fixed=fixed, steps=steps)
         dt = time.time() - t0
     print(tok.decode(out))
+    if a.engine == "gpu" and a.count:
+        m.save_counts(a.model)
+        print("counts: %d routed rows so far" % (m.counts[0].sum() // m.topk), file=sys.stderr)
     print("\n%d tokens in %.1f s; %d decoder passes (%s), %.1f tokens a pass" % (
         st.tokens, dt, sum(st.steps), " ".join(map(str, st.steps)), st.per_pass), file=sys.stderr)
 

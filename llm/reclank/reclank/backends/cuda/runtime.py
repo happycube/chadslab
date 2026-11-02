@@ -79,7 +79,7 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14)),
         P.ENC_CONV3: tuple(range(7, 13)),
         P.DG_KV_PUT: (5, 6, 7), P.DG_ATTN: (6, 7, 8, 9), P.DG_SAMPLE: (9, 10, 11),
-        P.DG_MOE: (11, 12, 13, 14, 15)}
+        P.DG_MOE: (11, 12, 13, 14, 15), P.DG_SPLIT: (3,)}
 
 
 def _no_numpy_hugepages():

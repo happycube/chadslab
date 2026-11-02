@@ -424,10 +424,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_DG_MOE: {
-        /* h, idx, val, gu, dn, out, start, ptok, ppos, act, de, t, k, E, hidden, inner */
+        /* h, idx, val, gu, dn, out, start, ptok, ppos, act, de, t, k, E, hidden, inner, map, cidx
+         * (E: the slots of the experts the GPU holds; map, or null: each expert's slot, -1 for the
+         * CPU's; cidx, or null: the CPU's ids, -1 for the GPU's pairs) */
         int t = (int)hlit(r, 11, &bad), k = (int)hlit(r, 12, &bad), E = (int)hlit(r, 13, &bad);
         int hidden = (int)hlit(r, 14, &bad), inner = (int)hlit(r, 15, &bad);
-        if (hidden % 128 != 0 || inner % 64 != 0) {
+        if (hidden % 128 != 0 || inner % 64 != 0 || E > DGM_MAXS) {
             bad = 1;
         } else if (t > 0) {
             dg_moe((const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
@@ -435,7 +437,18 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                    (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (float *)(intptr_t)hi(r, g->henv, 5),
                    (int *)(intptr_t)hi(r, g->henv, 6), (int *)(intptr_t)hi(r, g->henv, 7),
                    (int *)(intptr_t)hi(r, g->henv, 8), (float *)(intptr_t)hi(r, g->henv, 9),
-                   (float *)(intptr_t)hi(r, g->henv, 10), t, k, E, hidden, inner, s);
+                   (float *)(intptr_t)hi(r, g->henv, 10), t, k, E, hidden, inner,
+                   (const int *)(intptr_t)hi(r, g->henv, 16), (int *)(intptr_t)hi(r, g->henv, 17), s);
+        }
+        break;
+    }
+    case GP_DG_SPLIT: {
+        /* idx, map, cidx, P */
+        int P = (int)hlit(r, 3, &bad);
+        if (P > 0) {
+            k_dg_split<<<(unsigned)((P + 255) / 256), 256, 0, s>>>((const int *)(intptr_t)hi(r, g->henv, 0),
+                                                                    (const int *)(intptr_t)hi(r, g->henv, 1),
+                                                                    (int *)(intptr_t)hi(r, g->henv, 2), P);
         }
         break;
     }

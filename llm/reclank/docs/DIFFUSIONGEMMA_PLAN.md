@@ -199,6 +199,35 @@ default; `scripts/check_dgemma_gpu.py` for the records):
 - Speed (one 3090): a canvas pass 0.62 s, an encoder block 0.69 s. A warm
   answer of 247 tokens took 11.5 s: 19 passes, 13.0 tokens a pass, 21.5
   tokens/s. The CPU's 18 layers of experts are about 0.43 s of each pass.
-- Next: a tensor-core DG_MOE; more of the experts on the GPU (a smaller
-  cache in bfloat16); the CPU's experts at the same time as the GPU's
-  (CPU_START), with the shared MLP in between.
+- Overlap. The GPU holds the most used experts of all the layers.
+  `expert_counts.npz` beside the model holds the routers' counts from 7 real
+  prompts (`scripts/dgemma_generate.py --count`: 400K pairs a layer). The
+  budget is filled by one greedy pass over (layer, expert) by count: 1632
+  experts, 14.9 GB. In a layer the 40% most used experts take 78% of the
+  pairs. Each layer then runs:
+  1. The router, and DG_SPLIT (the CPU's ids, -1 for the GPU's).
+  2. TO_HOST and CPU_START (KQ_MOE of the CPU's pairs on its helper thread).
+  3. On the GPU, at the same time: the shared MLP, and DG_MOE of the GPU's
+     pairs (its packed rows, the slot map).
+  4. CPU_WAIT, TO_DEV, and the add.
+- DG_MOE on the tensor cores (the default; RECLANK_DG_MOE_TC=0 for the CUDA
+  cores):
+  - x in three bfloat16 planes (24 bits). Each plane's 16 products start from
+    zero in the tensor core and go into the sums with float32 adds. A tensor
+    core's float32 sums drop the low bits of a small addend: with the planes
+    summed inside it, three planes gave 2.4e-5 and two 1.7e-5.
+  - It is 6.7e-7 against NumPy (the CUDA cores' 1.4e-6).
+  - The pairs come in tiles of 32, and the next stage's BF12 bytes and x go
+    out as register loads before the current stage's products.
+  - All of a layer's 2048 pairs: 5.8 ms (CUDA cores 10.5).
+  - The route is parallel (32 warps, match_any): 46 us, not 325.
+- Speed now:
+  - A pass is 0.40 s at 2.3K of context (0.62 before the overlap). The GPU
+    is the critical path: 313 ms of kernels a pass.
+    - the dense BF12 products: 108 ms;
+    - DG_ATTN: 113 ms (float32 on the CUDA cores; it grows with the context);
+    - DG_MOE: 66 ms;
+    - the router's float32 product: 11 ms.
+  - A warm answer of 246 tokens took 4.5 s (12 passes).
+  - Against transformers, short prompt: l1 KL 0.0000, l2 0.0050, l3 0.0000.
+- Next: DG_ATTN on the tensor cores; the router's product.

@@ -287,44 +287,97 @@ static void dg_sample(float *z, float *probs, int t, int vocab, const float *tem
 #define DGM_TM 16
 #define DGM_KC 32
 
-__global__ void k_dg_moe_route(const int *idx, int P, int E, int *start, int *ptok, int *ppos, int k,
-                               int *tiles)
+/* The pairs by slot: map (or null: the identity) gives each expert's slot among the experts the
+ * GPU holds (-1: the CPU's), cidx (or null) the CPU's ids (-1 for the GPU's pairs). One block of
+ * 32 warps; warp w takes pairs [w cs, (w + 1) cs); the counts of each warp by slot (match_any),
+ * then each slot's starts and each warp's base, then the positions in the order of the pairs
+ * (a warp's lanes in order, its rounds in order): the same each run. */
+#define DGM_MAXS 128
+
+__global__ void __launch_bounds__(1024) k_dg_moe_route(const int *idx, int P, int nslot, const int *map,
+                                                       int *start, int *ptok, int *ppos, int k, int *tiles,
+                                                       int *cidx, int tm)
 {
-    if (threadIdx.x != 0) {
-        return;
+    __shared__ int cnt[32][DGM_MAXS + 1];
+    __shared__ int tot[DGM_MAXS + 1];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int cs = (P + 31) / 32, p0 = w * cs, p1 = min(P, p0 + cs);
+    for (int e = lane; e <= nslot; e += 32) {
+        cnt[w][e] = 0;
     }
-    for (int e = 0; e <= E; ++e) {
-        start[e] = 0;
-    }
-    for (int p = 0; p < P; ++p) {
-        start[idx[p] + 1] += 1;
-    }
-    for (int e = 0; e < E; ++e) {
-        start[e + 1] += start[e];
-    }
-    /* the fill: the next free position of each expert (start[e] moves on, then back) */
-    for (int p = 0; p < P; ++p) {
-        const int e = idx[p];
-        const int q = start[e]++;
-        ptok[q] = p / k;
-        ppos[p] = q;
-    }
-    for (int e = E; e > 0; --e) {
-        start[e] = start[e - 1];
-    }
-    start[0] = 0;
-    /* the tiles: (expert, first pair) of each DGM_TM pairs of an expert; -1 past the last */
-    int nt = 0;
-    for (int e = 0; e < E; ++e) {
-        for (int p0 = start[e]; p0 < start[e + 1]; p0 += DGM_TM) {
-            tiles[2 * nt] = e;
-            tiles[2 * nt + 1] = p0;
-            ++nt;
+    __syncwarp();
+    for (int b = p0; b < p1; b += 32) {
+        const int p = b + lane;
+        int sl = -1;
+        if (p < p1) {
+            const int e = idx[p];
+            sl = map != NULL ? (e >= 0 ? map[e] : -1) : e;
+            if (cidx != NULL) {
+                cidx[p] = sl >= 0 ? -1 : e;
+            }
         }
+        const unsigned act = __ballot_sync(0xffffffffu, p < p1 && sl >= 0);
+        if (p < p1 && sl >= 0) {
+            const unsigned peers = __match_any_sync(act, sl);
+            if (lane == __ffs(peers) - 1) {
+                cnt[w][sl] += __popc(peers);
+            }
+        }
+        __syncwarp();
     }
-    const int cap = (P + DGM_TM - 1) / DGM_TM + E;
-    for (; nt < cap; ++nt) {
-        tiles[2 * nt] = -1;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < nslot; ++e) {
+            start[e] = acc;
+            for (int v = 0; v < 32; ++v) {
+                const int c = cnt[v][e];
+                cnt[v][e] = acc;        /* warp v's base for slot e */
+                acc += c;
+            }
+        }
+        start[nslot] = acc;
+        tot[0] = acc;
+    }
+    __syncthreads();
+    for (int b = p0; b < p1; b += 32) {
+        const int p = b + lane;
+        int sl = -1;
+        if (p < p1) {
+            const int e = idx[p];
+            sl = map != NULL ? (e >= 0 ? map[e] : -1) : e;
+        }
+        const unsigned act = __ballot_sync(0xffffffffu, p < p1 && sl >= 0);
+        if (p < p1) {
+            if (sl >= 0) {
+                const unsigned peers = __match_any_sync(act, sl);
+                const int q = cnt[w][sl] + __popc(peers & ((1u << lane) - 1u));
+                ptok[q] = p / k;
+                ppos[p] = q;
+                __syncwarp(peers);
+                if (lane == __ffs(peers) - 1) {
+                    cnt[w][sl] += __popc(peers);
+                }
+            } else {
+                ppos[p] = -1;
+            }
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int nt = 0;
+        for (int e = 0; e < nslot; ++e) {
+            for (int q = start[e]; q < start[e + 1]; q += tm) {
+                tiles[2 * nt] = e;
+                tiles[2 * nt + 1] = q;
+                ++nt;
+            }
+        }
+        const int cap = (P + DGM_TM - 1) / DGM_TM + nslot;
+        for (; nt < cap; ++nt) {
+            tiles[2 * nt] = -1;
+        }
     }
 }
 
@@ -474,6 +527,261 @@ __global__ void __launch_bounds__(128) k_dg_moe_dn(const float *act, const uint8
     }
 }
 
+/* The tensor cores (mma m16n8k16, bfloat16 in, float32 sums): x in three bfloat16 planes
+ * (hi + mid + lo: the 24 bits of float32), each plane times the bfloat16 values of the BF12 rows,
+ * so the products are those of float32 (the sums in another order). A block of 4 warps: 16
+ * pairs by 128 weight rows, 64 columns a stage in shared memory (rows of 72 halves: no bank
+ * conflicts for the fragments).
+ *   gu: rows 64 gate + the 64 up rows of the same index; warp w: gate rows 16 w .. 16 w + 15 and
+ *       those up rows (two n blocks of 8 each), act = gelu(gate) up at the end
+ *   dn: 128 down rows; warp w: rows 32 w .. 32 w + 31 (four n blocks) */
+#define DGT_KS 64
+#define DGT_LD 72
+
+__device__ __forceinline__ void dg_split3(float v, uint16_t &h, uint16_t &m, uint16_t &l)
+{
+    h = f2bf_rn(v);
+    float r = v - __uint_as_float((uint32_t)h << 16);
+    m = f2bf_rn(r);
+    r -= __uint_as_float((uint32_t)m << 16);
+    l = f2bf_rn(r);
+}
+
+/* Tiles of DGT_TM = 32 pairs (two m blocks; the experts the GPU holds have ~30 pairs a layer, so
+ * a decoded row serves twice the products of 16). The next stage's global loads (each thread its
+ * row's 96 bytes of BF12, 64 columns, and 16 values of x) go out before the current stage's
+ * products, in registers, then make the shared tiles. */
+#define DGT_TM 32
+
+struct dg_raw {
+    uint4 lo[4], hi[2];
+    uint32_t E;
+    float4 x[4];
+};
+
+/* the next stage's bytes: row w of cols (64 columns from k0) and x (the pairs of the tile) */
+__device__ __forceinline__ void dg_raw_load(dg_raw &r, const uint8_t *w, int cols, int k0, const float *x, size_t ld,
+                                            const int *ptok, int s0, int n, int tid)
+{
+    const uint4 *lo = (const uint4 *)(w + k0), *hi = (const uint4 *)(w + cols + k0 / 2);
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        r.lo[q] = lo[q];
+    }
+    r.hi[0] = hi[0];
+    r.hi[1] = hi[1];
+    const uint8_t *E = w + cols + cols / 2 + k0 / 32;
+    r.E = (uint32_t)E[0] | (uint32_t)E[1] << 8;
+    const int i = tid >> 2, c = (tid & 3) * 16;
+    if (i < n) {
+        const float4 *xr = (const float4 *)(x + (ptok != NULL ? (size_t)ptok[s0 + i] : (size_t)(s0 + i)) * ld + k0 + c);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            r.x[q] = xr[q];
+        }
+    } else {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            r.x[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    }
+}
+
+/* the shared tiles from a stage's bytes: the thread's row of 64 bfloat16 values, and its 16 values
+ * of x in the three planes */
+__device__ __forceinline__ void dg_raw_store(const dg_raw &r, uint16_t (*ws)[DGT_LD], uint16_t (*xs)[DGT_TM][DGT_LD],
+                                             int tid)
+{
+    const uint32_t *lw = (const uint32_t *)r.lo, *hw = (const uint32_t *)r.hi;
+    #pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t E2 = (((r.E >> (8 * g)) & 0xffu) | 256u) * 0x00010001u;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint32_t p[8];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t l = lw[8 * g + 4 * h + k], hh = hw[4 * g + k];
+                p[2 * k] = bf12_frag(l, hh, 4 * h, E2);
+                p[2 * k + 1] = bf12_frag(l >> 16, hh >> 16, 4 * h, E2);
+            }
+            uint16_t *dst = ws[tid] + 32 * g + 16 * h;
+            *(uint4 *)dst = make_uint4(p[0], p[1], p[2], p[3]);
+            *(uint4 *)(dst + 8) = make_uint4(p[4], p[5], p[6], p[7]);
+        }
+    }
+    const int i = tid >> 2, c = (tid & 3) * 16;
+    const float *v = (const float *)r.x;
+    #pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        uint32_t ph[4], pm[4], pl[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            uint16_t h0, m0, l0, h1, m1, l1;
+            dg_split3(v[8 * q + 2 * u], h0, m0, l0);
+            dg_split3(v[8 * q + 2 * u + 1], h1, m1, l1);
+            ph[u] = (uint32_t)h0 | (uint32_t)h1 << 16;
+            pm[u] = (uint32_t)m0 | (uint32_t)m1 << 16;
+            pl[u] = (uint32_t)l0 | (uint32_t)l1 << 16;
+        }
+        *(uint4 *)&xs[0][i][c + 8 * q] = make_uint4(ph[0], ph[1], ph[2], ph[3]);
+        *(uint4 *)&xs[1][i][c + 8 * q] = make_uint4(pm[0], pm[1], pm[2], pm[3]);
+        *(uint4 *)&xs[2][i][c + 8 * q] = make_uint4(pl[0], pl[1], pl[2], pl[3]);
+    }
+}
+
+/* the products of k step kk: two m blocks (pairs 0..15, 16..31) by NB n blocks; each plane's 16
+ * products from zero, then into the float32 sums (lo + mid, then hi) */
+template <int NB>
+__device__ __forceinline__ void dg_mma2(uint16_t (*xs)[DGT_TM][DGT_LD], uint16_t (*ws)[DGT_LD], int kk,
+                                        const int *nb, float (*acc)[NB][4], int lane)
+{
+    const int g = lane >> 2, tg = lane & 3, c = kk + 2 * tg;
+    uint32_t b[NB][2];
+    #pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        b[j][0] = *(const uint32_t *)&ws[nb[j] + g][c];
+        b[j][1] = *(const uint32_t *)&ws[nb[j] + g][c + 8];
+    }
+    #pragma unroll
+    for (int mb = 0; mb < 2; ++mb) {
+        uint32_t a[3][4];
+        #pragma unroll
+        for (int pl = 0; pl < 3; ++pl) {
+            a[pl][0] = *(const uint32_t *)&xs[pl][16 * mb + g][c];
+            a[pl][1] = *(const uint32_t *)&xs[pl][16 * mb + g + 8][c];
+            a[pl][2] = *(const uint32_t *)&xs[pl][16 * mb + g][c + 8];
+            a[pl][3] = *(const uint32_t *)&xs[pl][16 * mb + g + 8][c + 8];
+        }
+        #pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            float pp[3][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+            #pragma unroll
+            for (int pl = 0; pl < 3; ++pl) {
+                mma16816_bf16(pp[pl], a[pl], b[j]);
+            }
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                acc[mb][j][q] += (pp[2][q] + pp[1][q]) + pp[0][q];
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128) k_dg_moe_gu_tc(const float *h, const uint8_t *gu, const int *start,
+                                                      const int *ptok, const int *tiles, float *act, int hidden,
+                                                      int inner, size_t rb)
+{
+    const int e = tiles[2 * blockIdx.x], r0 = blockIdx.y * 64;
+    if (e < 0) {
+        return;
+    }
+    const int s0 = tiles[2 * blockIdx.x + 1], n = min(DGT_TM, start[e + 1] - s0);
+    __shared__ __align__(16) uint16_t xs[3][DGT_TM][DGT_LD];
+    __shared__ __align__(16) uint16_t ws[128][DGT_LD];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int wrow = tid < 64 ? r0 + tid : inner + r0 + (tid - 64);
+    const uint8_t *wr = gu + ((size_t)e * 2 * inner + wrow) * rb;
+    const int nb[4] = {16 * w, 16 * w + 8, 64 + 16 * w, 64 + 16 * w + 8};
+    float acc[2][4][4];
+    for (int mb = 0; mb < 2; ++mb) {
+        for (int j = 0; j < 4; ++j) {
+            for (int q = 0; q < 4; ++q) {
+                acc[mb][j][q] = 0.f;
+            }
+        }
+    }
+    dg_raw r;
+    dg_raw_load(r, wr, hidden, 0, h, (size_t)hidden, ptok, s0, n, tid);
+    for (int k0 = 0; k0 < hidden; k0 += DGT_KS) {
+        __syncthreads();
+        dg_raw_store(r, ws, xs, tid);
+        __syncthreads();
+        if (k0 + DGT_KS < hidden) {
+            dg_raw_load(r, wr, hidden, k0 + DGT_KS, h, (size_t)hidden, ptok, s0, n, tid);
+        }
+        #pragma unroll
+        for (int kk = 0; kk < DGT_KS; kk += 16) {
+            dg_mma2<4>(xs, ws, kk, nb, acc, lane);
+        }
+    }
+    const int g = lane >> 2, tg = lane & 3;
+    for (int mb = 0; mb < 2; ++mb) {
+        for (int j = 0; j < 2; ++j) {
+            const int col = r0 + 16 * w + 8 * j + 2 * tg;
+            for (int hh = 0; hh < 2; ++hh) {
+                const int i = 16 * mb + g + 8 * hh;
+                if (i < n) {
+                    float *ar = act + (size_t)(s0 + i) * inner + col;
+                    ar[0] = dg_gelu(acc[mb][j][2 * hh]) * acc[mb][2 + j][2 * hh];
+                    ar[1] = dg_gelu(acc[mb][j][2 * hh + 1]) * acc[mb][2 + j][2 * hh + 1];
+                }
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128) k_dg_moe_dn_tc(const float *act, const uint8_t *dn, const int *start,
+                                                      const int *tiles, float *de, int hidden, int inner, size_t rb)
+{
+    const int e = tiles[2 * blockIdx.x], r0 = blockIdx.y * 128;
+    if (e < 0) {
+        return;
+    }
+    const int s0 = tiles[2 * blockIdx.x + 1], n = min(DGT_TM, start[e + 1] - s0);
+    __shared__ __align__(16) uint16_t xs[3][DGT_TM][DGT_LD];
+    __shared__ __align__(16) uint16_t ws[128][DGT_LD];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const uint8_t *wr = dn + ((size_t)e * hidden + r0 + tid) * rb;
+    const int nb[4] = {32 * w, 32 * w + 8, 32 * w + 16, 32 * w + 24};
+    float acc[2][4][4];
+    for (int mb = 0; mb < 2; ++mb) {
+        for (int j = 0; j < 4; ++j) {
+            for (int q = 0; q < 4; ++q) {
+                acc[mb][j][q] = 0.f;
+            }
+        }
+    }
+    dg_raw r;
+    dg_raw_load(r, wr, inner, 0, act, (size_t)inner, NULL, s0, n, tid);
+    for (int k0 = 0; k0 < inner; k0 += DGT_KS) {
+        __syncthreads();
+        dg_raw_store(r, ws, xs, tid);
+        __syncthreads();
+        if (k0 + DGT_KS < inner) {
+            dg_raw_load(r, wr, inner, k0 + DGT_KS, act, (size_t)inner, NULL, s0, n, tid);
+        }
+        #pragma unroll
+        for (int kk = 0; kk < DGT_KS; kk += 16) {
+            dg_mma2<4>(xs, ws, kk, nb, acc, lane);
+        }
+    }
+    const int g = lane >> 2, tg = lane & 3;
+    for (int mb = 0; mb < 2; ++mb) {
+        for (int j = 0; j < 4; ++j) {
+            const int col = r0 + 32 * w + 8 * j + 2 * tg;
+            for (int hh = 0; hh < 2; ++hh) {
+                const int i = 16 * mb + g + 8 * hh;
+                if (i < n) {
+                    float *dr_ = de + (size_t)(s0 + i) * hidden + col;
+                    dr_[0] = acc[mb][j][2 * hh];
+                    dr_[1] = acc[mb][j][2 * hh + 1];
+                }
+            }
+        }
+    }
+}
+
+static int dg_moe_tc_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_DG_MOE_TC");
+        on = v == NULL ? 1 : atoi(v) != 0;
+    }
+    return on && gg_caps.tc;
+}
+
 __global__ void k_dg_moe_sum(const float *de, const float *val, const int *ppos, float *out, int k, int hidden)
 {
     const int tok = blockIdx.x;
@@ -481,7 +789,9 @@ __global__ void k_dg_moe_sum(const float *de, const float *val, const int *ppos,
         float s = 0.f;
         for (int j = 0; j < k; ++j) {
             const int p = tok * k + j;
-            s = fmaf(val[p], de[(size_t)ppos[p] * hidden + c], s);
+            if (ppos[p] >= 0) {
+                s = fmaf(val[p], de[(size_t)ppos[p] * hidden + c], s);
+            }
         }
         out[(size_t)tok * hidden + c] = s;
     }
@@ -489,17 +799,39 @@ __global__ void k_dg_moe_sum(const float *de, const float *val, const int *ppos,
 
 static void dg_moe(const float *h, const int *idx, const float *val, const uint8_t *gu, const uint8_t *dn, float *out,
                    int *start, int *ptok, int *ppos, float *act, float *de, int t, int k, int E, int hidden,
-                   int inner, cudaStream_t s)
+                   int inner, const int *map, int *cidx, cudaStream_t s)
 {
     const int P = t * k;
     /* the tile table after start (E + 1 ints): its room is in the start buffer (DG_MOE's operand 6
      * holds E + 1 + 2 (P / DGM_TM + 1 + E) ints) */
     int *tiles = start + E + 1;
     const unsigned nt = (unsigned)((P + DGM_TM - 1) / DGM_TM + E);
-    k_dg_moe_route<<<1, 32, 0, s>>>(idx, P, E, start, ptok, ppos, k, tiles);
-    k_dg_moe_gu<<<dim3(nt, (unsigned)(inner / 64)), 128, 0, s>>>(
-        h, gu, start, ptok, tiles, act, hidden, inner, kq_row_bytes(KQ_BF12, hidden));
-    k_dg_moe_dn<<<dim3(nt, (unsigned)(hidden / 128)), 128, 0, s>>>(
-        act, dn, start, tiles, de, hidden, inner, kq_row_bytes(KQ_BF12, inner));
+    const int tc = dg_moe_tc_on() && inner % DGT_KS == 0 && hidden % DGT_KS == 0;
+    k_dg_moe_route<<<1, 1024, 0, s>>>(idx, P, E, map, start, ptok, ppos, k, tiles, cidx, tc ? DGT_TM : DGM_TM);
+    if (E > 0) {
+        const size_t rg = kq_row_bytes(KQ_BF12, hidden), rd = kq_row_bytes(KQ_BF12, inner);
+        if (tc) {
+            k_dg_moe_gu_tc<<<dim3(nt, (unsigned)(inner / 64)), 128, 0, s>>>(h, gu, start, ptok, tiles, act, hidden,
+                                                                            inner, rg);
+            k_dg_moe_dn_tc<<<dim3(nt, (unsigned)(hidden / 128)), 128, 0, s>>>(act, dn, start, tiles, de, hidden,
+                                                                              inner, rd);
+        } else {
+            k_dg_moe_gu<<<dim3(nt, (unsigned)(inner / 64)), 128, 0, s>>>(h, gu, start, ptok, tiles, act, hidden,
+                                                                         inner, rg);
+            k_dg_moe_dn<<<dim3(nt, (unsigned)(hidden / 128)), 128, 0, s>>>(act, dn, start, tiles, de, hidden,
+                                                                           inner, rd);
+        }
+    }
     k_dg_moe_sum<<<(unsigned)t, 256, 0, s>>>(de, val, ppos, out, k, hidden);
+}
+
+/* DG_SPLIT: the CPU's ids of a layer's pairs (cidx: the expert, or -1 when the GPU holds it: map
+ * gives its slot), before the GPU's experts, so that the CPU can start on them */
+__global__ void k_dg_split(const int *idx, const int *map, int *cidx, int P)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < P) {
+        const int e = idx[p];
+        cidx[p] = e >= 0 && map[e] >= 0 ? -1 : e;
+    }
 }

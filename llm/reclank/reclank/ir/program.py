@@ -811,8 +811,14 @@ def _py_step(op, a, e):
         dn = _arr(V(4), E * hidden * rdn, ctypes.c_uint8)
         out = _arr(V(5), t * hidden).reshape(t, hidden)
         out[:] = 0
-        for e in np.unique(idx):
-            tok, slot = np.nonzero(idx == e)
+        slots = idx
+        if V(16):
+            m = _arr(V(16), int(idx.max()) + 1, ctypes.c_int32)
+            slots = np.where(idx >= 0, m[np.maximum(idx, 0)], -1)
+        if V(17):
+            _arr(V(17), t * k, ctypes.c_int32)[:] = np.where(slots >= 0, -1, idx).reshape(-1)
+        for e in np.unique(slots[slots >= 0]):
+            tok, slot = np.nonzero(slots == e)
             w1 = cops.kq_bf12_to_bf16(gu[e * 2 * inner * rgu:(e + 1) * 2 * inner * rgu], 2 * inner, hidden)
             w2 = cops.kq_bf12_to_bf16(dn[e * hidden * rdn:(e + 1) * hidden * rdn], hidden, inner)
             w1 = (w1.astype(np.uint32) << 16).view(np.float32)
@@ -820,6 +826,11 @@ def _py_step(op, a, e):
             a = h[tok] @ w1.T
             a = ops.gelu_tanh(a[:, :inner]) * a[:, inner:]
             out[tok] += (a @ w2.T) * val[tok, slot, None]
+    elif op == DG_SPLIT:
+        n = V(3)
+        idx = _arr(V(0), n, ctypes.c_int32)
+        m = _arr(V(1), int(idx.max()) + 1, ctypes.c_int32)
+        _arr(V(2), n, ctypes.c_int32)[:] = np.where((idx >= 0) & (m[np.maximum(idx, 0)] >= 0), -1, idx)
     elif op == DG_SAMPLE:
         t, vocab, neos = V(9), V(10), V(11)
         z = _arr(V(0), t * vocab).reshape(t, vocab)
@@ -2467,11 +2478,13 @@ def k_dg_attn(c, q, K, V, lo, hi, heads, kvh, hd, out=None):
     return out
 
 
-def k_dg_moe(c, h, idx, val, gu, dn, E, inner, out=None):
+def k_dg_moe(c, h, idx, val, gu, dn, E, inner, out=None, map=None, cidx=None):
     """(dg_moe h idx val gu dn E inner): the routed experts of t rows h (the pairs idx, val of t x
     k) with BF12 weights on the GPU: gu (each expert's gate rows then its up rows), dn (its down
     rows); out = the sum over each row's slots of val (gelu_tanh(gate h) up h) down (a GPU
-    record; float32 products)."""
+    record; float32 products). map (or None: every expert, E of them): int32, each expert's slot
+    in gu and dn (E slots), -1 for an expert the GPU does not hold (its pairs add nothing here);
+    cidx (or None): int32 t x k, the ids of the CPU's pairs (KQ_MOE), -1 for the GPU's."""
     t, hidden = h.shape
     k = idx.shape[1]
     P = t * k
@@ -2481,7 +2494,15 @@ def k_dg_moe(c, h, idx, val, gu, dn, E, inner, out=None):
     # of each, at most P / 16 + E of them)
     c.p.emit(DG_MOE, h, idx, val, gu, dn, out, i32(E + 1 + 2 * (-(-P // 16) + E)), i32(P), i32(P),
              c.buffer((P, inner)),
-             c.buffer((P, hidden)), t, k, E, hidden, inner)
+             c.buffer((P, hidden)), t, k, E, hidden, inner, map, cidx)
+    return out
+
+
+def k_dg_split(c, idx, map, out=None):
+    """(dg_split idx map): the CPU's ids of the pairs idx (int32 t x k): the expert, or -1 where
+    map (each expert's GPU slot) is not -1 (a GPU record)."""
+    out = c.buffer(idx.shape, np.int32) if out is None else out
+    c.p.emit(DG_SPLIT, idx, map, out, idx.size)
     return out
 
 
@@ -2592,6 +2613,7 @@ KERNELS = {
     "dg_attn": k_dg_attn,
     "dg_sample": k_dg_sample,
     "dg_moe": k_dg_moe,
+    "dg_split": k_dg_split,
     "enc_warp": k_enc_warp,
     "enc_prelu": k_enc_prelu,
     "enc_mix": k_enc_mix,
