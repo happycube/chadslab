@@ -55,7 +55,7 @@ STOP, STOP_FLOOR = 0.9, 0.3
 class DSpark:
     """See the module text."""
 
-    def __init__(self, g, where="cpu", stop=None):
+    def __init__(self, g, where="cpu", stop=None, host=None):
         """where: the routed experts of the blocks on the GPU ("gpu": 7.2 GB of
         its memory), or in the RAM of both nodes, run by the teams of the main
         model's parts ("cpu": the GPU's memory for more hot experts of the main
@@ -65,7 +65,8 @@ class DSpark:
         the survival of their prefix (the product of the sigmoids of the
         confidences) is at least stop, and the first under it when its survival
         is at least STOP_FLOOR; 0: the length of the most expected tokens a
-        millisecond (choose)."""
+        millisecond (choose). host: the DSpark of this model before a release of the GPU (its
+        reload: g remade): its experts in RAM ("cpu", "cpu1") kept, not packed again."""
         self.g = g
         self.where = where
         m = g.m
@@ -80,7 +81,7 @@ class DSpark:
         self.rings = [g.cache_rows(m.win, m.head_dim, "w") for _ in range(self.blocks)]
         for r in self.rings:
             g.mirror.add(r)
-        self._experts()
+        self._experts(host)
         self.markov_embed = g._put(self._bf12_values("mtp.%d.markov_head.embed.weight" % (self.blocks - 1)))
         self.progs = {}
         self.scratch = {}           # the arrays of the seed programs (one at a time) share these
@@ -101,7 +102,7 @@ class DSpark:
         bits = cops.kq_bf12_to_bf16(rows, b.shape[0], b.shape[1])
         return (bits.astype(np.uint32) << 16).view(np.float32)
 
-    def _experts(self):
+    def _experts(self, host=None):
         """The routed experts of the blocks, whole, in KQ_MXX: on the GPU (a
         store of E slots for each block, its map the identity), in the RAM of
         both nodes as the main model's cold experts ("cpu": ExpertParts of a
@@ -111,6 +112,9 @@ class DSpark:
         g, src = self.g, self.g.w.src
         H, I = src.hidden, src.inner
         self.stores, self.maps = [], []
+        if self.where in ("cpu", "cpu1") and host is not None and host.where == self.where:
+            self.ram, self.parts, self.part_bufs = host.ram, host.parts, {}
+            return
         if self.where in ("cpu", "cpu1"):
             from reclank.runtime import moe_parts, numa
             if self.where == "cpu":

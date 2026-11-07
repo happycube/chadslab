@@ -235,12 +235,12 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         (hlit(r, 15, bad) == 1 || hlit(r, 15, bad) == 4)) {
         /* the heads of a key head in one tile (k_attn_part_tc) */
         static int attr = 0;
-        if (!attr) {
+        if (attr != gg_epoch) {
             cudaFuncSetAttribute(k_attn_part_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)QT_SMEM);
             cudaFuncSetAttribute(k_attn_part_tc<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)QT_SMEM);
-            attr = 1;
+            attr = gg_epoch;
         }
         dim3 grid((unsigned)kvh, ATTN_CHUNKS);
         if (qsa_tc_on() == 2) {
@@ -256,6 +256,40 @@ static int attn_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
                                                                               hg);
     k_attn_join<<<dim3((unsigned)qh, (unsigned)cdiv(hd, 128)), 128, 0, gg_stream>>>(
         dr, denv, g->part, 0);
+    return 0;
+}
+
+/* A verify group of GP_ATTN_F32H (the E4B) with operand 13 1: each query as a decode step
+ * (attn_launch: k_attn_part and k_attn_join on one query), so a token of the group gets the bits
+ * of a step; the queries in one launch (blockIdx.z, attn_as_step), as many at a time as their
+ * parts fit in g->part. Bolt E4B's group of 8 on the 3090: its attention 11.8 -> 9.2 ms (a step
+ * 1.7 ms); each query still reads its keys (the windows of a group's queries start one key
+ * apart, so are their chunks). */
+static int attn_steps_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const int64_t *denv,
+                             int *bad)
+{
+    int64_t qh = hlit(r, 5, bad), kvh = hlit(r, 6, bad), hd = hlit(r, 7, bad), t = hlit(r, 8, bad);
+    if (kvh <= 0 || qh % kvh != 0 || (hd != 256 && hd != 512)) {
+        *bad = 1;
+        return 0;
+    }
+    int hg = (int)cdiv(qh / kvh, ATTN_REP);
+    while ((qh / kvh) % hg != 0) {
+        ++hg;
+    }
+    size_t per = (size_t)qh * ATTN_CHUNKS * (size_t)(hd + 2);
+    if (per > GG_PART_FLOATS || qh / kvh / hg > ATTN_REP) {
+        *bad = 1;
+        return 0;
+    }
+    int nq = (int)(GG_PART_FLOATS / per);
+    for (int z0 = 0; z0 < t; z0 += nq) {
+        unsigned nz = (unsigned)(t - z0 < nq ? t - z0 : nq);
+        k_attn_part<<<dim3((unsigned)(kvh * hg), ATTN_CHUNKS, nz), 256, 0, gg_stream>>>(dr, denv, g->part,
+                                                                                     hg, z0);
+        k_attn_join<<<dim3((unsigned)qh, (unsigned)cdiv(hd, 128), nz), 128, 0, gg_stream>>>(
+            dr, denv, g->part, 0, z0);
+    }
     return 0;
 }
 
@@ -651,12 +685,12 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
             }
             dim3 grid((unsigned)cdiv(t, T2M), (unsigned)cdiv(rows, T2N));
             static int attr2 = 0;
-            if (!attr2) {
+            if (attr2 != gg_epoch) {
                 cudaFuncSetAttribute(k_gemm_q8<1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int)Q8SMEM_X2);
                 cudaFuncSetAttribute(k_gemm_q8<0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int)Q8SMEM_X2);
-                attr2 = 1;
+                attr2 = gg_epoch;
             }
             if ((cols / 32) % 8 == 0 && ((uintptr_t)w & 15) == 0) {
                 k_gemm_q8<1, 1><<<grid, 256, Q8SMEM_X2, gg_stream>>>(
@@ -676,12 +710,12 @@ static void gemm_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr,
         }
         dim3 grid((unsigned)cdiv(t, T2M), (unsigned)cdiv(rows, T2N));
         static int attr = 0;
-        if (!attr) {
+        if (attr != gg_epoch) {
             cudaFuncSetAttribute(k_gemm_q8<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)Q8SMEM);
             cudaFuncSetAttribute(k_gemm_q8<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)Q8SMEM);
-            attr = 1;
+            attr = gg_epoch;
         }
         if ((cols / 32) % 8 == 0 && ((uintptr_t)w & 15) == 0) {
             /* The rows of w start at a multiple of 16 bytes. */
@@ -779,16 +813,34 @@ static int kt_on(void)
     return gg_caps.tc ? on : 0;   /* the tensor cores: sm_80 */
 }
 
+/* The format of k_kq_tc for the rows of a large group of GP_KQ_LINEAR, or -1
+ * (k_kq_gemm): Q8_R, and the Q4_K and Q6_K rows of a GGUF file (x to int8 in
+ * blocks of 32, as the step's kq_i8 products; k_kq_gemm took 96% of a prompt
+ * of Bolt E4B's Q4_K_M). RECLANK_GPU_KQTC_K=0: the Q4_K and Q6_K rows in
+ * k_kq_gemm (float32). */
+static int kt_dense(int type)
+{
+    static int k = -1;
+    if (k < 0) {
+        const char *v = getenv("RECLANK_GPU_KQTC_K");
+        k = !(v && v[0] == '0');
+    }
+    int f = kt_format(type);
+    return f == KT_Q8R || (k && (f == KT_Q4K || f == KT_Q6K)) ? f : -1;
+}
+
 /* The shared memory of the instances of the tensor-core kernels (once). */
 static void kt_attr(void)
 {
     static int done = 0;
-    if (done) {
+    if (done == gg_epoch) {
         return;
     }
-    done = 1;
+    done = gg_epoch;
     int a = (int)KT_SMEM(128, 2), b = (int)KT_SMEM(64, 3);
     cudaFuncSetAttribute(k_kq_tc<KT_Q8R>, cudaFuncAttributeMaxDynamicSharedMemorySize, a);
+    cudaFuncSetAttribute(k_kq_tc<KT_Q4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, a);
+    cudaFuncSetAttribute(k_kq_tc<KT_Q6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, a);
 #define KT_SET(F) \
     cudaFuncSetAttribute(k_qmoe_gu_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b); \
     cudaFuncSetAttribute(k_qmoe_dn_tc<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
@@ -813,18 +865,32 @@ static int8_t *kt_lo(const gg_prog *g)
 /* Quantize n values (a multiple of 32) at x to the int16 form (k_quant_x2)
  * in the int8 scratch of g: the hi plane, xs and xsum as kt_quant, and the
  * lo plane at kt_lo. */
-static void kt_quant_x2(const gg_prog *g, const float *x, size_t n)
+static void kt_quant_x2(const gg_prog *g, const float *x, size_t n, const gp_rec *rp = NULL,
+                        const int64_t *re = NULL, int rk = 0)
 {
     float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+    if (rp != NULL) {
+        /* (x the operand rk of the record on the device: a chain's body, runtime/graphs.cu) */
+        k_quant_x2_rec<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(
+            rp, re, rk, g->kqx, kt_lo(g), xs, xsum, n / 32);
+        return;
+    }
     k_quant_x2<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(
         x, g->kqx, kt_lo(g), xs, xsum, n / 32);
 }
 
-/* Quantize n values (a multiple of 32) at x to the int8 scratch of g. */
-static void kt_quant(const gg_prog *g, const float *x, size_t n)
+/* Quantize n values (a multiple of 32) at x to the int8 scratch of g (rp: x the operand rk of that record on the
+ * device). */
+static void kt_quant(const gg_prog *g, const float *x, size_t n, const gp_rec *rp = NULL, const int64_t *re = NULL,
+                     int rk = 0)
 {
     int8_t *xq = g->kqx;
     float *xs = (float *)(g->kqx + g->kqx_n), *xsum = xs + g->kqx_n / 32;
+    if (rp != NULL) {
+        k_kq_quant_x_rec<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(rp, re, rk, xq, xs, xsum,
+                                                                                           n / 32);
+        return;
+    }
     k_kq_quant_x<<<(unsigned)cdiv((int64_t)(n / 32) * 8, 256), 256, 0, gg_stream>>>(x, xq, xs, xsum,
                                                                                    n / 32);
 }
@@ -964,17 +1030,20 @@ static int al16(int64_t p)
 /* The kernels of the media encoders (defined with their entry points below). */
 __global__ void k_enc_gemm(const float *x, const void *w, int wbf, const float *b, float *y,
                            int n, int m, int k, float imin, float imax, float omin, float omax);
+__global__ void k_enc_gemm_f20tc(const float *x, const uint8_t *w, const float *b, float *y, int n, int m, int k,
+                                 float imin, float imax, float omin, float omax);     /* (tiles of 128 x 128) */
 struct RifeTmps;
 static void enc_rife_in(const gp_rec *r, const int64_t *e, int *bad, cudaStream_t s);
 static void enc_rife_out(const gp_rec *r, const int64_t *e, int *bad, cudaStream_t s);
 static void enc_conv_mm(const float *src, const int *idx, const float *w, const float *b, const float *res,
                         const float *slope, float *y, int n, int m, int taps, int cin, const int *scat, int blk,
-                        int sms, cudaStream_t s);
+                        int sms, cudaStream_t s, int wbf = 0);
 static void enc_conv3(const float *x, const int *groups, const float *w, const float *b, const float *res,
                       const float *slope, float *y, int H, int W, int cin, int m, int up, int ng, float rs,
                       cudaStream_t s);
 static void enc_sgemm(const float *x, const void *w, int f20, const float *b, float *y, int n, int m, int k,
                       float imin, float imax, float omin, float omax, int sms, cudaStream_t s);
+static int kq_f20_linear(const float *x, const uint8_t *w, int rows, int cols, int t, float *out, cudaStream_t s);
 __global__ void k_enc_rms(const float *x, const float *w, float *y, int rows, int d, float eps);
 __global__ void k_enc_gelu_mul(const float *g, const float *u, float *y, int64_t n, int use_erf);
 __global__ void k_enc_lnorm(const float *x, const float *w, const float *b, float *y, int rows,
@@ -1008,13 +1077,19 @@ __global__ void k_enc_snake(const float *x, const float *al, const float *be, fl
 __global__ void k_enc_elu(const float *x, float *y, int64_t n);
 __global__ void k_enc_dupup(const float *x, float *y, int h, int w, int cin, int cout, int ft, int fs);
 __global__ void k_enc_f20_pack(const float *x, uint8_t *y, int64_t rows, int cols);
+__global__ void k_enc_bf16_pack(const float *x, uint16_t *y, int64_t n, int h);
+void enc_linear_w16h(const float *x, const uint16_t *w, const float *b, float *y, int n, int m, int k, float imin,
+                     float imax, float omin, float omax, cudaStream_t s);
+void enc_linear_w16i(const float *x, const uint8_t *w, const float *b, float *y, int n, int m, int k, float imin,
+                     float imax, float omin, float omax, cudaStream_t s);
+__global__ void k_enc_i16_pack(const float *x, uint8_t *y, int64_t rows, int cols);
 __global__ void k_enc_f20_unpack(const uint8_t *x, float *y, int64_t rows, int cols);
 __global__ void k_f20_to_bf16(const uint8_t *x, uint16_t *y, uint16_t *ylo, int64_t rows, int cols);
 __global__ void k_enc_resize(const float *x, float *y, int64_t n, int64_t h, int64_t w, int64_t H, int64_t W,
                              int64_t C, int mode, int64_t xs, int64_t xo, int64_t ys, int64_t yo);
 __global__ void k_enc_warp(const float *x, const float *fl, float *y, const float *gx, const float *gy, int64_t h,
                            int64_t w, int64_t C, int64_t xs, int64_t xo, int64_t fs, int64_t fo, int64_t ys,
-                           int64_t yo, float dx, float dy);
+                           int64_t yo, float dx, float dy, int zeros);
 __global__ void k_enc_prelu(const float *x, float *y, int64_t rows, int64_t cols, const float *a);
 __global__ void k_enc_mix(const float *x, float *y, int64_t n, int64_t xs, int64_t ao, int64_t bo, int64_t mo,
                           int64_t C, int64_t ys, int64_t yo);
@@ -1074,6 +1149,11 @@ template <int HP, int BQ, int NT, int MINB, bool HALF>
 __global__ void k_enc_attn_tile(const float *q, const float *k, const float *v, float *o, const int *lo, const int *hi,
                                 int n, int heads, int hd);
 /* Q, a step's K or V (rows of HP + 4; HALF: 64), P (rows of EAT_K + 4; HALF: EAT_K) */
+static void enc_block_mask(const float *qm, const float *km, const int *kr, const uint8_t *local, const int *ids,
+                           float *p, float *thr, int *bl, int nq, int nk, int nb, int heads, int hd, int64_t topk,
+                           int q0, int nq_all, int nsel, cudaStream_t s);
+static void enc_attn_blocks(const float *q, const void *k, const void *v, float *o, const int *bl, int nq, int heads,
+                            int hd, int nsel, int f16, int qb0, int nqb_all, cudaStream_t s, int *bad);
 static void enc_attn_tile(const float *q, const float *k, const float *v, float *o, const int *lo, const int *hi,
                           int n, int heads, int hd, cudaStream_t s);
 #define EAT_SMEM(HP, BQ, HALF) ((size_t)((BQ) * (HP) + EAT_K * ((HALF) ? 64 : (HP) + 4) + \

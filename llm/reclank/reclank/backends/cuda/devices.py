@@ -136,7 +136,9 @@ class ErCtx(ctypes.Structure):
     """er_ctx of backends/cpu/csrc/common/ops_qwen.c."""
     _fields_ = [("post", ctypes.c_void_p), ("wait", ctypes.c_void_p), ("held", ctypes.c_void_p),
                 ("experts", ctypes.c_int64), ("alive", ctypes.c_int64), ("post_t", ctypes.c_void_p),
-                ("cpu_max", ctypes.c_int64), ("more", ctypes.c_int64)]
+                ("cpu_max", ctypes.c_int64), ("more", ctypes.c_int64), ("post_g", ctypes.c_void_p),
+                ("prefetch", ctypes.c_void_p), ("stg", ctypes.c_void_p), ("settle", ctypes.c_void_p),
+                ("pf3", ctypes.c_void_p)]
 
 
 def _put_api(lib):
@@ -315,6 +317,19 @@ class ExpertDevice:
         return _refresh(self, score, busy)
 
 
+# Super's steps: of the next MoE layer's cold experts, the PREDICT that its router picks on the residual entering the
+# MoE layer before (models/nemotron/gpu.py NmEmit.predict: the primary's) are copied ahead to the expert device's decode
+# stage by the CPU's task of that layer (rc_gpu_ex_nm_prefetch: DMA beside the CPU's pairs and the layers between), and
+# the CPU's task of their layer posts their pairs to it, those whose copies have ended (rc_gpu_ex_nm_settle: no job
+# waits for one); 0: none. Of a token's ~13.5 cold experts the router picks the right ones ahead (the NumPy reference, a
+# real prompt): the top 4 92%, 6 88%, 8 83%. The W-2133 + 3060 + 1070, decode after a prompt of 1K (the primary's TAKE
+# off with it): 14.2 -> 14.6 (2), 14.7 (3; 78% of the copies read, 14% late), 14.2 (4: most late, the link's ~7.6 GB/s
+# a MoE layer's ~1.8 ms). The device's jobs read their inputs by a kernel then (ex_h2d), not behind the copies' DMA
+PREDICT = int(os.environ.get("RECLANK_NM_PREDICT", "3"))
+# a verify group's (2-8 rows: the drafter's; of the experts of its rows' choices, the largest of each); 0 by default:
+# the server's chats with MTP 3 drafts 15.97 tok/s without, 15.71 with 4 (the primary's TAKE on: its pulls of a group's
+# cold experts are worth more there; off, 4 14.82, 6 15.32)
+PREDICT_G = int(os.environ.get("RECLANK_NM_PREDICT_G", "0"))
 # Super's expert device: of each token's cold experts it does not hold, RECLANK_EXPERT_MORE more go to it too (the
 # CPU's task posts them; its job copies their rows from the keeper's stacks in host memory, DMA, beside the CPU's
 # work: a small CPU's pairs fewer); 0: its own experts only
@@ -343,6 +358,11 @@ class NmExpertDevice:
         lib.rc_gpu_ex_nm_init.argtypes = [i, i, i, i, i]
         lib.rc_gpu_ex_nm_store.argtypes = [i, i, vp, vp, sz, sz, i, vp, i]
         lib.rc_gpu_ex_nm_hosts.argtypes = [i, vp, vp, i]
+        lib.rc_gpu_ex_nm_ghosts.argtypes = [i, vp, vp, i, i, sz, sz]
+        lib.rc_gpu_ex_nm_gmask.argtypes = [i, i, vp]
+        lib.rc_gpu_ex_nm_dstage.argtypes = [i, vp, i]
+        lib.rc_gpu_ex_nm_dstats.argtypes = [vp]
+        lib.rc_gpu_ex_nm_dstats.restype = None
         _put_api(lib)
 
         def check(rc):
@@ -369,7 +389,7 @@ class NmExpertDevice:
                 upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
                 per[li] = (upm.data.nbytes // E, dnm.data.nbytes // E)
                 c = np.asarray(g.counts[li], np.float64) if g.counts and li in g.counts else np.ones(E)
-                hot = g.hot[li][0] >= 0
+                hot = g.gpu_held(li) if hasattr(g, "gpu_held") else g.hot[li][0] >= 0
                 b = per[li][0] + per[li][1]
                 cand += [(c[e] / b, li, e) for e in range(E) if not hot[e]]
             cand.sort(key=lambda z: -z[0])
@@ -400,13 +420,34 @@ class NmExpertDevice:
                 for li in self.slots:
                     upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
                     check(lib.rc_gpu_ex_nm_hosts(li, upm.data.ctypes.data, dnm.data.ctypes.data, 8 * self.more))
+            # (Super: every MoE layer's stacks in host memory for the share of a prompt group's experts, its group
+            # jobs: rc_gpu_ex_nm_gpost, models/nemotron/gpu.py XSPLIT)
+            self.group = bool(g.nv4)
+            if self.group:
+                for li, (E, inner, _k) in cfg.moe.items():
+                    upm, dnm = g.m.experts(li, "up"), g.m.experts(li, "down")
+                    check(lib.rc_gpu_ex_nm_ghosts(li, upm.data.ctypes.data, dnm.data.ctypes.data, E, inner, *per[li]))
+            # (the decode stage of the predicted experts: two buffers of PREDICT, stg its marks, er_ctx's)
+            self.predict, self.predict_g, self.stg = 0, 0, None
+            if self.group and max(PREDICT, PREDICT_G) > 0:
+                self.stg = np.zeros((cfg.layers, Em), np.uint8)
+                if lib.rc_gpu_ex_nm_dstage(max(PREDICT, PREDICT_G), self.stg.ctypes.data, Em) == 0:
+                    self.predict, self.predict_g = max(PREDICT, 0), max(PREDICT_G, 0)
+                else:
+                    self.stg = None
+                    print("expert device %s: no decode stage (%s)" % (gpu["name"], lib.rc_gpu_last_error().decode()),
+                          file=sys.stderr, flush=True)
         finally:
             os.sched_setaffinity(0, old)
         self.held = held
         self.ctx = ErCtx(ctypes.cast(lib.rc_gpu_ex_post, ctypes.c_void_p).value,
                          ctypes.cast(lib.rc_gpu_ex_wait, ctypes.c_void_p).value,
                          self.held.ctypes.data, Em, 1,
-                         ctypes.cast(lib.rc_gpu_ex_nm_post_t, ctypes.c_void_p).value, 0, self.more)
+                         ctypes.cast(lib.rc_gpu_ex_nm_post_t, ctypes.c_void_p).value, 0, self.more,
+                         ctypes.cast(lib.rc_gpu_ex_nm_gpost, ctypes.c_void_p).value if self.group else None,
+                         ctypes.cast(lib.rc_gpu_ex_nm_prefetch, ctypes.c_void_p).value if self.predict else None,
+                         self.stg.ctypes.data if self.predict else None,
+                         ctypes.cast(lib.rc_gpu_ex_nm_settle, ctypes.c_void_p).value if self.predict else None)
         self.ctx_bytes = np.frombuffer(ctypes.string_at(ctypes.addressof(self.ctx), ctypes.sizeof(self.ctx)),
                                        dtype=np.uint8).copy()
         n_all = sum(E for E, _n, _k in cfg.moe.values())
@@ -426,10 +467,32 @@ class NmExpertDevice:
         E = self.slots[li].size
         return (upm.data.nbytes // E, 0, dnm.data.nbytes // E)
 
+    def set_pf3(self, fn):
+        """er_ctx's pf3 (the primary's copies ahead: models/nemotron/gpu.py PF3), in the bytes the CPU's tasks read."""
+        self.ctx.pf3 = fn
+        self.ctx_bytes[:] = np.frombuffer(ctypes.string_at(ctypes.addressof(self.ctx), ctypes.sizeof(self.ctx)),
+                                          dtype=np.uint8)
+
+    def dstats(self):
+        """The decode stage's (experts copied ahead, those a job read, those not copied in time)."""
+        out = np.zeros(3, np.int64)
+        self.lib.rc_gpu_ex_nm_dstats(out.ctypes.data)
+        return int(out[0]), int(out[1]), int(out[2])
+
+    def gmask(self, li, experts):
+        """Layer li's share of a split prompt group's cold experts, the most routed first: the group job of the layer
+        before copies the first two chunks of its stage ahead (rc_gpu_ex_nm_gstage)."""
+        if not self.group:
+            return
+        a = np.ascontiguousarray(experts, np.int32)
+        self.check(self.lib.rc_gpu_ex_nm_gmask(li, int(a.size), a.ctypes.data))
+
     def refresh(self, score, busy=None):
-        """The experts here anew by score (_refresh), among those g does not hold (its hot stacks)."""
+        """The experts here anew by score (_refresh), among those g does not hold (its hot stacks; with Bolt's stage
+        the extra ones of its buffers too: NemotronGPU.gpu_held)."""
         if busy is None:
-            busy = {li: self.g.hot[li][0] >= 0 for li in self.slots}
+            g = self.g
+            busy = {li: g.gpu_held(li) if hasattr(g, "gpu_held") else g.hot[li][0] >= 0 for li in self.slots}
         return _refresh(self, score, busy)
 
 

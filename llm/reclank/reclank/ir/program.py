@@ -68,7 +68,7 @@ _QTYPES = {op: (ctypes.c_int8 if op in (KV_WRITE8, ATTN_Q8, ATTN_Q8_MT) else cty
            for op in (KV_WRITE, ATTN_QC, ATTN_QC_MT, KV_WRITE8, ATTN_Q8, ATTN_Q8_MT,
                       KV_WRITEV8, ATTN_V8, ATTN_V8_MT)}
 
-# One record: the operation, the flags (not used yet), the tag of each
+# One record: the operation, the flags (F_LAYER...), the tag of each
 # operand, and the value of each operand. The C struct gp_rec has the same
 # layout; Program.finish checks the size.
 REC = np.dtype([("op", "<i4"), ("flags", "<i4"), ("tag", "u1", (NARG,)),
@@ -119,6 +119,9 @@ class Program:
         # the CPU programs whose buffers its records name (CPU_TASK, CPU_START): they live as long as
         # it does, and go with it when the program is freed and made again
         self.cpu_progs = []
+        # the flags of records (F_LAYER, F_LAYER_END), by the id of their operand lists; mark gives the next one's
+        self.rflags = {}
+        self._next_flags = 0
 
     # ---- building ----------------------------------------------------------
     def slot(self, name, value=0):
@@ -159,7 +162,17 @@ class Program:
     def emit(self, op, *args):
         """Add one record. The operands follow the order of gp_step in C."""
         assert len(args) <= NARG
-        self.recs.append((op, [self._enc(a) for a in args]))
+        ops = [self._enc(a) for a in args]
+        self.recs.append((op, ops))
+        if self._next_flags:
+            self.rflags[id(ops)] = self._next_flags
+            self._next_flags = 0
+
+    def mark(self, flags):
+        """Give the next record emitted these flags: F_LAYER | (layer + 1) << F_LAYER_SHIFT at a layer's first
+        record, F_LAYER_END at the first after the layers. A record that moves or is made again loses them,
+        and its layer then runs as before (the runtime chains only the layers it can find)."""
+        self._next_flags |= int(flags)
 
     def finish(self):
         """Make the int64 array of the program.
@@ -172,6 +185,7 @@ class Program:
         code = np.zeros(len(self.recs), dtype=REC)
         for i, (op, args) in enumerate(self.recs):
             code[i]["op"] = op
+            code[i]["flags"] = self.rflags.get(id(args), 0)
             for k, (tag, val) in enumerate(args):
                 code[i]["tag"][k] = tag
                 code[i]["v"][k] = val
@@ -693,7 +707,7 @@ def _py_step(op, a, e):
         x = _arr(V(0), h * w * xs).reshape(h, w, xs)[..., xo:xo + C]
         fl = _arr(V(1), h * w * fs).reshape(h, w, fs)[..., fo:fo + 2]
         y = _arr(V(2), h * w * ys).reshape(h, w, ys)
-        y[..., yo:yo + C] = vref.warp(x, fl, _arr(V(3), w), _arr(V(4), h), _f(a, e, 14), _f(a, e, 15))
+        y[..., yo:yo + C] = vref.warp(x, fl, _arr(V(3), w), _arr(V(4), h), _f(a, e, 14), _f(a, e, 15), V(16))
     elif op == ENC_PRELU:
         rows, cols = V(2), V(3)
         x = _arr(V(0), rows * cols).reshape(rows, cols)
@@ -783,6 +797,39 @@ def _py_step(op, a, e):
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
         _arr(V(3), n * heads * hd).reshape(n, kvh, heads // kvh, hd)[:] = np.einsum("grqk,kgd->qgrd", s, v)
+    elif op == ENC_BLOCK_MASK:
+        from reclank.models.flashvsr import dit as fd
+        nq, nk, nb, heads, hd, topk, nsel = (V(i) for i in range(8, 15))
+        kr = _arr(V(2), nk, ctypes.c_int32)
+        qm = _arr(V(0), nq * heads * hd).reshape(nq, heads * hd)
+        km = _arr(V(1), (int(kr.max()) + 1) * heads * hd).reshape(-1, heads * hd)[kr]
+        local = _arr(V(3), nb * nb, ctypes.c_uint8).reshape(nb, nb).astype(bool)
+        ids = _arr(V(4), nk, ctypes.c_int32)
+        bl = _arr(V(7), heads * nq * nsel, ctypes.c_int32).reshape(heads, nq, nsel)
+        bl[...] = -1
+        bl[..., :nk] = fd.block_lists(fd.draft_mask(qm, km, nb, local, topk, heads=heads, hd=hd), ids)
+    elif op == ENC_ATTN_BLOCKS:
+        n, heads, hd, nsel, f16, qb0, nall = V(5), V(6), V(7), V(8), V(9), V(10), V(11)
+        bl = _arr(V(4), heads * nall * nsel, ctypes.c_int32).reshape(heads, nall, nsel)[:, qb0:qb0 + n // 128]
+        nk = int(bl.max()) + 1 if bl.size else 0
+        q = _arr(V(0), n * heads * hd).reshape(n, heads, hd)
+        if f16:
+            k, v = (_arr(V(i), 128 * nk * heads * hd, ctypes.c_uint16).view(np.float16).astype(np.float32)
+                    .reshape(-1, heads, hd) for i in (1, 2))
+        else:
+            k, v = (_arr(V(i), 128 * nk * heads * hd).reshape(-1, heads, hd) for i in (1, 2))
+        o = _arr(V(3), n * heads * hd).reshape(n, heads, hd)
+        for h in range(heads):
+            for b in range(n // 128):
+                sel = bl[h, b][bl[h, b] >= 0]
+                rows = slice(128 * b, 128 * b + 128)
+                if sel.size == 0:
+                    o[rows, h] = 0
+                    continue
+                keys = (sel[:, None] * 128 + np.arange(128)[None]).reshape(-1)
+                s = q[rows, h] @ k[keys, h].T
+                s = np.exp(s - s.max(1, keepdims=True))
+                o[rows, h] = (s / s.sum(1, keepdims=True)) @ v[keys, h]
     elif op == DG_KV_PUT:
         t, kc, vc = V(5), V(6), V(7)
         row = int(_arr(V(4), 1, ctypes.c_int32)[0])
@@ -1932,6 +1979,19 @@ def k_enc_linear(c, lin, x, out=None):
     if bf12 is not None:
         assert getattr(c, "pack", False), "KQ_BF12X16 is a CPU program's"
         f20 = bf12
+    # lin.wq: W in a 16-bit form of the tensor cores (encoders.runtime.to_w16; a GPU program): W16H, wbf 7
+    wq = getattr(lin, "wq", None)
+    if wq is not None:
+        assert not getattr(c, "pack", False) and kq is None and f20 is None, "lin.wq is a GPU program's"
+        assert wq.cols == k and k % (64 if wq.type == 91 else 32) == 0, (wq.cols, k)
+        out = c.buffer((n, wq.rows)) if out is None else out
+        assert getattr(lin, "act", None) is None, "lin.wq with act"
+        inf = float("inf")
+        c.p.emit(ENC_LINEAR, x, wq.data, _WQ_WBF[wq.type], lin.b, out, n, wq.rows, k,
+                 -inf if lin.imin is None else float(lin.imin), inf if lin.imax is None else float(lin.imax),
+                 -inf if lin.omin is None else float(lin.omin), inf if lin.omax is None else float(lin.omax),
+                 None, None)
+        return out
     m = f20.rows if f20 is not None else lin.w.shape[0] if kq is None else kq.rows
     out = c.buffer((n, m)) if out is None else out
     # FP4-Local's vision (models/qwen/vision.py): the input of the linear in bfloat16 values or as
@@ -1948,10 +2008,12 @@ def k_enc_linear(c, lin, x, out=None):
             c.p.emit(BF16_ROUND, out, n * m)
         return out
     # W: float32 (0), bfloat16 rows (1, uint16), float16 rows (2: a checkpoint's own, GPU programs),
-    # F20 (3) or BF12 (4: KQ_BF12X16)
+    # F20 (3; 5 on the tensor cores) or BF12 (4: KQ_BF12X16); lin.wq's (above): W16H (7)
     w = f20.data if f20 is not None else lin.w
     wbf = 4 if bf12 is not None else 3 if f20 is not None else 1 if w.dtype == np.uint16 else \
         2 if w.dtype == np.float16 else 0
+    if wbf == 3 and getattr(lin, "tc", False) and not getattr(c, "pack", False):
+        wbf = 5     # (F20 rows on the tensor cores: x and W in bfloat16, float32 sums; lin.tc, a GPU program)
     assert wbf != 2 or not getattr(c, "pack", False), "float16 W of enc_linear is for GPU programs"
     inf = float("inf")
     scratch = None
@@ -2411,18 +2473,19 @@ def k_enc_elu(c, x, out=None):
     return out
 
 
-def k_enc_warp(c, x, flow, out, gx, gy, h, w, C, xs=None, xo=0, fs=2, fo=0, ys=None, yo=0):
-    """(enc_warp x flow out gx gy h w C [xs xo fs fo ys yo]): the h x w image x (C values a pixel:
+def k_enc_warp(c, x, flow, out, gx, gy, h, w, C, xs=None, xo=0, fs=2, fo=0, ys=None, yo=0, zeros=False):
+    """(enc_warp x flow out gx gy h w C [xs xo fs fo ys yo zeros]): the h x w image x (C values a pixel:
     the columns xo.. of rows of xs) sampled at each pixel plus its flow (the columns fo, fo + 1 of
     rows of fs: x, y in pixels), bilinear with the border clamped: torch's grid_sample(bilinear,
     padding_mode="border", align_corners=True) at the grid gx, gy (models/vfi/ref.grid:
-    torch.linspace(-1, 1)) plus the flow over (size - 1) / 2, RIFE's warp. Into the columns yo..
-    of rows of ys of out. Return out."""
+    torch.linspace(-1, 1)) plus the flow over (size - 1) / 2, RIFE's warp; zeros: padding_mode
+    "zeros" (the point not clamped: its corners past the image 0; BasicVSR's feature warp). Into the
+    columns yo.. of rows of ys of out. Return out."""
     xs, ys = C if xs is None else int(xs), C if ys is None else int(ys)
     gx, gy = np.ascontiguousarray(gx, np.float32), np.ascontiguousarray(gy, np.float32)
     assert gx.size == w and gy.size == h and xo + C <= xs and fo + 2 <= fs and yo + C <= ys
     c.p.emit(ENC_WARP, x, flow, out, gx, gy, h, w, C, xs, int(xo), int(fs), int(fo), ys, int(yo),
-             float(np.float32((w - 1.0) / 2.0)), float(np.float32((h - 1.0) / 2.0)))
+             float(np.float32((w - 1.0) / 2.0)), float(np.float32((h - 1.0) / 2.0)), int(bool(zeros)))
     return out
 
 
@@ -2446,24 +2509,107 @@ def k_enc_mix(c, x, out, n, xs, ao, bo, mo, C, ys=None, yo=0):
     return out
 
 
-def k_enc_conv_mm(c, lin, x, idx, cin, slope=None, res=None, scat=None, blk=0, out=None):
+# ENC_LINEAR's wbf of a lin.wq type (encoders.runtime: KQ_W16H)
+_WQ_WBF = {90: 7, 91: 8}
+
+
+def k_enc_conv_mm(c, lin, x, idx, cin, slope=None, res=None, scat=None, blk=0, bf16=False, out=None):
     """(enc_conv_mm lin x idx cin [slope [res [scat blk]]]): a conv as ENC_GATHER (idx (rows, taps) of x's
     rows of cin values, -1 zeros) then ENC_LINEAR of lin (float32 W (m, taps cin), its bias), without the
     gathered rows; then + res (an array of the output's shape: ENC_ADD's) and PReLU of slope (m values)
     when given: the same bits as those records in a GPU program (ENC_CONV_MM, GPU only). scat: the
     output in place of an ENC_GATHER of its rows of blk values (out's row q = the products' block
-    gather[q], scat the inverse of that gather: block j to out's row scat[j], -1 none)."""
+    gather[q], scat the inverse of that gather: block j to out's row scat[j], -1 none). bf16: W's bfloat16
+    rows (lin.w16, uint16; cin a multiple of 32) on the tensor cores, x rounded to bfloat16 as gathered,
+    float32 sums: not those records' bits (k_enc_conv_tc); bf16 2: x's rows bfloat16 already (uint16,
+    k_enc_bf16_pack's: the bits of bf16 1 on the float32 rows they were packed from). bf16 3 and 4: the
+    same in float16, W lin.wq's W16H rows (encoders.runtime.to_w16), x saturated at +-65504. bf16 5 and 6:
+    W lin.wq's W16I rows (int16 with scales; cin a multiple of 64), x quantized as gathered (5) or x's
+    rows I16 already (6: k_enc_i16_pack's, uint8: the same bits)."""
     assert not getattr(c, "pack", False), "enc_conv_mm is a record of GPU programs"
     n, taps = idx.shape
     m = lin.shape[0]
-    assert lin.shape[1] == taps * cin and lin.w.dtype == np.float32
+    bf16 = int(bf16)
+    if bf16 in (3, 4, 5, 6):
+        w = lin.wq.data
+        assert lin.wq.type == (90 if bf16 < 5 else 91) and lin.wq.cols == taps * cin and \
+            cin % (32 if bf16 < 5 else 64) == 0
+    else:
+        w = lin.w16 if bf16 else lin.w
+        assert lin.shape[1] == taps * cin and (w.dtype == np.uint16 and cin % 32 == 0 if bf16
+                                               else w.dtype == np.float32)
+    assert x.dtype == (np.uint16 if bf16 in (2, 4) else np.uint8 if bf16 == 6 else np.float32), (x.dtype, bf16)
     if scat is not None:
         scat = np.ascontiguousarray(scat, np.int32)
         assert m % blk == 0 and scat.size == n * (m // blk) and res is None and out is not None
     out = c.buffer((n, m)) if out is None else out
-    c.p.emit(ENC_CONV_MM, x, np.ascontiguousarray(idx, np.int32), lin.w, lin.b, res,
+    c.p.emit(ENC_CONV_MM, x, np.ascontiguousarray(idx, np.int32), w, lin.b, res,
              None if slope is None else np.ascontiguousarray(slope, np.float32), out, n, m, taps, cin, scat,
-             int(blk) if scat is not None else 0)
+             int(blk) if scat is not None else 0, int(bf16))
+    return out
+
+
+def k_enc_attn_blocks(c, q, k, v, bl, heads, hd, qb0=0, tc=False, out=None):
+    """(enc_attn_blocks q k v bl heads hd [qb0 [tc]]): block-sparse attention (FlashVSR's DiT, Block-Sparse-
+    Attention's): the queries' block b (rows 128 b .. 128 b + 127; q's rows a multiple of 128) of head h over the keys
+    of the blocks bl[h, qb0 + b, :] (int32 (heads, blocks, nsel): blocks of 128 rows of k and v, ascending, -1 ends
+    them; qb0: q a tile of the rows whose lists bl holds), scale 1; a block with none gives zeros. k and v float32, or
+    float16 (uint16 rows; a GPU program: the device's float32 of them). On the GPU k_enc_attn_tile's float32 form over
+    the listed keys (tc, k and v float16, hd 128: on the tensor cores, q and the weights float16, the sums float32); on
+    the CPU and here (interp) the softmax of each row over its keys. Return out."""
+    n = q.shape[0]
+    assert n % 128 == 0 and bl.dtype == np.int32 and bl.ndim == 3 and bl.shape[0] == heads and \
+        0 <= qb0 and qb0 + n // 128 <= bl.shape[1] and bl.flags.c_contiguous
+    f16 = k.dtype == np.uint16
+    assert v.dtype == k.dtype and (k.dtype == np.float32 or f16 and not getattr(c, "pack", False))
+    out = c.buffer(q.shape) if out is None else out
+    assert not tc or f16, "the tensor cores' form: k and v float16"
+    c.p.emit(ENC_ATTN_BLOCKS, q, k, v, out, bl, n, heads, hd, bl.shape[2], 2 if tc else int(f16), int(qb0),
+             bl.shape[1])
+    return out
+
+
+def k_enc_block_mask(c, qm, km, kr, local, ids, p, thr, bl, nb, heads, hd, topk):
+    """(enc_block_mask qm km kr local ids p thr bl nb heads hd topk): FlashVSR's generate_draft_block_mask as the lists
+    of ENC_ATTN_BLOCKS. qm (nq, heads hd): the query blocks' means (nq a multiple of nb: slices of nb); km: the key
+    blocks' means, key block j at row kr[j] (int32, nk of them, nk a multiple of nb); local (nb, nb) uint8: block b
+    of a slice to block b' (b % nb, b' % nb); ids (nk int32): the values of the lists. The scores of each head (the
+    means' products, -inf outside local), the softmax over the keys, the (k + 1)-th largest of each head's query
+    slice's nb nk weights (k = min(nb nk - 1, topk)); bl (heads, nq, nsel) int32: the ids of the keys above it, in
+    order, -1 after. p (heads nq nk float32) and thr (heads nq / nb float32): scratch. Return bl."""
+    nq, nk = qm.shape[0], kr.size
+    assert nq % nb == 0 and nk % nb == 0 and p.size >= heads * nq * nk and thr.size >= heads * nq // nb
+    assert bl.dtype == np.int32 and bl.shape[:2] == (heads, nq) and bl.flags.c_contiguous and local.dtype == np.uint8
+    c.p.emit(ENC_BLOCK_MASK, qm, km, np.ascontiguousarray(kr, np.int32), local, np.ascontiguousarray(ids, np.int32),
+             p, thr, bl, nq, nk, nb, heads, hd, int(topk), bl.shape[2])
+    return bl
+
+
+def i16_row_bytes(k):
+    """The bytes of an I16 row of k values (k a multiple of 64): hi, lo, the scales, padded to 16"""
+    return (2 * k + 4 * (k // 64) + 15) // 16 * 16
+
+
+def k_enc_i16_pack(c, x, out=None):
+    """(enc_i16_pack x): out (uint8 rows of i16_row_bytes(cols)) x's float32 rows (cols a multiple of 64)
+    as I16 rows: each group of 64 values int16 with a scale (k_enc_conv_i16's quantization of x; GPU
+    only). Return out."""
+    assert not getattr(c, "pack", False), "enc_i16_pack is a record of GPU programs"
+    rows = x.shape[0]
+    cols = x.size // rows
+    assert cols % 64 == 0 and x.dtype == np.float32 and out is not None and out.dtype == np.uint8 and \
+        out.size == rows * i16_row_bytes(cols)
+    c.p.emit(ENC_I16_PACK, x, out, rows, cols)
+    return out
+
+
+def k_enc_bf16_pack(c, x, half=0, out=None):
+    """(enc_bf16_pack x [half]): out (uint16, x's size) x's float32 values rounded to bfloat16 (to
+    nearest, even: k_enc_conv_tc's rounding of x), or float16 (half: saturated at +-65504); GPU only.
+    Return out."""
+    assert not getattr(c, "pack", False), "enc_bf16_pack is a record of GPU programs"
+    assert out is not None and out.dtype == np.uint16 and out.size == x.size and x.dtype == np.float32
+    c.p.emit(ENC_BF16_PACK, x, out, x.size, int(bool(half)))
     return out
 
 
@@ -2630,6 +2776,8 @@ KERNELS = {
     "enc_elu": k_enc_elu,
     "enc_scatter": k_enc_scatter,
     "enc_f20_pack": k_enc_f20_pack,
+    "enc_bf16_pack": k_enc_bf16_pack,
+    "enc_i16_pack": k_enc_i16_pack,
     "enc_f20_unpack": k_enc_f20_unpack,
     "enc_attn_x2c": k_enc_attn_x2c,
     "enc_attn_wide": k_enc_attn_wide,
@@ -2643,6 +2791,8 @@ KERNELS = {
     "enc_attn_rel": k_enc_attn_rel,
     "enc_snake": k_enc_snake,
     "enc_attn_range_x2": k_enc_attn_range_x2,
+    "enc_attn_blocks": k_enc_attn_blocks,
+    "enc_block_mask": k_enc_block_mask,
     "enc_rope1d": k_enc_rope1d,
     "enc_rope_tab": k_enc_rope_tab,
     "enc_gnorm": k_enc_gnorm,

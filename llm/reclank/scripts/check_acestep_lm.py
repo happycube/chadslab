@@ -37,7 +37,8 @@ def kl(ref, x):
     lq = x - x.max(-1, keepdims=True)
     lq -= np.log(np.exp(lq).sum(-1, keepdims=True))
     p = np.exp(lp)
-    return np.where(p > 0, p * (lp - lq), 0.0).sum(-1)
+    with np.errstate(invalid="ignore"):         # (-inf - -inf where the constraint masks a token: p = 0 there)
+        return np.where(p > 0, p * (lp - lq), 0.0).sum(-1)
 
 
 n = int(r["lm_n"])

@@ -12,7 +12,9 @@ target's distribution).
 """
 from __future__ import annotations
 
+import collections
 import contextlib
+import json
 import os
 import time
 
@@ -20,6 +22,9 @@ import numpy as np
 
 # the sizes of the MTP block's parts over a prompt (NemotronMTPSpec.flush; RECLANK_NM_MTP_PARTS)
 FLUSH_PARTS = tuple(int(v) for v in os.environ.get("RECLANK_NM_MTP_PARTS", "2048,1024,256,64,16,4").split(","))
+# the verify group of the drafter's block on two planes of x on Pascal too (as the steps; the tensor cores always):
+# RECLANK_NM_VERIFY_X16=1 (else Bolt's on int8 x, as its prompt groups: NemotronGPU.x16_for)
+VERIFY_X16 = os.environ.get("RECLANK_NM_VERIFY_X16", "0") != "0"
 
 from reclank.models.nemotron.kq import BB
 
@@ -162,17 +167,18 @@ class NemotronGPUSpec(NemotronSpec):
 
     def _vprog(self):
         """The verify group: the step of 8 rows (gpu.NmEmit), the head on every row."""
-        from reclank.backends.cuda.runtime import GPUProgram
-        from reclank.ir import program as P
-        from reclank.models.nemotron.gpu import NmEmit
+        from reclank.backends.cuda.runtime import GPUProgram, caps
+        from reclank.models.nemotron.gpu import NmEmit, emit_head
         from reclank.models.nemotron.kq import compile_nemotron_step
         if self._v is None:
             t, g = self.block, self.g
-            prog = compile_nemotron_step(self.m, t, em=NmEmit(g, t))
+            # (Pascal: Bolt's group on int8 x as its prompt groups (x16_for; the one-plane forms of k_nm_t8s
+            # and k_nm_hg_*), Super's on two planes; the tensor cores: two planes)
+            x16 = None if caps().get("tc", 1) or VERIFY_X16 else g.x16_for(t)
+            prog = compile_nemotron_step(self.m, t, em=NmEmit(g, t, x16=x16))
             head = self.m.M("language_model.lm_head")
             lg = np.zeros((t, head.rows), np.float32)
-            prog.recs.append((P.KQ_LINEAR, [prog._enc(a) for a in (
-                None, None, None, prog.names["xn"], head.data, head.type, head.rows, head.cols, t, lg)]))
+            emit_head(prog, head, prog.names["xn"], t, lg)
             prog.names["logits"] = lg
             _to_other(prog)
             prog.finish()
@@ -233,6 +239,8 @@ class NemotronGPUSpec(NemotronSpec):
         x[:] = self.m.embed([int(last)] + drafts)
         gp.upload("H")
         self._bind_run(self._v)
+        # (the pool and Bolt's extra hot experts after the run, as after a step: NemotronGPU.after_run)
+        g.after_run(prog, gp, self.block)
         gp.download("logits")
         for b in d.target_ids:
             gp.download("feat.%d" % b)
@@ -262,6 +270,47 @@ class NemotronGPUSpec(NemotronSpec):
             if any(gg in stop for gg in got):
                 break
         return out[:n_new]
+
+
+class LiLiCorrRounds:
+    """Bolt's drafter in the server (engine.GpuRunner's mtp, the interface of NemotronMTPSpec): the LiLiCorr
+    drafter of path on the GPU beside gdev (whose model must capture the drafter's layers before its programs
+    are made: capture_ids) and NemotronGPUSpec's rounds. after_prompt (each run of a prompt or a plain step):
+    the captured rows of that run's program into the drafter's context (LiLiCorrGPU.inject), at once; flush
+    has nothing pending, and pend stays None. k: the drafts of a round (the block less one). The drafter's
+    context is not in the saved contexts: after another conversation's point is restored its window holds
+    that one's positions until new ones replace them (fewer drafts taken; the verify group decides the
+    tokens)."""
+
+    def __init__(self, gdev, path):
+        from reclank.models.nemotron.lilicorr import LiLiCorrGPU
+        self.g = gdev
+        self.d = LiLiCorrGPU(path, gdev.m, gdev)
+        self.spec = NemotronGPUSpec(gdev, self.d)
+        self.spec.stats = collections.deque(maxlen=256)
+        self.k = self.spec.block - 1
+        self.pend = None
+
+    @staticmethod
+    def capture_ids(path):
+        """The target's layers whose rows the drafter of path reads (its config's target_layer_ids)."""
+        with open(os.path.join(path, "config.json")) as f:
+            return list(json.load(f)["dflash_config"]["target_layer_ids"])
+
+    def after_prompt(self, pos, hidden):
+        g, n = self.g, len(hidden)
+        size = next(s for s in (1,) + tuple(g.groups) if s >= n)
+        prog, gp = g._prog(size)
+        for b in self.d.target_ids:
+            gp.download("feat.%d" % b)
+        feats = np.concatenate([prog.names["feat.%d" % b][:n] for b in self.d.target_ids], 1)
+        self.d.inject(None, feats, np.arange(pos, pos + n))
+
+    def flush(self, ids):
+        pass
+
+    def round(self, last, sample=None):
+        return self.spec.round(last, None, sample)
 
 
 class _NoDrafter:

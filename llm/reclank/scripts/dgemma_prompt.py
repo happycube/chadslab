@@ -7,6 +7,7 @@ start or more of the answer: a response template whose text stands where it is a
         --response "[[40]]'What lessons do we learn from this fact, comrades? The lesson—which is also one of \\
 the fundamental principles of Ingsoc—[[200]]"
     python scripts/dgemma_prompt.py --prompt-file q.txt --response-file r.txt --drafts
+    python scripts/dgemma_prompt.py --prompt "What is this?" --image picture.jpg   # server: --mmproj
     python scripts/dgemma_prompt.py --chat          # turns from stdin: "prompt" or "prompt ||| template"
 
 --drafts shows each denoising step as it comes (the canvas and step, the tokens the sampler kept,
@@ -21,7 +22,9 @@ the turns before (only the new part of a prompt is read). The key: --key or RECL
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -110,6 +113,7 @@ def main():
     ap.add_argument("--key", default=os.environ.get("RECLANK_API_KEY"))
     ap.add_argument("--prompt")
     ap.add_argument("--prompt-file")
+    ap.add_argument("--image", help="an image file (the server needs --mmproj)")
     ap.add_argument("--response", help="the answer's template: pinned text and [[n]] holes")
     ap.add_argument("--response-file")
     ap.add_argument("--system")
@@ -130,8 +134,17 @@ def main():
         prompt = read(a.prompt, a.prompt_file)
         if not prompt:
             ap.error("--prompt or --prompt-file (or --chat)")
-        ask(a, messages + [{"role": "user", "content": prompt}], read(a.response, a.response_file), out)
+        content = prompt
+        if a.image:
+            with open(a.image, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+            mime = mimetypes.guess_type(a.image)[0] or "image/png"
+            content = [{"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (mime, data)}},
+                       {"type": "text", "text": prompt}]
+        ask(a, messages + [{"role": "user", "content": content}], read(a.response, a.response_file), out)
         return
+    if a.image:
+        ap.error("--image with --chat is not supported")
     for line in sys.stdin:
         line = line.rstrip("\n")
         if not line.strip():

@@ -341,15 +341,19 @@ extern "C" int rc_gpu_set_pool(const int64_t *tab)
 #define GG_FENCES 4096
 static cudaEvent_t gg_fev[GG_FENCES];
 static int64_t gg_fseq;
+static int gg_fev_ep;           /* the epoch of the events */
+static int64_t gg_fev_base;     /* the fences of an older context: done (the reset waited for them) */
 
 extern "C" int64_t rc_gpu_fence(void)
 {
-    if (gg_fseq == 0) {
+    if (gg_fev_ep != gg_epoch) {
         for (int k = 0; k < GG_FENCES; ++k) {
             if (cudaEventCreateWithFlags(&gg_fev[k], cudaEventDisableTiming) != cudaSuccess) {
                 return -1;
             }
         }
+        gg_fev_ep = gg_epoch;
+        gg_fev_base = gg_fseq;
     }
     int64_t n = ++gg_fseq;
     if (cudaEventRecord(gg_fev[n % GG_FENCES], gg_stream) != cudaSuccess) {
@@ -360,7 +364,7 @@ extern "C" int64_t rc_gpu_fence(void)
 
 extern "C" int rc_gpu_fence_done(int64_t n, int wait)
 {
-    if (n <= 0 || gg_fseq - n >= GG_FENCES) {
+    if (n <= 0 || gg_fseq - n >= GG_FENCES || n <= gg_fev_base || gg_fev_ep != gg_epoch) {
         return 1;
     }
     cudaEvent_t ev = gg_fev[n % GG_FENCES];

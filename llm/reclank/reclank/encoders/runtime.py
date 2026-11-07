@@ -242,30 +242,147 @@ def to_f20(lin, gpu, src=None):
     return True
 
 
+# The 16-bit forms of float32 W for the GPU's tensor cores (to_w16; lin.wq, ENC_LINEAR wbf 7, ENC_CONV_MM
+# wbf 3 and 4): one uint8 array of m rows of k values, then a tail of scales (16-byte aligned: k a multiple
+# of 32).
+#   W16H: the rows float16 of W ws (to nearest even), then ws (m float32): a power of two of each row,
+#     max |w| ws in [2^14, 2^15) (no float16 overflow, the least of its subnormals); the products divided
+#     by ws, exactly. 11 significant bits a value.
+#   W16I: I16 rows (program.i16_row_bytes: hi and lo int8 of each value's int16, then a float32 scale of
+#     each group of 64; k a multiple of 64): q = rint(w 32639 / mx), mx the group's largest |w|. 15 bits
+#     and a sign a value within its group (ENC_CONV_MM wbf 5 and 6, ENC_LINEAR wbf 8).
+KQ_W16H = 90
+KQ_W16I = 91
+
+
+def w16h_pack(w, threads=16):
+    """W16H of float32 W (m, k): uint8 (2 m k + 4 m). Blocks of rows on threads (NumPy's float16 casts are slow
+    and let the GIL go; each row its own)."""
+    w = np.ascontiguousarray(w, np.float32)
+    m, k = w.shape
+    out = np.empty(2 * m * k + 4 * m, np.uint8)
+    h = out[:2 * m * k].view(np.float16).reshape(m, k)
+    ws = out[2 * m * k:].view(np.float32)
+
+    def rows(r0, r1):
+        mx = np.abs(w[r0:r1]).max(axis=1)
+        e = np.where(mx > 0, 14 - np.floor(np.log2(np.where(mx > 0, mx, 1.0))), 0.0)
+        ws[r0:r1] = np.ldexp(np.float32(1), e.astype(np.int32)).astype(np.float32)
+        h[r0:r1] = (w[r0:r1] * ws[r0:r1, None]).astype(np.float16)
+    n = max(1, min(threads, m * k >> 18, m))
+    if n == 1:
+        rows(0, m)
+        return out
+    from concurrent.futures import ThreadPoolExecutor
+
+    from reclank.models.media import widen
+    cut = np.linspace(0, m, n + 1).astype(int)
+    with ThreadPoolExecutor(n, initializer=widen) as pool:
+        list(pool.map(rows, cut[:-1], cut[1:]))
+    return out
+
+
+def w16h_values(data, m, k):
+    """The float32 W of W16H data (the values the tensor cores multiply, divided by ws)."""
+    h = data[:2 * m * k].view(np.float16).reshape(m, k).astype(np.float32)
+    return h / data[2 * m * k:].view(np.float32)[:m, None]
+
+
+def w16i_pack(w):
+    """W16I of float32 W (m, k; k a multiple of 64): uint8 (m, i16_row_bytes(k)), k_enc_i16_pack's rule."""
+    w = np.ascontiguousarray(w, np.float32)
+    m, k = w.shape
+    assert k % 64 == 0, k
+    g = w.reshape(m, k // 64, 64)
+    mx = np.abs(g).max(axis=2)
+    ok = (mx > 0) & np.isfinite(mx)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv = np.where(ok, np.float32(32639) / np.where(ok, mx, 1), 0).astype(np.float32)
+        sc = np.where(ok, mx / np.float32(32639), 0).astype(np.float32)
+    q = np.clip(np.rint(g * inv[:, :, None]), -32639, 32639).astype(np.int32).reshape(m, k)
+    hi = (q + 128) >> 8
+    lo = q - (hi << 8)
+    out = np.zeros((m, P.i16_row_bytes(k)), np.uint8)
+    out[:, :k] = hi.astype(np.int8).view(np.uint8)
+    out[:, k:2 * k] = lo.astype(np.int8).view(np.uint8)
+    out[:, 2 * k:2 * k + 4 * (k // 64)] = sc.view(np.uint8).reshape(m, -1)
+    return out
+
+
+def w16i_values(data, m, k):
+    """The float32 W of W16I data (q s: the values the tensor cores multiply)."""
+    d = np.asarray(data).reshape(m, -1)
+    q = d[:, :k].view(np.int8).astype(np.int32) * 256 + d[:, k:2 * k].view(np.int8).astype(np.int32)
+    sc = np.ascontiguousarray(d[:, 2 * k:2 * k + 4 * (k // 64)]).view(np.float32)
+    return (q.reshape(m, k // 64, 64) * sc[:, :, None]).reshape(m, k).astype(np.float32)
+
+
+W16_FORMATS = ("f16", "i16")
+
+
+def to_w16(lin, fmt, src=None):
+    """Give a linear of float32 W (a GPU program's) its 16-bit form fmt (lin.wq: W16H for "f16", W16I for
+    "i16") and drop W (and its pages, as to_f20). k a multiple of 32 (64 for "i16"), no Inf or NaN.
+    Return False (W kept) when W does not pass."""
+    from reclank.formats.safetensors import drop_pages
+    from reclank.models.gemma4.e4b import _KQ
+    assert fmt in W16_FORMATS, fmt
+    w = lin.w
+    if w is None or w.dtype != np.float32 or w.ndim != 2 or w.shape[1] % (64 if fmt == "i16" else 32) or \
+            not np.isfinite(w).all():
+        return False
+    m, k = w.shape
+    lin.wq = _KQ(w16i_pack(w), KQ_W16I, m, k) if fmt == "i16" else _KQ(w16h_pack(w), KQ_W16H, m, k)
+    lin.w = None
+    lin.x16 = None
+    drop_pages(w if src is None else src)
+    return True
+
+
+def lin_fmt():
+    """The form of the GPU's float32 matrices made by F20Lins: RECLANK_W16 ("f20", the default; "f16",
+    "i16")."""
+    f = os.environ.get("RECLANK_W16", "f20")
+    assert f == "f20" or f in W16_FORMATS, "RECLANK_W16=%s: f20 or one of %s" % (f, W16_FORMATS)
+    return f
+
+
+def lin_q(lin):
+    """(attribute, matrix) of a linear's reduced W: ("f20", lin.f20) or ("wq", lin.wq), else (None, None)."""
+    for a in ("f20", "wq"):
+        q = getattr(lin, a, None)
+        if q is not None:
+            return a, q
+    return None, None
+
+
 class F20Lins:
     """Linears to F20 one at a time, as a model makes them (add: to_f20, so that the float32 W of
-    only one matrix is in memory beside the F20 ones); done prints the count and the memory."""
+    only one matrix is in memory beside the F20 ones); done prints the count and the memory. fmt (a
+    GPU's: "f16", "i16"; None: lin_fmt()) one of the 16-bit forms instead (to_w16)."""
 
-    def __init__(self, gpu, label):
+    def __init__(self, gpu, label, fmt=None):
         self.gpu, self.label = gpu, label
+        self.fmt = (lin_fmt() if gpu else "f20") if fmt is None else fmt
+        assert self.fmt == "f20" or gpu, "the 16-bit forms are the GPU's"
         self.done = self.kept = self.before = self.after = 0
 
     def add(self, lin, src=None):
         w = lin.w
-        if w is None or getattr(lin, "f20", None) is not None:
+        if w is None or lin_q(lin)[1] is not None:
             return
         nbytes = w.nbytes
         del w
-        if to_f20(lin, self.gpu, src):
+        if to_f20(lin, self.gpu, src) if self.fmt == "f20" else to_w16(lin, self.fmt, src):
             self.done += 1
             self.before += nbytes
-            self.after += lin.f20.data.nbytes
+            self.after += lin_q(lin)[1].data.nbytes
         else:
             self.kept += 1
 
     def report(self):
-        print("%s: %d matrices F20 (%.2f -> %.2f GB)%s" % (
-            self.label, self.done, self.before / 1e9, self.after / 1e9,
+        print("%s: %d matrices %s (%.2f -> %.2f GB)%s" % (
+            self.label, self.done, self.fmt.upper(), self.before / 1e9, self.after / 1e9,
             ", %d stay float32" % self.kept if self.kept else ""), flush=True)
 
 
@@ -340,11 +457,14 @@ class Residency:
 
     enabled: the manager acts (evictions, the budget, the retry; a build also records its graphs
     then, g.prepare). Off by default: a _Runner then runs as it did before, and the registry only
-    counts (the LLM and embedding servers, the scripts). The generation server turns it on, and so
-    do RECLANK_RESIDENCY=1 and always.
+    counts (the LLM servers, the scripts). The generation and embedding servers turn it on, and so
+    do RECLANK_RESIDENCY=1 and always. peers: the other servers on the GPU (server/gpushare.py),
+    asked for room when this process's victims are not enough.
 
     always (RECLANK_EVICT_ALWAYS=1): every unpinned runner goes before every GPU run (and the
-    runner itself, when unpinned: its run uploads again), to check that a swap keeps the bits.
+    runner itself, when unpinned: its run uploads again), to check that a swap keeps the bits;
+    RECLANK_EVICT_ALWAYS=2: and the CUDA context too when nothing is left (release_all), so every
+    run is in a new context (docs/GPU_SWAP_PLAN.md 3.6).
     verbose (RECLANK_RESIDENCY_LOG=1, the server unless --quiet) prints each eviction and each
     load with its time; log keeps the last 256 of them (kind, label, bytes, seconds)."""
 
@@ -352,7 +472,9 @@ class Residency:
         self._mem_info = mem_info
         self.reserve = int(float(os.environ.get("RECLANK_GPU_RESERVE", "512e6"))) if reserve is None else reserve
         self.budget = budget
-        self.always = os.environ.get("RECLANK_EVICT_ALWAYS", "0") == "1" if always is None else always
+        ev = os.environ.get("RECLANK_EVICT_ALWAYS", "0")
+        self.always = ev in ("1", "2") if always is None else always
+        self.always_context = ev == "2"
         self.enabled = (os.environ.get("RECLANK_RESIDENCY", "0") == "1" or self.always) if enabled is None else enabled
         self.verbose = os.environ.get("RECLANK_RESIDENCY_LOG", "0") == "1"
         self.lock = threading.RLock()
@@ -362,12 +484,16 @@ class Residency:
         self.ticks = itertools.count(1)
         self.local = threading.local()              # the scopes of use of this thread
         self.log = []
+        self.peers = None                           # the other servers (server/gpushare.py Share)
 
     def free(self):
+        return self._info()[0]
+
+    def _info(self):
         if self._mem_info is None:
             from reclank.backends.cuda.gpumm import mem_info
             self._mem_info = mem_info
-        return self._mem_info()[0]
+        return self._mem_info()
 
     def _scopes(self):
         s = getattr(self.local, "scopes", None)
@@ -417,10 +543,15 @@ class Residency:
         with self.lock:
             self.register(r)
             if self.always and self.enabled:
-                self.evict_unpinned()
+                if self.always_context:
+                    self.release_all(context=True)
+                else:
+                    self.evict_unpinned()
             for s in self._scopes():
                 s.hold(r)
             self.state[r][0] = next(self.ticks)
+            if self.peers is not None:
+                self.peers.used()
 
     def _note(self, kind, r, nbytes, secs):
         self.log = self.log[-255:] + [(kind, self.label(r), int(nbytes), secs)]
@@ -450,6 +581,28 @@ class Residency:
         """Evict every unpinned runner but keep. Return the bytes freed."""
         return sum(self.evict(r) for r in self.victims(keep))
 
+    def release_all(self, context=True):
+        """Evict every unpinned runner; with context, when no runner holds device memory then, the
+        CUDA context too (gpumm.context_release: it refuses, and the context stays, while any Buffer
+        or program of the process is left). Return (the bytes freed, the context released)."""
+        with self.lock:
+            nb = self.evict_unpinned()
+            if not context or any(r.gpu_bytes() > 0 for r in list(self.state.keys())):
+                return nb, False
+            from reclank.backends.cuda import gpumm
+            t0 = time.time()
+            try:
+                gpumm.mem().poll(wait=True)
+                gpumm.context_release()
+            except RuntimeError as e:
+                if self.verbose:
+                    print("gpu: the context stays (%s)" % e, flush=True)
+                return nb, False
+            self.log = self.log[-255:] + [("context", "released", 0, time.time() - t0)]
+            if self.verbose:
+                print("gpu: the context released in %.2f s" % (time.time() - t0), flush=True)
+            return nb, True
+
     def short(self, need):
         """The bytes missing for need: of the free memory (with the reserve), and of the budget."""
         s = need + self.reserve - self.free()
@@ -460,7 +613,9 @@ class Residency:
     def make_room(self, runner, need, sure=None):
         """Evict unpinned runners (not runner), the least recently used first, until need bytes
         fit (short). MemoryError when sure (the part of need that is not an estimate; None: all of
-        it) does not fit the budget with all of them gone."""
+        it) does not fit the budget with all of them gone. Still short with peers (the other
+        servers: server/gpushare.py), they are asked for the rest; True then, the arbiter held until
+        the load ends (peers.done)."""
         sure = need if sure is None else sure
         with self.lock:
             for v in self.victims(runner):
@@ -470,6 +625,15 @@ class Residency:
             if self.budget is not None and self.total() + sure > self.budget:
                 raise MemoryError("%s needs %.2f GB: the GPU budget is %.2f GB, %.2f GB of it pinned or in use" % (
                     self.label(runner), sure / 1e9, self.budget / 1e9, self.total() / 1e9))
+            short = self.short(need) > 0 and self.peers is not None
+            if short:
+                card = self._info()[1]
+                mine = sum(r.gpu_bytes() for r in list(self.state.keys()) if self.pinned(r) or r is runner)
+        if short:
+            # the peers (outside the lock: a peer's request may take this server's parts not in use
+            # meanwhile); the arbiter stays held until the load is done (load)
+            self.peers.room(lambda: self.short(need), need, self.label(runner), card, self.reserve, mine, sure)
+        return short
 
     def load(self, runner, need, make, sure=None):
         """make() (a GPU build of runner's, need bytes, sure of them known) after make_room; when it
@@ -477,15 +641,25 @@ class Residency:
         make() alone."""
         if not self.enabled:
             return make()
-        self.make_room(runner, need, sure)
+        asked = self.make_room(runner, need, sure)
         t0 = time.time()
         try:
-            out = make()
-        except MemoryError:
-            with self.lock:
-                self.evict_unpinned(keep=runner)
-            t0 = time.time()
-            out = make()
+            try:
+                out = make()
+            except MemoryError:
+                with self.lock:
+                    self.evict_unpinned(keep=runner)
+                t0 = time.time()
+                try:
+                    out = make()
+                except MemoryError as e:
+                    note = getattr(self.peers, "note", None) if asked else None
+                    if note:
+                        raise MemoryError("%s (%s)" % (e, note)) from e
+                    raise
+        finally:
+            if asked:
+                self.peers.done()
         self._note("reloaded" if runner in self.evicted else "loaded", runner, getattr(runner, "last_load", need),
                    time.time() - t0)
         self.evicted.discard(runner)

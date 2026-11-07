@@ -1141,6 +1141,120 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1, phase 3 needs
   880, 12.1 GiB at 2352 x 1760 and 21.7 GiB at 720p (the VAE's), the host's 20.6-23.1 GiB. The
   evaluation of Comfy-Org's int8 "convrot" 7B (a 256-block rotation (K x K x K x K) / 16 of the
   input; 46 dB from the float32 7B) is not ported.
+- **SeedVR2 on the tensor cores (the 3B and 7B, the default; RECLANK_SEEDVR2_TC=0 and
+  RECLANK_SEEDVR2_DIT_TC=0 the float32 programs above):** the video VAE's causal 3x3x3 convs as
+  ENC_CONV_MM (an implicit im2col: the gather in the kernel, the same bits as gather + linear; its
+  cache product and its frame product), W in bfloat16 and x rounded to bfloat16 as gathered, float32
+  sums (k_enc_conv_tc: mma m16n8k16, 128 x 128 tiles); the DiT's F20 matrices decoded to bfloat16 on
+  the tensor cores (ENC_LINEAR wbf 5, k_enc_gemm_f20tc), the official code's bfloat16 autocast. The
+  float32 ENC_CONV_MM gains k steps of 16 (k_enc_conv_mm16, the same bits; RECLANK_CONV_MM16=0 the
+  steps of 4). On the 3090, the 7B on 121 frames of 768 x 484 to 1184 x 752: 646 -> 379 s (the encode
+  101 s, the DiT 107 s, the decode 115 s, the colour fix 35-50 s), against the float32 program 62.7
+  dB, at most 5 levels of 255.
+  The caches of the tensor cores' causal convs in bfloat16 (ENC_BF16_PACK, the rounding the conv's gather
+  gives x, read by k_enc_conv_tc as they are: the same bits; RECLANK_SEEDVR2_CACHE16=0 float32): about
+  half the VAE's caches, so the 3B at 1280 x 960 in batches of 85 frames peaks at 21.1 GB on the card.
+- **16-bit weights for the tensor cores, any float32 W (encoders.runtime.to_w16, W16_FORMATS):**
+  - W16H ("f16", KQ_W16H): float16 rows of W ws, ws a power of two of each row (max |w| ws in [2^14,
+    2^15)), then ws; x in float16 saturated at +-65504; the products divided by ws exactly. W16I ("i16",
+    KQ_W16I): I16 rows, each group of 64 values as int16 (two int8: hi and lo) with a float32 scale, then
+    the scales (program.i16_row_bytes); x quantized the same way as it is loaded (or packed:
+    ENC_I16_PACK); three int8 products (hi hi, hi lo, lo hi) a group, int32 sums, then the float32 sum.
+  - The records: ENC_LINEAR wbf 7 (W16H) and 8 (W16I) for a linear's lin.wq (input and output clamps
+    kept; any n); ENC_CONV_MM wbf 3 and 4 (W16H; 4 x's rows float16), 5 and 6 (W16I; 6 x's rows I16);
+    ENC_BF16_PACK (bfloat16 or float16) and ENC_I16_PACK write x's 16-bit rows with the kernels' own
+    conversion (the same bits).
+  - F20Lins(fmt=) or RECLANK_W16=f16|i16 (default f20) gives the GPU's matrices of Z-Image, Wan, SD and
+    SeedVR2 one of the forms (stored so: the VRAM of 16 bits a value); the streamed blocks of Wan A14B and
+    SeedVR2-7B take any of them (encoders.runtime.lin_q).
+  - SeedVR2: RECLANK_SEEDVR2_W16 = f16 (the default), i16 or bf16 (the VAE's convs and the DiT's
+    matrices); the VAE's caches in that form, and each causal conv's frame product reads x's packed rows
+    in the cache (packed once: the frame product twice as fast as from float32 x, the same bits). The
+    7B's streamed blocks now on the tensor cores too (their proxies had lost lin.tc). On 9 real frames
+    (1184 x 752), against the float32 programs:
+
+    | form | 3B PSNR | 3B max | 3B s | 7B PSNR | 7B max | 7B DiT host memory |
+    |---|---|---|---|---|---|---|
+    | bf16 (F20 W) | 57.0 dB | 19 | 26.1 | 60.6 dB | 7 | 20.6 GB |
+    | f16 | 65.9 dB | 10 | 25.8 | 69.5 dB | 1 | 16.3 GB |
+    | i16 | 71.5 dB | 5 | 33.5 | | | |
+
+    The 3B DiT on the card: 8.46 GB (F20), 6.69 GB (f16), 6.90 GB (i16). On the VAE's convs (real W
+    and x, the relative RMS error of the products against float64): bf16 1.4-1.8e-3, f16 0.5-1.6e-4,
+    i16 0.5-2.2e-5; f16 from packed x 49-62 TFLOPS, i16 33-36 (128 x 64 tiles: x read twice for 128
+    outputs; 64 x 128 tiles need dynamic shared memory, not done).
+- **SeedVR2 on a long video without batches (pipeline.restore_long; a scene at a time):** the video VAE's
+  encoder and decoder each one causal pass over all the frames (their caches carry on), the DiT on chunks
+  of `chunk` latent frames (long_chunks): each keeps its central chunk - 2 margin latents, the rest its
+  context, the chunks' starts multiples of that core and the core a multiple of the DiT's time window
+  (ceil(min(chunk, 30) / 4)), so a kept latent sees the windows of one pass over all; the latents padded
+  (the last frame repeated) so the last chunk is whole; each latent frame's noises its own (the seed and
+  its index). Against one pass of the DiT over 60 latents (237 real frames, the 3B at 688 x 432, chunks of
+  30, margin 3): no step at the joins (each frame's change from the one before within 4.7% of the one
+  pass's; median 0.999), the frames 32-52 dB from the one pass's (lowest near the joins and the padded
+  end). The 7B on 1280 x 960 in chunks of 30 (117 frames; the card's peak 22.1 GB at 121): 4.0 s a frame.
+  The colour fix of a video's frames on threads (color_frames, RECLANK_SEEDVR2_COLOR_PROCS: up to 16), each
+  rebound to the CPUs of the start (a new thread takes the main thread's single CPU), the same bits: 0.37 ->
+  0.05 s a frame at 1280 x 960. Not forked processes: a fork copies the host memory registered with CUDA
+  (the 7B's streamed blocks).
+- **RealBasicVSR (video super-resolution x4 of real-world footage; Apache 2.0):** models/realbasicvsr
+  (model.py), scripts/check_realbasicvsr.py. MMEditing v0.16.0's RealBasicVSRNet (64 channels, 20 residual blocks
+  a branch, 6.3 M parameters; the official checkpoints' generator_ema, realbasicvsr and realbasicvsr-wogan,
+  converted by pt_to_safetensors.py --key state_dict --prefix generator_ema.) as four programs of one runner:
+  the cleaning of a frame; SPyNet of a pair (the frames resized to multiples of 32, a pyramid of 2 x 2 means, six
+  levels of five 7 x 7 convs); a propagation step (backward or forward: the state's features warped by the flow,
+  zeros past the image, then 21 convs; the state stays on the device between steps); the upsampling (fusion, two
+  pixel shuffles read through the next conv's index, conv_hr, conv_last, + the bilinear x4 of the frame; x2: its
+  2 x 2 means). The convs ENC_CONV_MM on the GPU, im2col tiles + ENC_LINEAR on the CPU (the same bits), float32
+  as stored. ENC_WARP gains padding "zeros" (its operand 16; the border's records as before). A scene at once as
+  the official on the whole sequence: the backward features of one segment kept at a time on the host, a
+  checkpoint at each later segment's end and its segment computed again from it (the same bits; segments of 32
+  when a scene's features are over RECLANK_RBVSR_FEAT_GB, 16 by default). Against the official network (torch
+  float32 on the CPU, run in a sandbox) on real frames (30 of 256 x 192 and 7 of 250 x 190, both checkpoints,
+  CPU and GPU, segments of 3 and 8 too): the cleaned frames the same bits, the flows 103-107 dB, the features
+  84-98 dB, the output 112-125 dB, 99.98-99.996% of its uint8 values the same (the others 1 apart). A scene of
+  146 frames of 640 x 480 to 1280 x 960 on the RTX 3090: 0.96 s a frame (cleaning 23 s, flows 16 s, backward 34
+  s, forward and upsampling 67 s).
+- **FlashVSR v1.1 (one-step streaming diffusion video super-resolution; Apache 2.0):** models/flashvsr
+  (pipeline.py, dit.py, lq_proj.py, tcdecoder.py), scripts/check_flashvsr.py. The official Tiny-Long pipeline: the
+  LQ video (each frame bicubic to the output's H x W, multiples of 128; made as the chunks read them) streamed
+  through the LQ projector (Causal_LQ4x_Proj: two causal 4 x 3 x 3 convs of its 16 x 16 pixel-shuffled clips of 4
+  frames, their states kept on the device), the DiT (Wan 2.1 T2V-1.3B as the DMD checkpoint, one step at t = 1000:
+  the first chunk of 6 latent frames, then 2 at a time, the LQ condition added before the first block) and the
+  TCDecoder (TAEHV's decoder widened, the LQ frames as its condition; its MemBlocks' states carried from chunk to
+  chunk), then the AdaIN colour fix. The DiT's self-attention block-sparse as Block-Sparse-Attention's: its rows in
+  windows of 2 x 8 x 8 tokens (a block of 128 rows), the keys and values of the chunk's slices and the 3 before in
+  a ring of 4 slots (float16 on the GPU, by the user's choice; float32 on the CPU), each query block's key blocks
+  from the official's mask (the blocks' mean q and k, the 11 x 11 local window, the softmax, the top-k of each
+  head's slice). New records: ENC_ATTN_BLOCKS (370; k_enc_attn_tile's float32 form over a list of key blocks, K and V
+  float32 or float16, a tile's query blocks by qb0; on the tensor cores k_enc_attn_blocks_tc, q and the weights float16,
+  the scores, the softmax and the sums float32, K and V by cp.async in two buffers) and ENC_BLOCK_MASK (371; the mask on
+  the device: the means' scores, the softmax, each head's slice's (k + 1)-th largest by a radix select of its bits, the
+  lists; the CPU's and the interpreter's the host's draft_mask). A chunk of the DiT is one program of its 30 blocks, no
+  host step between them; on the GPU each layer's ring lives in pinned host memory (28 GB at 2560 x 1920) and two device
+  pairs take the layers in turn (GP_FETCH of layer i + 2's cached slots while the layers between run, GP_TO_HOST of each
+  new slice); its blocks in row tiles of 8192 (every operation but the attention a row's own; only the residual
+  stream and the queries kept for all the rows); the TCDecoder's last level in strips of 96 rows and its programs'
+  scratch from one pool, the convs' inputs packed to float16 once (the gather's conversion); the host's steps on
+  threads while the GPU runs (the next chunk's LQ frames, pixel shuffles, RoPE tables and the TCDecoder's inputs
+  made ahead, the chunk before's colour fix and uint8 behind, the TCDecoder's programs queued before the frame
+  before is read, the ring's pages written on threads before they are pinned): all the same bits. On the GPU the
+  DiT's matrices and self-attention and the LQ projector's and TCDecoder's convs in float16 on the tensor cores by
+  default (W16H rows, x, q and the attention's weights float16, float32 sums; RECLANK_FLASHVSR_TC=0: float32
+  products, the DiT's matrices F20); the rest float32. One change from the
+  script: the last frame repeated past the video's end (the script drops up to 7 of its last frames). Against the
+  official (float32 on the CPU, Block-Sparse-Attention as a dense float32 stand-in, run in a sandbox) on 41 real
+  frames at 512 x 384: the LQ projector 115.9 dB, the TCDecoder 112.5 dB, the DiT 109 dB on the CPU and 73-75 dB on
+  the GPU in float32 (F20, the float16 cache), every layer's block masks the same over all chunks (the CPU's and the
+  GPU's ENC_BLOCK_MASK); the whole pipeline on the GPU 65.6 dB in float32 (98% of its uint8 values the same, the
+  others at most 5 apart), 56.8 dB on the tensor cores (the DiT's 57.8, the decoder's 62.0, the projector's 65.1),
+  where the official's own bfloat16 is 28.1 dB from its float32 (32% of its uint8 values the same, up to 93 apart).
+  640 x 480 on the RTX 3090: to 1536 x 1152 in 2.2 s a frame (float32, before the host's steps were made faster);
+  to 2560 x 1920 (x 4) 5.1 s a frame in float32 and 3.45 s on the tensor cores (the steady chunks of 100 frames;
+  7.4 s before the masks went to the device and the copies and host steps overlapped), 1.6 s with the
+  self-attention on the tensor cores (57.2 dB against the official's float32) and the host's steps beside the
+  GPU's (a scene of 596 frames in 985 s, the first chunk's 60 s with it; 4653 s before), the card's peak 23.3 GB
+  (at its 220 W limit).
 - **Video frame interpolation, Practical-RIFE 4.25 (docs/VFI_PLAN.md):** models/vfi (rife.py,
   video.py, ref.py), server/interpolate.py, scripts/interpolate_video.py. hzwer's Practical-RIFE
   v4.25 (MIT; the README's Google Drive zip, flownet.pkl converted once by

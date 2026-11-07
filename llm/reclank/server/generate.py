@@ -187,10 +187,13 @@ into host RAM at the start; on the GPU a part's weights and buffers are
 uploaded at its first run and stay there until another part needs the room:
 then the parts used least recently go (their host copies stay; the next run
 uploads them again, a few seconds for a DiT), within --gpu-budget GB (default:
-the free memory at the start, less a reserve of 512 MB). A request's parts stay
-while it runs (each until its turn is over: Wan's DiT may go for its VAE).
---pin ID,... keeps whole models on the GPU; --keep keeps the image models'
-text encoders and VAEs.
+the card's, less a reserve of 512 MB). A request's parts stay while it runs
+(each until its turn is over: Wan's DiT may go for its VAE). --gpu-lock ID,...
+(--pin) keeps whole models on the GPU (no ids: all); --keep keeps the image
+models' text encoders and VAEs. The other reclank servers on the GPU are asked
+for room when this one's parts are not enough, and it gives its own when idle
+(server/gpushare.py; --gpu-peers off: neither, the budget the free memory at
+the start).
 """
 from __future__ import annotations
 
@@ -1044,6 +1047,8 @@ class _GenHandler(H._Handler):
             return self._json(200, {"status": "ok"})
         if not self._authorized():
             return
+        if self._admin(path, False):
+            return
         if path in ("/v1/audio/voices", "/audio/voices"):
             sp = self.server.speech
             return self._json(200, {"object": "list", "data": [
@@ -1076,6 +1081,9 @@ class _GenHandler(H._Handler):
                                  "input": "video" if mid == "vda-small" else "image"})
             if getattr(self.server, "interp", None):
                 data.append(self.server.interp.describe())
+            pins = self.server.pins
+            for d in data:
+                d["gpu_locked"] = "*" in pins or d["id"] in pins
             return self._json(200, {"object": "list", "data": data})
         self._error(404, "no route %s" % self.path, code="not_found")
 
@@ -1371,6 +1379,8 @@ class _GenHandler(H._Handler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if not self._authorized():
             return
+        if self._admin(path, True):
+            return
         if path in ("/v1/images/edits", "/images/edits"):
             return self._edits()
         if path in ("/v1/audio/speech", "/audio/speech"):
@@ -1434,7 +1444,7 @@ def _residency(server):
     for mid, m in _models(server).items():
         for part, r in m.runners().items():
             r.label = "%s/%s" % (mid, part)
-            if mid in server.pins:
+            if mid in server.pins or "*" in server.pins:
                 RESIDENCY.pin(r)
         if server.keep and hasattr(m, "kept"):
             for r in m.kept():
@@ -1491,10 +1501,12 @@ def main(argv=None):
     ap.add_argument("--cpu", action="store_true", help="the models on the CPU (float32)")
     ap.add_argument("--keep", action="store_true",
                     help="pin the image models' text encoders and VAEs on the GPU (never evicted)")
-    ap.add_argument("--pin", default="", metavar="ID,...", help="pin these models on the GPU (all their parts)")
     ap.add_argument("--gpu-budget", type=float, default=None, metavar="GB",
-                    help="the GPU memory the models may hold (default: the free memory at the start, less "
-                         "RESIDENCY's reserve of 512 MB); the parts used least recently go for the others")
+                    help="the GPU memory the models may hold (default: the card's, or with --gpu-peers off the "
+                         "free memory at the start, less RESIDENCY's reserve of 512 MB); the parts used least "
+                         "recently go for the others")
+    from server.gpushare import add_gpu_args
+    add_gpu_args(ap)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8084)
     ap.add_argument("--cpu-threads", type=int, default=None)
@@ -1513,8 +1525,11 @@ def main(argv=None):
         from reclank.backends.cuda.runtime import lib
         from reclank.encoders.runtime import RESIDENCY
         lib()
-        free0 = mem_info()[0]
-        budget = int(a.gpu_budget * 1e9) if a.gpu_budget is not None else max(0, free0 - RESIDENCY.reserve)
+        free0, card = mem_info()
+        if a.gpu_budget is not None:
+            budget = int(a.gpu_budget * 1e9)
+        else:
+            budget = max(0, (card if a.gpu_peers == "on" else free0) - RESIDENCY.reserve)
     images = {}
     if a.flux2:
         images[a.image_id] = Images(a.flux2, not a.cpu, a.cpu_threads, a.image_id)
@@ -1536,7 +1551,8 @@ def main(argv=None):
     speech = Speech(a.higgs, not a.cpu, a.cpu_threads, a.speech_id, a.voices) if a.higgs else None
     music = Music(a.acestep, not a.cpu, a.cpu_threads, a.music_id) if a.acestep else None
     whisper = Transcriber(a.whisper, not a.cpu, a.cpu_threads, a.whisper_id) if a.whisper else None
-    httpd = H._Server((a.host, a.port), _GenHandler)
+    from server import idle
+    httpd = idle.server(H._Server, (a.host, a.port), _GenHandler)
     httpd.images = images
     httpd.speech = speech
     httpd.music = music
@@ -1571,14 +1587,21 @@ def main(argv=None):
     httpd.quiet = a.quiet
     httpd.keep = a.keep
     httpd.pins = {p for p in a.pin.split(",") if p}
-    unknown = httpd.pins - set(_models(httpd))
+    unknown = httpd.pins - set(_models(httpd)) - {"*"}
     if unknown:
-        ap.error("--pin: no model %s (the models: %s)" % (", ".join(sorted(unknown)), ", ".join(_models(httpd))))
+        ap.error("--gpu-lock: no model %s (the models: %s)" % (", ".join(sorted(unknown)), ", ".join(_models(httpd))))
+    httpd.gpu_share = None
     if budget is not None:
         RESIDENCY.enabled = True
         RESIDENCY.budget = budget
         RESIDENCY.verbose = RESIDENCY.verbose or not a.quiet
         _residency(httpd)
+        if a.gpu_peers == "on":
+            from server.gpushare import RunnerShare, attach
+            httpd.gpu_share = attach(RunnerShare("generate", lambda: _models(httpd), lambda: [httpd.lock],
+                                                 locks=httpd.pins, port=httpd.server_address[1], host=a.host,
+                                                 api_key=a.api_key, wait=a.gpu_wait, hold=a.gpu_hold,
+                                                 quiet=a.quiet))
     httpd.api_key = a.api_key or None
     httpd.cors_origin = a.cors_origin or None
     httpd.max_body = int(a.max_body_mb * (1 << 20))
@@ -1590,13 +1613,20 @@ def main(argv=None):
               ",".join(httpd.stereo.model_ids) if httpd.stereo else "-",
               httpd.interp.model_id if httpd.interp else "-", "required" if httpd.api_key else "OFF",
         "  GPU budget %.2f GB" % (budget / 1e9) if budget is not None else ""), flush=True)
+
+    def busy():
+        """A job queued or running (an idle exit would fail it: the jobs of a new start that were
+        not done are)."""
+        ms = [httpd.videos, getattr(httpd, "upscales", None), getattr(httpd, "stereo", None),
+              getattr(httpd, "interp", None)]
+        return any(j.get("status") in ("queued", "in_progress") for m in ms if m is not None
+                   for j in list(m.jobs.values()))
     try:
-        httpd.serve_forever()
+        return idle.serve(httpd, a.idle_exit, busy)
     except KeyboardInterrupt:
-        pass
+        return 0
     finally:
         httpd.server_close()
-    return 0
 
 
 if __name__ == "__main__":

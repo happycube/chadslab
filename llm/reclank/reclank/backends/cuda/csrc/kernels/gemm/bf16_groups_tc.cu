@@ -343,14 +343,14 @@ static void gg_gemm_bf16(const float *x, size_t ldx, const int *xrow0, const uin
                          cudaStream_t s, int w12 = 0, int x1 = 0, int xready = 0)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_gemm_bf16_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
-        attr = 1;
+        attr = gg_epoch;
     }
     int x2 = bf16_tc_on() != 8 && !x1;
     uint16_t *xl = x2 ? xb + (size_t)t * cols : NULL;
@@ -425,12 +425,12 @@ static void gg_gemm_f16(const float *x, const uint16_t *w, const float *bias, fl
                         int cols, uint16_t *xb, float imin, float imax, float omin, float omax, cudaStream_t s)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 0, 0, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 0, 1, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
-        attr = 1;
+        attr = gg_epoch;
     }
     size_t nk = (size_t)t * cols;
     int steps = (cols + BHK - 1) / BHK;
@@ -461,12 +461,12 @@ static void gg_gemm_bf12_gather(const float *x, int src, int gc, const int *idx,
                                 float *out, int t, int rows, uint16_t *xb, cudaStream_t s, int xready)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
         cudaFuncSetAttribute(k_gemm_bf16_tc<1, 1, 1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)BF_SMEM(1));
-        attr = 1;
+        attr = gg_epoch;
     }
     int x2 = bf16_tc_on() != 8;
     int cols = nb * gc;

@@ -134,8 +134,8 @@ server" and "Weightkeeper".
 |---|---|---|
 | Gemma 4 26B-A4B | Mixture of experts, quantization-aware training | `reclank/models/gemma4/` |
 | Gemma 4 12B | Dense, quantization-aware training | `reclank/models/gemma4/` |
-| Gemma 4 E4B and E2B | Small dense models with Per-Layer Embeddings | `reclank/models/gemma4/e4b.py` |
-| Qwen3.6-35B-A3B | MoE, 256 experts, DeltaNet plus full attention | `reclank/models/qwen/` |
+| Gemma 4 E4B and E2B | Small dense models with Per-Layer Embeddings (also Nemotron 3.5 Bolt E4B, its bf16 folder) | `reclank/models/gemma4/e4b.py` |
+| Qwen3.6-35B-A3B | MoE, 256 experts, DeltaNet plus full attention (GGUF, or NVIDIA's NVFP4 from the weightkeeper) | `reclank/models/qwen/` |
 | Qwen3.8-Flash-Next | MoE, 125B, 512 experts, NVFP4, MTP drafter | `reclank/models/qwen/` |
 | DeepSeek V4.1 Flash | MoE, 510 GB checkpoint, MXFP4 experts, engram tables, DSpark drafter | `reclank/models/deepseek41/` |
 | LFM2.5-24B-A2B | MoE, 64 experts, short convolutions plus attention | `reclank/models/qwen/` |
@@ -323,6 +323,24 @@ Use `python -m server --help` for the full list.
 scripts/serve_forever.sh python scripts/serve_qwen4.py --port 8082
 ```
 
+### One port for every model: the gateway
+
+`server/gateway.py` puts all the servers (chat models, embeddings, image,
+video, speech and music) behind one port. A request picks its server by its
+`model` field; the gateway starts that server when it is not running and
+stops the least recently used idle ones when host memory runs short. The
+servers share the GPU among themselves as before. The page at `/` shows
+every server, the GPUs and the host memory. From it you can start, stop and
+restart a server, release or lock its GPU memory, keep it loaded, and choose
+which GPUs it may use or put it on the CPU.
+
+```sh
+python -m server.gateway --config gateway.json --port 8080
+```
+
+The module text of `server/gateway.py` gives the config's form: each
+server's command, port, models, host memory and GPU options.
+
 ## Command-line scripts
 
 These scripts run the NumPy path of the Gemma models from a Hugging Face
@@ -487,6 +505,7 @@ reference, and about 30 `bench_*.py` scripts.
 | `docs/EXL3_PLAN.md` | The ExLlamaV3 trellis format. |
 | `docs/MTP_PLAN.md`, `docs/MTP_DRAFTER_QUANT.md` | Multi-token prediction. |
 | `docs/MULTIMODAL_PLAN.md` | Image, audio, and video input. |
+| `docs/FLASHVSR.md` | Video upscaling with FlashVSR: the weights, a worked example, sizes, speed. |
 | `docs/MOE_PLAN.md` | The Gemma 4 26B-A4B support. |
 | `docs/CPU_PLAN.md`, `docs/PERF_PLAN.md`, `docs/PREFILL_GEMM_PLAN.md` | Speed work. |
 | `docs/SPLIT_PLAN.md` | One step across programs, NUMA nodes, and the GPU. |

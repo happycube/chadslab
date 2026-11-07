@@ -7,8 +7,10 @@
  * are float32 in an order of their own (the drafts do not need the bits of another kernel). */
 template <int R, int NT>
 __global__ void __launch_bounds__(256) k_nv4_gemv(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                 float *out)
+                                                 float *out,
+        const gp_rec *rp, const int64_t *re)
 {
+    GG_RP_KQ(rp, re, w, x, out);
     extern __shared__ __align__(16) float nxs[];       /* NT x cols */
     __shared__ float e2t[16];                          /* twice the E2M1 value of each code */
     if (threadIdx.x < 16) {
@@ -88,8 +90,10 @@ __global__ void __launch_bounds__(256) k_nv4_gemv(const uint8_t *w, int rows, in
  * lanes of a quarter warp read 8 different banks. */
 template <int R, int NT, int U>
 __global__ void __launch_bounds__(256) k_nv4_gemv2(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                  float *out)
+                                                  float *out,
+        const gp_rec *rp, const int64_t *re)
 {
+    GG_RP_KQ(rp, re, w, x, out);
     constexpr int SW = 1024 * U;                       /* the columns of a slice: U blocks a lane */
     extern __shared__ __align__(16) float nxs[];       /* NT x SW, rotated */
     __shared__ float e2t[16];
@@ -225,8 +229,13 @@ static int nv4_gemv2_off(void)
 }
 
 /* GP_KQ_LINEAR of KQ_NV4 rows for t <= 8 (else 1: the generic kernel) */
-static int nv4_linear_launch(const float *x, const uint8_t *w, int rows, int cols, int t, float *out, cudaStream_t s)
+static int nv4_linear_launch(const float *x, const uint8_t *w, int rows, int cols, int t, float *out, cudaStream_t s,
+                             const gp_rec *rp = NULL, const int64_t *re = NULL)
 {
+    /* (rp: the kernels read x, w and out in the record, GG_RP_KQ) */
+    const float *xa = rp != NULL ? NULL : x;
+    const uint8_t *wa = rp != NULL ? NULL : w;
+    float *oa = rp != NULL ? NULL : out;
     if (t > 8 || cols % 256 != 0 || nv4_gemv_off()) {
         return 1;
     }
@@ -243,23 +252,23 @@ static int nv4_linear_launch(const float *x, const uint8_t *w, int rows, int col
         unsigned nblk = (unsigned)((rows + per - 1) / per), cap = (unsigned)(nv4_sms() * 4);
         nblk = nblk < cap ? nblk : cap;
         if (t == 1) {
-            k_nv4_gemv2<2, 1, 4><<<nblk, nth, (size_t)1 * 4096 * 4, s>>>(w, rows, cols, x, t, out);
+            k_nv4_gemv2<2, 1, 4><<<nblk, nth, (size_t)1 * 4096 * 4, s>>>(wa, rows, cols, xa, t, oa, rp, re);
         } else if (t == 2) {
-            k_nv4_gemv2<2, 2, 4><<<nblk, nth, (size_t)2 * 4096 * 4, s>>>(w, rows, cols, x, t, out);
+            k_nv4_gemv2<2, 2, 4><<<nblk, nth, (size_t)2 * 4096 * 4, s>>>(wa, rows, cols, xa, t, oa, rp, re);
         } else if (t <= 4) {
-            k_nv4_gemv2<2, 4, 2><<<nblk, nth, (size_t)4 * 2048 * 4, s>>>(w, rows, cols, x, t, out);
+            k_nv4_gemv2<2, 4, 2><<<nblk, nth, (size_t)4 * 2048 * 4, s>>>(wa, rows, cols, xa, t, oa, rp, re);
         } else {
-            k_nv4_gemv2<2, 8, 1><<<nblk, nth, (size_t)8 * 1024 * 4, s>>>(w, rows, cols, x, t, out);
+            k_nv4_gemv2<2, 8, 1><<<nblk, nth, (size_t)8 * 1024 * 4, s>>>(wa, rows, cols, xa, t, oa, rp, re);
         }
         return 0;
     }
     const unsigned nblk = (unsigned)((rows + 8 * NV4_R - 1) / (8 * NV4_R));
     if (t == 1) {
-        k_nv4_gemv<NV4_R, 1><<<nblk, 256, sm, s>>>(w, rows, cols, x, t, out);
+        k_nv4_gemv<NV4_R, 1><<<nblk, 256, sm, s>>>(wa, rows, cols, xa, t, oa, rp, re);
     } else if (t == 2) {
-        k_nv4_gemv<NV4_R, 2><<<nblk, 256, sm, s>>>(w, rows, cols, x, t, out);
+        k_nv4_gemv<NV4_R, 2><<<nblk, 256, sm, s>>>(wa, rows, cols, xa, t, oa, rp, re);
     } else {
-        k_nv4_gemv<NV4_R, 4><<<nblk, 256, sm, s>>>(w, rows, cols, x, t, out);
+        k_nv4_gemv<NV4_R, 4><<<nblk, 256, sm, s>>>(wa, rows, cols, xa, t, oa, rp, re);
     }
     return 0;
 }

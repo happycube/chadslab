@@ -479,7 +479,9 @@ def gguf_or_kept(path, **kw):
     """The tensors of a GGUF file: the weightkeeper's (KeptGGUF) when one holds
     it, else the file (GGUF(path, **kw))."""
     if path.endswith(".gguf") and holds(path):
-        return KeptGGUF(path)
+        k = KeptGGUF(path)
+        print("the tensors from the weightkeeper (pid %s)" % k.w.index.get("pid"), flush=True)
+        return k
     return GGUF(path, **kw)
 
 
@@ -548,6 +550,9 @@ class KeptGGUF(GGUF):
         if d["place"] == "experts" and len(d["parts"]) == 1 and list(d["parts"][0][2]) == list(range(d["E"])):
             # one node holds every expert, in order: the stack whole, as the file has it
             # (the Gemma 26B on a machine of one socket)
+            a = self.w.tensor(gname)[0][1].reshape(-1)
+        elif d["place"] == "rows" and len(d["parts"]) == 1:
+            # one node holds every row (the E4B's per-layer token table, --nodes 0): the table whole
             a = self.w.tensor(gname)[0][1].reshape(-1)
         elif d["place"] != "node":
             raise ValueError("%s is split between the nodes (experts(), row_addrs())" % gname)

@@ -1348,9 +1348,21 @@ class QwenGGUF(Qwen):
         from reclank.formats.gguf import GGUF, GGUFAttached
         from reclank.models.qwen import keep
         self.path = path
+        if os.path.isdir(path):
+            # an NVFP4 checkpoint of ModelOpt (reclank/formats/q35nv_st.py): the weightkeeper's
+            # tensors when it holds it (models/qwen/keep_q35nv.py), else the checkpoint itself
+            from reclank.formats.q35nv_st import Q35NVSource
+            from reclank.models.qwen.keep_q35nv import KeptQ35NV
+            self.g = KeptQ35NV(path) if keep.holds(path) else Q35NVSource(path)
+            if getattr(self.g, "kept", False):
+                print("the tensors from the weightkeeper (pid %s)" % self.g.w.index.get("pid"), flush=True)
+            cfg = cfg or self.g.config()
         # the weightkeeper's tensors when it holds the file (scripts/weightkeeper.py
         # FILE.gguf: loaded once, mapped by each run), else the file
-        self.g = keep.KeptGGUF(path) if path.endswith(".gguf") and keep.holds(path) else GGUF(path)
+        elif path.endswith(".gguf") and keep.holds(path):
+            self.g = keep.KeptGGUF(path)
+        else:
+            self.g = GGUF(path)
         if mtp is not None:
             # the MTP layer in a file of its own (unsloth's quant drops it from the model's file)
             self.g = GGUFAttached(self.g, [mtp])
@@ -1541,8 +1553,11 @@ class QwenGGUFCPU(QwenCPU):
         # x and the act with the precision of int16 (two int8 planes, act bit
         # 32 of KQ_MOE, as Qwen4CPU): the GPU reads float32 x, and with int8
         # x the CPU left the GPU at row 9 of a prompt
-        extra = ((None, 0, xb["src"]) if self.M(p + "switch_mlp.gate_proj").type == BF12 else
-                 (None, 32, xb["src"]) if getattr(self, "rot_experts", False) else ())
+        # KQ_NVX experts (an NVFP4 checkpoint of ModelOpt: formats/q35nv_st.py) take x as int16
+        # only (two int8 planes of the float32 rows, as qwen38.emit_moe4)
+        t = self.M(p + "switch_mlp.gate_proj").type
+        extra = ((None, 0, xb["src"]) if t == BF12 else
+                 (None, 32, xb["src"]) if getattr(self, "rot_experts", False) or t == 53 else ())
         prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
                   cfg.num_experts, self.moe_mats(p), slog, cfg.hidden_size, cfg.moe_inter,
                   scratch, out, *extra)

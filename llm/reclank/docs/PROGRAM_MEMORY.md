@@ -78,6 +78,157 @@ pool's hot experts wait for the decode, and relax gives the memory back), and mo
 and 15.7K tokens at 321 and 389 tok/s plain (236 and 329 before the work of this note), 235 and 312 with MTP
 (197 and 223).
 
+## 2b. Nemotron's prompt programs packed (Super on the GTX 1070, Bolt; 8 GB beside 7 GB of dense rows)
+
+Super on the GTX 1070 had 0.18 GB free after its load: its prompt groups stopped at 256 rows (each pass of a group
+reads every expert across the link, so a 1K prompt ran 4 of them: 56 tok/s). Measured as section 1 says, the
+64-row program was 75 MB of which 27 MB its arrays, 8 MB its graphs (955 records in ~6 segments): the graphs and
+the records were never the problem, the buffers were. In order:
+
+1. **No scratch of the tensor cores' on a GPU without them.** rc_gpu_load made the bfloat16 rows of the BF12 and
+   MXFP8 matrices (up to 32 MB) and the two bfloat16 planes of x (2 t cols bytes) for every program; only
+   bf16_tc_on's kernels read them (0 without the tensor cores). api.cu skips both there; the same bits.
+2. **A window of the pairs on the mapped path** (MAP_WIN_C chunks of the experts, k_nm_gtile_nv4p's operand 23 as
+   k_nm_gtile_nv4t's): each chunk's pairs in a window of twice its share (passes enough for the worst chunk; the
+   empty ones exit at once), k_nm_gsumw adding each window's outputs. Each expert still crosses PCIe once (the
+   chunks split the experts). On the 3060 (k_nm_gtile_nv4p forced, the same chunks and windows as the stage) the
+   prompt's logits are bit for bit those of the staged path.
+3. **The sub-batch that fits** (_fit_big: for each count of chunks, each big group's sub-batch the largest of
+   its rows whose program fits the room with that count's window; SUB still fixes it).
+4. **Packing** (ir/alloc.pack, NemotronGPU._pack; WRITES has the Nemotron records): each layer's temporaries
+   its own (kq.compile_nemotron_step's rows, NmEmit's scratch and int8 x, P.lazy_zeros: no memory until
+   written), so those of layers that do not live at once share the arena's bytes; and the programs share one
+   arena (the largest so far; the programs on a smaller one made again on it when used). A big group's program
+   takes one of its own, freed after the prompt, unless the pool holds less than SHARE_BIG_GB (the 1070).
+   Super's arenas: 15.8 MB at 64 rows, 45.0 at 256 (its buffers had been 171 MB), 1024 rows 180 MB whole or 98
+   MB in sub-batches of 512 (0.62 GB before); Bolt's 12.9 and 184.6 MB at 64 and 1024. NemotronGPU.arena_bytes
+   estimates them (each layer kind's temporaries live at once: within 1% for Super, 20% over for Bolt), and the
+   margin of a big group is 0.12 GB where it shares the arena. The logits bit for bit those unpacked (Super and
+   Bolt, both GPUs; RECLANK_PACK_POISON=1, the arena NaN at first, the same bits: no record reads a byte it did
+   not write).
+
+The 1070 then takes Super's prompts in groups of 1024 (sub-batches of 512) with the graphs: 1K and 4K 56 -> 72
+tok/s, decode the same. Bolt's prompt programs 0.85 -> 0.40 GB of the estimate: its hot experts 32 -> 35% on the
+3060 (decode 30.1 -> 30.4, the drafter 34.8 -> 36.5, 4K 538 -> 547), 8 -> 11% on the 1070; the server on both
+cards 29 -> 32% hot, chats 37.9 -> 38.6, prompts of 5.2K / 15.7K 457 / 499 -> 462 / 504. Super's server on both
+cards (the 3060's pool 0.1 GB larger): MTP with 3 drafts, chats 15.5 (15.5-16.0 before), prompts 236 / 311 -> 262 /
+335; without MTP chats 14.1, prompts 321 / 390 -> 327 / 395.
+
+## 2c. One set of graphs for the layers of a kind, chained by tail launch
+
+What was left of a packed program was mostly its graphs, one exec a segment. Super on the GTX 1070, packed, the
+device memory of each program's graphs (cudaMemGetInfo around prepare, with the programs made largest first, so
+that no program is closed and no graph's freed memory is used again):
+
+| Rows | Records | Segments | Graphs | Arena |
+|---|---|---|---|---|
+| 1 | 994 | ~7 | 6 MB | (not packed) |
+| 64 | 955 | ~6 | 6-13 MB | 15.8 MB |
+| 384 | 2195 | ~14 | 57 MB | ~67 MB (est.) |
+
+The 256- and 1024-row programs have the same 2195 records: the windows' records, 8 chunks of the experts, each a
+few passes, each several kernels. A toy (one process a measure) gives ~7.5 KB of device memory a kernel node, a
+graph's memory in 2 MB chunks (14 graphs of 160 nodes: 27 MB; one of 2240: 17 MB), and the same for graphs made
+for device launch. The records themselves are 224 bytes each (0.5 MB). (A first measure of the 256 rows'
+graphs, 46 MB, was low: the bigger arena had closed the 64-row program, and its graphs' freed memory was used
+again.) Super's 88 layers are three kinds (Mamba, attention, MoE), and no two layers of a kind come one after
+the other (in Bolt either).
+
+**What was built.**
+
+1. **The layers marked.** A record's flags (ir/opcodes.py: F_LAYER with the layer's index + 1 from
+   F_LAYER_SHIFT, F_LAYER_END on the first record after the last layer; Program.mark gives them to the next
+   record emitted). kq.compile_nemotron_step and _compile_nemotron_sub mark the layers of programs of at least
+   TAIL_ROWS (RECLANK_NM_TAIL_ROWS, 17) rows. The records' order and count do not change, so the fusions across
+   records (gg_skip, gg_qx_src) see what they saw.
+2. **The chains** (runtime/graphs.cu). rc_gpu_load's gg_find_links: each run of marked layers with no boundary
+   record inside is one segment, a chain. At its capture (prepare or the first run) each of its layers' records
+   is captured with its kernels reading their records in one area, dbody, not at the layer's place in dcode,
+   and k_tail_next goes last. gg_graph_cmp compares it with the program's bodies so far: the same nodes
+   (kernels, grids, blocks, shared memory, every argument's bytes by cudaFuncGetParamInfo, memsets, memcpys,
+   edges). The same is that body; else a new body. The new bodies are instantiated for device launch and
+   uploaded.
+
+   The run: the host launches k_tail_start (the first layer's records into dbody) and its body. Each body's
+   k_tail_next copies the next layer's records into dbody and tail-launches that layer's body; the stream counts
+   the chain as the one launch, so what follows is queued as before. The host's records stay whole, so prepare,
+   the CPU's tasks and the mirror walk them as before.
+
+   Where the chain cannot run, its records are one ordinary graph instead:
+   - a layer whose record fuses one past the layer's end (gg_skip still set at its end);
+   - a body that cannot be made for device launch.
+
+   A failed tail launch writes its link and error into mapped memory; the next run reports it.
+3. **Kernels that took a layer's pointers as arguments** read them in the record when the launch gives it
+   (GG_RP_KQ, GG_RP_SC in kernels/operands.cu; the pointer arguments then null):
+   - the MXFP8 products k_mxf8_gemv(_s), k_mxf8_tc and k_mxf8_gemm_f, and their FP8 tensor scale (Super's
+     Mamba in/out, the head);
+   - the NVFP4 products k_nv4_gemv and k_nv4_gemv2 (Super's shared experts in a step);
+   - GP_KQ_LINEAR's x to int8 (k_kq_quant_x_rec, k_quant_x2_rec).
+
+   RECLANK_GPU_TAIL_LOG=1 prints, for each new body, what made it differ from the body most like it: that is how
+   these were found (Super's chain of 88 layers: 49 bodies, then 4).
+
+**What it gave.** Super on the GTX 1070, four bodies a program (layer 0, whose first record is a plain norm;
+Mamba; MoE; attention). Its graphs, made largest first:
+
+| Rows | Graphs, chains off | Graphs, chains on |
+|---|---|---|
+| 384 | 57 MB | 0 (under 2) |
+| 320 | 59 MB | 2 MB |
+| 256 | 59 MB | 2 MB |
+| 64 | 13 MB | 0 |
+
+Five programs made: 0.538 -> 0.727 GB free (189 MB). Bolt on the 1070, its prompt programs of 512, 256 and 64
+rows (not staged): 13 / 10 / 10 MB -> 2 / 0 / 4, 27 MB in all; its MoE layers vary (E 240-496, inner
+1536-2560), so the 64-row chain has 15 bodies.
+
+The logits are bit for bit those of the ordinary graphs (the prompt's last row and 8 steps):
+- Super on the 1070 (1K, and 4K with RECLANK_PACK_POISON=1), on the 3060 (4K), on both cards (1K);
+- Bolt on the 1070 and the 3060 (4K; the CPU's share off).
+
+check_nemotron_super_spec PASS on the 3060 and on both cards. The speed:
+
+| | Chains off | Chains on |
+|---|---|---|
+| Super, 1070, 1K / 4K prompt | 74 / 72 | 74 / 73 |
+| Super, 3060, 1K / 4K prompt | 172 / 402 | 172 / 403 |
+| Super, both cards, 1K prompt | 172 | 172 |
+| Bolt, 1070 / 3060, 4K prompt | 189 / 549 | 187 / 547 |
+
+**What is not chained.**
+- **The steps** (fewer than TAIL_ROWS rows). A chain costs a few us a layer: Super's step on the RTX 3060
+  13.01 -> 12.89 tok/s (192 steps, twice each, alternated), the 1070's 8.6-8.7 -> 8.5, for ~6-10 MB a
+  program. RECLANK_NM_TAIL_ROWS=1 chains them too.
+- **A program that fetches weights into a stage** (GP_FETCH: the 3060's staged groups, Bolt's on both GPUs).
+  Their MoE layers fetch inside, so only the Mamba and attention layers could be chains, of one or two layers.
+  - Super on the 3060, 1K prompt: 172 -> 164 tok/s with them chained. Its pull kernels (k_nm_tile_pull, on the
+    copies' stream beside the layers) took 5.42 -> 5.64 s; no toy's launches, events, priorities or overlaps
+    differed.
+  - Bolt on the 3060: 549 -> 537 tok/s.
+  - Those layers get little to share: on the 3060, none (below); on the 1070 Bolt's Mamba layers share 3
+    bodies, ~2-3 MB.
+
+  RECLANK_GPU_TAIL_FETCH=1 chains them anyway.
+- **The 3060's tensor-core products** (gg_gemm_bf16 and gg_gemm_bf12: k_to_bf16, k_gemm_bf16_tc,
+  k_mxf8_to_bf16 on chunks of rows) still take their pointers. Its 64-row chain has 88 bodies (no gain), and its
+  steps' chain 4. These would need the record form too, with the chunks' offsets.
+- **Programmatic edges** (PDL, sm_90 and later): none in a body. k_tail_next must wait for the whole layer.
+
+Switches: RECLANK_GPU_TAIL=0 (the ordinary graphs), RECLANK_GPU_TAIL_MIN (the fewest layers of a chain),
+RECLANK_GPU_TAIL_PLAIN=1 (each chain an ordinary graph, the cuts at the layers kept), RECLANK_GPU_TAIL_LOG=1.
+
+**The cost of the other ways**, a toy (2220 kernels of one block, 88 layers of 3 kinds, best of 8,
+interleaved) against 14 graphs:
+
+| | Tail launch | Host launch a layer + copy | WHILE + SWITCH |
+|---|---|---|---|
+| GTX 1070 | -0.04 to +0.33 ms | 0.27-0.63 ms less | +0.29-0.64 ms |
+| RTX 3060 | +0.46 ms | +0.23 ms | +0.79 ms |
+
+Two other ways were not chosen. Env slots per layer would need the compiler to emit them and the host's checks
+to read per-layer tables. cudaGraphExecKernelNodeSetParams costs ~1 us of host time a node.
+
 ## 3. Pitfalls met on the way
 
 - **numpy's huge pages against pinned memory.** numpy marks large arrays `MADV_HUGEPAGE`; their faults
@@ -111,8 +262,7 @@ and 15.7K tokens at 321 and 389 tok/s plain (236 and 329 before the work of this
 - Keep the small sizes that every request runs.
 
 Not done yet, and worth it: bfloat16 storage of the large intermediates (in_proj's output, the conv's, the
-pairs' outputs: ~90 KB a row); one arena for the programs that never run at once (the small groups, the MTP
-block's parts: their memory is a sum today); aliasing of buffers within a program by their lifetimes.
+pairs' outputs: ~90 KB a row); the MTP block's parts packed too (Nemotron's main programs are: section 2b).
 
 ## 5. Gemma 4 (the 26B and the 12B on the RTX 3090)
 

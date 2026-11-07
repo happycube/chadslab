@@ -5,12 +5,22 @@
  * address with rc_gpu_set_cpu_runner. */
 typedef int (*gg_cpu_runner)(const int64_t *prog, int limit);
 static gg_cpu_runner gg_cpu_run;
+/* (after a GP_CPU_TASK's flag out: rc_gpu_set_cpu_after, the CPU library's rc_er_after) */
+typedef void (*gg_cpu_after_fn)(void);
+static gg_cpu_after_fn gg_cpu_after;
 
-/* A segment: the kernel records from start to end - 1, and their graph. */
+/* A segment: the kernel records from start to end - 1, and their graph. A chain (graphs.cu): chain 1 + the
+ * index of its run, its layers the links link0 to link1, exec the graph of its first link's body. */
 typedef struct {
     int start, end;
     cudaGraphExec_t exec;
+    int chain, link0, link1;
 } gg_seg;
+
+/* A layer of a chain: its first record, its count of records, its body (the graph of its kind). */
+typedef struct {
+    int pc, n, body;
+} gg_link;
 
 typedef struct {
     int n_env, n_code;
@@ -47,13 +57,27 @@ typedef struct {
     int kqx_lo;          /* 1: kqx has the lo plane of the int16 form (kt_lo) */
     uint8_t *e3;         /* the scratch of the KQ_E3 products (e3_ws_bytes) */
     size_t e3_n;
+    int live;            /* loaded by rc_gpu_load (gg_nprog counts it) */
+    /* the chains (graphs.cu): the layers that run on the graph of their kind, one after another by tail launches */
+    int n_link;
+    gg_link *hlink;      /* the chained layers, in the order of the records */
+    gg_link *dlink;      /* (its copy on the GPU) */
+    int n_body;
+    cudaGraph_t *bodyg;  /* each kind's graph (to compare a layer's with) and its exec, made for device launch */
+    cudaGraphExec_t *body;
+    cudaGraphExec_t *dbodyx;  /* the execs on the GPU, for k_tail_next */
+    gp_rec *dbody;       /* the records of the layer that runs: the bodies' kernels read theirs here */
+    int body_recs;       /* its room (records) */
+    int *dst;            /* the chain that runs: [0] its link that runs, [1] its last link */
+    int *herr, *herr_d;  /* (mapped host memory) a tail launch's error: (link + 1) << 16 | the cudaError */
 } gg_prog;
 
-/* The size of the scratch of the attention: 24 query heads of 512 values
- * (the parts of 4 queries of a global layer of the Gemma 4 26B, 16 heads
- * in 85 chunks: k_attn_fdtc T 4), or the same count of values in another
- * form. */
-#define GG_PART_FLOATS ((size_t)24 * ATTN_CHUNKS * (512 + 2))
+/* The size of the scratch of the attention: 32 query heads of 512 values
+ * in ATTN_CHUNKS (a global layer of the Gemma 4 31B: 32 heads of 512; with
+ * 24 attn_launch refused its steps), the parts of 4 queries of a global layer
+ * of the 26B (16 heads in 85 chunks: k_attn_fdtc T 4), or the same count of
+ * values in another form. */
+#define GG_PART_FLOATS ((size_t)32 * ATTN_CHUNKS * (512 + 2))
 
 /* ---------- the handoff to the CPU inside a graph ----------
  * A step can hand work to the CPU with no boundary record, so the step is
@@ -287,7 +311,6 @@ extern "C" int rc_gpu_task_log(int on, double *out, int max)
  * the program in the mailbox, and waits; the model thread runs it while it
  * waits for its own signals (gg_cpu_task) and, after its run, until lane B is
  * done (rc_gpu_lane_serve). One program at a time on the one team. */
-static cudaStream_t gg_lane_stream;
 static __thread int gg_lane_b;
 static const int64_t *volatile gg_lb_prog;
 static int gg_lb_state;         /* 0 empty, 1 a program to run, 2 done, -1 it failed */
@@ -320,10 +343,12 @@ extern "C" int rc_gpu_lane_stats(double *out)
 
 extern "C" int rc_gpu_lane(int on)
 {
-    if (on && gg_lane_stream == NULL) {
+    if (on && (gg_lane_stream == NULL || gg_lane_ep != gg_epoch)) {
         CK(cudaStreamCreateWithFlags(&gg_lane_stream, cudaStreamNonBlocking));
+        gg_lane_ep = gg_epoch;
     }
     gg_tstream = on ? gg_lane_stream : NULL;
+    gg_tstream_ep = gg_epoch;
     gg_lane_b = on != 0;
     return 0;
 }
@@ -409,6 +434,9 @@ static int gg_cpu_task(const gp_rec *r, const int64_t *henv)
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
     *fout = v;
+    if (gg_cpu_after != NULL) {
+        gg_cpu_after();
+    }
     if (!gg_lane_b) {           /* (the measures: the model thread's tasks) */
         double t2 = gg_clock();
         gg_ts_wait += t1 - t0;

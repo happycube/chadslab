@@ -83,3 +83,26 @@ class Engine:
     def crash_report(self, exc, where_dir=None):
         """Write a report of a fatal error; return its directory or None."""
         return None
+
+
+def reload_lanes(eng, make):
+    """A reload's start of the lanes and its warm-up (reload_device, docs/GPU_SWAP_PLAN.md 3.6):
+    make() runs with the contexts in host memory set aside (an empty store, as at the load: the
+    warm-up's prompts do not go on from the requests' contexts), then each lane gets its store
+    back; lane B's engine stays the same object, with the new state (a request the server routed
+    to it before the reload runs on it)."""
+    old = list(eng.lanes)
+    real = [e.ctxs for e in old]
+    c0 = real[0]
+    eng.ctxs = type(c0)(eng, c0.max_contexts, c0.max_bytes, c0.name)
+    eng.lanes = [eng]
+    make()
+    new = eng.lanes
+    for i in range(1, min(len(old), len(new))):
+        o, n = old[i], new[i]
+        if o is not n:
+            o.__dict__.clear()
+            o.__dict__.update(n.__dict__)
+            new[i] = o
+    for e, c in zip(new, real):
+        e.ctxs = c

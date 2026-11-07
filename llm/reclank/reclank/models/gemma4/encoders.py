@@ -18,7 +18,22 @@ from reclank.core import ops
 from reclank.formats.gguf import GGUF
 from reclank.encoders.runtime import (  # noqa: F401
     _ENC_PY, _EncCompiler, _Linear, _Plain, _Runner, _Weights, _shape,
-    _bf16_exact, _gelu_tanh, _rms, _silu, _softmax, quantize_q8)
+    _bf16_exact, _gelu_tanh, _rms, _silu, _softmax, quantize_q8, to_bf12_dev)
+
+
+# The forms of the encoders' weights (load_embedder's q8): "bf16" as the mmproj holds them, "q8"
+# (Q8_0 weights and int8 activations), "bf12" (the bfloat16 values in 12.25 bits, float32 products;
+# a matrix that BF12 would harm stays bfloat16: to_bf12_dev's rule). True and False are "q8" and
+# "bf16".
+FORMS = ("bf16", "q8", "bf12")
+
+
+def weight_form(q8):
+    """The form of q8 (load_embedder): one of FORMS."""
+    f = {True: "q8", False: "bf16", None: "bf16", "on": "q8", "off": "bf16"}.get(q8, q8)
+    if f not in FORMS:
+        raise ValueError("the encoders' weights: %r is not one of %s" % (q8, FORMS))
+    return f
 
 
 PATCH = 16
@@ -482,24 +497,32 @@ class Gemma4Embedder:
         self.vision.gpu = gpu
         if self.audio_enc is not None:
             self.audio_enc.gpu = gpu
-        # q8: the linears with Q8_0 weights (half the bytes of bfloat16) and
-        # int8 activations, in the programs of the CPU and of the GPU.
-        self.q8 = q8
-        if q8:
+        # the form of the linears' weights (weight_form): q8, Q8_0 weights (half the bytes of
+        # bfloat16) and int8 activations, in the programs of the CPU and of the GPU; bf12, the
+        # bfloat16 values in 12.25 bits (BF12 rows for the GPU, KQ_BF12X16 for the CPU) with
+        # float32 activations and products
+        self.form = weight_form(q8)
+        self.q8 = self.form == "q8"
+        if self.form != "bf16":
             V = self.vision
             lins = [V.patch_lin] + [b[k] for b in V.blk
                                     for k in ("q", "k", "v", "o", "gate", "up", "down")]
-            V.q8 = True
             if self.audio_enc is not None:
                 A = self.audio_enc
                 lins += [A.in_proj, A.out_proj]
                 for b in A.blk:
                     lins += [b[k] for k in ("q", "k", "v", "o", "rel", "pw1", "pw2")]
                     lins += [b["ff1"][1], b["ff1"][2], b["ff2"][1], b["ff2"][2]]
-                A.q8 = True
-            for lin in lins:
-                quantize_q8(lin)
-        self.hidden = self.vision.proj.w.shape[0]
+            if self.q8:
+                V.q8 = True
+                if self.audio_enc is not None:
+                    self.audio_enc.q8 = True
+                for lin in lins:
+                    quantize_q8(lin)
+            else:
+                # (the projection runs in NumPy after the program: it stays bfloat16)
+                self.bf12 = sum(bool(to_bf12_dev(lin, gpu)) for lin in lins)
+        self.hidden = _shape(self.vision.proj)[0]
         # The tokens of an image see each other in the larger models
         # (use_bidirectional_attention "vision"); the E2B (1536) and the E4B
         # (2560) are causal (their config, and mtmd_decode_use_non_causal of
@@ -535,11 +558,12 @@ def load_embedder(path, gpu=False, q8=False):
     """Return the embedder of an mmproj GGUF: UnifiedEmbedder for the 12B
     (gemma4uv), Gemma4Embedder for gemma4v (and gemma4a), QwenEmbedder for
     qwen3vl_merger (or a Qwen3.8 checkpoint directory). gpu runs the encoder
-    programs on the GPU."""
+    programs on the GPU; q8 the form of Gemma4Embedder's weights (weight_form:
+    bf16, q8 or bf12; True is q8), QwenEmbedder's Q8_0 or not."""
     if os.path.isdir(path) or GGUF(path, stage=False).meta.get("clip.projector_type") == "qwen3vl_merger":
         # Qwen3.6 (an mmproj GGUF) or Qwen3.8 (the checkpoint directory)
         from reclank.models.qwen.vision import QwenEmbedder
-        return QwenEmbedder(path, gpu=gpu, q8=q8)
+        return QwenEmbedder(path, gpu=gpu, q8=weight_form(q8) == "q8")
     g = GGUF(path)
     kind = g.meta.get("clip.vision.projector_type")
     if kind == "gemma4uv":

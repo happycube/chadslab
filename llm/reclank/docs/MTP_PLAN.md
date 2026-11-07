@@ -792,6 +792,43 @@ the release by 0.18 per cent, as those of our quantizer. With them, the
 drafts and the speed were the same (83/75/67%, 77.26/89.78/102.84 tok/s).
 The CPU drafter in float32 and in int4 also accepted 83% with 1 draft.
 
+### The 31B on a Quadro P6000 with the QAT file
+
+The target is Google's QAT file (google/gemma-4-31B-it-qat-q4_0-gguf,
+gemma-4-31B_q4_0-it.gguf, 17.65 GB), the drafter
+google/gemma-4-31B-it-qat-q4_0-unquantized-assistant (the safetensors
+directory as --drafter), a P6000 alone (24 GB, sm_61, no tensor cores), the
+weights from a keeper (--dense). The GPU holds 16.48 GB of weights and
+buffers and the head (1.16 GB), with 7.3 GB free.
+
+The first step failed: "a size is not a literal, or the form is not
+supported" at the first global layer's ATTN_QC. attn_launch refused any
+record of more than GG_PART_FLOATS for its parts in ATTN_CHUNKS, sized for
+24 query heads of 512; the 31B's global layers have 32 (the 26B 16). Its
+kernel (k_attn_fdt of 512, 8 query heads a key head) needs half of that.
+GG_PART_FLOATS is now 32 heads of 512 (16.8 MB a program with attention,
+was 12.6). The step's head was k_q6k_head's general form (rows of 21 blocks:
+5376 columns), 10.9 ms of an 88.6 ms step (1.16 GB at 106 GB/s);
+k_q6k_head_s (the same bits) takes rows of 21 blocks now: the head 10.9 ->
+3.9 ms (~300 GB/s), a step 88.6 -> 81.5 ms.
+
+Through the server (chat_turns.py: three chats of two turns, 256 tokens a
+turn, greedy; the server's MTP defaults, 3 drafts and RECLANK_MTP_STOP 0.9):
+
+    mode                  chat turns (tok/s)                    harmonic mean
+    plain, general head   11.6 11.4 11.6 11.5 11.6 11.4         11.52
+    drafter, general head 24.4 25.8 20.6 18.1 23.6 26.0         22.70
+    plain                 12.6 12.4 12.6 12.5 12.6 12.5         12.53
+    drafter               27.4 29.0 23.5 20.5 26.6 29.3         25.64
+
+Drafts accepted: code 81-84%, the story 53-63%, the hash map 68-84%. The
+drafter's answers are the plain ones, every turn, with either head (the staged
+head: the same answers, the same drafts taken). Prompts of the docs: 1227
+/ 4753 / 9942 tokens at 112 / 170 / 156 tok/s, decode after them 10.9 / 10.7
+/ 10.4 plain. A step (nsys, 88.6 ms): the gate and up rows k_kq_glu_i8 29.8
+ms (~260 GB/s), down and o k_kq_linear_i8 24.3 (~220), q, k, v
+k_kq_multi_i8 13.7 (~220), the head 10.9, the norms 3.2, the attention 3.8.
+
 ## What is left
 
 - The 26B verify batch. A group of four costs 1.9 decode steps, and 55 ms of

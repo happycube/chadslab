@@ -51,6 +51,7 @@ import numpy as np
 
 from reclank.encoders.runtime import F20Lins, _EncCompiler, _Plain, _Runner
 from reclank.formats.safetensors import Shards
+from reclank.runtime.kept import Kept
 from reclank.models.flux2.dit import timestep_sinusoid
 from reclank.runtime.threads import team_threads
 
@@ -124,6 +125,11 @@ class ZImageDiT:
     """The DiT of a transformer directory (config.json and its safetensors). prefix(emb) runs the
     caption's rows; velocity(latents, t) runs a step over them."""
 
+    def _fmt(self):
+        """the matrices' form in the keeper's entry: not given for F20 (the entries of before)"""
+        f = self.f20.fmt if self.f20 is not None else "f20"
+        return {} if f == "f20" else dict(fmt=f)
+
     def __init__(self, path, gpu=False, cpu_threads=None, f20=None, x2=None):
         cfg = json.load(open(os.path.join(path, "config.json")))
         assert list(cfg["all_patch_size"]) == [2] and list(cfg["all_f_patch_size"]) == [1] and cfg["qk_norm"]
@@ -144,7 +150,9 @@ class ZImageDiT:
         self.axes, self.theta = list(cfg["axes_dims"]), float(cfg["rope_theta"])
         self.t_scale = np.float32(cfg["t_scale"])
         assert sum(self.axes) == hd
-        f = lambda n: np.ascontiguousarray(W.get(n), dtype=np.float32)  # noqa: E731
+        # the arrays and linears from the weightkeeper when it holds them (runtime/kept.py), else made
+        self.kept = k = Kept("zimage-dit", path, dict(gpu=self.gpu, f20=f20, **self._fmt()), code=[__name__])
+        f = lambda n: k.array(n, lambda: np.ascontiguousarray(W.get(n), dtype=np.float32))  # noqa: E731
         self.f = f
         sq = np.float32(hd ** -0.5)
         e = "t_embedder.mlp."
@@ -175,15 +183,19 @@ class ZImageDiT:
         self.noise = [block("noise_refiner.%d." % i, True) for i in range(cfg["n_refiner_layers"])]
         self.layers = [block("layers.%d." % i, True) for i in range(cfg["n_layers"])]
         self.inter = self.layers[0]["w1"].shape[0]
-        if self.f20 is not None:
+        if self.f20 is not None and k.mode != "read":
             self.f20.report()
+        k.done()
         self.runner = _Runner(self._build, keep=4, keep_gpu=3)     # a caption's and a step's
         self.caps = {}          # Tp: the caption's rows (Tp, width), written by the prefix, read by the steps
         self.T = None           # the tokens of the last prefix
 
     def linear(self, name, bias=True):
         """A linear (out, in) of the checkpoint with its bias; in F20 when f20 (its float32 W and
-        the checkpoint's pages dropped then)."""
+        the checkpoint's pages dropped then); the weightkeeper's when it holds it (self.kept)."""
+        return self.kept.linear(name, lambda: self._linear(name, bias))
+
+    def _linear(self, name, bias):
         src = self.W.get(name + ".weight")
         lin = _Plain(np.ascontiguousarray(src, dtype=np.float32))
         lin.shape = lin.w.shape

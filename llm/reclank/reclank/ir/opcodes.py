@@ -27,6 +27,12 @@ MAGIC = 0x4750524F47303031          # "GPROG001"
 # or the index of a slot of the environment.
 T_NONE, T_INT, T_F32, T_SLOT = 0, 1, 2, 3
 
+# The flags of a record. F_LAYER marks the first record of a layer (the layer's index + 1 in the bits from
+# F_LAYER_SHIFT), F_LAYER_END the first record after the last layer. The CUDA runtime runs the layers whose
+# records launch the same kernels with the same arguments on one graph, chained by tail launches
+# (runtime/graphs.cu: the chains).
+F_LAYER, F_LAYER_END, F_LAYER_SHIFT = 1, 2, 8
+
 B, C, G = ("cpu", "gpu"), ("cpu",), ("gpu",)
 
 TABLE = [
@@ -288,7 +294,7 @@ TABLE = [
     ("ENC_RESIZE_TAPS", 303, B, "images of pixel rows resized by each axis's taps (indices and weights): the columns first, then the rows"),
     ("ENC_UNPACK_U8", 304, B, "bytes to float32 values, each divided by a number (an uploaded 8-bit image)"),
     # Frame interpolation (reclank/models/vfi: Practical-RIFE 4.25, docs/VFI_PLAN.md)
-    ("ENC_WARP", 320, B, "the backward warp of pixel rows by a flow: bilinear, the border clamped, as torch's grid_sample(align_corners=True)"),
+    ("ENC_WARP", 320, B, "the backward warp of pixel rows by a flow: bilinear, the border clamped or zeros past it, as torch's grid_sample(align_corners=True)"),
     ("ENC_PRELU", 321, B, "x above 0, else a x with a of each column (LeakyReLU, PReLU)"),
     ("ENC_MIX", 322, B, "a s + b (1 - s), s = sigmoid(m), of columns of one buffer of pixel rows (RIFE's merge)"),
     ("ENC_CONV_MM", 323, G, "float32 W times the rows of ENC_GATHER without the gathered rows (an implicit im2col), + b, + res, PReLU"),
@@ -301,6 +307,7 @@ TABLE = [
     # Nemotron Super on a small CPU: a step's cold experts split with the GPUs' links (models/nemotron/gpu.py TAKE)
     ("NM_TAKE", 330, G, "of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked"),
     ("NM_PULL", 331, G, "NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL"),
+    ("NM_STAGED", 380, G, "of a step's cold pairs, those of the experts the GPU copied ahead (their copies ended): out of the CPU's, its slots and tables marked"),
     # Real-ESRGAN's convs (models/realesrgan)
     ("ENC_CONV3", 332, G, "a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU"),
     # DiffusionGemma (models/dgemma/gpu.py)
@@ -309,13 +316,20 @@ TABLE = [
     ("DG_MOE", 336, G, "the routed experts of a layer on the GPU: BF12 rows, float32 products; the pairs sorted by expert, act = gelu(gate) up, de, the sum of each token over its slots"),
     ("DG_SPLIT", 337, G, "the CPU's ids of a layer's pairs: the expert, or -1 for an expert the GPU holds (its slot in map)"),
     ("DG_SAMPLE", 335, G, "per row of logits: the temperature, the end-token ban, the entropy, the argmax, an inverse-CDF sample; the processed logits kept, their softmax out"),
+    # SeedVR2's video VAE: the causal convs' caches in 16 bits (the tensor cores' x: the same bits)
+    ("ENC_BF16_PACK", 338, G, "float32 values to bfloat16, or float16 (saturated), as uint16: k_enc_conv_tc's rounding of x"),
+    ("ENC_I16_PACK", 339, G, "float32 rows to I16 rows: groups of 64 as int16 (two int8) with a scale each, k_enc_conv_i16's quantization of x"),
+    # FlashVSR's DiT (models/flashvsr): Block-Sparse-Attention's attention (340-369 are other models')
+    ("ENC_ATTN_BLOCKS", 370, B, "block-sparse attention: each block of 128 queries of a head over its list of blocks of 128 keys, float32 (K, V float32 or float16 on the GPU), scale 1"),
+    ("ENC_BLOCK_MASK", 371, B, "FlashVSR's draft block mask: the mean blocks' scores in a local window, their softmax, each head's slice's top-k, as ENC_ATTN_BLOCKS's lists"),
 ]
 
 OPS = {name: code for name, code, _, _ in TABLE}
 OP_NAMES = {code: name for name, code in OPS.items()}
 RUNNERS = {name: runners for name, _, runners, _ in TABLE}
 globals().update(OPS)
-__all__ = ["NARG", "MAGIC", "T_NONE", "T_INT", "T_F32", "T_SLOT", "OP_NAMES"] + list(OPS)
+__all__ = ["NARG", "MAGIC", "T_NONE", "T_INT", "T_F32", "T_SLOT", "F_LAYER", "F_LAYER_END", "F_LAYER_SHIFT",
+           "OP_NAMES"] + list(OPS)
 
 HEADER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backends",
                       "include", "opcodes.h")
@@ -355,6 +369,9 @@ typedef struct {
 
 enum { GP_T_NONE = %d, GP_T_INT = %d, GP_T_F32 = %d, GP_T_SLOT = %d };
 
+/* the flags of a record: the first of a layer (its index + 1 from GP_F_LAYER_SHIFT), the first after the layers */
+enum { GP_F_LAYER = %d, GP_F_LAYER_END = %d, GP_F_LAYER_SHIFT = %d };
+
 enum {
 %s
 };
@@ -371,7 +388,8 @@ static inline int gp_op_known(int op)
 }
 
 #endif
-""" % (NARG, MAGIC, T_NONE, T_INT, T_F32, T_SLOT, "\n".join(rows), "\n".join(cases))
+""" % (NARG, MAGIC, T_NONE, T_INT, T_F32, T_SLOT, F_LAYER, F_LAYER_END, F_LAYER_SHIFT, "\n".join(rows),
+       "\n".join(cases))
 
 
 def main(argv):

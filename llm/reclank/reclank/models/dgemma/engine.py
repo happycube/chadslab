@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 
-from reclank.core.messages import content_text, has_media
+from reclank.core.messages import content_text, has_media, message_parts
 from reclank.models.base import Engine
 from reclank.models.dgemma import sampler as S
 from reclank.models.gemma4.engine import request_thinking, tool_done
@@ -38,10 +38,11 @@ def detect(meta):
 
 
 class DGPrompt(list):
-    """The prompt's ids, the response template (or None), and the request's fields (options: the
-    server sets it; "diffusion_drafts")."""
+    """The prompt's ids, the response template (or None), the soft rows of images (spans), and the
+    request's fields (options: the server sets it; "diffusion_drafts")."""
     template = None
     options = None
+    spans = ()          # the soft rows of images (encoders/media.Span)
 
 
 class DGemmaEngine(Engine):
@@ -53,6 +54,18 @@ class DGemmaEngine(Engine):
         self.s = settings
         self.max_context = max_context
         self.last_text = None
+        # images (--mmproj): the embedder of the soft rows, the image budget, and a cache by key
+        self.embedder = None
+        self.image_budget = 280
+        self._media_rows = {}
+        self.last_media = []
+
+    def release_device(self):
+        """The GPU sharing (server/gpushare.py): the device half goes (the cache kept on the host)."""
+        self.model.release_device()
+
+    def reload_device(self):
+        self.model.reload_device()
 
     def think_level(self, req, default):
         v = request_thinking(req)
@@ -60,21 +73,57 @@ class DGemmaEngine(Engine):
 
     def prompt_ids(self, messages, level, tools=None, preserve=None, source=None):
         from reclank.models.gemma4.chat import render_chat
-        msgs, template = [], None
+        msgs, template, parts = [], None, []
         for m in messages:
-            if has_media(m.get("content")):
-                raise ValueError("this server takes no image input (DiffusionGemma's vision is not in reclank)")
             msg = dict(m)
             msg["role"] = m.get("role", "user")
-            msg["content"] = content_text(m.get("content"))
+            c = m.get("content")
+            msg["content"] = message_parts(c) if has_media(c) else content_text(c)
             msgs.append(msg)
         if msgs and msgs[-1]["role"] == "assistant" and not msgs[-1].get("tool_calls"):
-            template = msgs.pop()["content"] or None
+            if has_media(msgs[-1].get("content")):
+                raise ValueError("the response template cannot hold an image")
+            template = content_text(msgs.pop()["content"]) or None
         text = render_chat(msgs, tools=tools, add_generation_prompt=True, enable_thinking=bool(level),
-                           preserve_thinking=bool(preserve), empty_thought_block=False)
+                           preserve_thinking=bool(preserve), empty_thought_block=False, media=parts)
+        if parts:
+            return self.media_prompt(text, parts, source, template)
         self.last_text = text if template is None else text + "[the response template] " + template
         out = DGPrompt(self.tokenizer.encode(text))
         out.template = template
+        return out
+
+    def media_prompt(self, text, parts, source, template):
+        """Return the DGPrompt of a prompt with image parts: the soft rows of
+        each image in the place of its tokens (encoders/media.expand)."""
+        from reclank.encoders import media as MD
+        if self.embedder is None:
+            raise ValueError("this server takes no image input (start it with --mmproj)")
+        if source is None:
+            raise ValueError("the request has no media source")
+        items = []
+        for part in parts:
+            kind = part.get("type")
+            if kind not in ("image", "image_url"):
+                raise ValueError("DiffusionGemma takes images only (no audio or video)")
+            data, budget = source.image(part, self.image_budget)
+            key = MD.media_key(data) + ":%d" % budget
+            rows = self._media_rows.get(key)
+            if rows is None:
+                rows, _ = self.embedder.image(data, budget)
+                self._media_rows[key] = rows
+                while len(self._media_rows) > 8:
+                    self._media_rows.pop(next(iter(self._media_rows)))
+            items.append(MD.Media("image", rows, key, bidir=getattr(self.embedder, "bidir", True)))
+        ids, spans = MD.expand(self.tokenizer.encode(text), items)
+        out = DGPrompt(ids)
+        out.template = template
+        out.spans = spans
+        self.last_media = [(sp.kind, sp.rows.shape[0], sp.key) for sp in spans]
+        self.last_text = text if template is None else text + "[the response template] " + template
+        print("[reclank] media: %s" % ", ".join(
+            "%s %d tokens" % (sp.kind, sp.rows.shape[0]) for sp in spans),
+            file=sys.stderr, flush=True)
         return out
 
     def stop_ids(self):
@@ -134,16 +183,24 @@ class DGemmaEngine(Engine):
                 if v < 0:
                     break
                 head.append(int(v))
+        spans = tuple(getattr(prompt_ids, "spans", ()) or ())
         target = [int(v) for v in prompt_ids] + head
-        held = m.reuse(target)
+        if spans:
+            # The ids do not tell one image from another: no cache reuse.
+            m.reset()
+            held = 0
+        else:
+            held = m.reuse(target)
         self.last_cached = held
-        state = {"skip": held}
+        state = {"skip": held, "spans": list(spans) if spans else None}
 
         def encode(ids):
             ids = ids[state["skip"]:]
             state["skip"] = 0
             if len(ids):
-                m.encode(ids)
+                sp = state["spans"]
+                state["spans"] = None
+                m.encode(ids, spans=sp)
 
         st = S.Stats()
         t0 = time.time()
@@ -173,7 +230,11 @@ def load(opts, meta=None, worker=None):
     from reclank.models.gemma4.tokenizer import Tokenizer
     d = os.path.dirname(os.path.abspath(opts.model))
     ctx = int(opts.ctx or 32768)
-    m = DGemmaGPU(opts.model, max_len=ctx)
+    # an image's encoder block (DGemmaGPU.P): the image budget's rows rounded up to 256, at least 768
+    prompt_rows = None
+    if getattr(opts, "mmproj", None):
+        prompt_rows = max(768, -(-int(getattr(opts, "image_budget", None) or 280) // 256) * 256)
+    m = DGemmaGPU(opts.model, max_len=ctx, prompt_rows=prompt_rows)
     tok = Tokenizer(opts.tokenizer or os.path.join(d, "tokenizer.json"))
     s = S.Settings.from_config(json.load(open(os.path.join(d, "generation_config.json"))),
                                json.load(open(os.path.join(d, "config.json"))))
@@ -190,4 +251,26 @@ def load(opts, meta=None, worker=None):
     # (the request's sampling fields do not apply: the checkpoint's sampler does)
     defaults = {"max_tokens": 4096, "temperature": 1.0, "top_k": None, "top_p": None,
                 "model_id": "diffusiongemma-26b-a4b", "thinking": thinking in ("on", "low", "medium", "high", "xhigh")}
+    if getattr(opts, "mmproj", None):
+        from reclank.models.gemma4.encoders import load_embedder
+        # The encoder on the CPU by default: the 26B's image tower holds about
+        # 2 GB of the GPU, and the experts already fill a 24 GB card.
+        env = os.environ.get("RECLANK_MEDIA_GPU")
+        media_gpu = env == "1" or (env is None and getattr(opts, "mmproj_gpu", None)
+                                    in ("on", "keep", "reserve", "lend"))
+        eng.embedder = load_embedder(opts.mmproj, gpu=media_gpu,
+                                     q8=getattr(opts, "mmproj_q8", None) == "on")
+        hidden = int(getattr(eng.embedder, "hidden", m.H))
+        if hidden != m.H:
+            raise SystemExit("%s writes %d rows; DiffusionGemma takes %d" % (opts.mmproj, hidden, m.H))
+        # The tower is the Gemma 4 26B's, the projection into the text model DiffusionGemma's own
+        # (scripts/dgemma_mmproj.py writes its mmproj); the Gemma 4 mmproj's gives other soft rows.
+        from reclank.formats.gguf import GGUF
+        if "DiffusionGemma" not in str(GGUF(opts.mmproj, stage=False).meta.get("general.name", "")):
+            print("warning: %s is not DiffusionGemma's mmproj (its projection differs; scripts/dgemma_mmproj.py "
+                  "writes it from the checkpoint)" % opts.mmproj, file=sys.stderr, flush=True)
+        eng.image_budget = int(getattr(opts, "image_budget", None) or 280)
+        defaults["image_budget"] = eng.image_budget
+        print("media input: %s (images), image budget %d, encoder on the %s" % (
+            opts.mmproj, eng.image_budget, "GPU" if media_gpu else "CPU"), flush=True)
     return eng, defaults

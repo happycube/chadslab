@@ -41,12 +41,23 @@ class E4BGroupCompiler(PoolCompiler):
         out = self.buffer((t, qh * hd))
         s = lambda name: self.p.slot("%s.%d" % (name, plan.source))  # noqa: E731
         slide = 1 if os.environ.get("RECLANK_SLIDE", "1") == "1" else 0
+        if ATTN_STEPS:
+            # one record: the GPU runs each query as a step, all in one launch (operand 13)
+            self.p.emit(P.ATTN_F32H, q, s("k"), s("v"), self.p.slot("scores"), out, qh,
+                        plan.num_kv_heads, hd, t, self.p.slot("pos"), s("hs"), plan.window, slide, 1)
+            return out
         for j in range(t):
             pos_j = self.scalar("+", [self.p.slot("pos"), j])
             self.p.emit(P.ATTN_F32H, q[j:j + 1], s("k"), s("v"), self.p.slot("scores"),
                         out[j:j + 1], qh, plan.num_kv_heads, hd, 1, pos_j, s("hs"),
                         plan.window, slide)
         return out
+
+
+# 1: the attention of an E4B verify group is one ATTN_F32H record with operand 13 (attn_steps_launch:
+# each query with the kernels and the bits of a step, in one launch; Bolt E4B's group of 8 on the
+# 3090: its attention 11.8 -> 9.2 ms, the group 33.7 -> 31.6); 0: a record for each query.
+ATTN_STEPS = os.environ.get("RECLANK_GPU_ATTN_STEPS", "1") != "0"
 
 
 def _fuse_kq(prog):
@@ -129,6 +140,7 @@ def compile_e4b_group(model, t, arena=None):
     c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
+    forms.tap_env(c, model, t)
     c.p.slot("pos")
     c.compile(forms.e4b_step_form(model, fused=2 if small else True))
     c.p.tokens = t
@@ -141,9 +153,11 @@ class E4BGPU(ProgramLRU):
     """The decode step, the groups of tokens, and the prompt pass of the
     E4B model on the GPU. See the module text."""
 
-    def __init__(self, model, graph=True):
+    def __init__(self, model, graph=True, free0=None):
         self.model = model
-        self.chunk = chunk_for(mem_info()[0])
+        # free0: the free memory the plan is made for (a reload: the load's)
+        self.free0 = mem_info()[0] if free0 is None else free0
+        self.chunk = chunk_for(self.free0)
         progs = model.__dict__.setdefault("_programs", {})
         # The GPU step has the fused operations; the CPU step (key 1) has not.
         prog = progs.get("gpu1")
@@ -156,6 +170,13 @@ class E4BGPU(ProgramLRU):
         self.arenas = alloc.Arenas(MT_CPU)
         self.arenas.keep(1, prog)
         self.g = GPUProgram(prog, graph=graph)
+        if getattr(model, "_plain", False) and not _CHUNK_ENV:
+            # A checkpoint folder's bfloat16 matrices take 9.4 GB of the card (a GGUF file's
+            # about 4); a group of a prompt takes about GROUP_ROW_BYTES a row more: the chunk
+            # halves until its group fits in what the weights leave (2048 -> 1024 on 24 GB).
+            room = mem_info()[0] - GROUP_RESERVE
+            while self.chunk > 256 and self.chunk * GROUP_ROW_BYTES > room:
+                self.chunk //= 2
         self.graph = graph
         self.cache = GPUCache()
         self.head = None
@@ -195,7 +216,17 @@ class E4BGPU(ProgramLRU):
         self.rows = 1
         self._head_ahead(1)
         self.g.download("xn")
+        self._taps(self.g, names, 1, pos)
         return names["xn"].copy()
+
+    def _taps(self, g, names, t, pos):
+        """The DFlash drafter's taps of a run (forms.tap_forms) to model.tap_sink."""
+        sink = getattr(self.model, "tap_sink", None)
+        if sink is None:
+            return
+        for k in range(len(self.model.taps)):
+            g.download("tap%d" % k)
+        sink(forms.tap_rows(names, self.model, t), pos)
 
     def _group(self, t):
         e = self.groups.get(t)
@@ -251,6 +282,7 @@ class E4BGPU(ProgramLRU):
         if size == t and t <= HEAD_AHEAD:
             self._head_ahead(t)       # an MTP verify group reads every row
         g.download("xn")
+        self._taps(g, names, t, pos)
         return names["xn"][:t].copy()
 
     def _ensure(self, cache):
@@ -365,26 +397,32 @@ class E4BGPU(ProgramLRU):
         files of the E2B and the E4B keep it in Q5_K) on the last rows rows:
         a program of one GP_KQ_LINEAR, the soft cap (GP_SOFTCAP), and the
         best token of each row (GP_ARGMAX, the first index of the largest
-        value, as np.argmax). Return the Program and the GPUProgram; the
-        logits are "out" and the tokens "tok"."""
+        value, as np.argmax). A checkpoint folder's table (bfloat16, as
+        stored) takes GP_BF16_LINEAR instead. Return the Program and the
+        GPUProgram; the logits are "out" and the tokens "tok"."""
         model, cfg = self.model, self.model.cfg
         progs = self.__dict__.setdefault("kq_heads", {})
         e = progs.get(rows)
         if e is None:
             k = model.kq(model.head)
-            if k is None:
-                raise RuntimeError("the GPU head needs a Q6_K or a K quant head")
+            w16 = None if k is not None else model.W16(model.head)
+            if k is None and w16 is None:
+                raise RuntimeError("the GPU head needs a Q6_K, a K quant or a bfloat16 head")
+            vocab = k.rows if k is not None else w16.shape[0]
             hp = P.Program()
             hx = np.zeros((rows, cfg.hidden_size), np.float32)
-            out = np.zeros((rows, k.rows), np.float32)
+            out = np.zeros((rows, vocab), np.float32)
             tok = np.zeros(rows, np.int32)
             hp.names.update(x=hx, out=out, tok=tok)
-            hp.emit(P.KQ_LINEAR, None, None, None, hx, k.data, k.type, k.rows, k.cols, rows, out)
+            if k is not None:
+                hp.emit(P.KQ_LINEAR, None, None, None, hx, k.data, k.type, k.rows, k.cols, rows, out)
+            else:
+                hp.emit(P.BF16_LINEAR, hx, w16, out, vocab, cfg.hidden_size, rows)
             cap = cfg.final_logit_softcapping
             if cap:
                 hp.emit(P.SOFTCAP, out, out.size, float(cap))
             for j in range(rows):
-                hp.emit(P.ARGMAX, out[j], k.rows, tok[j:j + 1])
+                hp.emit(P.ARGMAX, out[j], vocab, tok[j:j + 1])
             hp = hp.finish()
             e = progs[rows] = (hp, GPUProgram(hp, graph=self.graph, mirror=self.g.mirror))
         hp, hg = e
@@ -1142,6 +1180,10 @@ _CHUNK_ENV = os.environ.get("RECLANK_GPU_CHUNK")
 CHUNK = int(_CHUNK_ENV or "2048")
 SMALL_GPU = 7e9
 SMALL_CHUNK = 1024
+# the device bytes of a row of an E4B prompt group (measured: 1024 rows of Nemotron 3.5 Bolt E4B's
+# took 9.3 GB) and what is left free beside a group (E4BGPU's chunk of a checkpoint folder)
+GROUP_ROW_BYTES = 9.2e6
+GROUP_RESERVE = 1e9
 
 
 def chunk_for(free):
@@ -1446,6 +1488,8 @@ def ko_table(cfg):
         tabs.append(b)
     _check(lib().rc_gpu_ko_table(tabs[0].ptr, tabs[1].ptr, rd, half, nhi))
     _KO.update(key=key, bufs=tabs)
+    from reclank.backends.cuda.gpumm import on_context_release
+    on_context_release(_KO.clear)
 
 
 class GPUKV(DeviceCache):
@@ -1757,7 +1801,7 @@ class ModelGPU(WarmPool, ProgramLRU):
     warm_regrow = True
     hot_run = True          # HotCache: the uses of the conversation decide the copies
 
-    def __init__(self, model, graph=True, hot=None, kv=None, resident=False):
+    def __init__(self, model, graph=True, hot=None, kv=None, resident=False, free0=None):
         """hot is a dict layer -> experts (see pick_hot), or None. resident
         puts every expert on the GPU (the resident mode, REFACTOR_PLAN.md
         section 4.6): no CPU part, no HotCache, no copies of experts;
@@ -1770,11 +1814,13 @@ class ModelGPU(WarmPool, ProgramLRU):
         gives the budget in GB. The default budget is the free memory of the
         GPU less 6 GB: the step, its head, and a cache of 4096 tokens take
         about 2.7 GB, a prompt pass takes about 1.3 GB more, and the display
-        needs some memory too.
+        needs some memory too. free0: the free memory the plan is made for
+        (None: now; a reload of the device half: the load's).
         """
         self.model = model
         self.resident = bool(resident and model.cfg.enable_moe_block)
-        free0 = mem_info()[0]       # (the memory before the weights)
+        free0 = mem_info()[0] if free0 is None else free0      # (the memory before the weights)
+        self.free0 = free0
         self.chunk = chunk_for(free0)
         gb = os.environ.get("RECLANK_GPU_HOT_GB")
         budget = float(gb) * 1e9 if gb else max(0.0, free0 - 6.0e9)
@@ -2550,7 +2596,7 @@ class ModelGPU(WarmPool, ProgramLRU):
         return vocab
 
 
-def offload(model, experts_gb=0.0, resident=False):
+def offload(model, experts_gb=0.0, resident=False, free0=None):
     """Put the weights of a Model outside the experts, and its output head, on
     the GPU. The decode steps of one token then run there (RECLANK_GPU=1).
 
@@ -2563,14 +2609,15 @@ def offload(model, experts_gb=0.0, resident=False):
     has no effect, because the E4B has no experts. Return the E4BGPU.
 
     resident puts every expert on the GPU (ModelGPU); experts_gb then has no
-    effect. A dense model is resident anyway.
+    effect. A dense model is resident anyway. free0: the free memory of the
+    plan (a reload of the device half: the load's, g.free0).
     """
     from reclank.models.gemma4 import model as model_mod
     os.environ["RECLANK_GPU"] = "1"
     if hasattr(model, "mode"):
         from reclank.models.gemma4 import e4b as e4b_mod
         e4b_mod._GPU = True
-        g = E4BGPU(model)
+        g = E4BGPU(model, free0=free0)
         g.logits()      # copies the head to the GPU
         model._gpu, model._gpu_cache, model._gpu_xn = g, None, None
         return g
@@ -2581,7 +2628,7 @@ def offload(model, experts_gb=0.0, resident=False):
     elif experts_gb > 0 and model.cfg.enable_moe_block and not resident:
         counts = hot_counts(model)
         hot = pick_hot(model, counts, experts_gb * 1e9) if counts is not None else {}
-    g = ModelGPU(model, hot=hot, resident=resident)
+    g = ModelGPU(model, hot=hot, resident=resident, free0=free0)
     g.logits()          # copies the head to the GPU
     model._gpu = g
     model._gpu_cache = None
@@ -2613,7 +2660,8 @@ def room(g):
     used, _ = mem().usage()
     free = mem_info()[0] - mem().c_reserve + used.get("pool", 0)
     model = getattr(g, "model", None)
-    if getattr(g, "head", True) is None and model is not None:
+    if getattr(g, "head", True) is None and model is not None and hasattr(model, "_embed_q6k"):
+        # (an E4B's head program of _kq_head is on the GPU from the offload on)
         w = model._embed_q6k_bytes if model._embed_q6k is not None else model._embed_q
         free -= getattr(w, "nbytes", 0) or 0
     return max(0, free)
@@ -2760,6 +2808,12 @@ class GPUDrafter:
                                     rot=(False, False) if self.e4b else _model_mod.kv_rot(),
                                     prob=self.stop > 0)
         self.g = None
+
+    def release(self):
+        """The device half forgotten (a release of the GPU: GemmaEngine.release_device): the
+        program and the chain's device array made again at the next draft."""
+        self.g = None
+        self.chain_out = None
 
     def draft(self, target, token, h, pos, cache, n, eos_ids=()):
         target._gpu_attach(cache)

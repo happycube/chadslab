@@ -371,7 +371,29 @@ __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j
  * of a key head come in hg groups of at most ATTN_REP (12 heads of Qwen3.8:
  * 2 groups of 6); block x takes group x % hg of key head x / hg. qb is the
  * first query head of the block. */
-__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int hg)
+/* A verify group of GP_ATTN_F32H as decode steps (operand 13: 1; attn_steps_launch): block z of
+ * the launch takes query z0 + z of the group, at position pos + z0 + z, with the arithmetic of
+ * a step on it (one query, its own window), its scores after those of the queries before it
+ * (qh (pos + t) each) and its parts at z in part. One launch for the queries in place of one
+ * for each. */
+__device__ __forceinline__ void attn_as_step(attn_d &a, const gp_rec *r, const int64_t *e, int q)
+{
+    int64_t p0 = a.p, t = DI(8);
+    a.q += (size_t)q * a.qh * a.hd;
+    a.out += (size_t)q * a.qh * a.hd;
+    a.sc += (size_t)q * a.qh * (size_t)(p0 + t);
+    a.p = p0 + q;
+    int64_t lo = (DI(12) && a.window > 0) ? a.p - a.window + 1 : 0;
+    if (lo < 0) {
+        lo = 0;
+    }
+    a.kp0 = lo;
+    a.n = (int)(a.p + 1 - lo);
+    a.k = DP(const float, 1) + (size_t)lo * a.rstride;
+    a.v = DP(const float, 2) + (size_t)lo * a.rstride;
+}
+
+__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int hg, int z0 = -1)
 {
     PDL_START();
     __shared__ float qs[ATTN_REP * 512];
@@ -379,6 +401,10 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int 
     __shared__ float red[ATTN_REP * 512];
     __shared__ float cbs[64];
     attn_d a = attn_get(r, e);
+    if (z0 >= 0) {
+        attn_as_step(a, r, e, z0 + (int)blockIdx.z);
+        part += (size_t)blockIdx.z * a.qh * ATTN_CHUNKS * (a.hd + 2);
+    }
     if (a.tq) {
         if (threadIdx.x < 64) {
             cbs[threadIdx.x] = tq6_cb_d[threadIdx.x];
@@ -575,11 +601,15 @@ __device__ __forceinline__ int ft_len(int nl, int nb);
  * the chunks of attn_len; else the nb chunks of k_attn_fdtc (ft_len) of the
  * gridDim.x / qh queries of the record, head h of query h / qh (its n +
  * h / qh keys, its chunks), chunk stride nb. */
-__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part, int nb)
+__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part, int nb, int z0 = -1)
 {
     PDL_START();
     __shared__ float w[ATTN_CHUNKS];
     attn_d a = attn_get(r, e);
+    if (z0 >= 0) {
+        attn_as_step(a, r, e, z0 + (int)blockIdx.z);
+        part += (size_t)blockIdx.z * a.qh * ATTN_CHUNKS * (a.hd + 2);
+    }
     int h = blockIdx.x, hd = a.hd;
     int n = a.n, stride = ATTN_CHUNKS, len;
     if (nb > 0) {

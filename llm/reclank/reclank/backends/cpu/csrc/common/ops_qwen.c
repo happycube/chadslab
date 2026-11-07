@@ -357,9 +357,52 @@ typedef struct {
     /* GP_NM_REMOTE_POST: of each token's cold experts the device does not hold, this many more go to it too
      * (Super's extras: it copies their rows from the host's stacks; a group: this times its tokens) */
     int64_t more;
+    /* GP_NM_REMOTE_POST's group form (operands 9-11: a prompt group's share of the experts, every pair of its
+     * cold list, models/nemotron/gpu.py XSPLIT): the device's group job (rc_gpu_ex_nm_gpost), or null */
+    int (*post_g)(int layer, int t, int k, const int32_t *idx, const float *w, const float *x, int mc, int win,
+                  int x16);
+    /* Super's steps: the next MoE layer's predicted cold experts copied ahead to the device (rc_gpu_ex_nm_prefetch,
+     * GP_NM_REMOTE_POST's operands 12-17), and stg (layers x experts, or null): those in its decode stage now, whose
+     * pairs go to it as its own experts' do */
+    int (*prefetch)(int layer, int n, const int32_t *ids);
+    const uint8_t *stg;
+    /* (before a layer's pairs split: those of its experts copied ahead whose copies have not ended unmarked in stg) */
+    int (*settle)(int layer);
+    /* the primary's share of the predicted experts (operand 19 of them, after the device's), copied ahead across its
+     * own link at the join (rc_gpu_pf3_issue: the CPU's pairs done, the host's DRAM free), or null */
+    int (*pf3)(int layer, int n, const int32_t *ids);
 } er_ctx;
 #define ER_MAXK 16
 #define ER_MAXP 256
+
+/* the next MoE layer's experts to copy ahead, picked at a step's post and handed to the device there, beside the CPU's
+ * pairs; RECLANK_NM_PREDICT_AT=1: at its join, after them (the host's DRAM then free, but the time to the next layer
+ * too short for their copies: Super on the W-2133, 3 experts 14.7 tok/s at the post, 13.9 at the join) */
+static struct {
+    int layer, n;
+    int32_t ids[32];
+    int (*fn)(int layer, int n, const int32_t *ids);
+} er_pend = {-1, 0, {0}, NULL}, er_pend3 = {-1, 0, {0}, NULL};
+
+/* the primary's copies ahead of the next MoE layer (er_pend3), after the task's flag out (the GPU's runner,
+ * rc_gpu_set_cpu_after): their calls off the GPU's wait for the task */
+void rc_er_after(void)
+{
+    if (er_pend3.n > 0 && er_pend3.fn != NULL) {
+        er_pend3.fn(er_pend3.layer, er_pend3.n, er_pend3.ids);
+    }
+    er_pend3.n = 0;
+}
+
+static int er_pred_at_join(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("RECLANK_NM_PREDICT_AT");
+        v = s != NULL && s[0] == '1';
+    }
+    return v;
+}
 
 /* REMOTE_POST: h, val, idx, count (an int32 in memory), ctx, layer, hidden
  * (unused), lidx, lval, lcount, posted. The pairs of the experts the device
@@ -417,7 +460,7 @@ static void gp_remote_post(const gp_rec *r, const int64_t *e)
 }
 
 /* NM_REMOTE_POST: x (the latent rows), cold (the expert of each pair, or -1:
- * GP_NM_SPLIT), val, pairs, ctx, layer, lcold, posted, k. The cold pairs of
+ * GP_NM_SPLIT), val, pairs, ctx, layer, lcold, posted, k (then mc, win, x16: the group form, er_ctx post_g). The cold pairs of
  * the experts the device holds go to it (posted gets 1), lcold is cold
  * without them, for GP_NM_MOE: one token (pairs = k) by post, a group by
  * post_t. */
@@ -440,10 +483,40 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
             dbg = v != NULL && atoi(v) != 0;
         }
         const uint8_t *held = ctx->held + (size_t)layer * ctx->experts;
+        const uint8_t *stg = ctx->stg != NULL ? ctx->stg + (size_t)layer * ctx->experts : NULL;
+        if (stg != NULL && ctx->settle != NULL && ctx->alive) {
+            ctx->settle(layer);
+        }
         *posted = 0;
         int ncold = 0;
         for (int p = 0; p < np; ++p) {
             ncold += cold[p] >= 0;
+        }
+        if (r->tag[9] != GP_T_NONE && GP_I(9) > 0) {
+            /* the group form (mc > 0; a step's 0 before its prediction's operands): every pair of cold the device's
+             * (its share of the layer's experts); refused, the CPU's */
+            for (int p = 0; p < np; ++p) {
+                lcold[p] = cold[p];
+            }
+            if (ncold > 0 && ctx->alive && ctx->post_g != NULL &&
+                ctx->post_g(layer, np / k, k, cold, val, x, GP_I(9), GP_I(10), GP_I(11)) == 0) {
+                for (int p = 0; p < np; ++p) {
+                    lcold[p] = -1;
+                }
+                *posted = 1;
+            } else if (ncold > 0) {
+                static int said = 0;
+                if (!said) {
+                    fprintf(stderr, "[reclank] NM_REMOTE_POST layer %d: the expert device refused a prompt group of %d rows"
+                                    " (its pairs to the CPU)\n", layer, np / k);
+                    said = 1;
+                }
+            }
+            if (dbg) {
+                fprintf(stderr, "[cpu] group post layer %d: %d rows, %d pairs, posted %d\n", layer, np / k, ncold,
+                        (int)*posted);
+            }
+            goto done;
         }
         if (np > k && (ncold <= ctx->cpu_max || np > ER_MAXP || ctx->post_t == NULL)) {
             /* (a group of a few cold pairs in all, or larger than a job of the device: all its pairs
@@ -461,7 +534,8 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
                 int c = cold[p];
                 lcold[p] = c;
                 gidx[p] = -1;
-                if (c >= 0 && c < ctx->experts && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP && held[c]) {
+                if (c >= 0 && c < ctx->experts && ctx->alive && ctx->post_t != NULL && np <= ER_MAXP &&
+                    (held[c] || (stg != NULL && stg[c]))) {
                     gidx[p] = c;
                     lcold[p] = -1;
                     ++n;
@@ -509,7 +583,7 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
         for (int p = 0; p < np; ++p) {
             int c = cold[p];
             lcold[p] = c;
-            if (c >= 0 && c < ctx->experts && ctx->alive && held[c] && n < ER_MAXK) {
+            if (c >= 0 && c < ctx->experts && ctx->alive && (held[c] || (stg != NULL && stg[c])) && n < ER_MAXK) {
                 ids[n] = c;
                 w[n] = val[p];
                 at[n] = p;
@@ -540,6 +614,59 @@ static void gp_nm_remote_post(const gp_rec *r, const int64_t *e)
             }
         }
     done:;
+        if (r->tag[12] != GP_T_NONE && GP_P(const void, 12) != NULL && ctx->prefetch != NULL && ctx->alive) {
+            /* the next MoE layer's: its router's logits on this layer's residual (operand 12, the primary's: a row of
+             * operand 18's experts for each of the run's np / k tokens), its layer (13); of its experts neither GPU
+             * holds (the device's held, the primary's slots: 17), by the router's choice (sigmoid + the bias, 16; a
+             * group's: the largest of its rows'), after the first skip (14: those the primary takes) the next want
+             * (15) copied ahead to the device */
+            const float *plog = GP_P(const float, 12), *bias = GP_P(const float, 16);
+            const int nl = GP_I(13), skip = GP_I(14), want = GP_I(15), rows = np / k;
+            const int want3 = r->tag[19] != GP_T_NONE && ctx->pf3 != NULL ? GP_I(19) : 0;
+            const int es = r->tag[18] != GP_T_NONE ? GP_I(18) : (int)ctx->experts;
+            const int32_t *hot = GP_P(const int32_t, 17);
+            const uint8_t *nh = ctx->held + (size_t)nl * ctx->experts;
+            enum { PK = 32 };
+            int pid[PK];
+            float pv[PK];
+            int m = 0;
+            const int K = skip + want + want3 < PK ? skip + want + want3 : PK;
+            for (int e = 0; e < ctx->experts && K > 0; ++e) {
+                if (nh[e] || hot[e] >= 0) {
+                    continue;
+                }
+                float v = -1e30f;
+                for (int j = 0; j < rows; ++j) {
+                    const float c = 1.0f / (1.0f + expf(-plog[(size_t)j * es + e])) + bias[e];
+                    v = c > v ? c : v;
+                }
+                if (m == K && v <= pv[m - 1]) {
+                    continue;
+                }
+                int at = m < K ? m++ : K - 1;
+                while (at > 0 && pv[at - 1] < v) {
+                    pv[at] = pv[at - 1];
+                    pid[at] = pid[at - 1];
+                    --at;
+                }
+                pv[at] = v;
+                pid[at] = e;
+            }
+            const int m7 = m < skip + want ? m : skip + want;
+            if (m7 > skip && er_pred_at_join() && rows == 1) {
+                er_pend.layer = nl;
+                er_pend.n = m7 - skip;
+                memcpy(er_pend.ids, pid + skip, (size_t)(m7 - skip) * sizeof(int32_t));
+            } else if (m7 > skip) {
+                ctx->prefetch(nl, m7 - skip, pid + skip);
+            }
+            if (m > m7 && rows == 1) {
+                er_pend3.fn = ctx->pf3;
+                er_pend3.layer = nl;
+                er_pend3.n = m - m7;
+                memcpy(er_pend3.ids, pid + m7, (size_t)(m - m7) * sizeof(int32_t));
+            }
+        }
     }
 }
 
@@ -550,6 +677,10 @@ static void gp_remote_join(const gp_rec *r, const int64_t *e)
     #pragma omp single
     {
         er_ctx *ctx = GP_P(er_ctx, 0);
+        if (er_pend.n > 0 && ctx->prefetch != NULL && ctx->alive) {
+            ctx->prefetch(er_pend.layer, er_pend.n, er_pend.ids);
+        }
+        er_pend.n = 0;
         if (*GP_P(const int64_t, 1)) {
             static int dbg = -1;
             if (dbg < 0) {

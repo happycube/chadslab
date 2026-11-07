@@ -84,12 +84,33 @@ def build(opts):
     return backend
 
 
+def gpu_used():
+    """The CUDA library loaded in the process (a GPU engine)."""
+    rt = sys.modules.get("reclank.backends.cuda.runtime")
+    return rt is not None and rt._lib is not None
+
+
 def main(argv=None):
     opts = parser().parse_args(argv)
-    backend = build(opts)
-    H.serve(backend, host=opts.host, port=opts.port, quiet=opts.quiet, api_key=opts.api_key,
-            cors_origin=opts.cors_origin, max_body=int(opts.max_body_mb * (1 << 20)))
-    return 0
+    share = None
+    if opts.gpu_peers == "on" and opts.backend != "cpu":
+        # the peers release what they can first: the engines' plans take the free memory
+        from server.gpushare import Share
+        pre = Share(port=opts.port, host=opts.host, api_key=opts.api_key, wait=opts.gpu_wait, quiet=opts.quiet)
+        pre.clear(os.path.basename(opts.model.rstrip("/")))
+        try:
+            backend = build(opts)
+        finally:
+            pre.done()
+        if gpu_used():
+            from server.gpushare import EngineShare
+            share = EngineShare(backend, backend.worker, locked=opts.gpu_lock, port=opts.port, host=opts.host,
+                                api_key=opts.api_key, wait=opts.gpu_wait, hold=opts.gpu_hold, quiet=opts.quiet)
+    else:
+        backend = build(opts)
+    return H.serve(backend, host=opts.host, port=opts.port, quiet=opts.quiet, api_key=opts.api_key,
+                   cors_origin=opts.cors_origin, max_body=int(opts.max_body_mb * (1 << 20)), gpu_share=share,
+                   idle_exit=opts.idle_exit)
 
 
 if __name__ == "__main__":

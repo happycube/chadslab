@@ -49,6 +49,55 @@ def _check(rc):
         raise RuntimeError(_lib().rc_gpu_last_error().decode() + where_text())
 
 
+# The context's epoch (docs/GPU_SWAP_PLAN.md 3.6): context_release adds 1. A Buffer of an older epoch
+# went with its context (free does nothing).
+_EPOCH = [1]
+
+
+def context_epoch():
+    return _EPOCH[0]
+
+
+def context_release():
+    """Release the CUDA context (rc_gpu_shutdown: cudaDeviceReset): every Buffer and program must be
+    freed first (RuntimeError naming what is left, the context kept). The next CUDA call makes a new
+    context; context_up then registers the pinned host memory again (its seconds returned)."""
+    L = _lib()
+    _check(L.rc_gpu_shutdown())
+    _EPOCH[0] += 1
+    m = mem()
+    m.blocks.clear()
+    m.placed.clear()
+    m.shared.clear()
+    m.fences.clear()
+    m.reclaimers = []       # (their owners' device halves are gone)
+    for fn in list(_ON_RELEASE):
+        fn()
+
+
+_ON_RELEASE = []
+
+
+def on_context_release(fn):
+    """fn() at each release of the context: a module's cache of device memory forgets it."""
+    if fn not in _ON_RELEASE:
+        _ON_RELEASE.append(fn)
+
+
+_UP = [1]       # the epoch whose context is up (context_up)
+
+
+def context_up():
+    """The new context made now (after context_release): its device, the host memory registered
+    again. Return the seconds of the registrations."""
+    L = _lib()
+    _check(L.rc_gpu_context_up())
+    _UP[0] = _EPOCH[0]
+    s = ctypes.c_double()
+    L.rc_gpu_epoch(ctypes.byref(s))
+    return s.value
+
+
 def mem_info():
     """Return the free and the total memory of the GPU, in bytes."""
     f, t = ctypes.c_size_t(), ctypes.c_size_t()
@@ -130,6 +179,8 @@ class GpuMem:
         and when cudaMalloc fails it frees more and tries again while the
         reclaimers free some. Raise MemoryError."""
         n = max(int(nbytes), 1)
+        if _UP[0] != _EPOCH[0]:
+            context_up()        # (the first block after a release: the host memory registered again first)
         if reclaim:
             self.ensure_reserve(keep, n)
         while True:
@@ -342,6 +393,7 @@ class Buffer:
         self.pinned, self.on_move, self.locks = pinned, on_move, 0
         self.on_evict, self.region = on_evict, None
         self._ptr = None
+        self.epoch = _EPOCH[0]
         if shared:
             at = mem().place_shared(self.nbytes)
             if at is None and shared == "only":
@@ -362,8 +414,10 @@ class Buffer:
         return self._ptr
 
     def upload(self, a):
+        """a to the start (a of 8 MB or more staged by two threads through pinned buffers, 8.1 GB/s for
+        pageable memory's 4.5: rc_gpu_h2d_big; the source free to change when it returns)."""
         assert a.flags.c_contiguous and a.nbytes <= self.nbytes
-        _check(_lib().rc_gpu_h2d(self.ptr, a.ctypes.data, a.nbytes))
+        _check(_lib().rc_gpu_h2d_big(self.ptr, a.ctypes.data, a.nbytes))
 
     def download(self, a):
         assert a.flags.c_contiguous and a.nbytes <= self.nbytes
@@ -372,7 +426,7 @@ class Buffer:
     def upload_at(self, a, off):
         """a to the bytes from off on."""
         assert a.flags.c_contiguous and off + a.nbytes <= self.nbytes
-        _check(_lib().rc_gpu_h2d(self.ptr + off, a.ctypes.data, a.nbytes))
+        _check(_lib().rc_gpu_h2d_big(self.ptr + off, a.ctypes.data, a.nbytes))
 
     def download_at(self, a, off):
         """The bytes from off on to a."""
@@ -384,6 +438,9 @@ class Buffer:
         _check(_lib().rc_gpu_zero(self.ptr, self.nbytes))
 
     def free(self):
+        if self._ptr and self.epoch != _EPOCH[0]:
+            self._ptr = None            # (its context's reset freed it)
+            return
         if self._ptr:
             if self.locks:
                 mem().wait_unlocked([self])

@@ -116,6 +116,15 @@ class Embedder:
                   time.time() - t0, self.m.devices["text"], self.m.devices["audio"], self.m.devices["vision"],
                   len(self.m.prompts), self.task or "none"), flush=True)
 
+    def runners(self):
+        """{part: its _Runner} of the model's GPU parts (the GPU sharing: server/gpushare.py)."""
+        m = self.m
+        out = {"text": m.runner} if m.devices["text"] == "gpu" else {}
+        for part, t in (("audio", m._audio), ("vision", m._vision)):
+            if t is not None and m.devices[part] == "gpu":
+                out[part] = t.runner
+        return out
+
     def prompt(self, task):
         """The prompt name of a task (a prompt name of the model or an
         alias), else ValueError."""
@@ -278,6 +287,15 @@ class MusicServer:
         print("music: loaded in %.1f s; audio %s, text %s" % (
             time.time() - t0, self.m.devices["audio"], self.m.devices["text"]), flush=True)
 
+    def runners(self):
+        """{part: its _Runner} of the towers on the GPU."""
+        m, out = self.m, {}
+        for kind, towers in (("audio", m.audio_towers), ("text", m.text_towers)):
+            if towers and m.devices[kind] == "gpu":
+                for name, t in towers.items():
+                    out["%s-%s" % (name, kind)] = t.runner
+        return out
+
     def vectors(self, inputs, part, truncate):
         """The vectors of the inputs (texts and {"audio": ...}): 1024 (part
         None) or the 512 of one model."""
@@ -349,6 +367,8 @@ class _EmbedHandler(H._Handler):
             return self._json(200, {"status": "ok", "model": e.model_id if e else "music"})
         if not self._authorized():
             return
+        if self._admin(path, False):
+            return
         if path in ("/v1/models", "/models"):
             data = []
             if e:
@@ -361,12 +381,19 @@ class _EmbedHandler(H._Handler):
                     data.append({"id": mid, "object": "model", "owned_by": "reclank",
                                  "dimensions": [512 if part else 1024], "devices": mu.m.devices,
                                  "max_audio_s": mu.max_s})
+            share = self.server.gpu_share
+            if share is not None:
+                locks = share.models()
+                for d in data:
+                    d["gpu_locked"] = bool(locks.get("music" if d["id"] in MUSIC_IDS else d["id"]))
             return self._json(200, {"object": "list", "data": data})
         self._error(404, "no route %s" % self.path, code="not_found")
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if not self._authorized():
+            return
+        if self._admin(path, True):
             return
         if path not in ("/v1/embeddings", "/embeddings"):
             return self._error(404, "no route %s" % self.path, code="not_found")
@@ -469,20 +496,57 @@ def main(argv=None):
                     help="the team of a program on the CPU (default: the CPUs of the process)")
     ap.add_argument("--quiet", action="store_true")
     H.add_http_args(ap)
+    from server.gpushare import add_gpu_args
+    add_gpu_args(ap)
     a = ap.parse_args(argv)
     if not a.model and not a.music:
         ap.error("give -m (EmbeddingGemma 2), --music, or both")
-    embedder = Embedder(a.model, a.model_id, a.task, a.batch_tokens, a.gpu, a.audio_device,
-                        a.vision_device, a.cpu_threads) if a.model else None
-    music = None
-    if a.music:
-        dev = a.music_device or ("gpu" if a.gpu else "cpu")
-        music = MusicServer(a.music, dev, a.music_text_device or (dev if dev != "off" else "cpu"),
-                            a.cpu_threads, a.music_max_s)
-    httpd = H._Server((a.host, a.port), _EmbedHandler)
+    pre = None
+    if a.gpu_peers == "on" and (a.gpu or "gpu" in (a.audio_device, a.vision_device, a.music_device,
+                                                   a.music_text_device)):
+        # the peers release what they can first: the towers' warm-up below runs on the GPU
+        from server.gpushare import Share
+        pre = Share(port=a.port, host=a.host, api_key=a.api_key, wait=a.gpu_wait, quiet=a.quiet)
+        pre.clear("embeddings")
+    try:
+        embedder = Embedder(a.model, a.model_id, a.task, a.batch_tokens, a.gpu, a.audio_device,
+                            a.vision_device, a.cpu_threads) if a.model else None
+        music = None
+        if a.music:
+            dev = a.music_device or ("gpu" if a.gpu else "cpu")
+            music = MusicServer(a.music, dev, a.music_text_device or (dev if dev != "off" else "cpu"),
+                                a.cpu_threads, a.music_max_s)
+    finally:
+        if pre is not None:
+            pre.done()
+    from server import idle
+    httpd = idle.server(H._Server, (a.host, a.port), _EmbedHandler)
     httpd.embedder = embedder
     httpd.music = music
     httpd.quiet = a.quiet
+    httpd.gpu_share = None
+    models = {k: v for k, v in ((a.model_id, embedder), ("music", music)) if v is not None and v.runners()}
+    locks = {p for p in a.pin.split(",") if p}
+    if locks - set(models) - {"*"}:
+        ap.error("--gpu-lock: no GPU model %s (the GPU models: %s)" % (
+            ", ".join(sorted(locks - set(models) - {"*"})), ", ".join(models) or "none"))
+    if models:
+        # the towers on the GPU in RESIDENCY's hands (an eviction for another tower, a peer's room)
+        from reclank.backends.cuda.gpumm import mem_info
+        from reclank.encoders.runtime import RESIDENCY
+        RESIDENCY.enabled = True
+        RESIDENCY.budget = max(0, mem_info()[1] - RESIDENCY.reserve)
+        for mid, m in models.items():
+            for part, r in m.runners().items():
+                r.label = "%s/%s" % (mid, part)
+                if "*" in locks or mid in locks:
+                    RESIDENCY.pin(r)
+        if a.gpu_peers == "on":
+            from server.gpushare import RunnerShare, attach
+            httpd.gpu_share = attach(RunnerShare("embed", lambda: models, lambda: [m.lock for m in models.values()],
+                                                 locks=locks, port=httpd.server_address[1], host=a.host,
+                                                 api_key=a.api_key, wait=a.gpu_wait, hold=a.gpu_hold,
+                                                 quiet=a.quiet))
     httpd.api_key = a.api_key or None
     httpd.cors_origin = a.cors_origin or None
     httpd.max_body = int(a.max_body_mb * (1 << 20))
@@ -492,12 +556,11 @@ def main(argv=None):
         "required" if httpd.api_key else "OFF"),
         flush=True)
     try:
-        httpd.serve_forever()
+        return idle.serve(httpd, a.idle_exit)
     except KeyboardInterrupt:
-        pass
+        return 0
     finally:
         httpd.server_close()
-    return 0
 
 
 if __name__ == "__main__":

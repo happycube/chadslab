@@ -31,15 +31,42 @@ equals the whole clip at once (the official code's causal slices: the same value
 The caches are buffers of the VAE (both programs of a size share them); a program's other
 tensors live in an arena by their lifetimes (vae._Arena), one arena for both programs of a size.
 Memory (float32, the caches): the decoder 15.9 GB at 1280 x 720, the encoder 7.0 GB; 1664 x 960
-needs 27.6 GB of decoder caches (the pinned-host phase)."""
+needs 27.6 GB of decoder caches (the pinned-host phase). On the tensor cores (TC) the caches of the
+convs of cin a multiple of 32 are bfloat16 (CACHE16): about half that."""
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
 from reclank.encoders.runtime import _Plain, _Runner
+from reclank.ir import program as P_
 from reclank.formats.safetensors import drop_pages
 from reclank.models.seedvr2.vae import TILE, SeedVR2VAE, conv_index, down_index, up_index
 from reclank.runtime.threads import team_threads
+
+
+# a causal conv on the GPU as two ENC_CONV_MMs (the cache's product, then the frame's + it: the bits of the
+# ENC_GATHERs, ENC_LINEARs and ENC_ADD, without the im2col; 1.5x at 1184 x 752, 128 channels); 0: those records
+CONV_MM = os.environ.get("RECLANK_SEEDVR2_CONV_MM", "1") != "0"
+# those ENC_CONV_MMs on the tensor cores (cin a multiple of 32): W and x in bfloat16 (the official VAE's
+# dtype), float32 sums (k_enc_conv_tc); 0: the float32 products (the same bits as the records above)
+TC = os.environ.get("RECLANK_SEEDVR2_TC", "1") != "0"
+# their 16-bit form (RECLANK_SEEDVR2_W16, the VAE's and the DiT's): "bf16" (W and x in bfloat16; the DiT's F20
+# decoded to bfloat16), "f16" (W16H: W in float16 with a power-of-two scale of each row, x in float16
+# saturated: 3 more significant bits; the DiT's matrices stored so, encoders.runtime.to_w16) or "i16"
+# (W16I: W and x as int16 with a scale of each group of 64, int8 products: cin a multiple of 64, else f16)
+W16 = os.environ.get("RECLANK_SEEDVR2_W16", "f16")
+assert W16 in ("bf16", "f16", "i16"), "RECLANK_SEEDVR2_W16=%s" % W16
+# the caches of those convs in bfloat16 (ENC_BF16_PACK: the rounding the tensor cores' gather gives x; the
+# same bits, half the memory: 1280 x 960 on a 24 GB card); 0: float32
+CACHE16 = os.environ.get("RECLANK_SEEDVR2_CACHE16", "1") != "0"
+
+
+def _bf16_rn(a):
+    """float32 a to its bfloat16 bits (uint16), rounded to nearest even."""
+    u = np.ascontiguousarray(a, np.float32).view(np.uint32)
+    return ((u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)).astype(np.uint16)
 
 
 class SeedVR2VideoVAE:
@@ -93,6 +120,16 @@ class SeedVR2VideoVAE:
         f = _Plain(np.ascontiguousarray(w[:, 2].reshape(o, -1)))
         f.shape = f.w.shape
         f.b = None
+        if self.gpu and CONV_MM and TC and raw.shape[1] % 32 == 0:
+            if W16 in ("f16", "i16"):
+                from reclank.encoders.runtime import KQ_W16H, KQ_W16I, w16h_pack, w16i_pack
+                from reclank.models.gemma4.e4b import _KQ
+                i16 = W16 == "i16" and raw.shape[1] % 64 == 0
+                for L in (c, f):
+                    L.wq = _KQ(w16i_pack(L.w), KQ_W16I, *L.w.shape) if i16 else \
+                        _KQ(w16h_pack(L.w), KQ_W16H, *L.w.shape)
+            else:
+                c.w16, f.w16 = _bf16_rn(c.w), _bf16_rn(f.w)
         drop_pages(src)
         return dict(cache=c, frame=f, cin=raw.shape[1], name=name)
 
@@ -114,11 +151,27 @@ class SeedVR2VideoVAE:
             self.caches, self.first = caches, first
             self.fill = set()           # the caches a first program has filled
 
+        @staticmethod
+        def tc(C):
+            """C's products on the tensor cores: ENC_CONV_MM's wbf of float32 x (1 bfloat16, 3 float16, 5 int16),
+            else 0"""
+            q = getattr(C["cache"], "wq", None)
+            if q is not None:
+                return 5 if q.type == 91 else 3
+            return 1 if getattr(C["cache"], "w16", None) is not None else 0
+
+        def cache16(self, C):
+            """Whether C's cache is 16-bit (uint16: bfloat16 or float16; uint8 I16 rows: the tensor cores' x)"""
+            return self.gpu and CONV_MM and CACHE16 and self.tc(C) > 0
+
         def cache(self, C, P):
             """The cache of a causal conv C over frames of P pixels: its two frames' views"""
             nm = C["name"]
             if nm not in self.caches:
-                self.caches[nm] = np.zeros((2 * P, C["cin"]), np.float32)
+                if self.cache16(C) and self.tc(C) == 5:
+                    self.caches[nm] = np.zeros((2 * P, P_.i16_row_bytes(C["cin"])), np.uint8)
+                else:
+                    self.caches[nm] = np.zeros((2 * P, C["cin"]), np.uint16 if self.cache16(C) else np.float32)
             arr = self.caches[nm]
             base = "_c_" + nm
             self.env[base], self.env[base + "_a"], self.env[base + "_b"] = arr, arr[:P], arr[P:]
@@ -130,11 +183,33 @@ class SeedVR2VideoVAE:
             P = h * w
             cb = self.cache(C, P)
             cin = C["cin"]
+            c16 = self.cache16(C)
+            tc = self.tc(C)
+            put = (("enc_i16_pack", x) if tc == 5 else ("enc_bf16_pack", x, int(tc == 3))) if c16 else ("copy", x)
             if self.first and C["name"] not in self.fill:
                 self.fill.add(C["name"])
-                self.forms += [("set", cb + "_a", ("copy", x)), ("set", cb + "_b", ("copy", x))]
+                self.forms += [("set", cb + "_a", put), ("set", cb + "_b", put)]
             out = None
-            if emit:
+            if emit and self.gpu and CONV_MM and c16:
+                # the cache's product, the cache moved on (x packed into its frame b), then the frame's product
+                # of x's 16-bit rows there (idx9 shifted to frame b: the conversion the gather would make, the
+                # same bits; twice the speed of float32 x)
+                out = self.tensor(rows, C["cache"].shape[0])
+                i18, i9b = self.name(), self.name()
+                self.env[i18] = idx18
+                self.env[i9b] = self.idx(("b", id(idx18)), lambda: np.ascontiguousarray(idx18[:, 9:]))
+                self.forms += [("set", out, ("enc_conv_mm", C["cache"], cb, i18, cin, None, None, None, 0, tc + 1)),
+                               ("set", cb + "_a", ("copy", cb + "_b")), ("set", cb + "_b", put),
+                               ("set", out, ("enc_conv_mm", C["frame"], cb, i9b, cin, None, out, None, 0, tc + 1))]
+                return out
+            if emit and self.gpu and CONV_MM:
+                out = self.tensor(rows, C["cache"].shape[0])
+                i18, i9 = self.name(), self.name()
+                self.env[i18], self.env[i9] = idx18, idx9
+                self.forms += [("set", out, ("enc_conv_mm", C["cache"], cb, i18, cin, None, None, None, 0,
+                                             tc + 1 if c16 else tc)),
+                               ("set", out, ("enc_conv_mm", C["frame"], x, i9, cin, None, out, None, 0, tc))]
+            elif emit:
                 out = self.tensor(rows, C["cache"].shape[0])
                 tmp = self.tensor(min(rows, TILE), C["cache"].shape[0])
                 self.col_cols = max(self.col_cols, 18 * cin)
@@ -150,7 +225,7 @@ class SeedVR2VideoVAE:
                                    ("set", c9, ("enc_gather", x, i9, cin)),
                                    ("set", tt, ("enc_linear", C["frame"], c9)),
                                    ("enc_add", ot, tt)]
-            self.forms += [("set", cb + "_a", ("copy", cb + "_b")), ("set", cb + "_b", ("copy", x))]
+            self.forms += [("set", cb + "_a", ("copy", cb + "_b")), ("set", cb + "_b", put)]
             return out
 
         def cresnet(self, x, R, h, w, cin, cout, ix):

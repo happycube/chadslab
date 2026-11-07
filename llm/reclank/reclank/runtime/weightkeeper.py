@@ -69,22 +69,49 @@ before the first root keeper when the last one exits (a state file /tmp/reclank-
 <uid>.settings.json under flock: the original values and the pids holding them). The memfds,
 their names and the NUMA binding are per process. RECLANK_WEIGHTKEEPER_DIR: the directory of the
 sockets and the state file (the tests).
+
+**The catalog** (docs/GPU_SWAP_PLAN.md 3.7): a keeper holds entries (Entry: a checkpoint's index,
+segments and plugin), each with an ID (its model and a hash of the checkpoint and the options that
+shape it). The checkpoint it starts with is its first entry (none with --serve); "load OPTIONS"
+(--add) makes another and reads it in the background, one load at a time, each checking the memory
+before it takes a page; "drop ID" closes an entry (a round that maps it keeps its pages); "list"
+and "status ID" tell them; "get ID|CKPT" hands one out. A plain "get" and "status" are the first
+entry's, as before the catalog, so the rounds attach unchanged; find() looks through every entry.
+As root only the first entry takes the pools' pages and the lock: later loads run as the user.
+
+**Leases and the host budget** (3.7, step 2): a round's get keeps its socket open as its lease (the
+keeper knows who maps what: the peer's pid; the lease ends when the round exits). With a host budget
+(--host-budget GB) a load that would take the entries over it, or that the memory cannot take,
+first drops the entries no round leases, the least recently leased first; a kept entry (--keep: an
+ID or a checkpoint, "keep KEY" at run time) is never dropped. Without a budget nothing is dropped
+but by "drop", and a load that does not fit fails, as before.
+
+**The converted-weights cache** (3.7, step 3; off unless --save DIR): an entry's segments (the bytes
+in use) and its index written once to DIR/<ID>-<code key>/ (in a directory of its own, renamed when
+complete; not when the disk has no room); a load of the same entry reads them back with O_DIRECT
+(no conversion, no page cache) before it reads the checkpoint. The key: the entry's ID (the
+checkpoint's identity and the options) and code_key (the plugin's source, the CPU library's hash of
+every C source, VERSION), and the layout made again must be the saved one; a copy of other code is
+not read (and not removed: the log names it).
 """
 from __future__ import annotations
 
 import ctypes
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
 import resource
+import selectors
 import signal
 import socket
 import struct
 import sys
 import threading
 import time
+import types
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -94,6 +121,7 @@ from reclank.runtime import numa
 LAYOUT = "dsv41-expert-mxx-v2"
 LAYOUT_V1 = "dsv41-expert-planes-v1"
 LAYOUT_TENSORS = "tensors-v1"       # the GGUF tensors of a model (reclank/models/qwen/keep.py)
+LAYOUT_STORE = "store-v1"           # a model's host arrays, put by the process that made them (runtime/kept.py)
 MATS = ("w1", "w3", "w2")
 VERSION = 1
 PLANES = ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
@@ -142,8 +170,8 @@ def _check(r, what):
     return r
 
 
-def _mmap(addr, size, prot, flags, fd=-1):
-    return _check(_libc.mmap(addr, size, prot, flags, fd, 0), "mmap")
+def _mmap(addr, size, prot, flags, fd=-1, offset=0):
+    return _check(_libc.mmap(addr, size, prot, flags, fd, offset), "mmap")
 
 
 def _up(n, a):
@@ -392,6 +420,15 @@ class Segment:
         for (pg, n, o) in self.chunks:
             if pg == K4:
                 _libc.madvise(self.base + o, n, MADV_HUGEPAGE)
+
+    @classmethod
+    def of_fd(cls, name, node, fd, size, numa_on):
+        """A segment of one memfd a round made and sealed (runtime/kept.py's put), mapped read-only."""
+        s = cls.__new__(cls)
+        s.name, s.node, s.numa_on = name, node, numa_on
+        s.chunks, s.fds, s.size = [[K4, size, 0]], [fd], size
+        s.base = map_chunks(s.fds, s.chunks, PROT_READ)
+        return s
 
     def array(self, off, n):
         return np.frombuffer((ctypes.c_uint8 * n).from_address(self.base + off), np.uint8)
@@ -687,6 +724,16 @@ class Options:
     name: str = None            # the keeper's name: its socket socket_path(name) (None: the default)
     user: int = None            # the uid to drop to as root (default SUDO_UID)
     group: int = None
+    # the host budget (docs/GPU_SWAP_PLAN.md 3.7, step 2): the entries together at most host_budget
+    # GB; a load over it (or one the memory cannot take) drops the entries no round leases, the least
+    # recently leased first, but never a kept one: keep (this entry), keep_keys (the keeper's: IDs or
+    # checkpoints). None: nothing is dropped but by "drop"
+    host_budget: float = None
+    keep: bool = False
+    keep_keys: list = None
+    # the converted-weights cache (3.7, step 3): the keeper's directory of the entries' segments (None:
+    # none, the default): a load reads them there before the checkpoint, and writes them there once
+    save: str = None
     extra: dict = field(default_factory=dict)
 
 
@@ -797,21 +844,28 @@ def memory_available(node=None):
     return m.get("MemFree", 0) + max(0, m.get("FilePages", 0) - m.get("Shmem", 0)) + _free_huge(node)
 
 
-def check_memory(need, numa_on=True, margin=MEM_MARGIN):
-    """need: {node: bytes}. Raise SystemExit with what is missing when it does not fit the memory
-    available (each node, and the host)."""
+def memory_short(need, numa_on=True, margin=MEM_MARGIN):
+    """need: {node: bytes}. [(the node, None: the host; what it says)] where it does not fit the
+    memory available."""
     bad = []
     total = sum(need.values())
     host = memory_available()
     if total > host - margin:
-        bad.append("the host: %.1f GB to hold, %.1f GB available" % (total / 1e9, host / 1e9))
+        bad.append((None, "the host: %.1f GB to hold, %.1f GB available" % (total / 1e9, host / 1e9)))
     for nd, n in sorted(need.items()) if numa_on else ():
         a = memory_available(nd)
         if n > a - margin:
-            bad.append("node %d: %.1f GB to hold, %.1f GB available" % (nd, n / 1e9, a / 1e9))
+            bad.append((nd, "node %d: %.1f GB to hold, %.1f GB available" % (nd, n / 1e9, a / 1e9)))
+    return bad
+
+
+def check_memory(need, numa_on=True, margin=MEM_MARGIN):
+    """need: {node: bytes}. Raise SystemExit with what is missing when it does not fit the memory
+    available (each node, and the host)."""
+    bad = [m for _nd, m in memory_short(need, numa_on, margin)]
     if bad:
-        held = ["%s %.1f GB" % (nm or "default", sum(x["gb"] for x in st.get("segments", [])))
-                for nm, _p, st in keepers()]
+        held = ["%s %s %.1f GB" % (nm or "default", e.get("id"), sum(x["gb"] for x in e.get("segments", [])))
+                for nm, _p, st in keepers() for e in st.get("entries") or [st] if e.get("segments")]
         raise SystemExit("weightkeeper: not enough memory: %s (with %.1f GB left free a node; keepers running: "
                          "%s)" % ("; ".join(bad), margin / 1e9, ", ".join(held) or "none"))
 
@@ -820,7 +874,7 @@ def plugin(ckpt):
     """The module of a model that the weightkeeper takes in the tensors layout
     (layout(), fill()), or None: DeepSeek V4.1 (this module's layouts)."""
     from reclank.models.qwen import keep as qwen_keep
-    from reclank.models.qwen import keep_exl3, keep_fp4l
+    from reclank.models.qwen import keep_exl3, keep_fp4l, keep_q35nv
     from reclank.models.nemotron import keep as nemotron_keep
     from reclank.models.wan import keep as wan_keep
     if wan_keep.detect(ckpt):
@@ -831,6 +885,8 @@ def plugin(ckpt):
         return keep_exl3.PLUGIN             # an EXL3 directory of Qwen3.8 (its MUL1 blocks)
     if keep_fp4l.detect(ckpt):
         return keep_fp4l.PLUGIN             # nvidia/Qwen3.8-Flash-Next-FP4-Local (KQ_NVX experts)
+    if keep_q35nv.detect(ckpt):
+        return keep_q35nv.PLUGIN            # an NVFP4 Qwen3.5 / 3.6 MoE of ModelOpt (KQ_NVX experts)
     if qwen_keep.detect_gguf(ckpt):
         return qwen_keep.GGUF_PLUGIN        # a GGUF file of Qwen3.8 (its tensors as they are)
     cfg = json.load(open(os.path.join(ckpt, "config.json")))
@@ -839,10 +895,90 @@ def plugin(ckpt):
     return None
 
 
-class Weightkeeper:
+def entry_id(o, model, ident):
+    """The ID of an entry: its model and a hash of its checkpoint (the path, the files' identity) and
+    of the options that shape what it holds."""
+    keys = {k: v for k, v in vars(o).items() if k not in ("sock", "name", "user", "group", "threads", "lock",
+                                                          "host_budget", "keep", "keep_keys", "save")}
+    keys["ckpt"] = os.path.realpath(o.ckpt)
+    h = hashlib.sha1(json.dumps([keys, ident], sort_keys=True, default=str).encode()).hexdigest()[:8]
+    return "%s-%s" % (model, h)
+
+
+RUNTIME_KEYS = ("segments", "locked", "pid", "writable")     # an index's keys of one load, not saved
+SAVE_MARGIN = 4 << 30       # what a save leaves free on its disk
+_PIECE = 64 << 20
+
+
+def code_key(plugin):
+    """A hash of the code that makes an entry's bytes: the plugin's module (DeepSeek: fill), the CPU
+    library's name (a hash of every C source and the compiler) and VERSION. A saved entry is read back
+    only with the same."""
+    from reclank.backends.cpu import cops
+    if plugin is None:
+        src = inspect.getsource(fill)
+    else:
+        mod = plugin if isinstance(plugin, types.ModuleType) else sys.modules[type(plugin).__module__]
+        src = open(mod.__file__).read()
+    return hashlib.sha1(json.dumps([src, os.path.basename(str(cops._path)), VERSION]).encode()).hexdigest()[:8]
+
+
+def _layout_hash(ix):
+    return hashlib.sha1(json.dumps(ix, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _direct_io(path, write, spans, threads):
+    """spans [(address, bytes, file offset)] (each a multiple of 4 KB at an address of 4 KB) written
+    to, or read from, path: O_DIRECT (no page cache) by threads, else buffered and the pages
+    dropped after. Return whether it was O_DIRECT."""
+    flags = (os.O_WRONLY | os.O_CREAT) if write else os.O_RDONLY
+    try:
+        fd, direct = os.open(path, flags | os.O_DIRECT, 0o644), True
+    except OSError:
+        fd, direct = os.open(path, flags, 0o644), False
+    pieces = [(a + x, min(_PIECE, n - x), o + x) for a, n, o in spans for x in range(0, n, _PIECE)]
+    errs, lock = [], threading.Lock()
+
+    def work():
+        while True:
+            with lock:
+                if not pieces or errs:
+                    return
+                a, n, o = pieces.pop()
+            mv = memoryview((ctypes.c_uint8 * n).from_address(a)).cast("B")
+            try:
+                got = 0
+                while got < n:
+                    r = os.pwritev(fd, [mv[got:]], o + got) if write else os.preadv(fd, [mv[got:]], o + got)
+                    if r <= 0:
+                        raise OSError("%s: short %s at %d" % (path, "write" if write else "read", o + got))
+                    got += r
+            except OSError as e:
+                errs.append(e)
+    try:
+        ts = [threading.Thread(target=work) for _ in range(max(1, threads))]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        if errs:
+            raise errs[0]
+        if write:
+            os.fsync(fd)
+        if not direct:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return direct
+
+
+class Entry:
+    """A checkpoint the keeper holds (docs/GPU_SWAP_PLAN.md 3.7: an entry of the catalog): its index,
+    its segments, its plugin. Made (the layout) then load()ed."""
+
     def __init__(self, o: Options):
         self.o = o
         self.root = os.geteuid() == 0
+        self.kept = bool(o.keep)
+        self.last = time.time()     # its last lease's start or end (the order of the drops)
         self.numa_on = numa.enabled()
         t0 = time.time()
         self.plugin = plugin(o.ckpt)
@@ -864,6 +1000,8 @@ class Weightkeeper:
                     o.ckpt, len(self.sh.ident), ix["model"], ix["types"]["dense"], ix["types"]["experts"],
                     ix["types"]["ngram"], "on all the" if ix.get("copies") == "both" else "split between",
                     ix["nodes"], ["%.1f" % (b / 1e9) for b in ix["part_bytes"]], time.time() - t0))
+            self.id = entry_id(o, ix["model"], self.sh.ident)
+            self.layout_hash = _layout_hash(ix)
             return
         L = int(self.sh.hf["num_hidden_layers"])
         layers = list(o.layers) if o.layers is not None else list(range(L))
@@ -886,15 +1024,96 @@ class Weightkeeper:
                 ["%.1f" % (b / 1e9) for b in self.index["part_bytes"]],
                 "%.1f GB on node %d" % (self.index["dense"]["bytes"] / 1e9, o.dense_node)
                 if o.dense else "in the shards", time.time() - t0))
+        self.id = entry_id(o, "deepseek_v41", self.sh.ident)
+        self.layout_hash = _layout_hash(self.index)
 
-    def load(self):
+    def need(self):
+        """{node: bytes} it holds (loaded or not)."""
         o, ix = self.o, self.index
         need = {}
         for part, nd in enumerate(ix["nodes"]):
             need[nd] = need.get(nd, 0) + ix["part_bytes"][part]
         if ix.get("dense"):
             need[o.dense_node] = need.get(o.dense_node, 0) + ix["dense"]["bytes"]
-        check_memory(need, self.numa_on)
+        return need
+
+    def saved_path(self, save):
+        return os.path.join(save, "%s-%s" % (self.id, code_key(self.plugin)))
+
+    def _spans(self):
+        """[(address, bytes)] of what the segments hold (each segment's bytes in use, to 4 KB)."""
+        ix = self.index
+        out = [(s.base, _up(ix["part_bytes"][k], K4)) for k, s in enumerate(self.segs)]
+        if self.dense:
+            out.append((self.dense.base, _up(ix["dense"]["bytes"], K4)))
+        return out
+
+    def _read_saved(self, save):
+        """The segments from the saved copy of this entry (the same key and layout); False when there
+        is none."""
+        d = self.saved_path(save)
+        try:
+            meta = json.load(open(os.path.join(d, "index.json")))
+        except (OSError, ValueError):
+            others = [x for x in (os.listdir(save) if os.path.isdir(save) else [])
+                      if x.startswith(self.id + "-") and not x.startswith(".")]
+            if others:
+                log("%s: saved copies of other code, not read: %s" % (save, ", ".join(sorted(others))))
+            return False
+        spans = self._spans()
+        if meta.get("layout") != self.layout_hash or meta.get("bytes") != [n for _a, n in spans]:
+            log("%s: another layout, not read" % d)
+            return False
+        t0 = time.time()
+        direct = all([_direct_io(os.path.join(d, "seg%d.bin" % k), False, [(a, n, 0)], min(8, self.o.threads))
+                      for k, (a, n) in enumerate(spans)])
+        dt = time.time() - t0
+        total = sum(n for _a, n in spans)
+        self.index.update(meta["index"])
+        self.source = "saved"
+        log("read the saved copy %s: %.1f GB in %.1f s (%.2f GB/s; O_DIRECT %s)" % (
+            d, total / 1e9, dt, total / 1e9 / max(dt, 1e-9), "yes" if direct else "no"))
+        return True
+
+    def _save(self, save):
+        """The segments and the index written to save (once: in a directory of its own, renamed
+        when complete); skipped, said, when the disk has no room."""
+        d = self.saved_path(save)
+        if os.path.exists(d):
+            return
+        spans = self._spans()
+        total = sum(n for _a, n in spans)
+        os.makedirs(save, exist_ok=True)
+        st = os.statvfs(save)
+        if st.f_bavail * st.f_frsize < total + SAVE_MARGIN:
+            log("not saved to %s: %.1f GB to write, %.1f GB free" % (save, total / 1e9,
+                                                                      st.f_bavail * st.f_frsize / 1e9))
+            return
+        t0 = time.time()
+        tmp = os.path.join(save, ".%s.%d" % (os.path.basename(d), os.getpid()))
+        os.makedirs(tmp)
+        for k, (a, n) in enumerate(spans):
+            _direct_io(os.path.join(tmp, "seg%d.bin" % k), True, [(a, n, 0)], min(8, self.o.threads))
+        ix = {k: v for k, v in self.index.items() if k not in RUNTIME_KEYS}
+        if ix.get("dense"):
+            ix["dense"] = {k: v for k, v in ix["dense"].items() if k != "chunks"}
+        with open(os.path.join(tmp, "index.json"), "w") as f:
+            json.dump(dict(layout=self.layout_hash, bytes=[n for _a, n in spans], index=ix,
+                           checkpoint=self.index["checkpoint"]), f)
+        if self.root and (self.o.user is not None or os.environ.get("SUDO_UID")):
+            uid = self.o.user if self.o.user is not None else int(os.environ["SUDO_UID"])
+            gid = self.o.group if self.o.group is not None else int(os.environ.get("SUDO_GID", uid))
+            for x in [tmp] + [os.path.join(tmp, f) for f in os.listdir(tmp)]:
+                os.chown(x, uid, gid)
+        os.rename(tmp, d)
+        dt = time.time() - t0
+        log("saved to %s: %.1f GB in %.1f s (%.2f GB/s)" % (d, total / 1e9, dt, total / 1e9 / max(dt, 1e-9)))
+
+    def load(self, save=None):
+        """The segments made and filled: from the saved copy in save when there is one, else from the
+        checkpoint (then written to save)."""
+        o, ix = self.o, self.index
+        check_memory(self.need(), self.numa_on)
         t0 = time.time()
         self.segs = []
         name = "%s-n%%d" % ("dsv41-experts" if self.plugin is None else ix["model"])
@@ -924,10 +1143,17 @@ class Weightkeeper:
         if errs:
             raise errs[0]
         log("populated in %.1f s" % (time.time() - t0))
-        if self.plugin is not None:
-            self.plugin.fill(self.sh, ix, self.segs, o.threads, log)
-        else:
-            fill(self.sh, ix, self.segs, self.dense, o.threads)
+        self.source = "checkpoint"
+        if not (save and self._read_saved(save)):
+            if self.plugin is not None:
+                self.plugin.fill(self.sh, ix, self.segs, o.threads, log)
+            else:
+                fill(self.sh, ix, self.segs, self.dense, o.threads)
+            if save:
+                try:
+                    self._save(save)
+                except OSError as e:
+                    log("not saved to %s: %s" % (save, e))
         ix["writable"] = o.seal == "size"
         for s in every:
             weak = s.seal(write=not ix["writable"])
@@ -967,6 +1193,393 @@ class Weightkeeper:
             out += self.dense.fds
         return out
 
+    def status(self):
+        ix = self.index
+        return dict(pid=os.getpid(), model=ix.get("model", "deepseek_v41"), layout=ix["layout"],
+                    types=ix.get("types"), locked=ix["locked"], layers=len(ix.get("layers", [])) or ix.get("L"),
+                    nodes=ix["nodes"],
+                    segments=[dict(node=s.node, gb=round(s.size / 1e9, 2),
+                                   chunks=[[_pname(pg), round(n / 1e9, 2)] for pg, n, _o in s.chunks])
+                              for s in self.segs + ([self.dense] if self.dense else [])],
+                    checkpoint=ix["checkpoint"], id=self.id, source=getattr(self, "source", None))
+
+    def close(self):
+        """Its memfds closed and its maps gone (a round that maps them keeps their pages until it
+        unmaps them: the kernel counts the maps)."""
+        for seg in self.segs + ([self.dense] if self.dense else []):
+            for fd in seg.fds:
+                os.close(fd)
+            _libc.munmap(seg.base, seg.size)
+        self.segs, self.dense = [], None
+
+
+class PutEntry(Entry):
+    """An entry a round made and put (runtime/kept.py: a model's host arrays, made by its own loader):
+    one memfd and its index, its ID the round's (the label and a hash of its key). Saved with --save
+    as any entry (DIR/<ID>/) and read back by "restore ID"."""
+
+    def __init__(self, index, seg, source="put"):
+        self.o = Options(ckpt=None)
+        self.root = os.geteuid() == 0
+        self.numa_on = numa.enabled()
+        self.kept, self.last, self.plugin = False, time.time(), None
+        self.index, self.id, self.source = index, index["id"], source
+        self.layout_hash = _layout_hash({k: v for k, v in index.items() if k not in RUNTIME_KEYS})
+        self.segs, self.dense = [seg], None
+        self.saver = None
+        index.update(segments=[seg.describe()], locked=False, pid=os.getpid(), writable=True)
+
+    def saved_path(self, save):
+        return os.path.join(save, self.id)
+
+    @classmethod
+    def restore(cls, save, i, threads=8):
+        """The entry i from its saved copy in save (O_DIRECT into new pages on its node), or None."""
+        d = os.path.join(save, i)
+        try:
+            meta = json.load(open(os.path.join(d, "index.json")))
+        except (OSError, ValueError):
+            return None
+        ix = meta["index"]
+        if ix.get("layout") != LAYOUT_STORE or ix.get("id") != i or meta.get("layout") != _layout_hash(ix):
+            log("%s: not a saved copy of %s, not read" % (d, i))
+            return None
+        node, n = ix["nodes"][0], meta["bytes"][0]
+        numa_on = numa.enabled()
+        check_memory({node: n}, numa_on)
+        t0 = time.time()
+        seg = Segment("%s-n%d" % (ix["model"], node), node, pages(n, node, os.geteuid() == 0, K4), numa_on)
+        seg.populate(threads)
+        direct = _direct_io(os.path.join(d, "seg0.bin"), False, [(seg.base, n, 0)], min(8, threads))
+        seg.seal(write=False)
+        dt = time.time() - t0
+        log("read the saved copy %s: %.1f GB in %.1f s (%.2f GB/s; O_DIRECT %s)" % (
+            d, n / 1e9, dt, n / 1e9 / max(dt, 1e-9), "yes" if direct else "no"))
+        return cls(ix, seg, "saved")
+
+    def close(self):
+        if self.saver is not None:
+            self.saver.join()
+        super().close()
+
+
+class Keeper:
+    """The catalog (docs/GPU_SWAP_PLAN.md 3.7, steps 1 and 2): the entries by ID on one socket. The
+    requests: "get [KEY]" (the index and the memfds; KEY an ID or a checkpoint's path, none: the first
+    entry; the connection stays open as the round's lease), "status [KEY]" (an entry's status; with no
+    KEY the first's, and every entry's under "entries"), "list", "load OPTIONS" (the JSON of Options:
+    made at once, read in the background; one load at a time), "drop KEY", "keep KEY", "unkeep KEY",
+    "put INDEX" (a round's memfd and its index: runtime/kept.py; the connection its lease), "restore ID"
+    (an entry from the saved copy, in the background), "stop". budget (bytes, None: none): a load over
+    it, or one the memory cannot take, drops the entries with no lease that are not kept, the least
+    recently leased first."""
+
+    def __init__(self, budget=None, keep_keys=(), save=None):
+        self.entries = {}           # id -> Entry (ready), in the order they came
+        self.loading = {}           # id -> {"checkpoint", "since"}
+        self.failed = {}            # id -> the error of its load
+        self.leases = {}            # the socket of a round's get -> (the entry's id, the round's pid)
+        self.budget = budget
+        self.keep_keys = list(keep_keys or ())
+        self.save = save
+        self.mu = threading.RLock()     # (a get hands out the fds under it: no drop closes them meanwhile)
+        self.load_mu = threading.Lock()     # (one load at a time: each checks the memory before it takes a page)
+
+    def add(self, e):
+        with self.mu:
+            e.last = time.time()
+            self.entries[e.id] = e
+
+    def pick(self, key=None):
+        """The entry of key: an ID, a checkpoint's path, or None (the first); None when none."""
+        with self.mu:
+            if not key:
+                return next(iter(self.entries.values()), None)
+            if key in self.entries:
+                return self.entries[key]
+            want = os.path.realpath(key)
+            return next((e for e in self.entries.values()
+                         if os.path.realpath(e.index["checkpoint"]) == want), None)
+
+    def lessees(self, e):
+        """The pids of the rounds that lease e."""
+        with self.mu:
+            return sorted(pid for i, pid in self.leases.values() if i == e.id)
+
+    def is_kept(self, e):
+        return e.kept or any(k == e.id or os.path.realpath(k) == os.path.realpath(e.index["checkpoint"])
+                             for k in self.keep_keys)
+
+    def entry_status(self, e):
+        st = e.status()
+        st["leases"] = self.lessees(e)
+        st["kept"] = self.is_kept(e)
+        st["idle_s"] = None if st["leases"] else round(time.time() - e.last, 1)
+        return st
+
+    def listing(self):
+        with self.mu:
+            out = [self.entry_status(e) for e in self.entries.values()]
+            out += [dict(id=i, status="loading", **d) for i, d in self.loading.items()]
+            out += [dict(id=i, status="failed", error=m) for i, m in self.failed.items()]
+        return out
+
+    def held(self):
+        with self.mu:
+            return sum(n for e in self.entries.values() for n in e.need().values())
+
+    def status(self, key=None):
+        e = self.pick(key)
+        st = self.entry_status(e) if e is not None else dict(pid=os.getpid(), checkpoint=None, segments=[])
+        if key is None:
+            st["entries"] = self.listing()
+            st["host_budget_gb"] = None if self.budget is None else round(self.budget / 1e9, 2)
+            st["held_gb"] = round(self.held() / 1e9, 2)
+            st["keep"] = self.keep_keys
+            st["save"] = self.save
+        return st
+
+    def make_room(self, e, memory=True):
+        """Before e's load, with a budget: the entries no round leases and none keeps dropped, the least
+        recently leased first, while e would take the held bytes over the budget or does not fit the
+        memory (on a node short of it, the entries with pages there). SystemExit when the budget is
+        still short; a memory still short is left to the load's check (it says what is missing)."""
+        if self.budget is None:
+            return
+        need = e.need()
+        with self.mu:
+            while True:
+                held = self.held()
+                over = held + sum(need.values()) > self.budget
+                short = memory_short(need, e.numa_on) if memory else []
+                if not over and not short:
+                    return
+                free = [x for x in self.entries.values() if not self.lessees(x) and not self.is_kept(x)
+                        and not (getattr(x, "saver", None) and x.saver.is_alive())]
+                nodes = {nd for nd, _m in short}
+                if not over and None not in nodes:
+                    free = [x for x in free if nodes & set(x.need())]
+                if not free:
+                    if over:
+                        raise SystemExit(
+                            "weightkeeper: the host budget %.1f GB: %.1f GB held, %.1f GB to load, and every entry "
+                            "leased or kept (%s)" % (
+                                self.budget / 1e9, held / 1e9, sum(need.values()) / 1e9,
+                                ", ".join("%s %.1f GB %s" % (x.id, sum(x.need().values()) / 1e9,
+                                                             "kept" if self.is_kept(x) else
+                                                             "leased by %s" % self.lessees(x))
+                                          for x in self.entries.values())))
+                    return
+                v = min(free, key=lambda x: x.last)
+                self.entries.pop(v.id)
+                v.close()
+                log("dropped %s (%.1f GB, no lease for %.0f s) for %s: %s" % (
+                    v.id, sum(v.need().values()) / 1e9, time.time() - v.last, e.id,
+                    "over the budget" if over else "; ".join(m for _nd, m in short)))
+
+    def load(self, o):
+        """An entry of o: made now (its layout and ID), loaded in a thread. Return its ID and its
+        status ("ready" when the catalog had it)."""
+        e = Entry(o)
+        with self.mu:
+            if e.id in self.entries:
+                if o.keep:
+                    self.entries[e.id].kept = True
+                return e.id, "ready"
+            if e.id in self.loading:
+                return e.id, "loading"
+            self.failed.pop(e.id, None)
+            self.loading[e.id] = dict(checkpoint=e.index["checkpoint"], since=time.time())
+
+        def work():
+            try:
+                with self.load_mu:
+                    self.make_room(e)
+                    e.load(self.save)
+                self.add(e)
+            except BaseException as exc:    # noqa: BLE001 (SystemExit of check_memory too)
+                log("the load of %s: %r" % (e.id, exc))
+                with self.mu:
+                    self.failed[e.id] = str(exc)
+            finally:
+                with self.mu:
+                    self.loading.pop(e.id, None)
+        threading.Thread(target=work, daemon=True).start()
+        return e.id, "loading"
+
+    def drop(self, key):
+        """The entry of key closed (leased or not: a round that maps it keeps its pages). Return
+        its ID and the pids that lease it."""
+        with self.mu:
+            e = self.pick(key)
+            if e is None:
+                return None, []
+            pids = self.lessees(e)
+            self.entries.pop(e.id, None)
+            e.close()
+        log("dropped %s%s" % (e.id, " (mapped still by %s)" % pids if pids else ""))
+        return e.id, pids
+
+    def keep(self, key, on=True):
+        """key kept (on) or not: an entry's flag, and the keeper's keys (a checkpoint not loaded
+        yet kept when it comes)."""
+        with self.mu:
+            e = self.pick(key)
+            if e is not None:
+                e.kept = on
+            if on and key not in self.keep_keys and e is None:
+                self.keep_keys.append(key)
+            if not on:
+                self.keep_keys = [k for k in self.keep_keys if k != key and not (
+                    e is not None and (k == e.id or os.path.realpath(k) == os.path.realpath(e.index["checkpoint"])))]
+            return e.id if e is not None else key
+
+    def put(self, c, index, fd, pid):
+        """A round's memfd (sealed for size, the size of its index) and index as an entry, c its lease:
+        its ID, or an error (the round keeps its own)."""
+        sz = os.fstat(fd).st_size
+        if fcntl.fcntl(fd, F_GET_SEALS) & SEALS_SIZE != SEALS_SIZE or sz != index["part_bytes"][0]:
+            os.close(fd)
+            return dict(error="a memfd not sealed for size, or not of the index's size")
+        index["id"] = str(index["id"])
+        if os.sep in index["id"] or index["id"].startswith("."):
+            os.close(fd)
+            return dict(error="an ID of a path")
+        e = PutEntry(index, Segment.of_fd("%s-n%d" % (index["model"], index["nodes"][0]), index["nodes"][0], fd,
+                                          sz, numa.enabled()))
+        with self.mu:
+            if e.id in self.entries:
+                e.close()
+                return dict(error="the keeper has %s" % e.id)
+            try:
+                self.make_room(e, memory=False)
+            except SystemExit as exc:
+                e.close()
+                return dict(error=str(exc))
+            self.entries[e.id] = e
+            self.leases[c] = (e.id, pid)
+        log("put %s: %.1f GB by pid %d" % (e.id, sz / 1e9, pid))
+        if self.save:
+            def save():
+                try:
+                    e._save(self.save)
+                except OSError as exc:
+                    log("not saved to %s: %s" % (self.save, exc))
+            e.saver = threading.Thread(target=save, daemon=True)
+            e.saver.start()
+        return dict(id=e.id)
+
+    def restore(self, i):
+        """"ready" (the entry is held), "loading" (read from the saved copy in the background), or
+        "none"."""
+        with self.mu:
+            if i in self.entries:
+                return "ready"
+            if i in self.loading:
+                return "loading"
+            if not self.save or os.sep in i or i.startswith(".") or \
+                    not os.path.isfile(os.path.join(self.save, i, "index.json")):
+                return "none"
+            self.failed.pop(i, None)
+            self.loading[i] = dict(checkpoint=None, since=time.time())
+
+        def work():
+            try:
+                with self.load_mu:
+                    e = PutEntry.restore(self.save, i)
+                if e is None:
+                    return
+                with self.mu:
+                    self.make_room(e, memory=False)
+                    self.entries[e.id] = e
+            except BaseException as exc:    # noqa: BLE001
+                log("the restore of %s: %r" % (i, exc))
+                with self.mu:
+                    self.failed[i] = str(exc)
+            finally:
+                with self.mu:
+                    self.loading.pop(i, None)
+        threading.Thread(target=work, daemon=True).start()
+        return "loading"
+
+    def _get(self, c, arg, pid):
+        """A round's get: the index and the fds, and c its lease (True), or an error (False)."""
+        with self.mu:
+            # (a checkpoint the catalog knows by another path: its only entry, which the round
+            # checks by the files' identity, as before the catalog)
+            e = self.pick(arg) or (self.pick() if len(self.entries) == 1 and arg and os.sep in arg else None)
+            if e is None:
+                _send_msg(c, json.dumps(dict(error="no entry %s" % (arg or ""))).encode())
+                return False
+            _send_msg(c, json.dumps(e.index).encode())
+            socket.send_fds(c, [b"F"], e.fds())
+            self.leases[c] = (e.id, pid)
+            e.last = time.time()
+        log("a lease of %s: pid %d" % (e.id, pid))
+        return True
+
+    def _end_lease(self, c):
+        with self.mu:
+            i, pid = self.leases.pop(c, (None, None))
+            e = self.entries.get(i)
+            if e is not None:
+                e.last = time.time()
+        if i is not None:
+            log("the lease of %s ended: pid %d" % (i, pid))
+
+    def _request(self, c):
+        """One request on c. Return "lease" (c stays open), "stop", or None (c closed)."""
+        c.settimeout(60)
+        uid, pid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1::-1]
+        if uid != os.getuid():
+            return None
+        req, _sp, arg = _recv_msg(c).decode().strip().partition(" ")
+        arg = arg.strip() or None
+        if req == "get":
+            return "lease" if self._get(c, arg, pid) else None
+        if req == "put":
+            _msg, fds, _f, _a = socket.recv_fds(c, 16, 1)
+            if len(fds) != 1:
+                [os.close(fd) for fd in fds]
+                _send_msg(c, json.dumps(dict(error="put: one memfd")).encode())
+                return None
+            r = self.put(c, json.loads(arg), fds[0], pid)
+            _send_msg(c, json.dumps(r).encode())
+            return "lease" if "id" in r else None
+        if req == "restore":
+            st = self.restore(arg or "")
+            if st == "none" and arg in self.failed:
+                st = "failed"
+            _send_msg(c, json.dumps(dict(status=st)).encode())
+            return None
+        if req == "status":
+            _send_msg(c, json.dumps(self.status(arg)).encode())
+        elif req == "list":
+            _send_msg(c, json.dumps(self.listing()).encode())
+        elif req == "load":
+            d = json.loads(arg or "{}")
+            try:
+                i, st = self.load(Options(**d))
+                _send_msg(c, json.dumps(dict(id=i, status=st)).encode())
+            except (SystemExit, Exception) as exc:  # noqa: BLE001 (the layout's)
+                _send_msg(c, json.dumps(dict(error=str(exc))).encode())
+        elif req == "drop":
+            i, pids = self.drop(arg)
+            _send_msg(c, json.dumps(dict(dropped=i, **(dict(mapped_by=pids) if pids else {}))).encode())
+        elif req in ("keep", "unkeep"):
+            if not arg:
+                _send_msg(c, json.dumps(dict(error="%s: an ID or a checkpoint" % req)).encode())
+            else:
+                _send_msg(c, json.dumps({"kept" if req == "keep" else "unkept": self.keep(arg, req == "keep")})
+                          .encode())
+        elif req == "stop":
+            try:
+                _send_msg(c, b"stopping")
+            except OSError:
+                pass
+            return "stop"
+        return None
+
     def serve(self, path):
         if os.path.exists(path):
             try:
@@ -984,47 +1597,47 @@ class Weightkeeper:
         self.path = path
         signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
         signal.signal(signal.SIGINT, lambda *_a: sys.exit(0))
-        log("serving on %s" % path)
-        blob = json.dumps(self.index).encode()
+        log("serving on %s (%d entries%s)" % (path, len(self.entries), "; the host budget %.1f GB" % (
+            self.budget / 1e9) if self.budget is not None else ""))
+        sel = selectors.DefaultSelector()
+        sel.register(srv, selectors.EVENT_READ)
         try:
             while True:
-                c, _ = srv.accept()
-                with c:
-                    try:
-                        uid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                                               12))[1]
-                        if uid != os.getuid():
+                for key, _ev in sel.select():
+                    if key.fileobj is srv:
+                        c, _ = srv.accept()
+                        try:
+                            r = self._request(c)
+                        except (OSError, ValueError) as e:
+                            log("a client: %s" % e)
+                            r = None
+                        if r == "lease":
+                            c.settimeout(None)
+                            sel.register(c, selectors.EVENT_READ)
                             continue
-                        req = _recv_msg(c).decode().strip()
-                        if req == "get":
-                            _send_msg(c, blob)
-                            socket.send_fds(c, [b"F"], self.fds())
-                        elif req == "status":
-                            _send_msg(c, json.dumps(self.status()).encode())
-                        elif req == "stop":
-                            try:
-                                _send_msg(c, b"stopping")
-                            except OSError:
-                                pass
+                        c.close()
+                        if r == "stop":
                             return
-                    except (OSError, ValueError) as e:
-                        log("a client: %s" % e)
+                        continue
+                    # a lease's socket: the round closed it (or exited), or sent what a lease ignores
+                    c = key.fileobj
+                    try:
+                        b = c.recv(4096)
+                    except OSError:
+                        b = b""
+                    if not b:
+                        sel.unregister(c)
+                        self._end_lease(c)
+                        c.close()
         finally:
+            for c in list(self.leases):
+                c.close()
+            sel.close()
             srv.close()
             try:
                 os.unlink(path)
             except OSError:
                 pass
-
-    def status(self):
-        ix = self.index
-        return dict(pid=os.getpid(), model=ix.get("model", "deepseek_v41"), layout=ix["layout"],
-                    types=ix.get("types"), locked=ix["locked"], layers=len(ix.get("layers", [])) or ix.get("L"),
-                    nodes=ix["nodes"],
-                    segments=[dict(node=s.node, gb=round(s.size / 1e9, 2),
-                                   chunks=[[_pname(pg), round(n / 1e9, 2)] for pg, n, _o in s.chunks])
-                              for s in self.segs + ([self.dense] if self.dense else [])],
-                    checkpoint=ix["checkpoint"])
 
 
 def _send_msg(c, b):
@@ -1163,6 +1776,18 @@ def give_back_pools(added):
             log("could not give back the pool %s: %s" % (d, e))
 
 
+def _first(o):
+    """The catalog with the entry of o.ckpt loaded (none: an empty catalog, --serve)."""
+    k = Keeper(None if o.host_budget is None else int(o.host_budget * 1e9), o.keep_keys,
+               os.path.abspath(o.save) if o.save else None)
+    if o.ckpt:
+        e = Entry(o)
+        k.make_room(e)
+        e.load(k.save)
+        k.add(e)
+    return k
+
+
 def run(o: Options):
     """The weightkeeper, as the module text says: as root a parent that stays root and gives back
     the pages it added to the pools and (the last root keeper) the settings when it exits."""
@@ -1176,9 +1801,7 @@ def run(o: Options):
     if _answers(path):
         raise SystemExit("weightkeeper: a weightkeeper answers on %s (--list; another --name for a second one)" % path)
     if not root:
-        z = Weightkeeper(o)
-        z.load()
-        return z.serve(path)
+        return _first(o).serve(path)
     gid = o.group if o.group is not None else int(os.environ.get("SUDO_GID", "0"))
     nodes = sorted(set(numa.node_of_cpu().values())) or [0]
     now = system_state(nodes)
@@ -1211,8 +1834,7 @@ def run(o: Options):
         try:
             _pdeathsig()
             resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            z = Weightkeeper(o)
-            z.load()
+            z = _first(o)
             tell()
             _drop(uid, gid)
             log("dropped to uid %d" % uid)
@@ -1285,38 +1907,55 @@ def find(ckpt):
                 st = json.loads(_recv_msg(c))
         except (OSError, ValueError):
             continue
-        if os.path.realpath(st.get("checkpoint", "")) == want:
-            return path, st
+        for e in st.get("entries") or [st]:
+            if e.get("checkpoint") and os.path.realpath(e["checkpoint"]) == want and e.get("status") is None:
+                return path, e
     return None, None
+
+
+_LEASES = []        # the sockets of this process's gets: open for its life (the maps are never unmapped)
 
 
 class Weights:
     """The segments of a weightkeeper, mapped in this process: read-only, or
     writable when the weightkeeper sealed only their size (self.writable:
-    CUDA can page-lock them; the arrays stay read-only)."""
+    CUDA can page-lock them; the arrays stay read-only). The get's socket
+    stays open as the lease (self.lease: the keeper drops no leased entry for
+    its budget), until the process exits or end_lease()."""
 
-    def __init__(self, path=None, populate=True, ckpt=None):
+    def __init__(self, path=None, populate=True, ckpt=None, key=None):
         """ckpt: the checkpoint the round wants (with no path, the keeper that
         holds it: find); another one raises ValueError before anything is
         mapped."""
         if path is None and ckpt is not None:
             path = find(ckpt)[0]
-        c = request("get", path)
-        with c:
+        c = request("get" + (" " + key if key is not None else " " + os.path.realpath(ckpt) if ckpt is not None
+                             else ""), path)
+        try:
             self.index = json.loads(_recv_msg(c))
+            if "error" in self.index:
+                raise ValueError("the weightkeeper: %s" % self.index["error"])
             nfd = sum(len(s["chunks"]) for s in self.index["segments"])
             if self.index.get("dense"):
                 nfd += len(self.index["dense"]["chunks"])
             _msg, fds, _flags, _addr = socket.recv_fds(c, 16, nfd)
-        if self.index["version"] != VERSION or self.index["layout"] not in (LAYOUT, LAYOUT_V1, LAYOUT_TENSORS):
+        except BaseException:
+            c.close()
+            raise
+        if self.index["version"] != VERSION or self.index["layout"] not in (LAYOUT, LAYOUT_V1, LAYOUT_TENSORS,
+                                                                                LAYOUT_STORE):
             for fd in fds:
                 os.close(fd)
+            c.close()
             raise ValueError("the weightkeeper has the layout %r (version %s)" % (
                 self.index["layout"], self.index["version"]))
         if ckpt is not None and identity(ckpt) != self.index["shards"]:
             for fd in fds:
                 os.close(fd)
+            c.close()
             raise ValueError("the weightkeeper holds another checkpoint (%s)" % self.index["checkpoint"])
+        self.lease = c
+        _LEASES.append(c)
         self.fds = list(fds)
         self.writable = bool(self.index.get("writable"))
         prot = PROT_READ | (PROT_WRITE if self.writable else 0)
@@ -1332,6 +1971,13 @@ class Weights:
             self.dense_base = map_chunks(self.fds[k:], d["chunks"], prot, populate)
         for fd in self.fds:
             os.close(fd)
+
+    def end_lease(self):
+        """The lease ended (the keeper may drop the entry for its budget: only when this process
+        reads its maps no more, or the memory stays taken)."""
+        if self.lease in _LEASES:
+            _LEASES.remove(self.lease)
+        self.lease.close()
 
     def check(self, ckpt):
         """Raise when the checkpoint at ckpt is not the one of the segments."""

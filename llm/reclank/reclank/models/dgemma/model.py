@@ -38,6 +38,7 @@ import os
 import numpy as np
 
 from reclank.core import ops
+from reclank.encoders import media as MD
 from reclank.formats.safetensors import Shards
 from reclank.models.gemma4 import rope as rope_mod
 
@@ -315,14 +316,19 @@ class DGemmaRef:
         return x + ops.rms_norm(h1 + h2, w["post_feedforward_layernorm"], eps)
 
     # ---- the encoder -------------------------------------------------------
-    def encode(self, ids, cache, hook=None):
+    def encode(self, ids, cache, hook=None, spans=None):
         """Run the encoder over ids at the positions after the cache; append
-        their keys and values to it. Returns the last hidden state (normed)."""
+        their keys and values to it. Returns the last hidden state (normed).
+
+        spans: the soft rows of images (encoders/media.Span), positions
+        relative to ids."""
         cfg = self.cfg
         t = len(ids)
         start = cache.n
         positions = np.arange(start, start + t)
         x = self.embed(ids)
+        if spans:
+            MD.place_rows(x, spans, offset=0)
         for i in range(cfg.layers):
             w = self.layer(i)
             h = ops.rms_norm(x, w["input_layernorm"], cfg.eps)
@@ -330,7 +336,8 @@ class DGemmaRef:
             cache.append(i, k, v)
             K, V = cache.k[i], cache.v[i]
             kpos = np.arange(K.shape[0])
-            mask = kpos[None, :] <= positions[:, None]
+            limit = MD.limit_positions(positions, spans, start=start) if spans else positions
+            mask = kpos[None, :] <= limit[:, None]
             if cfg.sliding[i]:
                 mask &= kpos[None, :] > positions[:, None] - cfg.window
             a = self._attend(q, K, V, mask) @ w["self_attn.o_proj"].T

@@ -31,7 +31,8 @@ THINK_MIN_CONTEXT = 32768
 
 
 def detect(meta):
-    return str(meta.get("general.architecture", "")).startswith("gemma")
+    # a GGUF file, or a checkpoint folder (its config.json: an E2B or E4B, ct.Checkpoint)
+    return str(meta.get("general.architecture", "")).startswith("gemma") or meta.get("model_type") == "gemma4"
 
 
 def request_thinking(req):
@@ -97,6 +98,12 @@ class GemmaEngine(Engine):
         self._media_rows = {}
         self.last_media = []
         self.last_text = None
+        # NVIDIA's template of its fine-tunes (chat.render_chat: content_first, conversational):
+        # content_first always, conversational when a request asks (chat_template_kwargs
+        # conversational_mode; read with its think setting, which the backend asks first)
+        self.chat_form = {}
+        self.spoken = False
+        self._req_spoken = False
 
     def _session(self, max_len):
         from reclank.models.gemma4.model import Session
@@ -105,6 +112,7 @@ class GemmaEngine(Engine):
     # ---- the prompt
 
     def think_level(self, req, default):
+        self._req_spoken = self.spoken and bool((req.get("chat_template_kwargs") or {}).get("conversational_mode"))
         v = request_thinking(req)
         return bool(default) if v is None else bool(v)
 
@@ -123,7 +131,8 @@ class GemmaEngine(Engine):
         parts = []
         text = self.tokenizer.apply_chat_template(
             msgs, add_generation_prompt=True, thinking=think, tools=tools,
-            empty_thought_block=self.empty_thought_block, media=parts)
+            empty_thought_block=self.empty_thought_block, media=parts,
+            conversational=self._req_spoken, **self.chat_form)
         if parts:
             return self.media_prompt(text, parts, source)
         self.last_text = text
@@ -242,6 +251,34 @@ class GemmaEngine(Engine):
                           tool=(tt["tool_open"], tt["tool_close"]), open_id=tt["open"],
                           ends_line=tt.get("ends_line"))
 
+    # ---- the device half (the GPU sharing: server/gpushare.py, docs/GPU_SWAP_PLAN.md 3.6)
+    offload = None      # load: (experts_gb, resident) of gpu.offload, None on the CPU
+
+    def can_release_device(self):
+        from reclank.backends.cuda.devices import expert_device
+        return self.offload is not None and expert_device(self.model) is None
+
+    def release_device(self):
+        """The cache's rows on the GPU to the host cache (the sessions keep it), the GPU half
+        forgotten (runtime.close_all frees it); the drafter's device half made again at its next draft."""
+        m = self.model
+        g = m.__dict__.get("_gpu")
+        if g is None:
+            return
+        prev = m._gpu_cached()
+        if prev is not None:
+            m.gpu_sync(prev)            # (the rows the GPU made into the host cache)
+        self._free0 = g.free0
+        m._gpu, m._gpu_cache, m._gpu_xn = None, None, None
+        if getattr(self.drafter, "on_gpu", False):
+            self.drafter.release()
+
+    def reload_device(self):
+        """The GPU half as the load made it (gpu.offload with the load's free memory: the same hot
+        experts, chunk and budget)."""
+        from reclank.models.gemma4 import gpu
+        gpu.offload(self.model, self.offload[0], resident=self.offload[1], free0=self._free0)
+
     def idle(self):
         """Between requests (server/worker.py: no job waits): the expert device's experts by the
         conversation (ModelGPU.refresh_experts)."""
@@ -285,9 +322,11 @@ class GemmaEngine(Engine):
             report(guard, "reclank", self.wrap_left)
             st = session.mtp_stats
             if self.drafter is not None and st.get("drafts"):
-                print('[reclank] mtp steps=%d drafts=%d accepted=%d (%d%%)' % (
+                print('[reclank] mtp steps=%d drafts=%d accepted=%d (%d%%)%s' % (
                     st["steps"], st["drafts"], st["accepted"],
-                    100 * st["accepted"] // st["drafts"]), file=sys.stderr, flush=True)
+                    100 * st["accepted"] // st["drafts"],
+                    "; rounds by drafts " + " ".join("%d:%d" % kv for kv in sorted(st["by_k"].items()))
+                    if st.get("by_k") else ""), file=sys.stderr, flush=True)
 
 
 # The room of the GPU after the weights (gpu.room) under which the default
@@ -329,11 +368,22 @@ def load(opts, meta=None):
     os.environ["RECLANK_ATTN"] = "0" if kv == "float" else "1"
     if kv in ("int8", "k16v8", "rq8", "k16vr8"):
         model_mod.KV_FORM = kv
-    from reclank.models.qwen.keep import gguf_or_kept
-    g = gguf_or_kept(opts.model)        # (the weightkeeper's tensors when one holds the file)
-    tok = Tokenizer(opts.tokenizer) if opts.tokenizer else Tokenizer.from_gguf(g)
+    if os.path.isdir(opts.model):
+        # a checkpoint folder (transformers'): the E2B and E4B, their weights as stored
+        from reclank.models.gemma4.ct import Checkpoint
+        g = Checkpoint(opts.model)
+        tok = Tokenizer(opts.tokenizer or os.path.join(opts.model, "tokenizer.json"))
+        # the end tokens of generation_config.json (<eos>, <turn|>, 50), as a GGUF file's end of a turn
+        tok.stop_ids |= set(g.eos_ids)
+    else:
+        from reclank.models.qwen.keep import gguf_or_kept
+        g = gguf_or_kept(opts.model)        # (the weightkeeper's tensors when one holds the file)
+        tok = Tokenizer(opts.tokenizer) if opts.tokenizer else Tokenizer.from_gguf(g)
     tc = g.text_config()
     e4b = bool(tc.get("hidden_size_per_layer_input"))
+    if os.path.isdir(opts.model) and not e4b:
+        raise SystemExit("%s: a checkpoint folder of the E2B or E4B only (the 12B, 26B and 31B load from a "
+                         "GGUF file)" % opts.model)
     print("loading %s ..." % opts.model, flush=True)
     gpu_on = opts.backend == "cuda"
     if opts.backend == "auto":
@@ -346,10 +396,17 @@ def load(opts, meta=None):
         from reclank.backends.cuda.gpumm import mem_info
         free0, total0 = mem_info()
         small_card = min(free0, total0) < SMALL_CARD
+    from reclank.models.gemma4.dflash import is_dflash, target_layers
+    dflash = bool(opts.drafter) and is_dflash(opts.drafter)
+    if dflash and not e4b:
+        raise SystemExit("%s: a DFlash drafter of the E4B (Nemotron 3.5 Bolt E4B)" % opts.drafter)
     if e4b:
         from reclank.models.gemma4.e4b import E4B, E4BConfig
         cfg = E4BConfig({"text_config": tc})
         model = E4B(g, cfg, mode="int4" if (opts.dtype or "int4") == "int4" else "f32")
+        if dflash:
+            # its target layers' outputs come out of every run (the programs compile them in)
+            model.taps = tuple(target_layers(opts.drafter))
         if opts.drafter and gpu_on and not small_card:
             # The E4B with its drafter on the GPU is faster with MTP than
             # without it (SPLIT_PLAN.md, phase 5).
@@ -365,8 +422,8 @@ def load(opts, meta=None):
             from reclank.backends.cuda.devices import start_expert_device
             start_expert_device(model)
         print("copying the weights to the GPU ...", flush=True)
-        dev = gpu.offload(model, 0.0 if opts.gpu_dense else opts.hot_gb,
-                          resident=getattr(opts, "resident", False))
+        offload_args = (0.0 if opts.gpu_dense else opts.hot_gb, getattr(opts, "resident", False))
+        dev = gpu.offload(model, offload_args[0], resident=offload_args[1])
         print(gpu.describe(dev), flush=True)
     # The model file gives the sampling that the model wants. Use it unless the
     # caller asks for another value. A greedy default is not the wish of the
@@ -398,6 +455,14 @@ def load(opts, meta=None):
         # a card of less than 8 GB (SMALL_CARD): the memory of the drafter
         # and of the programs of the groups goes to the cache
         n_def = 0
+    if dflash:
+        # A DFlash block of 8 (the last token and 7 drafts) costs the same for any count, the verify
+        # group grows with it (Bolt E4B on the 3090, tok/s of code, chat, a summary, a server's second
+        # requests; no drafter 56.2, 56.6, 54.4): 7 drafts 131.5, 71.2, 78.2; 5 158.6, 86.8, 94.9;
+        # 4 155.4, 93.9, 97.3; 3 149.2, 96.7, 98.0; 2 122.9, 94.7, 91.6. RECLANK_MTP_ADAPT=1: each
+        # round takes the count of 1 .. 7 with the most tokens a second (speculative.AdaptiveDrafts:
+        # 153.0, 93.5, 96.2); --mtp N: N.
+        n_def = 3
     n_draft = opts.mtp if opts.mtp is not None else n_def
     from reclank.core.speculative import mtp_stop
     stop = mtp_stop(stop_def)
@@ -410,7 +475,19 @@ def load(opts, meta=None):
         # With a GPU the default of assistant.mtp_enabled is off; the drafter
         # was asked for, so turn MTP on.
         os.environ["RECLANK_MTP"] = "1"
-    if opts.drafter and n_draft > 0:
+    if opts.drafter and n_draft > 0 and dflash:
+        from reclank.models.gemma4.dflash import DFlashGPU, DFlashKQ
+        print("loading the DFlash drafter %s ..." % opts.drafter, flush=True)
+        drafter = DFlashGPU(opts.drafter, model) if gpu_on else DFlashKQ(opts.drafter, model)
+        model.tap_sink = drafter.inject_rows
+        n_draft = min(n_draft, drafter.block - 1)
+        if opts.mtp is None and os.environ.get("RECLANK_MTP_ADAPT") == "1":
+            from reclank.core.speculative import AdaptiveDrafts
+            n_draft = AdaptiveDrafts(range(1, drafter.block), start=n_draft)
+        print("DFlash: %s drafts a round, the context of layers %s of the target" % (
+            "1 .. %d (the most tokens a second)" % n_draft.ks[-1] if not isinstance(n_draft, int)
+            else n_draft, list(model.taps)), flush=True)
+    elif opts.drafter and n_draft > 0:
         print("loading the MTP drafter %s ..." % opts.drafter, flush=True)
         if gpu_on:
             # The drafter on the GPU reads the cache on the GPU.
@@ -446,6 +523,14 @@ def load(opts, meta=None):
             cdir, store.max_bytes / 1e9, store.min_tokens), flush=True)
     eng = GemmaEngine(model, tok, cfg, drafter=drafter, n_draft=n_draft, empty_thought_block=not e4b,
                       max_context=ctx, contexts=getattr(opts, "contexts", 4), store=store)
+    template = g.chat_template() if hasattr(g, "chat_template") else str(g.meta.get("tokenizer.chat_template", ""))
+    if "conversational_mode" in template:
+        # NVIDIA's template (Nemotron 3.5 Bolt E4B): see GemmaEngine.chat_form
+        eng.chat_form = {"content_first": True}
+        eng.spoken = True
+        print("chat template: NVIDIA's (content before tool calls; conversational_mode)", flush=True)
+    if gpu_on:
+        eng.offload = offload_args
     # the thought channel of Gemma 4 (<|channel>thought ... <channel|>): the
     # budget of a think part and the words to wrap up (core/think_guard.py)
     one = lambda t: tok.encode(t)[0] if len(tok.encode(t)) == 1 else None  # noqa: E731
@@ -465,13 +550,16 @@ def load(opts, meta=None):
         # cache then finds no room.
         media_env = os.environ.get("RECLANK_MEDIA_GPU")
         media_gpu = gpu_on and (media_env == "1" if media_env else not small_card)
-        q8 = opts.mmproj_q8 == "on" or (opts.mmproj_q8 in (None, "auto") and e4b)
+        # the encoders' weights (encoders.weight_form): --mmproj-q8 on Q8_0, off bfloat16, bf12 BF12; auto
+        # BF12 for the E2B and E4B (their bfloat16 towers' outputs within 1.5e-3 at 77% of the bytes;
+        # Q8_0 was 2.3e-2), bfloat16 for the others
+        q8 = {"on": "q8", "off": "bf16", "bf12": "bf12"}.get(opts.mmproj_q8) or ("bf12" if e4b else "bf16")
         eng.embedder = load_embedder(opts.mmproj, gpu=media_gpu, q8=q8)
         eng.image_budget = opts.image_budget or defaults["image_budget"]
         eng.video_frames = opts.video_frames or 32
         eng.video_budget = opts.video_budget or defaults["video_budget"]
         print("media input: %s (images%s), image budget %d%s, encoder on the %s" % (
             opts.mmproj, " and audio" if eng.embedder.has_audio else "",
-            eng.image_budget, ", Q8_0 encoder weights" if getattr(eng.embedder, "q8", False)
-            else "", "GPU" if media_gpu else "CPU"), flush=True)
+            eng.image_budget, {"q8": ", Q8_0 encoder weights", "bf12": ", BF12 encoder weights"}.get(
+                getattr(eng.embedder, "form", None), ""), "GPU" if media_gpu else "CPU"), flush=True)
     return eng, defaults

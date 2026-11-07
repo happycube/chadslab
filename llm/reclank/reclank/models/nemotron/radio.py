@@ -18,7 +18,8 @@ NVIDIA CORPORATION). See THIRD_PARTY_NOTICES.md.
        x + fc2(gelu_erf(fc1(LN(x)))) (layer scale 1: none in the checkpoint);
        no final norm in RADIO
     -> the features: the patch tokens (the 10 prefix tokens dropped)
-    -> vision_final_layernorm (LN 1280, eps 1e-6; there because the LLM has an MTP layer)
+    -> vision_final_layernorm (LN 1280, eps 1e-6): the config's vision_final_layernorm, else
+       (checkpoints before the field) when the LLM has an MTP layer: Super's on, Bolt's off
     -> pixel shuffle (ps v2, ratio 0.5): each 2 x 2 block of patches one row of 5120,
        channel dh * 2560 + dw * 1280 + c
     -> mlp1: RMSNorm (eps 1e-5) -> linear1 5120 -> 20480 -> relu^2 -> linear2 -> 4096
@@ -294,8 +295,13 @@ class RadioVision:
                 "norm1.weight", "norm1.bias", "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight",
                 "attn.proj.bias", "norm2.weight", "norm2.bias", "mlp.fc1.weight", "mlp.fc1.bias",
                 "mlp.fc2.weight", "mlp.fc2.bias")})
+        # (the final layer norm as modeling_nemotron_h_omni.py decides it: None for Bolt, whose config says False and
+        # whose checkpoint has none)
+        fl = cfg.get("vision_final_layernorm")
+        if fl is None:
+            fl = int(cfg.get("llm_config", {}).get("num_nextn_predict_layers") or 0) > 0
         self.fln = (f("vision_projector.vision_final_layernorm.weight"),
-                    f("vision_projector.vision_final_layernorm.bias"))
+                    f("vision_projector.vision_final_layernorm.bias")) if fl else None
         self.m_norm = f("mlp1.0.weight")
         self.m_up = f("mlp1.1.weight")                            # [20480, 5120]
         self.m_down = f("mlp1.3.weight")                          # [4096, 20480]
@@ -375,7 +381,7 @@ class RadioVision:
 
     def project(self, feats, hp, wp):
         """The image rows [hp * wp / 4, 4096] of RADIO's features."""
-        x = layer_norm(feats, self.fln[0], self.fln[1], self.eps)
+        x = layer_norm(feats, self.fln[0], self.fln[1], self.eps) if self.fln is not None else feats
         x = rms_norm(pixel_shuffle(x, hp, wp), self.m_norm, 1e-5)
         y = np.empty((x.shape[0], self.m_down.shape[0]), np.float32)
         for r in range(0, x.shape[0], self.rows):
@@ -396,6 +402,15 @@ def _bf16_bits(a):
     return (a.view(np.uint32) >> 16).astype(np.uint16)
 
 
+def _team(p, gpu):
+    """A CPU program with its own team (team_threads(): beside the GPU OMP_NUM_THREADS is 1, and the
+    encoder on one thread took 213 s for an image of 1008 rows)."""
+    if not gpu:
+        from reclank.runtime.threads import team_threads
+        p.threads = p.buf[3] = team_threads()
+    return p
+
+
 class RadioGPU(RadioVision):
     """RadioVision on the GPU: RADIO and the final layer norm as one program of the encoder records
     (reclank/encoders/runtime.py: ENC_LINEAR with the bfloat16 weights on the tensor cores, ENC_LNORM,
@@ -403,10 +418,12 @@ class RadioGPU(RadioVision):
     GP_RELU2); the CPE table, the patches and the pixel shuffle on the host. The host gives the
     blocks x0: the prefix tokens in its first rows, the CPE rows after them; the patch linear adds
     to it (the prefix rows' patches are zeros). max_patches (optional): a smaller budget of
-    patches than the checkpoint's 13312 (its attention and memory)."""
+    patches than the checkpoint's 13312 (its attention and memory). gpu False: the same programs
+    in C on the CPU (no GPU memory: Bolt's hot experts keep it)."""
 
-    def __init__(self, path, max_patches=None):
+    def __init__(self, path, max_patches=None, gpu=True):
         super().__init__(path)
+        self.gpu = bool(gpu)
         from reclank.encoders.runtime import _Runner
         from reclank.models.qwen.vision import _Lin
         if max_patches:
@@ -436,7 +453,8 @@ class RadioGPU(RadioVision):
 
     def _vit_program(self, n, gpu=True):
         """n tokens (the prefix and the patches): inputs "p" [n, 768] (zeros in the prefix rows), "x0"
-        [n, 1280]; output "f" [n, 1280] (the final layer norm of the last hidden state)."""
+        [n, 1280]; output "f" [n, 1280] (the final layer norm of the last hidden state; without one
+        (Bolt) "x", the last hidden state)."""
         from reclank.encoders.runtime import _EncCompiler
         w, H, hd = self.width, self.heads, self.hd
         kp = self.lin_patch.w.shape[1]
@@ -462,9 +480,10 @@ class RadioGPU(RadioVision):
                 ("set", "t", ("enc_linear", b["fc2"], "g")),
                 ("enc_add", "x", "t"),
             ]
-        forms.append(("set", "f", ("enc_lnorm", "x", self.fln[0], self.fln[1], w)))
+        if self.fln is not None:
+            forms.append(("set", "f", ("enc_lnorm", "x", self.fln[0], self.fln[1], w)))
         c.compile(("seq", *forms))
-        return c.p.finish()
+        return _team(c.p.finish(), gpu)
 
     def _proj_program(self, m, gpu=True):
         """m rows of the pixel shuffle: input "b" [m, 5120]; output "y" [m, 4096]."""
@@ -477,10 +496,10 @@ class RadioGPU(RadioVision):
         c.compile(("seq", ("set", "r", ("enc_rms", "b", self.m_norm, kb)), ("set", "u", ("enc_linear", self.lin_up, "r"))))
         c.p.emit(P.RELU2, c.env["u"], c.env["u"], m * up)
         c.compile(("set", "y", ("enc_linear", self.lin_down, "u")))
-        return c.p.finish()
+        return _team(c.p.finish(), gpu)
 
     def image(self, image, n_images=1, max_tokens=None):
-        """(rows [n, 4096] float32, n) of an image, on the GPU."""
+        """(rows [n, 4096] float32, n) of an image, on the GPU (or the CPU: gpu False)."""
         px, hp, wp = self.pixels(image, n_images, max_tokens)
         p = self.patch
         c = px.shape[0]
@@ -492,9 +511,9 @@ class RadioGPU(RadioVision):
         x0 = np.empty((n, self.width), np.float32)
         x0[:self.prefix] = self.cls
         x0[self.prefix:] = self.pos_embed(hp, wp)
-        f = self.gvit.run(n, True, {"p": pin, "x0": x0}, "f")[self.prefix:]
+        f = self.gvit.run(n, self.gpu, {"p": pin, "x0": x0}, "f" if self.fln is not None else "x")[self.prefix:]
         b = pixel_shuffle(f, hp, wp)
-        rows = self.gproj.run(b.shape[0], True, {"b": b}, "y")
+        rows = self.gproj.run(b.shape[0], self.gpu, {"b": b}, "y")
         return rows, rows.shape[0]
 
     def release(self):

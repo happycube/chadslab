@@ -943,14 +943,14 @@ template <int T>
 static void fdtc_run(int op, dim3 grid, const gp_rec *dr, const int64_t *denv, float *part)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 1));
         cudaFuncSetAttribute(k_attn_fdtc<T, 8, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 0));
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 0));
-        attr = 1;
+        attr = gg_epoch;
     }
     if (op == GP_ATTN_QC) {
         k_attn_fdtc<T, 16, 16><<<grid, 256, FT_SMEM(T, 1), gg_stream>>>(dr, denv, part);

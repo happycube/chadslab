@@ -6,12 +6,13 @@ anything but tensors and plain containers is refused) and its tensors written as
 that JSON can hold (MoGe-2's model_config) go to NAME.json. Then the pages of both files are
 dropped from the page cache.
 
-    pt_to_safetensors.py FILE.pth [FILE.pt ...] [--key KEY[,KEY...]] [--out DIR]
+    pt_to_safetensors.py FILE.pth [FILE.pt ...] [--key KEY[,KEY...]] [--prefix P] [--out DIR]
 
 The tensors: the checkpoint itself when it is a dict of tensors, a bare tensor (saved under the
 file's stem: SeedVR2's pos_emb.pt), else its entry KEY (the first of the keys given that it has,
 such as "params_ema,params" for Real-ESRGAN; default: the one entry that is a dict of tensors,
-such as "model"). The depth models of models/depth:
+such as "model"); --prefix: only its tensors whose names start with P, P taken off (RealBasicVSR's
+training checkpoint: --key state_dict --prefix generator_ema.). The depth models of models/depth:
 Video-Depth-Anything-Small's video_depth_anything_vits.pth and MoGe-2's model.pt. Run it in a
 venv with torch and safetensors (the generation reference venv)."""
 from __future__ import annotations
@@ -31,10 +32,13 @@ def drop(path):
     os.close(fd)
 
 
-def convert(src, out_dir=None, key=None):
+def convert(src, out_dir=None, key=None, prefix=None):
     import torch
     from safetensors.torch import save_file
-    obj = torch.load(src, map_location="cpu", weights_only=True, mmap=True)
+    try:
+        obj = torch.load(src, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError:            # (a checkpoint of the legacy format, before the zip one: RealBasicVSR's)
+        obj = torch.load(src, map_location="cpu", weights_only=True)
     is_sd = lambda d: isinstance(d, dict) and d and all(isinstance(v, torch.Tensor) for v in d.values())  # noqa: E731
     rest = {}
     stem = os.path.splitext(os.path.basename(src))[0]
@@ -54,6 +58,10 @@ def convert(src, out_dir=None, key=None):
             key = keys[0]
         sd = obj[key]
         rest = {k: v for k, v in obj.items() if k != key and not isinstance(v, torch.Tensor) and not is_sd(v)}
+    if prefix:
+        sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+        if not sd:
+            raise ValueError("%s: no tensor starts with %s" % (src, prefix))
     out_dir = out_dir or os.path.dirname(os.path.abspath(src))
     dst = os.path.join(out_dir, stem + ".safetensors")
     save_file({k: v.contiguous() for k, v in sd.items()}, dst,
@@ -73,10 +81,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+")
     ap.add_argument("--key")
+    ap.add_argument("--prefix")
     ap.add_argument("--out")
     a = ap.parse_args()
     for f in a.files:
-        convert(f, a.out, a.key)
+        convert(f, a.out, a.key, a.prefix)
 
 
 if __name__ == "__main__":

@@ -109,6 +109,12 @@ MODELS = [
           cpu=Need(26, 0, "the file (22.1 GB) and the cache", est=True),
           args="--model {d}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --mmproj {d}/mmproj-BF16.gguf",
           gpu_args="--backend cuda", cpu_args="--backend cpu"),
+    Model("qwen36-35b-nvfp4", "Qwen3.6-35B-A3B (NVIDIA's NVFP4)", "chat",
+          "nvidia/Qwen3.6-35B-A3B-NVFP4", "Qwen3.6-35B-A3B-NVFP4", 23.46, "Apache-2.0",
+          gpu=Need(56, 22, "measured: the weightkeeper 45 GB (the experts on both nodes), the server 10 GB; on "
+                   "the card the dense matrices and the head, then hot experts"),
+          args="--model {d} --mmproj {d}", gpu_args="--backend cuda",
+          notes=["start the weightkeeper first: python scripts/weightkeeper.py {d}"]),
     Model("lfm25-24b", "LFM2.5-24B-A2B (QAD Q4_0)", "chat",
           "LiquidAI/LFM2.5-24B-A2B-GGUF", "LFM2.5-24B-A2B-GGUF", 13.58, "LFM Open License v1.0",
           files=["LFM2.5-24B-A2B-QAD-Q4_0.gguf"],
@@ -173,13 +179,24 @@ MODELS = [
     Model("nemotron-bolt-e4b", "Nemotron 3.5 Bolt E4B (BF16)", "chat",
           "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16", "NVIDIA-Nemotron-3.5-Bolt-E4B-BF16", 16.03, "OpenMDW-1.1",
           files=["*.json", "*.safetensors", "*.jinja", "*.md"],
-          status="not-yet",
-          why="a Gemma 4 E4B fine-tune in a bfloat16 safetensors folder: the gemma4 family loads GGUF files "
-              "only, and its chat template is NVIDIA's (thinking budget, conversational mode)",
-          gpu=Need(18, 16, "the 16 GB of bfloat16 weights (7.9 GB of layers, 5.6 GB per-layer table, 1.3 GB "
-                   "embedding, 0.9 GB towers)", est=True),
-          notes=["NVIDIA's 4 GB form, nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB (one Q4_K_M GGUF, 6.2 GB, "
-                 "general.architecture gemma4), may load through the Gemma E4B path: not yet checked"]),
+          gpu=Need(19, 10, "measured: 18.4 GB of host memory, 9.3 GB of the card (the bfloat16 weights read in "
+                   "place from the folder; prompt groups of 1024 rows)"),
+          cpu=Need(19, 0, "measured: 18.4 GB (the bfloat16 weights in place)"),
+          args="--model {d} --model-id nemotron-3.5-bolt-e4b", gpu_args="--backend cuda", cpu_args="--backend cpu",
+          notes=["a Gemma 4 E4B fine-tune: the gemma4 family reads its bfloat16 folder in place, with NVIDIA's "
+                 "chat template (thinking, conversational_mode in chat_template_kwargs)",
+                 "images and audio: write its towers' mmproj once (PYTHONPATH=llama.cpp/gguf-py python "
+                 "scripts/gemma4_mmproj.py {d} {d}/nemotron-3.5-bolt-e4b-mmproj.gguf), then --mmproj that file",
+                 "drafts: NVIDIA's DFlash drafter (nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16-DFlash-NVFP4, 0.58 GB) "
+                 "by --drafter DIR, 3 drafts a round: code 2.65x, a long summary 1.80x, short chat 1.71x (the same tokens; "
+                 "the 3090)"]),
+    Model("nemotron-bolt-e4b-4gb", "Nemotron 3.5 Bolt E4B (4 GB, Q4_K_M)", "chat",
+          "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB", "NVIDIA-Nemotron-3.5-Bolt-E4B-4GB", 6.21, "OpenMDW-1.1",
+          files=["Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf"],
+          gpu=Need(9, 7, "the 6.2 GB file", est=True), cpu=Need(9, 0, "the 6.2 GB file", est=True),
+          args="--model {d}/Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf", gpu_args="--backend cuda", cpu_args="--backend cpu",
+          notes=["NVIDIA's Q4_K_M of the BF16 folder through the Gemma E4B path: against transformers' float32 of "
+                 "the BF16 weights a continuation's KL 0.002-0.09, top-1 0.88-1.0 (the BF16 folder 0.00000)"]),
 
     # ---- embeddings (python -m server.embed, port 8082)
     Model("embeddinggemma2", "EmbeddingGemma 2 (text, image, audio)", "embed",

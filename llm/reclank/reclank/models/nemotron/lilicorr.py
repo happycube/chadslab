@@ -34,6 +34,25 @@ from reclank.models.nemotron.model import nvfp4, rms_norm, silu
 
 RING = 2048             # the positions of the context the layers keep (a window of 1024, and room)
 LILI_HEAD = os.environ.get("RECLANK_LILI_HEAD", "program")     # "numpy": the NumPy head (LiLiCorr.lattice)
+# On a GPU without tensor cores (Pascal, dp4a): the drafter's products on int8 x of one plane (k_nm_t8s), its
+# bfloat16 matrices as Q8_0 rows (the int8 products: q_proj on the 8 rows of a draft took k_mt_gemv_bf16 261 us
+# on a P6000), the head's ENC_LINEAR on float32 rows (k_enc_sgemm's small tiles: k_enc_gemm ran 16 blocks).
+# Only the drafts change: the verify group decides the tokens. RECLANK_LILI_PASCAL=0: as on the tensor cores.
+LILI_PASCAL = os.environ.get("RECLANK_LILI_PASCAL", "1") != "0"
+
+
+def _q8_0_rows(bits):
+    """A bfloat16 matrix (its bits, rows x cols) as Q8_0 rows: blocks of 32, a float16 scale (amax / 127)
+    and 32 int8 values each."""
+    rows, cols = bits.shape
+    x = (np.asarray(bits, np.uint32) << 16).view(np.float32).reshape(rows, cols // 32, 32)
+    d = (np.abs(x).max(-1) / 127.0).astype(np.float16)
+    df = d.astype(np.float32)
+    q = np.rint(x / np.where(df > 0, df, 1.0)[..., None]).clip(-127, 127).astype(np.int8)
+    out = np.empty((rows, cols // 32, 34), np.uint8)
+    out[..., :2] = d.view(np.uint8).reshape(rows, cols // 32, 2)
+    out[..., 2:] = q.view(np.uint8)
+    return out.reshape(-1)
 
 
 def _rope(x, pos, theta):
@@ -281,6 +300,11 @@ class LiLiCorrKQ(LiLiCorr):
         super().__init__(path, embed=target.embed, head=target.logits)
         from reclank.backends.cpu import cops
         self.gpu = gpu
+        self.lite = False
+        if gpu and LILI_PASCAL:
+            from reclank.backends.cuda.runtime import caps
+            c = caps()
+            self.lite = not c.get("tc", 1) and bool(c.get("dp4a", 0))
         self._m = {}
         self._cops = cops
         self.progs = {}
@@ -308,7 +332,10 @@ class LiLiCorrKQ(LiLiCorr):
                 m = (out, 51, rows, cols)
             else:
                 w = self.bf16(name + ".weight")
-                m = (w, None, w.shape[0], w.shape[1])
+                if self.lite and w.shape[1] % 32 == 0:
+                    m = (_q8_0_rows(w), 8, w.shape[0], w.shape[1])
+                else:
+                    m = (w, None, w.shape[0], w.shape[1])
             self._m[name] = m
         return m
 
@@ -320,9 +347,10 @@ class LiLiCorrKQ(LiLiCorr):
         if typ is None:
             prog.emit(P.BF16_LINEAR, src, w, out, rows, cols, t)
         elif self.gpu and t > 1:
-            # (the GPU's tiled int8 product on the two planes, as gpu.NmEmit)
-            prog.emit(P.NM_QX, src, t, cols, scr["xq"], scr["xs"], scr["xl"])
-            prog.emit(P.NM_GEMM8, scr["xq"], scr["xs"], w, typ, rows, cols, t, out, scr["xl"])
+            # (the GPU's tiled int8 product on the two planes, as gpu.NmEmit; lite: one)
+            xl = None if self.lite else scr["xl"]
+            prog.emit(P.NM_QX, src, t, cols, scr["xq"], scr["xs"], xl)
+            prog.emit(P.NM_GEMM8, scr["xq"], scr["xs"], w, typ, rows, cols, t, out, xl)
         elif self.gpu:
             prog.emit(P.KQ_LINEAR, scr["xq"], scr["xs"], scr["xm"], src, w, typ, rows, cols, t, out)
         else:
@@ -436,6 +464,7 @@ class LiLiCorrKQ(LiLiCorr):
         L = "lilicorr."
 
         def enc(src, name, out, rows, m, kk, bf=True):
+            bf = bf and not self.lite
             w = self.bf16(L + name + ".weight") if bf else self.f32(L + name + ".weight")
             prog.emit(P.ENC_LINEAR, src, w, int(bf), self.f32(L + name + ".bias"), out, rows, m, kk, -inf, inf, -inf,
                       inf, None, None)
@@ -459,9 +488,9 @@ class LiLiCorrKQ(LiLiCorr):
         for i in range(self.llayers):
             p = L + "layers.%d." % i
             prog.emit(P.RMS_NORM, x, self.f32(p + "attn_norm.weight"), a, n, H, self.eps)
-            w = self.bf16(p + "attn.in_proj_weight")
-            prog.emit(P.ENC_LINEAR, a, w, 1, self.f32(p + "attn.in_proj_bias"), qkv, n, 3 * H, H, -inf, inf, -inf, inf,
-                      None, None)
+            w = self.f32(p + "attn.in_proj_weight") if self.lite else self.bf16(p + "attn.in_proj_weight")
+            prog.emit(P.ENC_LINEAR, a, w, 0 if self.lite else 1, self.f32(p + "attn.in_proj_bias"), qkv, n, 3 * H, H,
+                      -inf, inf, -inf, inf, None, None)
             prog.keep.append(w)
             prog.emit(P.NM_LATT, qkv, lbias, att, n, self.lheads, hd)
             self._lin(prog, p + "attn.out_proj", att, ob, n, scr)
@@ -568,7 +597,7 @@ class LiLiCorrGPU(LiLiCorrKQ):
 
     def _prog(self, key, make):
         from reclank.backends.cuda.runtime import GPUProgram
-        from reclank.ir import program as P
+        from reclank.models.nemotron.gpu import emit_head
         e = self.progs.get(key)
         if e is None:
             prog = make()
@@ -576,8 +605,7 @@ class LiLiCorrGPU(LiLiCorrKQ):
                 head = self.gdev.m.M("language_model.lm_head")
                 hid = prog.names["hid"]
                 lg = np.zeros((self.block - 1, head.rows), np.float32)
-                prog.recs.append((P.KQ_LINEAR, [prog._enc(a) for a in (
-                    None, None, None, hid[1:], head.data, head.type, head.rows, head.cols, self.block - 1, lg)]))
+                emit_head(prog, head, hid[1:], self.block - 1, lg)
                 prog.names["logits"] = lg
                 if LILI_HEAD != "numpy":
                     self._topk(prog, lg)

@@ -206,6 +206,9 @@ class ModelWorker:
         self.jobs = queue.Queue()
         self.engine = None          # for the fatal errors (engine.fatal)
         self.lanes = None           # a LaneScheduler (--lanes 2)
+        self.running = False        # a job runs (busy)
+        self.before = None          # before each job (the GPU sharing: the device half back first)
+        self.released = False       # the engine's device half is gone: no idle work
         self._thread = threading.Thread(target=self._loop, daemon=True, name="model")
         self._thread.start()
 
@@ -234,18 +237,25 @@ class ModelWorker:
                 # no job waits: the engine's work of the downtime (NemotronEngine: the expert GPU's
                 # experts by the last prompts' routing), then wait for one
                 idle = getattr(self.engine, "idle", None)
-                if idle is not None:
+                if idle is not None and not self.released:
                     self._job(idle)
                 job = self.jobs.get()
             self._job(job)
 
-    def _job(self, job):
+    def busy(self):
+        """A job runs or waits, or a lane generates (the GPU sharing: server/gpushare.py)."""
+        return self.running or not self.jobs.empty() or (self.lanes is not None and self.lanes.busy())
+
+    def _job(self, job, device=True):
+        self.running = True
         try:
             job()
         except BaseException as exc:
             print("[reclank] a job failed:", file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             self._note(exc)
+        finally:
+            self.running = False
         self._fatal()
 
     def _fatal(self):
@@ -268,14 +278,23 @@ class ModelWorker:
         if self.engine is not None:
             self.engine.note_error(exc)
 
-    def call(self, fn):
-        """Run fn on the model thread; return its value or raise its error."""
+    def _device(self, generation=False):
+        """At the start of a job (generation: a stream's): the engine's device half back after a
+        release (self.before, the GPU sharing); its error (no room) is the job's."""
+        if self.before is not None:
+            self.before(generation)
+
+    def call(self, fn, device=True):
+        """Run fn on the model thread; return its value or raise its error. device False: fn makes
+        no device calls (the release itself)."""
         if threading.current_thread() is self._thread:
             return fn()
         q = queue.Queue()
 
         def job():
             try:
+                if device:
+                    self._device()
                 q.put((True, fn()))
             except BaseException as exc:
                 self._note(exc)
@@ -298,7 +317,15 @@ class ModelWorker:
         between the parts of the prompt; a request still waiting never starts)."""
         q, stop = queue.Queue(), (stop if stop is not None else threading.Event())
         if lane is not None and self.lanes is not None:
-            self.jobs.put(lambda: self.lanes.admit(lane, make, q, stop, tokens))
+            def admit():
+                try:
+                    self._device(True)
+                except BaseException as exc:
+                    self._note(exc)
+                    q.put(("error", exc))
+                    return
+                self.lanes.admit(lane, make, q, stop, tokens)
+            self.jobs.put(admit)
             try:
                 while True:
                     kind, value = q.get()
@@ -312,6 +339,7 @@ class ModelWorker:
 
         def job():
             try:
+                self._device(True)
                 for item in make():
                     q.put(("item", item))
                     if stop.is_set():

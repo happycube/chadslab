@@ -25,11 +25,12 @@ def grid(n):
     return np.where(i < n // 2, lo, hi).astype(np.float32)
 
 
-def warp(x, fl, gx, gy, dx, dy):
+def warp(x, fl, gx, gy, dx, dy, zeros=False):
     """x (h, w, C) sampled at each pixel plus the flow fl (h, w, 2), as ENC_WARP: torch's CUDA
     grid_sampler_2d (bilinear, padding "border", align_corners): the grid gx, gy plus the flow over
     dx, dy ((size - 1) / 2), unnormalized ((g + 1) / 2 (size - 1)), clipped to the image, the
-    corners in bounds summed in the order nw, ne, sw, se."""
+    corners in bounds summed in the order nw, ne, sw, se; zeros: padding "zeros" (not clipped: the
+    corners past the image 0)."""
     x = np.asarray(x, np.float32)
     h, w, C = x.shape
     one, two = f32(1), f32(2)
@@ -37,8 +38,9 @@ def warp(x, fl, gx, gy, dx, dy):
     gyv = (gy[:, None] + (fl[..., 1] / f32(dy)).astype(np.float32)).astype(np.float32)
     ix = (((gxv + one) / two).astype(np.float32) * f32(w - 1)).astype(np.float32)
     iy = (((gyv + one) / two).astype(np.float32) * f32(h - 1)).astype(np.float32)
-    ix = np.minimum(f32(w - 1), np.maximum(ix, f32(0))).astype(np.float32)
-    iy = np.minimum(f32(h - 1), np.maximum(iy, f32(0))).astype(np.float32)
+    if not zeros:
+        ix = np.minimum(f32(w - 1), np.maximum(ix, f32(0))).astype(np.float32)
+        iy = np.minimum(f32(h - 1), np.maximum(iy, f32(0))).astype(np.float32)
     xw, yn = np.floor(ix), np.floor(iy)
     xe, ys = (xw + one).astype(np.float32), (yn + one).astype(np.float32)
     wts = (((xe - ix) * (ys - iy)).astype(np.float32), ((ix - xw) * (ys - iy)).astype(np.float32),

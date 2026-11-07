@@ -224,22 +224,41 @@ class DSV41GPU:
         self.w = m.w
         if self.w.z is None or self.w.z.index["layout"] == "dsv41-expert-planes-v1":
             raise ValueError("the GPU step needs a weightkeeper with the KQ_MXX layout (v2)")
-        self.mirror = Mirror()
         self.keep_layers = keep_layers
-        self.cap = min(m.max_len, CAP)
         # the lane whose state is in place (lanes.py: 0, the model's own; a lane's view swaps
         # LANE_ATTRS) and the most positions of that lane's caches
         self.lane_id = 0
         self.max_pos = m.max_len
-        self.ends = {}              # lane -> the end of its last fit (relax keeps the cap of each)
         # the GPU memory the hot experts leave free beside GROW_MARGIN_GB as they grow (the engine: the image
         # encoder's room)
         self.reserve_gb = 0.0
+        self.parts = self._parts()
+        self.graph = graph
+        self.hot_dyn = hot_dyn
+        self._hot_args = (hot_gb, counts)
+        self._embed_table()
+        # the host forms of the dense weights as made for the GPU (_stashed: BF12, RQ8_0; 1.2 GB): a
+        # reload uploads them again with no conversion (the head alone 4.8 s)
+        self.stash = {}
+        # the host half (runtime.remake; engram's reader, made at its first use, too); then the device half
+        self._host_keys = set(self.__dict__) | {"_eg_reader"}
+        self._device_init()
+
+    def _device_state(self):
+        pass
+
+    def _device_init(self):
+        """The device half (docs/GPU_SWAP_PLAN.md 3.6): the mirror (the dense weights from the
+        weightkeeper's segments and the stash as they are used: _put), the state, the first hot
+        experts, the tables, the programs of a step. The load runs it; a reload after a release
+        again (no disk read: the segments are in memory; no conversion: the stash)."""
+        m = self.m
+        self.mirror = Mirror()
+        self.cap = min(m.max_len, CAP)
+        self.ends = {}              # lane -> the end of its last fit (relax keeps the cap of each)
         self.on_grow = []           # (DSpark) told when the programs go: cap grew
         self._state()
-        self.parts = self._parts()
-        self._hot_init(hot_gb, counts)
-        self.graph = graph
+        self._hot_init(*self._hot_args)
         self.part_bufs = {}
         self._w = {}
         self._tables()
@@ -256,8 +275,7 @@ class DSV41GPU:
         # of each query its own)
         self.akeys = np.zeros((VERIFY_MAX, m.win + m.ix_topk, m.head_dim), np.float32)
         self.rep_raw = np.zeros((m.win, 24), np.float32)
-        self._embed_table()
-        self.hot = DSHot(self) if self.n_slots > 0 and hot_dyn else None
+        self.hot = DSHot(self) if self.n_slots > 0 and self.hot_dyn else None
         if self.hot is not None:
             self.hot.register()
         self._stage_init()
@@ -294,6 +312,14 @@ class DSV41GPU:
         self.mirror.bufs[ph.ctypes.data] = b
         return ph
 
+    def _stashed(self, key, make):
+        """The host form of a dense weight (key as _w's), made once by make() and kept (the host
+        half): the device copy of a reload is made from it."""
+        v = self.stash.get(key)
+        if v is None:
+            v = self.stash[key] = make()
+        return v
+
     def fp8(self, name):
         if ("fp8", name) not in self._w:
             codes, _dt, shape = self.w.src.raw(name, copy=False)
@@ -303,9 +329,11 @@ class DSV41GPU:
 
     def bf12(self, name):
         if ("bf12", name) not in self._w:
-            b = self.w.src.bf16(name)
-            rows, _rep = cops.kq_bf16_to_bf12(b, b.shape[1])
-            self._w["bf12", name] = (self._put(rows), b.shape[0], b.shape[1])
+            def make():
+                b = self.w.src.bf16(name)
+                return cops.kq_bf16_to_bf12(b, b.shape[1])[0], b.shape[0], b.shape[1]
+            rows, r, c = self._stashed(("bf12", name), make)
+            self._w["bf12", name] = (self._put(rows), r, c)
         return self._w["bf12", name]
 
     def rq8w(self, name):
@@ -314,13 +342,15 @@ class DSV41GPU:
         of the GPU's Q8_R (the int8 values, then the float16 scales, then
         zeros to a multiple of 16 bytes)."""
         if ("rq8", name) not in self._w:
-            b = self.w.src.bf16(name)
-            rows, cols = b.shape
-            f = (b.astype(np.uint32) << 16).view(np.float32)
-            q = cops.kq_to_q8_0(cops.tq6_rotate(f), cols).reshape(rows, cols // 32, 34)
-            pad = -(cols // 32 * 34) % 16
-            a = np.concatenate([q[:, :, 2:].reshape(rows, cols), q[:, :, :2].reshape(rows, cols // 16),
-                                np.zeros((rows, pad), np.uint8)], axis=1)
+            def make():
+                b = self.w.src.bf16(name)
+                rows, cols = b.shape
+                f = (b.astype(np.uint32) << 16).view(np.float32)
+                q = cops.kq_to_q8_0(cops.tq6_rotate(f), cols).reshape(rows, cols // 32, 34)
+                pad = -(cols // 32 * 34) % 16
+                return np.concatenate([q[:, :, 2:].reshape(rows, cols), q[:, :, :2].reshape(rows, cols // 16),
+                                       np.zeros((rows, pad), np.uint8)], axis=1), rows, cols
+            a, rows, cols = self._stashed(("rq8", name), make)
             self._w["rq8", name] = (self._put(a), rows, cols)
         return self._w["rq8", name]
 
@@ -633,29 +663,16 @@ class DSV41GPU:
             for a in self.stores.values():
                 self.mirror.buffer_of(a).upload(a)
 
-    def expert_bytes(self, i, e):
-        """Expert e of layer i whole (w1, w3, w2 in KQ_MXX): the rows of the
-        parts one after the other (the groups of 16 rows in order)."""
-        z = self.w.z
-        out = np.empty(self.per, np.uint8)
-        at = 0
-        parts = range(len(z.index["segments"]))
-        for name in ("w1", "w3", "w2"):
-            for p in parts:
-                b = z.mats(i, p)[name][e]
-                out[at:at + b.size] = b
-                at += b.size
-        assert at == self.per
-        return out
-
     def load_expert(self, i, slot, e, upload_map=True):
         """Expert e of layer i into slot (the expert there leaves)."""
         from reclank.backends.cuda.runtime import _check, lib
         old = int(self.slot_expert[i][slot])
         if old >= 0:
             self.maps[i][old] = -1
-        host = self.expert_bytes(i, e)
-        _check(lib().rc_gpu_h2d(int(self.stores[i][slot]), host.ctypes.data, self.per))
+        # (straight from the weightkeeper's segments, range by range)
+        r = self.expert_ranges(i, e, slot)
+        for k in range(0, len(r), 3):
+            _check(lib().rc_gpu_h2d(r[k + 1], r[k], r[k + 2]))
         self.slot_expert[i][slot] = e
         self.maps[i][e] = slot
         if upload_map:
@@ -663,7 +680,8 @@ class DSV41GPU:
 
     def expert_ranges(self, i, e, slot):
         """The (host, device, bytes) ranges that copy expert e of layer i from
-        the weightkeeper's segments into slot (the order of expert_bytes)."""
+        the weightkeeper's segments into slot (whole: w1, w3, w2, each the rows of
+        the parts one after the other, the groups of 16 rows in order)."""
         z = self.w.z
         ix = z.index
         k = ix["layers"].index(i)

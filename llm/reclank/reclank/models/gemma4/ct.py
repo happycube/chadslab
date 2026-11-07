@@ -352,3 +352,46 @@ class CompressedTensors:
     def scalar(self, name):
         """Return a one-element tensor as a Python float."""
         return float(self.plain(name).reshape(-1)[0])
+
+
+class Checkpoint(CompressedTensors):
+    """A checkpoint folder of a Gemma 4 model as transformers saves it (config.json,
+    generation_config.json, tokenizer.json, chat_template.jinja, the safetensors of its index),
+    for the E2B and E4B: the weights read in place through the memory maps, as stored (bfloat16;
+    a tensor the quantization did not touch is the third kind above). It gives what the engine
+    takes of a GGUF file: text_config(), and the sampling of generation_config.json as the keys
+    general.sampling.* of meta. A checkpoint of a fine-tune names no lm_head when the head is the
+    token table (tie_word_embeddings)."""
+
+    # every matrix a plain bfloat16 tensor: the programs of the E4B (CPU and GPU) take each one's
+    # bfloat16 copy (E4B.W16), the same values
+    bf16_weights = True
+
+    def __init__(self, folder):
+        from reclank.formats.safetensors import Shards
+        super().__init__(os.path.join(folder, "config.json"), st=Shards(folder))
+        self.folder = folder
+        with open(os.path.join(folder, "config.json")) as fh:
+            self.config = json.load(fh)
+        gen = {}
+        gp = os.path.join(folder, "generation_config.json")
+        if os.path.exists(gp):
+            with open(gp) as fh:
+                gen = json.load(fh)
+        eos = gen.get("eos_token_id", self.config.get("eos_token_id", []))
+        self.eos_ids = [int(v) for v in (eos if isinstance(eos, list) else [eos])]
+        self.meta = {"general.architecture": self.config.get("model_type", "gemma4"),
+                     "general.sampling.temp": gen.get("temperature"),
+                     "general.sampling.top_p": gen.get("top_p"),
+                     "general.sampling.top_k": gen.get("top_k")}
+
+    def text_config(self):
+        return dict(self.config.get("text_config", self.config))
+
+    def chat_template(self):
+        """The text of the folder's chat_template.jinja ("" when it has none)."""
+        p = os.path.join(self.folder, "chat_template.jinja")
+        if not os.path.exists(p):
+            return ""
+        with open(p) as fh:
+            return fh.read()

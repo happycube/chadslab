@@ -125,3 +125,38 @@ def test_dense_copy_at_first_read(gguf):
             ops._Q4X.todo.pop(k, None)
             ops._Q4X_MOE.pop(k, None)
             ops._Q4X_SELF.pop(k, None)
+
+
+@pytest.mark.skipif(not ops._COPS_READY, reason="the C library")
+def test_kept_gguf_saved(gguf, tmp_path):
+    """--save DIR (docs/GPU_SWAP_PLAN.md 3.7, step 3): the second keeper reads the KQ_Q4X stacks and
+    the dense tensors back from the saved copy: the same bytes, the same index."""
+    path, data = gguf
+    save = str(tmp_path / "saved")
+    got = []
+    for k in range(2):
+        sock = str(tmp_path / ("k%d.sock" % k))
+        p = _serve(path, sock, "--dense", "--save", save)
+        try:
+            c = Z.request("status", sock)
+            with c:
+                import json
+                got.append(json.loads(Z._recv_msg(c))["source"])
+            g = keep.KeptGGUF(path, Z.attach(sock))
+            assert g.raw(STACK)[0].tobytes() == _pack(data[STACK]).tobytes()
+            packed, s = g.int4_packed(g._name(DENSE))
+            assert s is None and packed.tobytes() == _pack(data[DENSE]).tobytes()
+            assert np.array_equal(g.dequant(NORM), data[NORM])
+            ix = {k_: v for k_, v in g.index.items() if k_ not in Z.RUNTIME_KEYS}
+            if k == 0:
+                first = ix
+            else:
+                assert ix == first
+            g.close()
+        finally:
+            try:
+                Z.request("stop", sock).close()
+            except OSError:
+                pass
+            p.wait(timeout=30)
+    assert got == ["checkpoint", "saved"]

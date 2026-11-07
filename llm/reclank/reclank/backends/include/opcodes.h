@@ -17,6 +17,9 @@ typedef struct {
 
 enum { GP_T_NONE = 0, GP_T_INT = 1, GP_T_F32 = 2, GP_T_SLOT = 3 };
 
+/* the flags of a record: the first of a layer (its index + 1 from GP_F_LAYER_SHIFT), the first after the layers */
+enum { GP_F_LAYER = 1, GP_F_LAYER_END = 2, GP_F_LAYER_SHIFT = 8 };
+
 enum {
     GP_S_MOV           =   1,   /* cpu+gpu a slot gets a value */
     GP_S_ADD           =   2,   /* cpu+gpu the sum of two values */
@@ -241,7 +244,7 @@ enum {
     GP_ENC_PACK_U8     = 302,   /* cpu+gpu values rounded and clamped to 0..255, four bytes in each float32 of the output */
     GP_ENC_RESIZE_TAPS = 303,   /* cpu+gpu images of pixel rows resized by each axis's taps (indices and weights): the columns first, then the rows */
     GP_ENC_UNPACK_U8   = 304,   /* cpu+gpu bytes to float32 values, each divided by a number (an uploaded 8-bit image) */
-    GP_ENC_WARP        = 320,   /* cpu+gpu the backward warp of pixel rows by a flow: bilinear, the border clamped, as torch's grid_sample(align_corners=True) */
+    GP_ENC_WARP        = 320,   /* cpu+gpu the backward warp of pixel rows by a flow: bilinear, the border clamped or zeros past it, as torch's grid_sample(align_corners=True) */
     GP_ENC_PRELU       = 321,   /* cpu+gpu x above 0, else a x with a of each column (LeakyReLU, PReLU) */
     GP_ENC_MIX         = 322,   /* cpu+gpu a s + b (1 - s), s = sigmoid(m), of columns of one buffer of pixel rows (RIFE's merge) */
     GP_ENC_CONV_MM     = 323,   /* gpu     float32 W times the rows of ENC_GATHER without the gathered rows (an implicit im2col), + b, + res, PReLU */
@@ -253,12 +256,17 @@ enum {
     GP_ENC_THUMB_U8    = 329,   /* gpu     the pixels of rows x columns of a frame's bytes, and its blocks' sums of the three channels */
     GP_NM_TAKE         = 330,   /* gpu     of a step's cold pairs, the GPU takes up to g experts (by their rows over the link): out of the CPU's, its slots marked */
     GP_NM_PULL         = 331,   /* gpu     NM_TAKE's copies (its operands): the taken experts' rows across the link into its stage, after the SIGNAL */
+    GP_NM_STAGED       = 380,   /* gpu     of a step's cold pairs, those of the experts the GPU copied ahead (their copies ended): out of the CPU's, its slots and tables marked */
     GP_ENC_CONV3       = 332,   /* gpu     a 3 x 3 conv of an image's pixel rows (channel groups; zero padding; or of its 2x nearest upsampling) by tiles in shared memory, float32 in its own order of the sums: + b, x s + res, LeakyReLU */
     GP_DG_KV_PUT       = 333,   /* gpu     t rows of k and v into a layer's cache at the row in device memory */
     GP_DG_ATTN         = 334,   /* gpu     t queries over rows of a layer's cache, query i the rows [lo[i], hi[i]), GQA, scale 1, float32 */
     GP_DG_MOE          = 336,   /* gpu     the routed experts of a layer on the GPU: BF12 rows, float32 products; the pairs sorted by expert, act = gelu(gate) up, de, the sum of each token over its slots */
     GP_DG_SPLIT        = 337,   /* gpu     the CPU's ids of a layer's pairs: the expert, or -1 for an expert the GPU holds (its slot in map) */
     GP_DG_SAMPLE       = 335,   /* gpu     per row of logits: the temperature, the end-token ban, the entropy, the argmax, an inverse-CDF sample; the processed logits kept, their softmax out */
+    GP_ENC_BF16_PACK   = 338,   /* gpu     float32 values to bfloat16, or float16 (saturated), as uint16: k_enc_conv_tc's rounding of x */
+    GP_ENC_I16_PACK    = 339,   /* gpu     float32 rows to I16 rows: groups of 64 as int16 (two int8) with a scale each, k_enc_conv_i16's quantization of x */
+    GP_ENC_ATTN_BLOCKS = 370,   /* cpu+gpu block-sparse attention: each block of 128 queries of a head over its list of blocks of 128 keys, float32 (K, V float32 or float16 on the GPU), scale 1 */
+    GP_ENC_BLOCK_MASK  = 371,   /* cpu+gpu FlashVSR's draft block mask: the mean blocks' scores in a local window, their softmax, each head's slice's top-k, as ENC_ATTN_BLOCKS's lists */
 };
 
 /* 1 for a code of the table, else 0: a runner fails on an unknown code. */
@@ -322,8 +330,10 @@ static inline int gp_op_known(int op)
     case GP_ENC_WARP: case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM:
     case GP_ENC_RIFE_IN: case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P:
     case GP_ENC_PACK_U8C: case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE:
-    case GP_NM_PULL: case GP_ENC_CONV3: case GP_DG_KV_PUT: case GP_DG_ATTN: case GP_DG_MOE:
-    case GP_DG_SPLIT: case GP_DG_SAMPLE:
+    case GP_NM_PULL: case GP_NM_STAGED: case GP_ENC_CONV3: case GP_DG_KV_PUT:
+    case GP_DG_ATTN: case GP_DG_MOE: case GP_DG_SPLIT: case GP_DG_SAMPLE:
+    case GP_ENC_BF16_PACK: case GP_ENC_I16_PACK: case GP_ENC_ATTN_BLOCKS:
+    case GP_ENC_BLOCK_MASK:
         return 1;
     default:
         return 0;

@@ -38,6 +38,9 @@ MODEL_TYPES = ("nemotron_h_omni", "nemotron_h_puzzle", "nemotron_h")
 VISION_GB = float(os.environ.get("RECLANK_NM_VISION_GB", "2.6"))
 # and to the MTP block's programs (Super: its prompt parts of up to 256 rows, its drafts, the verify group)
 MTP_GB = float(os.environ.get("RECLANK_NM_MTP_GB", "0.6"))
+# and to Bolt's LiLiCorr drafter (--drafter DIR: its 1.1B weights, its programs, its context, the captured layers'
+# rows of the target's programs, the verify group of 8 rows)
+LILI_GB = float(os.environ.get("RECLANK_NM_LILI_GB", "1.5"))
 # and to lane B (--lanes 2): its cache (~1.5 GB at 131072 positions with the Mamba states' two sets) and its
 # programs
 LANE_GB = float(os.environ.get("RECLANK_NM_LANE_GB", "1.5"))
@@ -107,7 +110,8 @@ class CpuRunner:
 
 class GpuRunner:
     """The model on the GPU (NemotronGPU: its cache on the device), for the engine. mtp: Super's
-    rounds of drafts by its MTP block (spec.NemotronMTPSpec), or None."""
+    rounds of drafts by its MTP block (spec.NemotronMTPSpec), Bolt's by its LiLiCorr drafter
+    (spec.LiLiCorrRounds), or None."""
 
     def __init__(self, g, mtp=None):
         self.g = g
@@ -203,7 +207,7 @@ class NemotronEngine(Engine):
 
     def __init__(self, run, tok, ctx, contexts=4, contexts_gb=16.0, vision=None, worker=None):
         self.run = run                  # CpuRunner or GpuRunner
-        # Super's image input (radio.RadioGPU, or None), the model thread's worker for it, the rows of
+        # the image input (radio.RadioGPU, or None), the model thread's worker for it, the rows of
         # the last images by key, the most rows of an image
         self.vision = vision
         self.worker = worker
@@ -265,7 +269,7 @@ class NemotronEngine(Engine):
                     continue
                 if any(k not in ("text", "input_text", "output_text", None) for k in kinds):
                     raise ValueError("this model takes text and images only" if self.vision is not None else
-                                     "this server takes no image input (Bolt, or --mmproj off)")
+                                     "this server takes no image input (--mmproj off)")
                 m["content"] = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in m["content"])
         esc = self.tokenizer.t.escape
         text = self.tokenizer.apply_chat_template(_escaped(msgs, esc), thinking=level is not None,
@@ -318,7 +322,8 @@ class NemotronEngine(Engine):
                 except (MemoryError, RuntimeError) as exc:
                     # (no room for the encoder: the hot experts give back its share, then once more)
                     pool = getattr(getattr(self.run, "g", None), "pool", None)
-                    if pool is None or "memory" not in str(exc).lower() and "cudaMalloc" not in str(exc):
+                    if pool is None or not getattr(self.vision, "gpu", True) or \
+                            "memory" not in str(exc).lower() and "cudaMalloc" not in str(exc):
                         raise
                     n = pool.shrink(VISION_GB * 1e9)
                     print("[nemotron] the image encoder found no room (%s): the hot experts -%.1f GB" % (exc, n / 1e9),
@@ -353,6 +358,40 @@ class NemotronEngine(Engine):
     def turn_fields(self, rec):
         return {"prompt_text": self.tokenizer.t.unescape(self.last_text),
                 "raw": self.clean_raw(rec.get("raw", "")), "cached_tokens": self.last_cached}
+
+    # ---- the device half (the GPU sharing: server/gpushare.py, docs/GPU_SWAP_PLAN.md 3.6)
+    _load = None        # load: (ctx, drafts, lanes, the warm prompt, the drafter's folder) of a GPU engine
+
+    def can_release_device(self):
+        g = getattr(self.run, "g", None)
+        return self._load is not None and g is not None and g.xdev is None
+
+    def release_device(self):
+        """Each lane's context to host memory (RowCache: a point at the end of what its cache read, so
+        the next turn goes on from it); the device half is then forgotten (runtime.close_all frees it)."""
+        for e in self.lanes:
+            with e.on():
+                if e.as_is:
+                    e._save(list(e.as_is))
+                if e.ctxs.live is not None:
+                    e.ctxs._store(e.ctxs.live)
+                    e.ctxs.live = None
+                e.as_is = []
+
+    def reload_device(self):
+        """A NemotronGPU of the load's plan (its free memory, link rate, registrations), its runner, and
+        the load's start (_device_up); the contexts come back from host memory with the next prompts."""
+        from reclank.models.nemotron.gpu import NemotronGPU
+        old = self.run.g
+        ctx, drafts, lanes, warm, lili = self._load
+        g = NemotronGPU(old._model0, free0=old.free0, link_gbps=old.link_gbps, zc_reg=old._zc_reg, **old._init)
+        from reclank.models.base import reload_lanes
+        self.run = _gpu_runner(g, drafts, lili)
+        self.lane, self.coop, self.decoding = None, False, False
+        reload_lanes(self, lambda: _device_up(self, warm, ctx, drafts, lanes, lili))
+        sch = getattr(self.worker, "lanes", None)
+        if sch is not None:
+            sch.engines = self.lanes            # (lane B's engine is a new one)
 
     # ---- the contexts (core/session.py, RowCache)
 
@@ -581,6 +620,32 @@ class _LaneDev:
         raise RuntimeError("the Nemotron lanes hand over single steps only")
 
 
+def _gpu_runner(g, drafts, lili=None):
+    """The GpuRunner of a NemotronGPU (Super's MTP rounds with drafts > 0; Bolt's LiLiCorr drafter: lili,
+    its folder)."""
+    mtp = None
+    if g.cfg.mtp and drafts > 0:
+        from reclank.models.nemotron.spec import NemotronMTPSpec
+        mtp = NemotronMTPSpec(g, drafts)
+    elif lili:
+        from reclank.models.nemotron.spec import LiLiCorrRounds
+        print("loading the drafter %s ..." % lili, flush=True)
+        mtp = LiLiCorrRounds(g, lili)
+    return GpuRunner(g, mtp)
+
+
+def _device_up(eng, warm, ctx, drafts, lanes, lili=None):
+    """The start of the device half (the load; a reload after a release: the same steps): the programs
+    of a prompt and of a step (a warm prompt), the drafter's and the verify group's, lane B."""
+    eng.run.forward(warm)
+    eng.run.forward([warm[-1]])
+    if lili:
+        eng.run.round(warm[-1], None)
+    eng._fresh()
+    if lanes > 1:
+        _lanes_up(eng, ctx, drafts, warm)
+
+
 def _lanes_up(eng, ctx, drafts, warm):
     """--lanes 2: lane B (lanes.NmLane: a second sequence, its own state on the GPU, its cache as long
     as the model's so that the lanes share the contexts in host memory) and its engine; both hand their
@@ -645,17 +710,34 @@ def load(opts, meta, worker=None):
                 raise
             print("no GPU (%s): the CPU engine" % exc, flush=True)
     vision = None
-    # (Super's RADIO and projector: Bolt's checkpoint has modeling_radio.py too, its C-RADIO v4-H not done, and the
-    # server failed to load it on the projector's tensors)
+    # (the RADIO tower and the projector: Super's, and Bolt's (its own weights, the same shapes; no final layer norm,
+    # radio.RadioVision). --mmproj-gpu off: the encoder in C on the CPU, the GPU memory left to the hot experts)
     images = gpu and str(opts.mmproj or "on").lower() not in ("off", "none", "0") and \
-        os.path.exists(os.path.join(path, "modeling_radio.py")) and \
-        "vision_projector.vision_final_layernorm.weight" in m.ck.where
+        os.path.exists(os.path.join(path, "modeling_radio.py")) and "mlp1.1.weight" in m.ck.where
+    vision_cpu = str(getattr(opts, "mmproj_gpu", None) or "").lower() == "off"
     lanes = int(getattr(opts, "lanes", 1) or 1) if gpu else 1
     if gpu:
-        from reclank.models.nemotron.gpu import NemotronGPU, load_counts
+        from reclank.models.nemotron.gpu import BSTAGE_MIN, NemotronGPU, load_counts
         # (Super's image encoder: its weights and a 1024-row image on the GPU while it runs)
-        drafts = 3 if opts.mtp is None else int(opts.mtp)
-        reserve = (VISION_GB if images else 0.0) + (MTP_GB if m.cfg.mtp and drafts > 0 else 0.0)
+        drafts = int(opts.mtp) if opts.mtp is not None else None
+        if drafts is None:
+            # (Super's MTP drafts: 2 on a GPU without tensor cores, where a verify row costs more (its dense rows'
+            # products, its cold experts on the CPU): the P6000 alone, the check's two prompts, MTP 16.8 / 13.2 tok/s
+            # with 3 drafts, 17.1 / 16.4 with 2, 15.5 / 14.8 with 1, plain 13.0; else 3)
+            from reclank.backends.cuda.runtime import caps
+            drafts = 3 if caps().get("tc") else 2
+        reserve = (VISION_GB if images and not vision_cpu else 0.0) + (MTP_GB if m.cfg.mtp and drafts > 0 else 0.0)
+        # (Bolt's drafter, --drafter DIR; --mtp 0 turns it off. One lane only: its context is one sequence's)
+        lili = getattr(opts, "drafter", None) if not m.cfg.mtp and drafts > 0 else None
+        if lili and lanes > 1:
+            print("the drafter runs on one lane (--lanes 1): off with %d lanes" % lanes, flush=True)
+            lili = None
+        if lili:
+            from reclank.models.nemotron.spec import LiLiCorrRounds
+            # (the drafter reads these layers' rows: every program of the target captures them)
+            m.capture = LiLiCorrRounds.capture_ids(lili)
+            m.programs = {}
+            reserve += LILI_GB
         if lanes > 1:
             # (lane B's thread on a CPU of its own, out of the CPU team planned at the first run; its cache
             # and programs out of the hot experts)
@@ -663,17 +745,17 @@ def load(opts, meta, worker=None):
             reserve_lane_cpu()
             reserve += LANE_GB
         g = NemotronGPU(m, ctx=ctx, hot_gb=opts.hot_gb, counts=load_counts(path), reserve_gb=reserve)
-        mtp = None
-        if m.cfg.mtp and drafts > 0:
-            from reclank.models.nemotron.spec import NemotronMTPSpec
-            mtp = NemotronMTPSpec(g, drafts)
-        run = GpuRunner(g, mtp)
+        run = _gpu_runner(g, drafts, lili)
         if images:
             from reclank.models.nemotron.radio import RadioGPU
-            vision = RadioGPU(path, max_patches=4 * (opts.image_budget or 1024))
+            vision = RadioGPU(path, max_patches=4 * (opts.image_budget or 1024), gpu=not vision_cpu)
         where = "GPU, %d%% of the experts hot (%.1f GB); the host link %.1f GB/s: a prompt's cold experts on the %s%s%s" % (
-            round(100 * g.hot_share), g.hot_bytes / 1e9, g.link_gbps, "GPU (mapped)" if g.zc_tables else "CPU",
-            "; MTP %d drafts" % drafts if mtp else "", "; images on" if vision else "")
+            round(100 * g.hot_share), g.hot_bytes / 1e9, g.link_gbps,
+            ("GPU (staged from %d rows, else mapped)" % BSTAGE_MIN if getattr(g, "_bst", None) else "GPU (mapped)")
+            if g.zc_tables else "CPU",
+            ("; the LiLiCorr drafter, %d drafts a round" % run.mtp.k if lili else "; MTP %d drafts" % drafts)
+            if run.mtp else "",
+            ("; images on (the encoder on the CPU)" if vision_cpu else "; images on") if vision else "")
     else:
         run = CpuRunner(m, ctx)
         where = "CPU, tier %s" % __import__("reclank.backends.cpu.cops", fromlist=["TIER"]).TIER
@@ -687,11 +769,8 @@ def load(opts, meta, worker=None):
     eng.ends_line = newline_test(tok.decode)
     # the experts of every layer and the programs of a prompt and of a step now
     warm = tok.encode(tok.apply_chat_template([{"role": "user", "content": "Hello. " * 40}], thinking=False))
-    run.forward(warm)
-    run.forward([warm[-1]])
-    eng._fresh()
-    if lanes > 1:
-        _lanes_up(eng, ctx, drafts, warm)
+    eng._load = (ctx, drafts if gpu else 0, lanes, warm, lili) if gpu else None
+    _device_up(eng, warm, ctx, drafts if gpu else 0, lanes, lili if gpu else None)
     thinking = opts.thinking or "high"
     level = None if thinking == "off" else thinking_of({"reasoning_effort": thinking}, "xhigh")
     defaults = {"temperature": 1.0, "top_p": 0.95, "top_k": None, "max_tokens": 32768,

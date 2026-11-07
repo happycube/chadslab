@@ -832,6 +832,19 @@ static void nm_moe_body(const float *x, const int32_t *ids, const float *val, in
         up = up1;
         down = down1;
     }
+    /* no pair of an expert (a split prompt group's pairs all the expert device's: models/nemotron/gpu.py XSPLIT):
+     * zero rows, as the sums of zero rows below (each thread reads ids alike: one choice for the team) */
+    int any = 0;
+    for (int a = 0; a < np && !any; ++a) {
+        any = ids[a] >= 0;
+    }
+    if (!any) {
+        #pragma omp for schedule(static)
+        for (int x0 = 0; x0 < t * L; ++x0) {
+            out[x0] = 0.f;
+        }
+        return;
+    }
     if (t <= 4 && L <= 1024 && inner % 64 == 0) {
         nm_moe_few(x, ids, val, t, k, up, up_type, down, down_type, L, inner, scratch, out, x16);
         return;

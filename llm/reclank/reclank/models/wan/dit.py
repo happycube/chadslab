@@ -65,8 +65,9 @@ import threading
 
 import numpy as np
 
-from reclank.encoders.runtime import F20Lins, _EncCompiler, _Plain, _Runner
+from reclank.encoders.runtime import F20Lins, _EncCompiler, _Plain, _Runner, lin_q
 from reclank.formats.safetensors import Shards
+from reclank.runtime.kept import Kept
 from reclank.ir import program as P
 from reclank.models.flux2.dit import rope_table, timestep_sinusoid
 from reclank.runtime.threads import team_threads
@@ -111,6 +112,11 @@ class _Prefetch:
     made."""
 
     AHEAD = 6
+
+    def _fmt(self):
+        """the matrices' form in the keeper's entry: not given for F20 (the entries of before)"""
+        f = self.f20.fmt if self.f20 is not None else "f20"
+        return {} if f == "f20" else dict(fmt=f)
 
     def __init__(self, W, path):
         first, last = {}, {}
@@ -203,7 +209,11 @@ class WanDiT:
         hd = self.hd
         hw = 2 * (hd // 6)
         self.axes = [hd - 2 * hw, hw, hw]       # frames, height, width (44, 42, 42)
-        f = lambda n: np.ascontiguousarray(W.get(n), dtype=np.float32)  # noqa: E731
+        # the arrays and linears from the weightkeeper when it holds them (runtime/kept.py), else made;
+        # not with the keeper's segments (keep.py) nor the streamed blocks (_pack copies them)
+        self.kept = k = Kept("wan-dit", path, dict(gpu=self.gpu, f20=f20, **self._fmt()), code=[__name__]) \
+            if keeper is None and not self.stream else Kept.off()
+        f = lambda n: k.array(n, lambda: np.ascontiguousarray(W.get(n), dtype=np.float32))  # noqa: E731
         self.f = f
         sq = np.float32(hd ** -0.5)
         e = "condition_embedder."
@@ -234,8 +244,9 @@ class WanDiT:
                 pf.done(i)
         if pf is not None:
             pf.close()
-        if self.f20 is not None:
+        if self.f20 is not None and k.mode != "read":
             self.f20.report()
+        k.done()
         if share is None:
             self.group = [self]
             # the text and the steps of both caches (of each expert of a pair: the older go first)
@@ -263,9 +274,9 @@ class WanDiT:
         B = self.blocks[i]
         offs, tot = {}, 0
         for m in MATS:
-            assert getattr(B[m], "f20", None) is not None, "a streamed matrix that F20 refused: %d %s" % (i, m)
+            assert lin_q(B[m])[1] is not None, "a streamed matrix that F20 refused: %d %s" % (i, m)
             offs[m] = tot
-            tot += (B[m].f20.data.nbytes + ALIGN - 1) // ALIGN * ALIGN
+            tot += (lin_q(B[m])[1].data.nbytes + ALIGN - 1) // ALIGN * ALIGN
         assert self.offs in (None, offs)
         self.offs, self.block_bytes = offs, tot
         if self.keeper is not None:
@@ -276,10 +287,11 @@ class WanDiT:
         m_ = mmap.mmap(-1, tot, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         buf = np.frombuffer(m_, np.uint8)
         for m in MATS:
-            d = B[m].f20.data
+            q = lin_q(B[m])[1]
+            d = q.data
             v = buf[offs[m]:offs[m] + d.nbytes]
             v[...] = d.reshape(-1)
-            B[m].f20.data = v.reshape(d.shape)
+            q.data = v.reshape(d.shape)
         self.packed[i] = (buf.ctypes.data, tot, buf)
 
     def _register(self):
@@ -303,6 +315,9 @@ class WanDiT:
         rows (or float32 W) when it holds them."""
         if self.keeper is not None:
             return self.keeper.linear(name)
+        return self.kept.linear(name, lambda: self._linear(name))
+
+    def _linear(self, name):
         src = self.W.get(name + ".weight")
         lin = _Plain(np.ascontiguousarray(src.reshape(src.shape[0], -1), dtype=np.float32))
         lin.shape = lin.w.shape
@@ -454,7 +469,7 @@ class WanDiT:
             r = np.zeros((len(mats), 3), np.int64)
             for k, m in enumerate(mats):
                 r[k, 0] = self.packed[j][0] + self.offs[m]
-                r[k, 2] = self.blocks[j][m].f20.data.nbytes
+                r[k, 2] = lin_q(self.blocks[j][m])[1].data.nbytes
             rng.append(r)
         for j in range(min(2, n)):
             c.p.emit(P.FETCH, rng[j], len(mats), j, j % 2)
@@ -484,8 +499,8 @@ class WanDiT:
             src = B[m]
             p = _Plain(None)
             p.b, p.shape = src.b, src.shape
-            p.f20 = _KQ(slot[self.offs[m]:self.offs[m] + src.f20.data.nbytes], src.f20.type, src.f20.rows,
-                        src.f20.cols)
+            a, q = lin_q(src)
+            setattr(p, a, _KQ(slot[self.offs[m]:self.offs[m] + q.data.nbytes], q.type, q.rows, q.cols))
             B[m] = p
         return B
 

@@ -18,6 +18,41 @@ const void *rc_gpu_where(int *out)
     return gg_where_prog;
 }
 
+/* The programs loaded and not unloaded yet (rc_gpu_shutdown: none). */
+static int gg_nprog;
+/* The values of the device's symbols that the host set (a new context has their first values):
+ * g_reuse (rc_gpu_set_reuse); gg_kv_e4m3_d is kernels/small.cu's (gg_kv_e4m3_v). */
+static int gg_reuse_v;
+static int gg_ctx_ep = 1;          /* the epoch gg_context_up last saw */
+
+/* In a context made after rc_gpu_shutdown (any CUDA call makes one): its device, the capabilities'
+ * symbol, the host's symbols again, the registrations of host memory again. The entry points that
+ * build on the GPU call it (rc_gpu_load, rc_gpu_host_alloc); rc_gpu_context_up from the host. */
+static int gg_context_up(void)
+{
+    if (gg_ctx_ep == gg_epoch) {
+        return 0;
+    }
+    CK(cudaSetDevice(gg_device));
+    gg_caps_init(gg_device);
+    if (gg_reuse_v) {
+        CK(cudaMemcpyToSymbol(g_reuse, &gg_reuse_v, sizeof(int)));
+    }
+    if (gg_kv_e4m3_v) {
+        CK(cudaMemcpyToSymbol(gg_kv_e4m3_d, &gg_kv_e4m3_v, sizeof(int)));
+    }
+    if (gg_reg_again() != 0) {
+        return -1;
+    }
+    gg_ctx_ep = gg_epoch;
+    return 0;
+}
+
+int rc_gpu_context_up(void)
+{
+    return gg_context_up();
+}
+
 int rc_gpu_init(int device)
 {
     CK(cudaSetDevice(device));
@@ -47,6 +82,12 @@ int rc_gpu_caps_get(int *out, int n)
 void rc_gpu_set_cpu_runner(void *fn)
 {
     gg_cpu_run = (gg_cpu_runner)fn;
+}
+
+/* (the CPU library's work after a GP_CPU_TASK's flag out: what a task left for after it, off the GPU's wait) */
+void rc_gpu_set_cpu_after(void *fn)
+{
+    gg_cpu_after = (gg_cpu_after_fn)fn;
 }
 
 void rc_gpu_set_gemv_max(int t)
@@ -134,6 +175,10 @@ int rc_gpu_clear_error(void)
     return (int)cudaGetLastError();
 }
 
+/* The blocks of rc_gpu_malloc not freed yet (rc_gpu_shutdown: none, or a block of the old context
+ * would be freed in the new one, where its address may be another's). */
+static int64_t gg_nmalloc;
+
 void *rc_gpu_malloc(size_t n)
 {
     void *p = NULL;
@@ -141,30 +186,73 @@ void *rc_gpu_malloc(size_t n)
         snprintf(gg_error, sizeof(gg_error), "cudaMalloc of %zu bytes failed", n);
         return NULL;
     }
+    __atomic_add_fetch(&gg_nmalloc, 1, __ATOMIC_RELAXED);
     return p;
 }
 
 int rc_gpu_free(void *p)
 {
     CK(cudaFree(p));
+    if (p != NULL) {
+        __atomic_sub_fetch(&gg_nmalloc, 1, __ATOMIC_RELAXED);
+    }
     return 0;
 }
 
-/* Pinned host memory, for the copies of the handoff to the CPU. */
+/* Pinned host memory, for the copies of the handoff to the CPU: an anonymous map registered with
+ * CUDA (mapped, portable), which outlives a context (rc_gpu_shutdown: registered again in the next,
+ * gg_reg_again). A device that cannot read registered memory at its host address (no
+ * cudaDevAttrCanUseHostPointerForRegisteredMem: the kernels take these addresses as they are) gets
+ * cudaMallocHost's memory, and its context can then not be released (gg_nmallochost). */
+static int64_t gg_nmallochost;
+
 void *rc_gpu_host_alloc(size_t n)
 {
-    void *p = NULL;
-    if (cudaMallocHost(&p, n) != cudaSuccess) {
-        snprintf(gg_error, sizeof(gg_error), "cudaMallocHost of %zu bytes failed", n);
+    int same = 0;
+    cudaDeviceGetAttribute(&same, cudaDevAttrCanUseHostPointerForRegisteredMem, gg_device);
+    if (!same) {
+        void *p = NULL;
+        if (cudaMallocHost(&p, n) != cudaSuccess) {
+            snprintf(gg_error, sizeof(gg_error), "cudaMallocHost of %zu bytes failed", n);
+            return NULL;
+        }
+        memset(p, 0, n);
+        __atomic_add_fetch(&gg_nmallochost, 1, __ATOMIC_RELAXED);
+        return p;
+    }
+    if (gg_context_up() != 0) {
         return NULL;
     }
-    memset(p, 0, n);
+    const size_t pg = 4096, len = (n + pg - 1) / pg * pg;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        snprintf(gg_error, sizeof(gg_error), "mmap of %zu bytes failed", len);
+        return NULL;
+    }
+    const unsigned fl = cudaHostRegisterMapped | cudaHostRegisterPortable;
+    cudaError_t err = cudaHostRegister(p, len, fl);
+    if (err != cudaSuccess) {
+        munmap(p, len);
+        snprintf(gg_error, sizeof(gg_error), "cudaHostRegister of %zu bytes: %s", len, cudaGetErrorString(err));
+        cudaGetLastError();
+        return NULL;
+    }
+    gg_reg_add(p, len, fl, 1);
     return p;
 }
 
 int rc_gpu_host_free(void *p)
 {
-    CK(cudaFreeHost(p));
+    size_t len = 0;
+    gg_reg_del(p, &len);
+    if (len == 0) {
+        CK(cudaFreeHost(p));        /* (cudaMallocHost's: a device without host pointers) */
+        __atomic_sub_fetch(&gg_nmallochost, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    cudaHostUnregister(p);
+    cudaGetLastError();
+    munmap(p, len);
     return 0;
 }
 
@@ -211,6 +299,12 @@ int rc_gpu_h2d_rows(int n, void *const *dsts, const void *const *srcs, size_t nb
 {
     static char *stage = NULL, *dstage = NULL;
     static size_t cap = 0;
+    static int ep = 0;
+    if (ep != gg_epoch) {
+        stage = dstage = NULL;      /* (a new context: the old stages went with the old one) */
+        cap = 0;
+        ep = gg_epoch;
+    }
     if (n <= 0) {
         return 0;
     }
@@ -397,7 +491,7 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
     size_t code_b = (size_t)g->n_code * sizeof(gp_rec);
     g->hcode = (gp_rec *)malloc(code_b);
     memcpy(g->hcode, prog + 4 + g->n_env, code_b);
-    /* the parts of the attention of attn_launch (12.6 MB): only for a program with its records (a program
+    /* the parts of the attention of attn_launch (16.8 MB): only for a program with its records (a program
      * of DeepSeek or Nemotron has none: 1.4 GB over the ~110 programs of DeepSeek's server) */
     int parts = 0;
     for (int pc = 0; pc < g->n_code; ++pc) {
@@ -424,13 +518,40 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
      * segment: no new one while a pull is open (open_pulls: a bit for each
      * event with a pull and no GP_DS_STAGE_JOIN yet). */
     int in_seg = 0, run = 0, open_pulls = 0;
+    /* The chains (graphs.cu): each run of layers that can run on the graphs of their kinds, a segment. */
+    int *crun = NULL;
+    if (g->use_graph && gg_tail_on()) {
+        crun = (int *)calloc(4 * ((size_t)g->n_code + 1), sizeof(int));
+        if (gg_find_links(g, crun, crun + g->n_code + 1, crun + 2 * (g->n_code + 1), crun + 3 * (g->n_code + 1)) == 0) {
+            free(crun);
+            crun = NULL;
+        } else if (gg_chain_alloc(g) != 0) {
+            free(crun);
+            snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: no memory for the chains");
+            return NULL;
+        }
+    }
     for (int pc = 0; pc < g->n_code; ++pc) {
         const gp_rec *r = g->hcode + pc;
+        if (crun != NULL && crun[pc] && open_pulls == 0) {
+            gg_seg *sg = g->seg + g->n_seg++;
+            sg->start = pc;
+            sg->end = crun[g->n_code + 1 + pc];
+            sg->chain = crun[pc];
+            sg->link0 = crun[2 * (g->n_code + 1) + pc];
+            sg->link1 = crun[3 * (g->n_code + 1) + pc];
+            in_seg = 0;
+            run = 1;
+            pc = sg->end - 1;
+            continue;
+        }
         if (r->op == GP_DS_STAGE_PULL && gg_side_init() != 0) {
+            free(crun);
             return NULL;
         }
         if (is_boundary(r->op) && open_pulls > 0) {
             snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: a boundary record before a GP_DS_STAGE_JOIN");
+            free(crun);
             return NULL;
         }
         if (is_boundary(r->op)) {
@@ -449,6 +570,7 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
             const int64_t ev = hlit(r, r->op == GP_DS_STAGE_PULL ? 8 : 0, &bad);
             if (bad || ev < 0 || ev >= GG_SIDE_EV) {
                 snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: a GP_DS_STAGE event out of range");
+                free(crun);
                 return NULL;
             }
             open_pulls = r->op == GP_DS_STAGE_PULL ? open_pulls | 1 << ev : open_pulls & ~(1 << ev);
@@ -461,6 +583,7 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
         }
         g->seg[g->n_seg - 1].end = pc + 1;
     }
+    free(crun);
     /* The float16 scratch of the products of large groups. */
     size_t need = 0;
     for (int pc = 0; pc < g->n_code; ++pc) {
@@ -491,12 +614,13 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
             n = (2 * (size_t)r->v[8] + 4 * ((size_t)r->v[8] + (size_t)r->v[9])) * (size_t)r->v[10] * (size_t)r->v[11];
         } else if (r->op == GP_ENC_ATTN && r->v[6] % 8 == 0) {
             n = 3 * (size_t)r->v[4] * (size_t)r->v[5] * (size_t)r->v[6];   /* q, k, v (k_enc_attn_tc) */
-        } else if (r->op == GP_KQ_GROUP_MOE && (r->v[16] == KQ_BF16 || r->v[16] == KQ_BF12)) {
+        } else if (r->op == GP_KQ_GROUP_MOE && (r->v[16] == KQ_BF16 || r->v[16] == KQ_BF12) && gg_caps.tc) {
             /* the two bfloat16 planes of h (or act2) for the shared expert */
             n = 2 * (size_t)r->v[3] * (size_t)(r->v[6] > r->v[7] ? r->v[6] : r->v[7]);
         } else if (r->op == GP_KQ_LINEAR && r->tag[8] != GP_T_SLOT && r->v[8] > MT_MAX &&
-                   (r->v[5] == KQ_BF16 || r->v[5] == KQ_BF12 || r->v[5] == KQ_MXF8)) {
-            n = 2 * (size_t)r->v[8] * (size_t)r->v[7];  /* the two bfloat16 planes of x (k_gemm_bf16_tc) */
+                   (r->v[5] == KQ_BF16 || r->v[5] == KQ_BF12 || r->v[5] == KQ_MXF8) && gg_caps.tc) {
+            /* the two bfloat16 planes of x (k_gemm_bf16_tc; no tensor cores: the float forms, bf16_tc_on 0) */
+            n = 2 * (size_t)r->v[8] * (size_t)r->v[7];
         } else if (r->op == GP_MOE_GPU) {
             size_t a = (size_t)r->v[3] * (size_t)r->v[8];
             size_t b = (size_t)r->v[3] * (size_t)r->v[4] * (size_t)r->v[10];
@@ -530,6 +654,10 @@ static void *gg_load(const int64_t *prog, int use_graph, gg_prog **made)
     }
     wneed = bf12_fused_on() ? 0 : wneed;
     wneed = mneed > wneed ? mneed : wneed;
+    if (!gg_caps.tc) {
+        wneed = 0;      /* (the bfloat16 rows are the tensor cores' only: bf16_tc_on 0; Super's prompt programs on
+                         * the GTX 1070 took 32 MB of them) */
+    }
     wneed = wneed < ((size_t)16 << 20) ? wneed : ((size_t)16 << 20);
     if (wneed > 0 && (g->w16 = (uint16_t *)gg_scratch_get(GG_SH_W16, wneed * 2, 0)) == NULL) {
         snprintf(gg_error, sizeof(gg_error), "rc_gpu_load: no memory for the bfloat16 rows of BF12");
@@ -684,10 +812,17 @@ int rc_gpu_unload(void *handle);
  * the shared scratch): a GPU short of memory makes room and loads again. */
 void *rc_gpu_load(const int64_t *prog, int use_graph)
 {
+    if (gg_context_up() != 0) {
+        return NULL;
+    }
     gg_prog *made = NULL;
     void *h = gg_load(prog, use_graph, &made);
     if (h == NULL && made != NULL) {
         rc_gpu_unload(made);
+    }
+    if (h != NULL) {
+        ((gg_prog *)h)->live = 1;
+        ++gg_nprog;
     }
     return h;
 }
@@ -709,9 +844,8 @@ int rc_gpu_ko_table(const void *hi, const void *lo, int rd, int half, int nhi)
 int rc_gpu_set_reuse(int on)
 {
     /* In the order of the stream, so the steps before keep their setting. */
-    static int v;
-    v = on;
-    CK(cudaMemcpyToSymbolAsync(g_reuse, &v, sizeof(int), 0, cudaMemcpyHostToDevice, gg_stream));
+    gg_reuse_v = on;
+    CK(cudaMemcpyToSymbolAsync(g_reuse, &gg_reuse_v, sizeof(int), 0, cudaMemcpyHostToDevice, gg_stream));
     CK(cudaStreamSynchronize(gg_stream));
     return 0;
 }
@@ -824,10 +958,11 @@ int rc_gpu_q6k_head(const void *w, const float *x, float *out, int rows, int col
         CK(cudaGetLastError());
         return 0;
     }
-    if ((nb == 8 || nb == 11 || nb == 16) && ((uintptr_t)w & 15) == 0) {
+    if ((nb == 8 || nb == 11 || nb == 16 || nb == 21) && ((uintptr_t)w & 15) == 0) {
         /* 1 to 4 rows of x (a step, a verify group of MTP) with their own forms: the
          * form of any count kept 16 sums and took 14.1 ms for the 2 rows of a verify
-         * group of Qwen3.6 on the GTX 1070, against 2.9 for one */
+         * group of Qwen3.6 on the GTX 1070, against 2.9 for one. (21 blocks: the 31B's
+         * head, 5376 columns; k_q6k_head took it at 106 GB/s on the P6000, 10.9 ms a step) */
         const uint8_t *wb = (const uint8_t *)w;
 #define Q6K_S(NX, NB) k_q6k_head_s<NX, NB><<<grid, 32 * ROWS_PER_BLOCK, 0, gg_stream>>>(wb, x, out, rows, cols, cap, nx)
         if (nb == 8) {
@@ -837,6 +972,10 @@ int rc_gpu_q6k_head(const void *w, const float *x, float *out, int rows, int col
             /* (the tied head of the Gemma 4 26B: cols 2816) */
             if (nx == 1) Q6K_S(1, 11); else if (nx == 2) Q6K_S(2, 11); else if (nx == 3) Q6K_S(3, 11);
             else if (nx == 4) Q6K_S(4, 11); else Q6K_S(0, 11);
+        } else if (nb == 21) {
+            /* (the tied head of the Gemma 4 31B: cols 5376) */
+            if (nx == 1) Q6K_S(1, 21); else if (nx == 2) Q6K_S(2, 21); else if (nx == 3) Q6K_S(3, 21);
+            else if (nx == 4) Q6K_S(4, 21); else Q6K_S(0, 21);
         } else {
             if (nx == 1) Q6K_S(1, 16); else if (nx == 2) Q6K_S(2, 16); else if (nx == 3) Q6K_S(3, 16);
             else if (nx == 4) Q6K_S(4, 16); else Q6K_S(0, 16);
@@ -957,11 +1096,15 @@ int rc_gpu_gdn_commit(float *conv, float *S, const float *log, int n, int kernel
 int rc_gpu_unload(void *handle)
 {
     gg_prog *g = (gg_prog *)handle;
+    if (g->live) {
+        --gg_nprog;
+    }
     for (int k = 0; k < g->n_seg; ++k) {
-        if (g->seg[k].exec != NULL) {
-            cudaGraphExecDestroy(g->seg[k].exec);
+        if (g->seg[k].exec != NULL && !g->seg[k].chain) {
+            cudaGraphExecDestroy(g->seg[k].exec);   /* (a chain's is a body's: gg_chain_free) */
         }
     }
+    gg_chain_free(g);
     for (int k = 0; g->ev != NULL && k < g->n_ev; ++k) {
         if (g->ev[k] != NULL) {
             cudaEventDestroy(g->ev[k]);

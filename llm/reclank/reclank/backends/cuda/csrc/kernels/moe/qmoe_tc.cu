@@ -58,14 +58,27 @@ __host__ __device__ __forceinline__ int kt_format(int type)
 }
 
 /* x (n rows of cols values) to int8, with xs and xsum for each block of 32. */
-__global__ void k_kq_quant_x(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
+__device__ __forceinline__ void kq_quant_x_dev(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
 {
-    PDL_START();
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t bi = tid / 8;
     bool live = bi < blocks;
     float4 v = live ? *(const float4 *)(x + tid * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
     quant8_block(v, live, bi, threadIdx.x % 8, q, xs, xsum);
+}
+
+__global__ void k_kq_quant_x(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
+{
+    PDL_START();
+    kq_quant_x_dev(x, q, xs, xsum, blocks);
+}
+
+/* k_kq_quant_x of operand k of a record (a chain's body reads x there: runtime/graphs.cu) */
+__global__ void k_kq_quant_x_rec(const gp_rec *rp, const int64_t *re, int k, int8_t *q, float *xs, float *xsum,
+                                 size_t blocks)
+{
+    PDL_START();
+    kq_quant_x_dev((const float *)(intptr_t)di(rp, re, k), q, xs, xsum, blocks);
 }
 
 /* Copy the bytes of row `row` of w for the step at column k0 to dst. */

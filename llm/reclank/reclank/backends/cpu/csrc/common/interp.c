@@ -249,16 +249,19 @@ static float gp_taps2(const float *x, int64_t w, int64_t C, int64_t c, const int
 
 /* pixel (i, j) of ENC_WARP: torch's CUDA grid_sampler_2d (bilinear, border,
  * align_corners): the grid plus the flow over (size - 1) / 2, unnormalized,
- * clipped, the four corners in bounds summed nw, ne, sw, se */
+ * clipped (zeros: padding "zeros", not clipped), the four corners in bounds
+ * summed nw, ne, sw, se */
 static void vfi_warp_px(const float *x, const float *fl, float *y, const float *gx, const float *gy, int64_t i,
                         int64_t j, int64_t h, int64_t w, int64_t C, int64_t xs, int64_t xo, int64_t fs, int64_t fo,
-                        int64_t ys, int64_t yo, float dx, float dy)
+                        int64_t ys, int64_t yo, float dx, float dy, int zeros)
 {
     const float *f = fl + (i * w + j) * fs + fo;
     float gxv = gx[j] + f[0] / dx, gyv = gy[i] + f[1] / dy;
     float ix = ((gxv + 1.f) / 2.f) * (float)(w - 1), iy = ((gyv + 1.f) / 2.f) * (float)(h - 1);
-    ix = fminf((float)(w - 1), fmaxf(ix, 0.f));
-    iy = fminf((float)(h - 1), fmaxf(iy, 0.f));
+    if (!zeros) {
+        ix = fminf((float)(w - 1), fmaxf(ix, 0.f));
+        iy = fminf((float)(h - 1), fmaxf(iy, 0.f));
+    }
     float xw = floorf(ix), yn = floorf(iy), xe = xw + 1.f, ysth = yn + 1.f;
     float nw = (xe - ix) * (ysth - iy), ne = (ix - xw) * (ysth - iy);
     float sw = (xe - ix) * (iy - yn), se = (ix - xw) * (iy - yn);
@@ -290,6 +293,13 @@ static void vfi_prelu_row(const float *x, float *y, const float *a, int64_t cols
         float v = x[c];
         y[c] = v > 0.f ? v : v * a[c];
     }
+}
+
+/* qsort's order of ENC_BLOCK_MASK's weights: the largest first */
+static int gp_cmp_desc_f32(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
 }
 
 /* a row of ENC_MIX: a s + b (1 - s), s = 1 / (1 + exp(-m)) */
@@ -1765,17 +1775,18 @@ static void gp_step(const gp_rec *r, int64_t *e)
         break;
     }
     case GP_ENC_WARP: {
-        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy: RIFE's
-         * backward warp (vfi_warp_px) a pixel at a time */
+        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy, zeros:
+         * RIFE's backward warp (vfi_warp_px) a pixel at a time */
         const float *x = GP_P(const float, 0), *fl = GP_P(const float, 1);
         float *y = GP_P(float, 2);
         const float *gx = GP_P(const float, 3), *gy = GP_P(const float, 4);
         int64_t h = gp_i(r, e, 5), w = gp_i(r, e, 6), C = gp_i(r, e, 7), xs = gp_i(r, e, 8), xo = gp_i(r, e, 9);
         int64_t fs = gp_i(r, e, 10), fo = gp_i(r, e, 11), ys = gp_i(r, e, 12), yo = gp_i(r, e, 13);
         float dx = gp_f(r, e, 14), dy = gp_f(r, e, 15);
+        int zeros = (int)gp_i(r, e, 16);
         #pragma omp for schedule(static)
         for (int64_t p = 0; p < h * w; ++p) {
-            vfi_warp_px(x, fl, y, gx, gy, p / w, p % w, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy);
+            vfi_warp_px(x, fl, y, gx, gy, p / w, p % w, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy, zeros);
         }
         break;
     }
@@ -2291,6 +2302,119 @@ static void gp_step(const gp_rec *r, int64_t *e)
                 p[j] = a * c - bb * sn;
                 p[j + h2] = bb * c + a * sn;
             }
+        }
+        break;
+    }
+    case GP_ENC_BLOCK_MASK: {
+        /* qm, km, kr, local, ids, p, thr, bl, nq, nk, nb, heads, hd, topk, nsel: FlashVSR's draft block mask (the
+         * scores of the means, -inf outside local, the softmax, each head's query slice's (k + 1)-th largest, the
+         * lists of the keys above it) */
+        const float *qm = GP_P(const float, 0), *km = GP_P(const float, 1);
+        const int32_t *kr = GP_P(const int32_t, 2), *ids = GP_P(const int32_t, 4);
+        const uint8_t *local = GP_P(const uint8_t, 3);
+        float *p = GP_P(float, 5), *thr = GP_P(float, 6);
+        int32_t *bl = GP_P(int32_t, 7);
+        int64_t nq = GP_I(8), nk = GP_I(9), nb = GP_I(10), heads = GP_I(11), hd = GP_I(12), topk = GP_I(13);
+        int64_t nsel = GP_I(14), w = heads * hd, n = nb * nk, k = topk < n - 1 ? topk : n - 1;
+        #pragma omp for schedule(static)
+        for (int64_t t = 0; t < heads * nq; ++t) {
+            int64_t h = t / nq, q = t % nq;
+            float *r = p + t * nk, mx = -INFINITY, sum = 0.f;
+            for (int64_t j = 0; j < nk; ++j) {
+                float s = -INFINITY;
+                if (local[(q % nb) * nb + j % nb]) {
+                    const float *a = qm + q * w + h * hd, *b = km + (int64_t)kr[j] * w + h * hd;
+                    s = 0.f;
+                    for (int64_t d = 0; d < hd; ++d) {
+                        s = fmaf(a[d], b[d], s);
+                    }
+                }
+                r[j] = s;
+                mx = s > mx ? s : mx;
+            }
+            for (int64_t j = 0; j < nk; ++j) {
+                r[j] = r[j] == -INFINITY ? 0.f : expf(r[j] - mx);
+                sum += r[j];
+            }
+            for (int64_t j = 0; j < nk; ++j) {
+                r[j] = r[j] * (1.f / sum);
+            }
+        }
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t g = 0; g < heads * (nq / nb); ++g) {
+            /* the (k + 1)-th largest of the slice's values: a sorted copy's */
+            float *c = (float *)malloc((size_t)n * sizeof(float));
+            memcpy(c, p + g * n, (size_t)n * sizeof(float));
+            qsort(c, (size_t)n, sizeof(float), gp_cmp_desc_f32);
+            thr[g] = c[k];
+            free(c);
+        }
+        #pragma omp for schedule(static)
+        for (int64_t t = 0; t < heads * nq; ++t) {
+            int64_t h = t / nq, q = t % nq, at = 0;
+            const float *r = p + t * nk;
+            float th = thr[h * (nq / nb) + q / nb];
+            int32_t *out = bl + t * nsel;
+            for (int64_t j = 0; j < nk; ++j) {
+                if (r[j] > th && at < nsel) {
+                    out[at++] = ids[j];
+                }
+            }
+            for (; at < nsel; ++at) {
+                out[at] = -1;
+            }
+        }
+        break;
+    }
+    case GP_ENC_ATTN_BLOCKS: {
+        /* q, k, v, o, bl, n, heads, hd, nsel, f16, qb0, nqb_all: query block b (128 rows) of head h over the
+         * key blocks bl[h][qb0 + b][..] of lists of nqb_all blocks (-1 ends them), scale 1, float32 (f16: a GPU
+         * form); a block with none gives zeros */
+        const float *q = GP_P(const float, 0), *k = GP_P(const float, 1), *v = GP_P(const float, 2);
+        float *o = GP_P(float, 3);
+        const int32_t *bl = GP_P(const int32_t, 4);
+        int64_t n = GP_I(5), heads = GP_I(6), hd = GP_I(7), nsel = GP_I(8), rs = heads * hd;
+        int64_t nqb = n / 128, qb0 = GP_I(10), nqb_all = GP_I(11);
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t t = 0; t < heads * nqb; ++t) {
+            int64_t h = t / nqb, b = t % nqb;
+            const int32_t *L = bl + (h * nqb_all + qb0 + b) * nsel;
+            int64_t nb = 0;
+            while (nb < nsel && L[nb] >= 0) {
+                ++nb;
+            }
+            float *sc = (float *)malloc((size_t)(nb > 0 ? nb : 1) * 128 * sizeof(float));
+            for (int64_t r = 128 * b; r < 128 * b + 128; ++r) {
+                const float *qr = q + r * rs + h * hd;
+                float *orow = o + r * rs + h * hd;
+                float mx = -INFINITY;
+                for (int64_t e = 0; e < nb * 128; ++e) {
+                    const float *kr = k + ((int64_t)L[e / 128] * 128 + e % 128) * rs + h * hd;
+                    float s = 0.f;
+                    for (int64_t d = 0; d < hd; ++d) {
+                        s += qr[d] * kr[d];
+                    }
+                    sc[e] = s;
+                    mx = s > mx ? s : mx;
+                }
+                float l = 0.f;
+                for (int64_t d = 0; d < hd; ++d) {
+                    orow[d] = 0.f;
+                }
+                for (int64_t e = 0; e < nb * 128; ++e) {
+                    float p = expf(sc[e] - mx);
+                    const float *vr = v + ((int64_t)L[e / 128] * 128 + e % 128) * rs + h * hd;
+                    l += p;
+                    for (int64_t d = 0; d < hd; ++d) {
+                        orow[d] += p * vr[d];
+                    }
+                }
+                float inv = l > 0.f ? 1.f / l : 0.f;
+                for (int64_t d = 0; d < hd; ++d) {
+                    orow[d] *= inv;
+                }
+            }
+            free(sc);
         }
         break;
     }

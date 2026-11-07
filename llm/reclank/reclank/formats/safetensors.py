@@ -206,6 +206,14 @@ class Shards:
     def names(self):
         return list(self.where)
 
+    @property
+    def header(self):
+        """Each name's entry of its file's header (its dtype, shape and offsets in that file)."""
+        h = getattr(self, "_header", None)
+        if h is None:
+            h = self._header = {n: f.header[n] for n, f in self.where.items()}
+        return h
+
     def close(self):
         for f in self.files.values():
             f.close()

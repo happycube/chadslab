@@ -37,6 +37,7 @@ import time
 import numpy as np
 
 from reclank.backends.cpu import cops
+from reclank.encoders import media as MD
 from reclank.ir import program as P
 from reclank.formats.gguf import GGUF
 from reclank.models.dgemma.model import inv_freq_f32
@@ -58,7 +59,8 @@ class _Lin:
 
 def _gguf_file(path):
     if os.path.isdir(path):
-        names = [f for f in os.listdir(path) if f.endswith(".gguf")]
+        # (the vision tower's mmproj may sit beside the model: scripts/dgemma_mmproj.py)
+        names = [f for f in os.listdir(path) if f.endswith(".gguf") and "mmproj" not in f]
         assert len(names) == 1, "one .gguf file in %s, not %s" % (path, names)
         return os.path.join(path, names[0]), path
     return path, os.path.dirname(path)
@@ -72,7 +74,7 @@ class DGemmaGPU:
     # and a margin
     RESERVE = 8.0e9
 
-    def __init__(self, path, max_len=32768, slide_rows=2048, gpu_experts=None, count=False):
+    def __init__(self, path, max_len=32768, slide_rows=2048, gpu_experts=None, count=False, prompt_rows=None):
         from reclank.backends.cuda.gpumm import pinned
         from reclank.backends.cuda.runtime import Mirror
         gpath, d = _gguf_file(path)
@@ -88,8 +90,13 @@ class DGemmaGPU:
         self.eps = cfg.rms_norm_eps
         self.window = cfg.sliding_window
         self.E, self.topk, self.inner = cfg.num_experts, cfg.top_k_experts, cfg.moe_intermediate_size
-        self.max_len, self.S = max_len, slide_rows
-        assert slide_rows >= self.window - 1 + 2 * self.C
+        # the rows of the encoder's block for an image that a block of C rows would split (the
+        # image's rows see each other: its span whole in one block); text takes blocks of C. 768
+        # holds an image of budget 560 and fits the windowed buffers of 2048 rows (window - 1 + P
+        # + C); a larger P makes them larger
+        self.P = int(prompt_rows or os.environ.get("RECLANK_DG_PROMPT_ROWS", 768))
+        assert self.P >= self.C
+        self.max_len, self.S = max_len, max(slide_rows, self.window - 1 + self.P + self.C)
         t0 = time.time()
         g = self.g = GGUF(gpath)
 
@@ -154,13 +161,14 @@ class DGemmaGPU:
         self.probs = np.zeros((C, self.vocab), np.float32)
         self.eos = np.asarray(self.gen_cfg.get("eos_token_id", [1, 106, 50]), np.int32)
         # the CPU's experts: one set of pinned rows for every layer and program (the layers run
-        # one after the other)
-        self.hp, self.po = pinned((C, self.H)), pinned((C, self.H))
-        self.vp, self.ip = pinned((C, self.topk)), pinned((C, self.topk), np.int32)
-        self.moe_scratch = cops.kq_moe_scratch(C, self.topk, self.E, self.H, self.inner)
-        self.hq = np.zeros((C, self.H), np.int8)
-        self.hs = np.zeros((C, self.H // 32), np.float32)
-        self.hm = np.zeros((C, self.H // 16), np.float32)
+        # one after the other), as many as the larger block's
+        R = self.P
+        self.hp, self.po = pinned((R, self.H)), pinned((R, self.H))
+        self.vp, self.ip = pinned((R, self.topk)), pinned((R, self.topk), np.int32)
+        self.moe_scratch = cops.kq_moe_scratch(R, self.topk, self.E, self.H, self.inner)
+        self.hq = np.zeros((R, self.H), np.int8)
+        self.hs = np.zeros((R, self.H // 32), np.float32)
+        self.hm = np.zeros((R, self.H // 16), np.float32)
         self.mirror = Mirror()
         self.mirror.kind = "dgemma"
         self.progs = {}
@@ -251,10 +259,10 @@ class DGemmaGPU:
                 self.held = self.held[:n]
         return n
 
-    def _room(self):
-        """Before a block at n: the windowed layers' last window - 1 rows to the front when the
-        block (and a canvas after it) would pass the end of their buffers."""
-        if self.n - self.base + 2 * self.C <= self.S:
+    def _room(self, rows=None):
+        """Before a block of rows (C) at n: the windowed layers' last window - 1 rows to the front
+        when the block (and a canvas after it) would pass the end of their buffers."""
+        if self.n - self.base + (rows or self.C) + self.C <= self.S:
             return
         from reclank.encoders.runtime import _EncCompiler
         keep = self.window - 1
@@ -278,8 +286,9 @@ class DGemmaGPU:
 
     # ---- the programs ----------------------------------------------------------------------
     def _program(self, kind):
+        """kind: enc (a block of C rows), encP (of P rows), dec0, dec1 (the canvas)."""
         from reclank.encoders.runtime import _EncCompiler
-        C, H, L = self.C, self.H, self.L
+        C, H, L = self.P if kind == "encP" else self.C, self.H, self.L
         c = _EncCompiler(self.eps)
         c.cfg = self.cfg
         z = lambda *shape: np.zeros(shape, np.float32)   # noqa: E731
@@ -288,7 +297,8 @@ class DGemmaGPU:
         c.env.update(x=z(C, H), cs=z(C, hs // 2), ss=z(C, hs // 2), cf=z(C, hf // 2), sf=z(C, hf // 2),
                      los=i32(C), his=i32(C), lof=i32(C), hif=i32(C), rows=i32(1), rowf=i32(1),
                      _scratch=z(C * max(H, 8192)))
-        if kind != "enc":
+        enc = kind.startswith("enc")
+        if not enc:
             c.env.update(temp=z(1), ban=i32(C), u=z(C), ent=z(C), am=i32(C), draw=i32(C), pmax=z(C),
                          praw=z(C))
         e = c.env
@@ -300,7 +310,7 @@ class DGemmaGPU:
             s = P.k_enc_rms(c, soft, self.sc["pre"], H)
             gm = P.k_enc_gelu_mul(c, P.k_enc_linear(c, self.sc["gate"], s), P.k_enc_linear(c, self.sc["up"], s))
             P.k_enc_add(c, x, P.k_enc_linear(c, self.sc["down"], gm))
-        if kind != "enc":
+        if not enc:
             x = P.k_enc_rms(c, x, None, H)
         n_ev = 0
         cpu_progs = []
@@ -332,7 +342,7 @@ class DGemmaGPU:
             nh_ = len(b["hot"])
             if nh_ < self.E:
                 cidx = idx if nh_ == 0 else P.k_dg_split(c, idx, b["map"])
-                self._cpu_start(c, b, h2, val, cidx, n_ev, cpu_progs)
+                self._cpu_start(c, C, b, h2, val, cidx, n_ev, cpu_progs)
                 n_ev += 1
             h = P.k_enc_rms(c, x, b["pre_ff"], H)
             gm = P.k_enc_gelu_mul(c, P.k_enc_linear(c, b["gate"], h), P.k_enc_linear(c, b["up"], h))
@@ -344,13 +354,13 @@ class DGemmaGPU:
             if nh_ < self.E:
                 c.p.emit(P.CPU_WAIT)
                 part = c.buffer((C, H))
-                c.p.emit(P.TO_DEV, self.po, part, self.po.nbytes)
+                c.p.emit(P.TO_DEV, self.po[:C], part, part.nbytes)
                 mo = part if mo is None else P.k_enc_add(c, mo, part)
             h2 = P.k_enc_rms(c, mo, b["post_ff2"], H)
             P.k_enc_add(c, h1, h2)
             P.k_enc_add(c, x, P.k_enc_rms(c, h1, b["post_ff"], H))
-            x = P.k_enc_mul_vec(c, x, b["enc_vec" if kind == "enc" else "dec_vec"], out=x)
-        if kind != "enc":
+            x = P.k_enc_mul_vec(c, x, b["enc_vec" if enc else "dec_vec"], out=x)
+        if not enc:
             xn = P.k_enc_rms(c, x, self.norm, H)
             P.k_enc_linear(c, self.head, xn, out=self.z)
             c.p.emit(P.SOFTCAP, self.z, self.z.size, float(self.cfg.final_logit_softcapping))
@@ -363,15 +373,15 @@ class DGemmaGPU:
         prog.keep.extend(cpu_progs)
         return prog
 
-    def _cpu_start(self, c, b, h2, val, cidx, ev, cpu_progs):
-        """The CPU's pairs of a layer (cidx: -1 for the GPU's) on the CPU's helper thread: the rows
-        to pinned memory, CPU_START of KQ_MOE (into self.po); the caller's CPU_WAIT joins it."""
-        C, H = self.C, self.H
-        c.p.emit(P.TO_HOST, h2, self.hp, self.hp.nbytes, val, self.vp, self.vp.nbytes, cidx, self.ip,
-                 self.ip.nbytes, ev)
+    def _cpu_start(self, c, C, b, h2, val, cidx, ev, cpu_progs):
+        """The CPU's pairs of a layer (C rows; cidx: -1 for the GPU's) on the CPU's helper thread:
+        the rows to pinned memory, CPU_START of KQ_MOE (into self.po); the caller's CPU_WAIT joins it."""
+        H = self.H
+        hp, po, vp, ip = self.hp[:C], self.po[:C], self.vp[:C], self.ip[:C]
+        c.p.emit(P.TO_HOST, h2, hp, hp.nbytes, val, vp, vp.nbytes, cidx, ip, ip.nbytes, ev)
         cp = P.Program()
-        cp.emit(P.KQ_MOE, self.hq, self.hs, self.hm, self.ip, self.vp, C, self.topk, self.E, b["mats"], None,
-                H, self.inner, self.moe_scratch, self.po, None, 3 | 128, self.hp)
+        cp.emit(P.KQ_MOE, self.hq[:C], self.hs[:C], self.hm[:C], ip, vp, C, self.topk, self.E, b["mats"], None,
+                H, self.inner, self.moe_scratch, po, None, 3 | 128, hp)
         cpu = cp.finish()
         cpu.keep.extend([b["mats"]] + list(b["experts"]))
         cpu_progs.append(cpu)
@@ -388,6 +398,38 @@ class DGemmaGPU:
             self.progs[kind] = g
             print("dgemma gpu: program %s %.1f s" % (kind, time.time() - t0), flush=True)
         return g
+
+    # ---- the device half (docs/GPU_SWAP_PLAN.md 3.6) ---------------------------------------------
+    def release_device(self):
+        """Free all the device memory: the cache's rows in use [0, n) to their host arrays (a
+        windowed layer's from its base), then the programs and the mirror. The host arrays stay
+        (the weights, the GPU's experts as placed at the load, the cache), so reload_device (or the
+        next run) makes the device half again as at the load."""
+        from reclank.backends.cuda.gpumm import mem
+        from reclank.backends.cuda.runtime import Mirror
+        mem().poll(wait=True)
+        for i in range(self.L):
+            rows = self.n - self.base if self.cfg.plan[i].is_sliding else self.n
+            for a in (self.K[i], self.V[i]):
+                b = self.mirror.bufs.get(a.ctypes.data)
+                if b is not None and rows > 0:
+                    b.download(a[:rows])
+        self._had_p = getattr(self, "_had_p", False) or "encP" in self.progs
+        for g in self.progs.values():
+            g.close()
+        self.progs = {}
+        for b in self.mirror.bufs.values():
+            b.free()
+        self.mirror = Mirror()
+        self.mirror.kind = "dgemma"
+
+    def reload_device(self):
+        """The programs (and so the mirror: the weights, the experts, the cache) on the device again."""
+        for kind in ("enc", "dec0", "dec1") + (("encP",) if getattr(self, "_had_p", False) else ()):
+            self._get(kind)
+
+    def device_bytes(self):
+        return self.mirror.nbytes()
 
     # ---- the inputs of a block ----------------------------------------------------------------
     def _tables(self, pos):
@@ -414,25 +456,39 @@ class DGemmaGPU:
     def embed(self, ids):
         return cops.kq_rows(self.table, BF12, self.H, ids) * self.embed_scale
 
-    def encode(self, ids):
-        """The encoder over ids at the end of the cache (blocks of C rows)."""
+    def encode(self, ids, spans=None):
+        """The encoder over ids at the end of the cache (blocks of C rows).
+
+        spans: the soft rows of images (encoders/media.Span), positions
+        relative to ids. A span that fits in one block is not split; one that
+        a block of C rows would split takes a block of P rows (encP); a span
+        longer than P crosses, and the mask stops at the block's end.
+        """
         ids = np.asarray(ids, np.int64)
-        for a in range(0, len(ids), self.C):
-            part = ids[a:a + self.C]
+        spans = list(spans or ())
+        for sp in spans:
+            if sp.end - sp.start > self.P:
+                print("dgemma gpu: an image of %d rows is longer than a block of %d (prompt_rows): its rows see "
+                      "those of their block only" % (sp.end - sp.start, self.P), flush=True)
+        for a, end, rows, limit in MD.encoder_blocks(self.n, len(ids), self.C, spans, big=self.P):
+            kind = "encP" if rows == self.P and rows != self.C else "enc"
+            part = ids[a:end]
             m = len(part)
-            assert self.n + self.C <= self.max_len, "the cache holds %d positions" % self.max_len
-            self._room()
-            blk = np.zeros(self.C, np.int64)
+            assert self.n + rows <= self.max_len, "the cache holds %d positions" % self.max_len
+            self._room(rows)
+            blk = np.zeros(rows, np.int64)
             blk[:m] = part
             n, base = self.n, self.base
-            i = np.arange(self.C)
-            pos = n + i
-            d = dict(x=self.embed(blk), **self._tables(pos))
+            pos = n + np.arange(rows)
+            x = self.embed(blk)
+            if spans:
+                MD.place_rows(x, spans, offset=a)
+            d = dict(x=x, **self._tables(pos))
             d.update(los=np.maximum(0, pos - base - (self.window - 1)).astype(np.int32),
-                     his=(pos - base + 1).astype(np.int32), lof=np.zeros(self.C, np.int32),
-                     hif=(pos + 1).astype(np.int32), rows=np.array([n - base], np.int32),
+                     his=(limit - base + 1).astype(np.int32), lof=np.zeros(rows, np.int32),
+                     hif=(limit + 1).astype(np.int32), rows=np.array([n - base], np.int32),
                      rowf=np.array([n], np.int32))
-            g = self._get("enc")
+            g = self._get(kind)
             self._set(g, d)
             g.run()
             self._tally(g, m)

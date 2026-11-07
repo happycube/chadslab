@@ -25,6 +25,7 @@ import os
 import numpy as np
 
 from reclank.core import ops
+from reclank.encoders import media as MD
 from reclank.formats.safetensors import Shards
 from reclank.models.gemma4 import model as g4
 from reclank.models.gemma4.config import Config
@@ -128,9 +129,16 @@ class DGemma:
         return g4.KVCache(self.cfg, max_len=self.max_len)
 
     # ---- the encoder -------------------------------------------------------
-    def encode(self, ids, cache, start):
-        """Append ids at positions start... to the cache (Gemma 4's prompt pass)."""
-        self.enc.prefill(np.asarray(ids, dtype=np.int64), cache, start=start)
+    def encode(self, ids, cache, start, spans=None):
+        """Append ids at positions start... to the cache (Gemma 4's prompt pass).
+
+        spans: the soft rows of images (encoders/media.Span), positions
+        relative to ids."""
+        media = None
+        if spans:
+            media = [MD.Span(sp.start + start, sp.rows, sp.bidir, sp.kind, sp.key, sp.grid)
+                     for sp in spans]
+        self.enc.prefill(np.asarray(ids, dtype=np.int64), cache, start=start, media=media)
 
     # ---- the decoder -------------------------------------------------------
     def _lin(self, x, w):

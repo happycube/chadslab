@@ -176,20 +176,22 @@ class _DevCache4(_DevCache):
 class Qwen4GPU(QwenGPU):
     """Qwen3.8-Flash-Next (a Qwen4CPU) on the GPU; see the module text."""
 
-    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None):
-        self.head_progs = {}
-        self.mtp_progs = {}
-        self.sel_bufs = {}
-        self._qpos_version = -1
-        self._qsa_buf = None        # the scratch of QSA_SELECT (_params)
-        self.mcache = None
+    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None, free0=None):
         L = model.cfg.num_hidden_layers
         self.has_mtp = "blk.%d.nextn.eh_proj.weight" % L in model.g.tensors
         self.model = model
         # RQ8_0 experts: the MoE kernels of the GPU rotate the act (Qwen4CPU
         # sets those of the CPU)
         lib().rc_gpu_set_moe_rot(int(getattr(model, "rot_experts", False)))
-        super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph, ctx=ctx)
+        super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph, ctx=ctx, free0=free0)
+
+    def _device_state(self):
+        super()._device_state()
+        self._qpos_version = -1
+        self._qsa_buf = None        # the scratch of QSA_SELECT (_params)
+
+    def _device_init(self):
+        super()._device_init()
         self.cache_dev = _DevCache4()
         self.cache_dev.before = self._share_before
 

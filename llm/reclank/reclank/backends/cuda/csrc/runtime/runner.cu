@@ -69,10 +69,11 @@ static int gg_nm_hg_off;
 #define GG_SIDE_EV 4
 static __thread cudaStream_t gg_side;            /* (each thread its own: the lanes, rc_gpu_lane) */
 static __thread cudaEvent_t gg_side_fork, gg_side_ev[GG_SIDE_EV];
+static __thread int gg_side_ep;
 
 static int gg_side_init(void)
 {
-    if (gg_side != NULL) {
+    if (gg_side != NULL && gg_side_ep == gg_epoch) {
         return 0;
     }
     CK(cudaStreamCreateWithFlags(&gg_side, cudaStreamNonBlocking));
@@ -80,6 +81,7 @@ static int gg_side_init(void)
     for (int k = 0; k < GG_SIDE_EV; ++k) {
         CK(cudaEventCreateWithFlags(&gg_side_ev[k], cudaEventDisableTiming));
     }
+    gg_side_ep = gg_epoch;
     return 0;
 }
 
@@ -107,6 +109,39 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     /* ---- the media encoders: the operands of bf16_linear.c gp_step ---- */
     case GP_ENC_LINEAR: {
         int n = (int)hlit(r, 5, &bad), m = (int)hlit(r, 6, &bad), k = (int)hlit(r, 7, &bad);
+        if (hlit(r, 2, &bad) == 5 && k % 32 == 0 && n >= 128 && hi(r, g->henv, 0) % 16 == 0) {
+            /* F20 rows on the tensor cores (wbf 5): x and W in bfloat16, float32 sums (k_enc_gemm_f20tc) */
+            k_enc_gemm_f20tc<<<dim3((unsigned)cdiv(m, 128), (unsigned)cdiv(n, 128)), 256, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (const uint8_t *)(intptr_t)hi(r, g->henv, 1),
+                (const float *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 4), n, m, k,
+                hlitf(r, 8, &bad), hlitf(r, 9, &bad), hlitf(r, 10, &bad), hlitf(r, 11, &bad));
+            break;
+        }
+        if (hlit(r, 2, &bad) == 8) {
+            /* W16I rows (int16 with scales: encoders.runtime.to_w16 "i16") on the tensor cores: k a multiple of 64 */
+            if (k % 64 != 0 || hi(r, g->henv, 0) % 16 != 0) {
+                bad = 1;
+                break;
+            }
+            enc_linear_w16i((const float *)(intptr_t)hi(r, g->henv, 0), (const uint8_t *)(intptr_t)hi(r, g->henv, 1),
+                            (const float *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 4), n, m, k,
+                            hlitf(r, 8, &bad), hlitf(r, 9, &bad), hlitf(r, 10, &bad), hlitf(r, 11, &bad), s);
+            break;
+        }
+        if (hlit(r, 2, &bad) == 7) {
+            /* W16H rows (float16 W ws, ws a power of two of each row: encoders.runtime.to_w16) on the tensor cores:
+             * the program gives them with k a multiple of 32 and x's rows 16-byte aligned */
+            if (k % 32 != 0 || hi(r, g->henv, 0) % 16 != 0) {
+                bad = 1;
+                break;
+            }
+            enc_linear_w16h((const float *)(intptr_t)hi(r, g->henv, 0), (const uint16_t *)(intptr_t)hi(r, g->henv, 1),
+                            (const float *)(intptr_t)hi(r, g->henv, 3), (float *)(intptr_t)hi(r, g->henv, 4), n, m, k,
+                            hlitf(r, 8, &bad), hlitf(r, 9, &bad), hlitf(r, 10, &bad), hlitf(r, 11, &bad), s);
+            break;
+        }
+        /* (wbf 5 that the tensor cores do not take: F20 rows, wbf 3, below) */
+        const int wbf = hlit(r, 2, &bad) == 5 ? 3 : (int)hlit(r, 2, &bad);
         if (hlit(r, 2, &bad) == 2 && enc_tc_on() && gg_tc && g->tc && k % 8 == 0 && n > MT_MAX &&
             2 * (size_t)n * k + 2 * (size_t)n * ((k + 31) / 32) <= g->xh_n) {
             /* float16 W (wbf 2): each block of 32 columns of x scaled, as two float16 planes (gg_gemm_f16) */
@@ -156,11 +191,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             }
             break;
         }
-        if ((hlit(r, 2, &bad) == 0 || (hlit(r, 2, &bad) == 3 && k % 32 == 0)) && enc_sgemm_on() &&
+        if ((wbf == 0 || (wbf == 3 && k % 32 == 0)) && enc_sgemm_on() &&
             hi(r, g->henv, 0) % 16 == 0 && hi(r, g->henv, 1) % 16 == 0) {
             /* float32 W, or F20 rows (wbf 3): k_enc_sgemm (the same bits) */
             enc_sgemm((const float *)(intptr_t)hi(r, g->henv, 0), (const void *)(intptr_t)hi(r, g->henv, 1),
-                      hlit(r, 2, &bad) == 3, (const float *)(intptr_t)hi(r, g->henv, 3),
+                      wbf == 3, (const float *)(intptr_t)hi(r, g->henv, 3),
                       (float *)(intptr_t)hi(r, g->henv, 4), n, m, k, hlitf(r, 8, &bad), hlitf(r, 9, &bad),
                       hlitf(r, 10, &bad), hlitf(r, 11, &bad), enc_sms(), s);
             break;
@@ -168,7 +203,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         dim3 grid((unsigned)cdiv(m, 64), (unsigned)cdiv(n, 64));
         k_enc_gemm<<<grid, 256, 0, s>>>(
             (const float *)(intptr_t)hi(r, g->henv, 0), (const void *)(intptr_t)hi(r, g->henv, 1),
-            (int)hlit(r, 2, &bad), (const float *)(intptr_t)hi(r, g->henv, 3),
+            wbf, (const float *)(intptr_t)hi(r, g->henv, 3),
             (float *)(intptr_t)hi(r, g->henv, 4), n, m, k, hlitf(r, 8, &bad), hlitf(r, 9, &bad),
             hlitf(r, 10, &bad), hlitf(r, 11, &bad));
         break;
@@ -373,16 +408,17 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_ENC_CONV_MM: {
-        /* src, idx, w, b, res, slope, y, n, m, taps, cin, scat, blk: the bits of ENC_GATHER + ENC_LINEAR
+        /* src, idx, w, b, res, slope, y, n, m, taps, cin, scat, blk, wbf (1: W bfloat16 on the tensor cores; 2: and
+         * src's rows bfloat16; 3: W16H rows (float16); 4: and src's rows float16; 5: W16I rows; 6: and src's rows I16): the bits of ENC_GATHER + ENC_LINEAR
          * (+ ENC_ADD, ENC_PRELU; + the ENC_GATHER of its output rows: scat) without the im2col buffer */
         int n = (int)hlit(r, 7, &bad), m = (int)hlit(r, 8, &bad), taps = (int)hlit(r, 9, &bad);
-        int cin = (int)hlit(r, 10, &bad), blk = (int)hlit(r, 12, &bad);
+        int cin = (int)hlit(r, 10, &bad), blk = (int)hlit(r, 12, &bad), wbf = (int)hlit(r, 13, &bad);
         if (n > 0 && m > 0) {
             enc_conv_mm((const float *)(intptr_t)hi(r, g->henv, 0), (const int *)(intptr_t)hi(r, g->henv, 1),
                         (const float *)(intptr_t)hi(r, g->henv, 2), (const float *)(intptr_t)hi(r, g->henv, 3),
                         (const float *)(intptr_t)hi(r, g->henv, 4), (const float *)(intptr_t)hi(r, g->henv, 5),
                         (float *)(intptr_t)hi(r, g->henv, 6), n, m, taps, cin,
-                        (const int *)(intptr_t)hi(r, g->henv, 11), blk > 0 ? blk : 1, enc_sms(), s);
+                        (const int *)(intptr_t)hi(r, g->henv, 11), blk > 0 ? blk : 1, enc_sms(), s, wbf);
         }
         break;
     }
@@ -533,16 +569,16 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         break;
     }
     case GP_ENC_WARP: {
-        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy: a thread a pixel */
+        /* x, flow, y, gx, gy, h, w, C, xs, xo, fs, fo, ys, yo, dx, dy, zeros: a thread a pixel */
         int64_t h = hlit(r, 5, &bad), w = hlit(r, 6, &bad), C = hlit(r, 7, &bad), xs = hlit(r, 8, &bad);
         int64_t xo = hlit(r, 9, &bad), fs = hlit(r, 10, &bad), fo = hlit(r, 11, &bad), ys = hlit(r, 12, &bad);
-        int64_t yo = hlit(r, 13, &bad);
+        int64_t yo = hlit(r, 13, &bad), zeros = hlit(r, 16, &bad);
         if (h > 0 && w > 0) {
             k_enc_warp<<<(unsigned)cdiv(h * w, T), T, 0, s>>>(
                 (const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
                 (float *)(intptr_t)hi(r, g->henv, 2), (const float *)(intptr_t)hi(r, g->henv, 3),
                 (const float *)(intptr_t)hi(r, g->henv, 4), h, w, C, xs, xo, fs, fo, ys, yo, hlitf(r, 14, &bad),
-                hlitf(r, 15, &bad));
+                hlitf(r, 15, &bad), (int)zeros);
         }
         break;
     }
@@ -636,6 +672,27 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_enc_dupup<<<(unsigned)cdiv(n, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
                                                            (float *)(intptr_t)hi(r, g->henv, 1), h, w, cin, cout,
                                                            ft, fs);
+        }
+        break;
+    }
+    case GP_ENC_I16_PACK: {
+        /* x, y, rows, cols: two threads a group of 64 */
+        int64_t rows = hlit(r, 2, &bad), cols = hlit(r, 3, &bad);
+        if (rows > 0 && cols > 0 && cols % 64 == 0) {
+            k_enc_i16_pack<<<(unsigned)cdiv(rows * (cols / 32), T), T, 0, s>>>(
+                (const float *)(intptr_t)hi(r, g->henv, 0), (uint8_t *)(intptr_t)hi(r, g->henv, 1), rows, (int)cols);
+        } else if (rows > 0) {
+            bad = 1;
+        }
+        break;
+    }
+    case GP_ENC_BF16_PACK: {
+        /* x, y, n, h (0 bfloat16, 1 float16): a thread 2 values */
+        int64_t n = hlit(r, 2, &bad);
+        if (n > 0) {
+            k_enc_bf16_pack<<<(unsigned)cdiv((n + 1) / 2, T), T, 0, s>>>((const float *)(intptr_t)hi(r, g->henv, 0),
+                                                                     (uint16_t *)(intptr_t)hi(r, g->henv, 1), n,
+                                                                     (int)hlit(r, 3, &bad));
         }
         break;
     }
@@ -787,10 +844,10 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                                                               hd);
         } else {
             static int attr = 0;
-            if (!attr) {
+            if (attr != gg_epoch) {
                 cudaFuncSetAttribute(k_enc_attn_x2<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int)EAX_SMEM(128));
-                attr = 1;
+                attr = gg_epoch;
             }
             k_enc_attn_x2<128><<<grid, 128, EAX_SMEM(128), s>>>(xh, xh + 2 * nE, xh + 4 * nE, nE, nE, o, lo, hi_, n,
                                                                   heads, hd);
@@ -828,12 +885,50 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             k_enc_attn_x2<64><<<grid, 128, EAX_SMEM(64), s>>>(qp, kp, vp, nEq, nEk, o, lo, hi_, nq, heads, hd);
         } else {
             static int attr = 0;
-            if (!attr) {
+            if (attr != gg_epoch) {
                 cudaFuncSetAttribute(k_enc_attn_x2<128>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int)EAX_SMEM(128));
-                attr = 1;
+                attr = gg_epoch;
             }
             k_enc_attn_x2<128><<<grid, 128, EAX_SMEM(128), s>>>(qp, kp, vp, nEq, nEk, o, lo, hi_, nq, heads, hd);
+        }
+        break;
+    }
+    case GP_ENC_BLOCK_MASK: {
+        /* qm, km, kr, local, ids, p, thr, bl, nq, nk, nb, heads, hd, topk, nsel: enc_block_mask (FlashVSR's mask) */
+        int nq = (int)hlit(r, 8, &bad), nk = (int)hlit(r, 9, &bad), nb = (int)hlit(r, 10, &bad);
+        int heads = (int)hlit(r, 11, &bad), hd = (int)hlit(r, 12, &bad), nsel = (int)hlit(r, 14, &bad);
+        int64_t topk = hlit(r, 13, &bad);
+        if (nq % nb != 0 || nk % nb != 0) {
+            bad = 1;
+            break;
+        }
+        if (nq > 0 && nk > 0) {
+            enc_block_mask((const float *)(intptr_t)hi(r, g->henv, 0), (const float *)(intptr_t)hi(r, g->henv, 1),
+                           (const int *)(intptr_t)hi(r, g->henv, 2), (const uint8_t *)(intptr_t)hi(r, g->henv, 3),
+                           (const int *)(intptr_t)hi(r, g->henv, 4), (float *)(intptr_t)hi(r, g->henv, 5),
+                           (float *)(intptr_t)hi(r, g->henv, 6), (int *)(intptr_t)hi(r, g->henv, 7), nq, nk, nb, heads,
+                           hd, topk, 0, nq, nsel, s);
+        }
+        break;
+    }
+    case GP_ENC_ATTN_BLOCKS: {
+        /* q, k, v, o, bl, nq, heads, hd, nsel, f16, qb0, nqb_all: k_enc_attn_blocks (float32; K and V float32 or
+         * float16), f16 2: k_enc_attn_blocks_tc (the tensor cores) */
+        int nq = (int)hlit(r, 5, &bad), heads = (int)hlit(r, 6, &bad), hd = (int)hlit(r, 7, &bad);
+        int nsel = (int)hlit(r, 8, &bad), f16 = (int)hlit(r, 9, &bad);
+        int qb0 = (int)hlit(r, 10, &bad), nqb_all = (int)hlit(r, 11, &bad);
+        const float *q = (const float *)(intptr_t)hi(r, g->henv, 0);
+        const void *k = (const void *)(intptr_t)hi(r, g->henv, 1), *v = (const void *)(intptr_t)hi(r, g->henv, 2);
+        float *o = (float *)(intptr_t)hi(r, g->henv, 3);
+        const int *bl = (const int *)(intptr_t)hi(r, g->henv, 4);
+        if (hd % 4 != 0 || hd > 128 || nq % 128 != 0 || ((uintptr_t)q | (uintptr_t)o) % 16 != 0 ||
+            ((uintptr_t)k | (uintptr_t)v) % (f16 == 1 ? 8 : 16) != 0) {
+            bad = 1;
+            break;
+        }
+        if (nq > 0) {
+            enc_attn_blocks(q, k, v, o, bl, nq, heads, hd, nsel, f16, qb0, nqb_all, s, &bad);
         }
         break;
     }
@@ -1002,6 +1097,20 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         if (t == 1) {
             k_bf16_linear<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(dr, denv);
+        } else if (t <= 8 && mt_bf16_r(t, rows) > 0) {
+            const float *x = (const float *)(intptr_t)hlit(r, 0, &bad);
+            const uint16_t *w = (const uint16_t *)(intptr_t)hlit(r, 1, &bad);
+            float *o = (float *)(intptr_t)hlit(r, 2, &bad);
+            int R = mt_bf16_r(t, rows);
+            unsigned grid = (unsigned)cdiv(rows, ROWS_PER_BLOCK * R);
+            switch (t * 4 + (R == 2) + 2 * (R == 4)) {
+#define BF_RT(n) case 4 * n: k_mt_bf16_rows<n, 1><<<grid, W, 0, s>>>(x, w, o, (int)rows, (int)cols); break; \
+                 case 4 * n + 1: k_mt_bf16_rows<n, 2><<<grid, W, 0, s>>>(x, w, o, (int)rows, (int)cols); break; \
+                 case 4 * n + 2: k_mt_bf16_rows<n, 4><<<grid, W, 0, s>>>(x, w, o, (int)rows, (int)cols); break;
+            BF_RT(2) BF_RT(3) BF_RT(4) BF_RT(5) BF_RT(6) BF_RT(7) BF_RT(8)
+#undef BF_RT
+            default: bad = 1;
+            }
         } else if (t <= MT_MAX) {
             k_mt_gemv_bf16<<<(unsigned)cdiv(rows, ROWS_PER_BLOCK), W, 0, s>>>(
                 (const float *)(intptr_t)hlit(r, 0, &bad), (const uint16_t *)(intptr_t)hlit(r, 1, &bad),
@@ -1111,6 +1220,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
     case GP_ATTN_F32H:
         if (hlit(r, 8, &bad) == 1) {
             attn_launch(g, r, dr, denv, &bad);
+        } else if (r->tag[13] != GP_T_NONE && hlit(r, 13, &bad) == 1) {
+            /* a verify group as decode steps */
+            attn_steps_launch(g, r, dr, denv, &bad);
         } else {
             /* A group: every query sees the keys of a window before it, as
              * the decode step does. */
@@ -1157,12 +1269,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 }
             } else if (tcq && (form == 1 || form == 4) && rep <= 16) {
                 static int attr = 0;
-                if (!attr) {
+                if (attr != gg_epoch) {
                     cudaFuncSetAttribute(k_attn_qsa_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          (int)QT_SMEM);
                     cudaFuncSetAttribute(k_attn_qsa_tc<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          (int)QT_SMEM);
-                    attr = 1;
+                    attr = gg_epoch;
                 }
                 dim3 grid((unsigned)hlit(r, 10, &bad), (unsigned)nk);
                 if (tcq == 2) {
@@ -1539,6 +1651,16 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         /* The GPU products read the float rows (operand 3 of GP_KQ_LINEAR). */
         return 0;
     case GP_KQ_LINEAR:
+        if (hlit(r, 5, &bad) == KQ_F20) {
+            /* F20 rows (the float32 dense matrices of an NVFP4 Qwen3.6: gpu35 QwenGPU.dense; kernels/enc) */
+            if (bad || kq_f20_linear((const float *)(intptr_t)hi(r, g->henv, 3),
+                                     (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (int)hlit(r, 6, &bad),
+                                     (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
+                                     (float *)(intptr_t)hi(r, g->henv, 9), s) != 0) {
+                bad = 1;
+            }
+            break;
+        }
         if (hlit(r, 5, &bad) == KQ_MXF8) {
             /* an MXFP8 matrix of FP4-Local (kernels/quant/mxf8.cu): x in bfloat16, out rounded; operand 10 (or
              * none): a factor of every output (Super's FP8 tensor scale, the GP_MUL after it folded in) */
@@ -1547,7 +1669,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                                           (const uint8_t *)(intptr_t)hi(r, g->henv, 4), (int)hlit(r, 6, &bad),
                                           (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
                                           (float *)(intptr_t)hi(r, g->henv, 9), sc, g->w16, g->w16_n,
-                                          (uint16_t *)g->xh, g->xh_n, s) != 0) {
+                                          (uint16_t *)g->xh, g->xh_n, s, dr, denv) != 0) {
                 bad = 1;
             }
             break;
@@ -1555,7 +1677,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (hlit(r, 5, &bad) == KQ_NV4 && !bad &&
             nv4_linear_launch((const float *)(intptr_t)hi(r, g->henv, 3), (const uint8_t *)(intptr_t)hi(r, g->henv, 4),
                               (int)hlit(r, 6, &bad), (int)hlit(r, 7, &bad), (int)hlit(r, 8, &bad),
-                              (float *)(intptr_t)hi(r, g->henv, 9), s) == 0) {
+                              (float *)(intptr_t)hi(r, g->henv, 9), s, dr, denv) == 0) {
             /* NVFP4 rows of a step or a few tokens (kernels/quant/nv4.cu: FP4-Local's MTP head) */
             break;
         }
@@ -1605,16 +1727,23 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             break;
         }
         if (hlit(r, 8, &bad) > MT_MAX && kt_on() && g->tc &&
-            kt_format((int)hlit(r, 5, &bad)) == KT_Q8R && hlit(r, 7, &bad) % KT_K == 0 &&
+            kt_dense((int)hlit(r, 5, &bad)) >= 0 && hlit(r, 7, &bad) % KT_K == 0 &&
             (size_t)hlit(r, 8, &bad) * hlit(r, 7, &bad) <= g->kqx_n) {
             /* The operand x (3) is a device address in the record on the device;
              * the host copy of the record has it too. */
             int64_t t = hlit(r, 8, &bad), cols = hlit(r, 7, &bad), rows = hlit(r, 6, &bad);
             kt_attr();
-            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 3), (size_t)(t * cols));
+            kt_quant(g, (const float *)(intptr_t)hi(r, g->henv, 3), (size_t)(t * cols), dr, denv, 3);
             float *xs = (float *)(g->kqx + g->kqx_n);
-            k_kq_tc<KT_Q8R><<<dim3((unsigned)cdiv(t, 128), (unsigned)cdiv(rows, KT_BN)), 256,
-                              KT_SMEM(128, 2), s>>>(dr, denv, g->kqx, xs, xs + g->kqx_n / 32);
+            dim3 gr((unsigned)cdiv(t, 128), (unsigned)cdiv(rows, KT_BN));
+            int f = kt_dense((int)hlit(r, 5, &bad));
+            if (f == KT_Q4K) {
+                k_kq_tc<KT_Q4K><<<gr, 256, KT_SMEM(128, 2), s>>>(dr, denv, g->kqx, xs, xs + g->kqx_n / 32);
+            } else if (f == KT_Q6K) {
+                k_kq_tc<KT_Q6K><<<gr, 256, KT_SMEM(128, 2), s>>>(dr, denv, g->kqx, xs, xs + g->kqx_n / 32);
+            } else {
+                k_kq_tc<KT_Q8R><<<gr, 256, KT_SMEM(128, 2), s>>>(dr, denv, g->kqx, xs, xs + g->kqx_n / 32);
+            }
         } else if (hlit(r, 8, &bad) > MT_MAX && hlit(r, 5, &bad) == KQ_BF12 && bf16_tc_on() &&
                    hlit(r, 7, &bad) % 32 == 0 &&
                    (bf12_fused_on() || (g->w16 != NULL && (size_t)hlit(r, 7, &bad) <= g->w16_n)) &&
@@ -1646,9 +1775,9 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             const int x2 = kq_x2_on();
             const int8_t *xl = x2 ? kt_lo(g) : NULL;
             if (x2) {
-                kt_quant_x2(g, x, (size_t)(t * cols));
+                kt_quant_x2(g, x, (size_t)(t * cols), dr, denv, 3);
             } else {
-                kt_quant(g, x, (size_t)(t * cols));
+                kt_quant(g, x, (size_t)(t * cols), dr, denv, 3);
             }
             dim3 gr((unsigned)cdiv(t, KD_BM), (unsigned)cdiv(rows, KT_BN));
             int f = kd_format((int)hlit(r, 5, &bad));
@@ -1669,7 +1798,7 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             size_t n = (size_t)(hlit(r, 8, &bad) * hlit(r, 7, &bad));
             const float *x = (const float *)(intptr_t)hi(r, g->henv, 3);
             if (x != qx_src || n != qx_n) {
-                kt_quant(g, x, n);
+                kt_quant(g, x, n, dr, denv, 3);
             }
             dim3 gr((unsigned)cdiv(hlit(r, 6, &bad), KQ_RPB));
             const float *xs = (const float *)(g->kqx + g->kqx_n);
@@ -1677,11 +1806,15 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
              * one kernel with the counts 1 to KQ_NT (NT 0) was faster on the
              * E4B than a kernel for each count: a down matrix of 3 tokens took
              * 0.066 ms, not 0.103 ms. The terms of a token are the same. */
-            int q40 = hlit(r, 5, &bad) == KQ_Q4_0;
+            int q40 = hlit(r, 5, &bad) == KQ_Q4_0, q80 = hlit(r, 5, &bad) == KQ_Q8_0;
             int64_t tg = hlit(r, 8, &bad);
             if (tg <= 1) {
                 if (q40) {
                     k_kq_linear_i8<1, KQ_Q4_0><<<gr, 32 * KQ_RPB, 0, s>>>(dr, denv, g->kqx, xs);
+                } else if (q80) {
+                    /* (Q8_0 fixed too: the general form's 180 registers left 2 blocks an SM; Nemotron's latent
+                     * projections, attention and head of a step) */
+                    k_kq_linear_i8<1, KQ_Q8_0><<<gr, 32 * KQ_RPB, 0, s>>>(dr, denv, g->kqx, xs);
                 } else {
                     k_kq_linear_i8<1><<<gr, 32 * KQ_RPB, 0, s>>>(dr, denv, g->kqx, xs);
                 }
@@ -2234,7 +2367,11 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             break;
         }
         k_nm_conv<<<(unsigned)cdiv(conv, 256), 256, 0, s>>>(dr, denv);
-        k_nm_scan<<<(unsigned)cdiv(heads * hdim, 4), 128, 0, s>>>(dr, denv);
+        if (nm_scan2_on() && hdim % (SCM_W * SCM_DPW) == 0) {
+            k_nm_scanm<SCM_W, SCM_DPW, 16, 2><<<(unsigned)(heads * hdim / (SCM_W * SCM_DPW)), 32 * SCM_W, 0, s>>>(dr, denv);
+        } else {
+            k_nm_scan<<<(unsigned)cdiv(heads * hdim, 4), 128, 0, s>>>(dr, denv);
+        }
         k_nm_gnorm<false><<<(unsigned)(t * groups), 256, 0, s>>>(dr, denv);
         break;
     }
@@ -2264,6 +2401,15 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         k_nm_take<<<1, 1024, 0, s>>>(dr, denv);
         break;
+    case GP_NM_STAGED:
+        if (hlit(r, 5, &bad) > NM_TAKE_E || hlit(r, 4, &bad) > 65535 || hlit(r, 17, &bad) <= 0 ||
+            hlit(r, 17, &bad) > 64 ||
+            hlit(r, 15, &bad) % 16 != 0 || hlit(r, 16, &bad) % 16 != 0) {
+            bad = 1;
+            break;
+        }
+        k_nm_staged<<<1, 1024, 0, s>>>(dr, denv);
+        break;
     case GP_NM_PULL:
         if (hlit(r, 13, &bad) % 16 != 0 || hlit(r, 14, &bad) % 16 != 0) {
             bad = 1;
@@ -2289,13 +2435,15 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         if (i8 && t >= 2 && t <= NM_HG && t * k <= 128 && nm_hg_on() && !gg_nm_hg_off) {
             /* a small group by expert (k_nm_hg_*: each expert's rows decoded once for its pairs) */
             k_nm_hot_qx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+            /* (two planes: operands 17 and 18) */
+            const bool hx2 = r->tag[17] == GP_T_SLOT || (r->tag[17] == GP_T_INT && r->v[17] != 0);
             switch (nm_hg_form()) {
-            case 22: nm_hg_launch<2, 2>(t, k, L, inner, s, dr, denv); break;
-            case 24: nm_hg_launch<2, 4>(t, k, L, inner, s, dr, denv); break;
-            case 44: nm_hg_launch<4, 4>(t, k, L, inner, s, dr, denv); break;
-            case 82: nm_hg_launch<8, 2>(t, k, L, inner, s, dr, denv); break;
-            case 81: nm_hg_launch<8, 1>(t, k, L, inner, s, dr, denv); break;
-            default: nm_hg_launch<4, 2>(t, k, L, inner, s, dr, denv); break;
+            case 22: nm_hg_launch<2, 2>(t, k, L, inner, s, dr, denv, hx2); break;
+            case 24: nm_hg_launch<2, 4>(t, k, L, inner, s, dr, denv, hx2); break;
+            case 44: nm_hg_launch<4, 4>(t, k, L, inner, s, dr, denv, hx2); break;
+            case 82: nm_hg_launch<8, 2>(t, k, L, inner, s, dr, denv, hx2); break;
+            case 81: nm_hg_launch<8, 1>(t, k, L, inner, s, dr, denv, hx2); break;
+            default: nm_hg_launch<4, 2>(t, k, L, inner, s, dr, denv, hx2); break;
             }
             k_nm_hg_sum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
             break;
@@ -2331,8 +2479,15 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             bad = 1;
             break;
         }
-        if (nm_hot_b_on() && L <= 1024 && inner <= 3072) {
-            /* (up: x of L <= 1024 columns, one block a lane; down: the act of inner <= 3072, three) */
+        if (nm_hot_b_on() && L <= 1024 && inner <= 3072 && !gg_caps.tc) {
+            /* (up: x of L <= 1024 columns, one block a lane; down: the act of inner <= 3072, three. Pascal: blocks of
+             * 16 rows, the registers capped, the next rows' loads beside the sums; nm.cu k_nm_hot_nv4b) */
+            k_nm_hot_nv4b<false, 2, 1, 1, 8><<<dim3((unsigned)cdiv(inner, 16), (unsigned)(t * k)), 256,
+                                               (size_t)L * 4, s>>>(dr, denv);
+            k_nm_hot_nv4b<true, 1, 3, 2, 4><<<dim3((unsigned)cdiv(L, 16), (unsigned)(t * k)), 256,
+                                              (size_t)inner * 4, s>>>(dr, denv);
+        } else if (nm_hot_b_on() && L <= 1024 && inner <= 3072) {
+            /* (the tensor-core GPUs: the shapes measured there) */
             k_nm_hot_nv4b<false, 8, 1><<<dim3((unsigned)cdiv(inner, 64), (unsigned)(t * k)), 256,
                                          (size_t)L * 4, s>>>(dr, denv);
             k_nm_hot_nv4b<true, 4, 3><<<dim3((unsigned)cdiv(L, 32), (unsigned)(t * k)), 256,
@@ -2369,6 +2524,65 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         const int64_t xtype = r->tag[21] != GP_T_NONE ? hlit(r, 21, &bad) : KQ_IQ2R;
         if (xtype == KQ_NV4) {
             const int x2 = r->tag[19] != GP_T_NONE && hlit(r, 19, &bad) != 0;
+            if (nm_nv4p_on() && (r->tag[22] == GP_T_NONE || hlit(r, 22, &bad) == 0 || hlit(r, 22, &bad) == 3)) {
+                /* no tensor cores (Pascal; RECLANK_NM_NV4P=1: a check): k_nm_gtile_nv4p on the rows where they are (the
+                 * slots, the mapped host memory; the stage is the tensor cores'); operand 23 (or none): a chunk of the
+                 * experts and a window of its pairs (x0 | nx << 16 | pass << 32 | cap << 40: the pairs' scratch a
+                 * window's; x's planes and the sort with the first chunk's first window, the sums of each window or of
+                 * the last chunk) */
+                int x0 = 0, nx = (int)E, pass = 0, cap = 0;
+                if (r->tag[23] != GP_T_NONE) {
+                    const int64_t c = hlit(r, 23, &bad);
+                    x0 = (int)(c & 0xffff);
+                    nx = (int)((c >> 16) & 0xffff);
+                    pass = (int)((c >> 32) & 0xff);
+                    cap = (int)(c >> 40);
+                    if (nx <= 0 || x0 + nx > E) {
+                        bad = 1;
+                        break;
+                    }
+                }
+                if (L % NV4P_KS != 0 || inner % NV4P_KS != 0 || L % 16 != 0 || inner % 32 != 0 || L > 1024 || E > 4096 ||
+                    nm_gtile_nv4p_smem((int)inner, true) + 20 * 1024 > (size_t)48 * 1024 ||
+                    nm_gtile_nv4p_smem((int)L, false) + 24 * 1024 > (size_t)48 * 1024) {
+                    bad = 1;
+                    break;
+                }
+                if (x0 == 0 && pass == 0) {
+                    k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+                    k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+                }
+                const size_t pu = nm_gtile_nv4p_smem((int)L, false), pd = nm_gtile_nv4p_smem((int)inner, true);
+                dim3 gu((unsigned)(inner / 32), (unsigned)nx), gd((unsigned)(L / 16), (unsigned)nx);   /* (x rows, y experts) */
+                /* (operand 22 = 3: the experts of a slot in operand 7's table, in the GPU's memory, by k_nm_gtile_nv4pc, the
+                 * others by k_nm_gtile_nv4p: up 2 batches of pairs a pass, down 1) */
+                const bool res = r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) == 3;
+                if (x2) {
+                    k_nm_gtile_nv4p<false, true><<<gu, 128, pu, s>>>(dr, denv);
+                    if (res) {
+                        k_nm_gtile_nv4pc<false, true, 2><<<gu, 128, 0, s>>>(dr, denv);
+                    }
+                    k_nm_gtile_nv4p<true, true><<<gd, 128, pd, s>>>(dr, denv);
+                    if (res) {
+                        k_nm_gtile_nv4pc<true, true, 1><<<gd, 128, 0, s>>>(dr, denv);
+                    }
+                } else {
+                    k_nm_gtile_nv4p<false, false><<<gu, 128, pu, s>>>(dr, denv);
+                    if (res) {
+                        k_nm_gtile_nv4pc<false, false, 2><<<gu, 128, 0, s>>>(dr, denv);
+                    }
+                    k_nm_gtile_nv4p<true, false><<<gd, 128, pd, s>>>(dr, denv);
+                    if (res) {
+                        k_nm_gtile_nv4pc<true, false, 1><<<gd, 128, 0, s>>>(dr, denv);
+                    }
+                }
+                if (cap > 0) {
+                    k_nm_gsumw<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+                } else if (x0 + nx == E) {
+                    k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+                }
+                break;
+            }
             if (L % 32 != 0 || L > 1024 || inner % 32 != 0 || E > 4096 || !nm_tc_on()) {
                 bad = 1;
                 break;
@@ -2447,6 +2661,88 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
         }
         if (L % 256 != 0 || L > 1024 || inner % 256 != 0 || inner > 256 * NM_GMAXB || E > 4096) {
             bad = 1;
+            break;
+        }
+        /* operand 22 (or none): 1, the experts in the GPU's memory (Bolt's staged groups: a hot expert's slot, a cold
+         * one's place in a stage buffer; NemotronGPU.bstage); operand 23 (or none): a chunk of them, x0 | nx << 16 (the
+         * tiles of its experts; x's planes and the sort with the first chunk, the sums with the last) */
+        int qx0 = 0, qnx = (int)E;
+        if (r->tag[23] != GP_T_NONE) {
+            const int64_t c = hlit(r, 23, &bad);
+            qx0 = (int)(c & 0xffff);
+            qnx = (int)((c >> 16) & 0xffff);
+            if (qnx <= 0 || qx0 + qnx > E || (c >> 32) != 0 || !(nm_tc_on() || gg_caps.dp4a)) {
+                bad = 1;
+                break;
+            }
+        }
+        if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) != 0 && !nm_tc_on() && gg_caps.dp4a) {
+            /* no tensor cores (Pascal): k_nm_gtile_q2p on the rows where they are (k_nm_gtile with
+             * RECLANK_NM_Q2V=0), the float act quantized between the up and the down tiles (k_nm_gqa) */
+            const int x2 = r->tag[19] != GP_T_NONE && hlit(r, 19, &bad) != 0;
+            if (L % Q2P_BM != 0 || inner % Q2P_BM != 0) {
+                bad = 1;
+                break;
+            }
+            if (qx0 == 0) {
+                k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+                k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            }
+            const unsigned gqa = (unsigned)cdiv(t * k * inner / 32, 128);
+            if (nm_q2v_on()) {
+                nm_q2p_launch(x2, L, inner, t * k * inner, qnx, s, dr, denv);
+            } else {
+                const size_t su = nm_gtile_smem((int)L), sd = nm_gtile_smem((int)inner);
+                dim3 gu((unsigned)qnx, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)qnx, (unsigned)cdiv(L, GM_BM));
+                if (x2) {
+                    k_nm_gtile<false, true><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gqa<<<gqa, 128, 0, s>>>(dr, denv);
+                    k_nm_gtile<true, true><<<gd, 256, sd, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile<false, false><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gqa<<<gqa, 128, 0, s>>>(dr, denv);
+                    k_nm_gtile<true, false><<<gd, 256, sd, s>>>(dr, denv);
+                }
+            }
+            if (qx0 + qnx == E) {
+                k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            }
+            break;
+        }
+        if (r->tag[22] != GP_T_NONE && hlit(r, 22, &bad) != 0 && nm_tc_on()) {
+            const int x2 = r->tag[19] != GP_T_NONE && hlit(r, 19, &bad) != 0;
+            if (qx0 == 0) {
+                k_nm_gqx<<<(unsigned)cdiv(t * L / 32, 128), 128, 0, s>>>(dr, denv);
+                k_nm_gsort<<<1, 1024, 0, s>>>(dr, denv);
+            }
+            if (nm_q2v_on()) {
+                /* (k_nm_gtile_q2v: the rows where they are, 64 x 32 tiles; the row tiles of an expert fastest) */
+                dim3 cu((unsigned)(inner / Q2V_BM), (unsigned)qnx), cd((unsigned)(L / Q2V_BM), (unsigned)qnx);
+                if (x2) {
+                    k_nm_gtile_q2v<false, true><<<cu, 128, 0, s>>>(dr, denv);
+                    k_nm_gtile_q2v<true, true><<<cd, 128, 0, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile_q2v<false, false><<<cu, 128, 0, s>>>(dr, denv);
+                    k_nm_gtile_q2v<true, false><<<cd, 128, 0, s>>>(dr, denv);
+                }
+            } else {
+                const size_t su = nm_gtile_smem((int)L), sd = nm_gtile_smem((int)inner);
+                dim3 gu((unsigned)qnx, (unsigned)cdiv(inner, GM_BM)), gd((unsigned)qnx, (unsigned)cdiv(L, GM_BM));
+                if (x2) {
+                    k_nm_gtile_tc<false, true><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gtile_tc<true, true><<<gd, 256, sd, s>>>(dr, denv);
+                } else {
+                    k_nm_gtile_tc<false, false><<<gu, 256, su, s>>>(dr, denv);
+                    k_nm_gtile_tc<true, false><<<gd, 256, sd, s>>>(dr, denv);
+                }
+            }
+            if (qx0 + qnx == E) {
+                k_nm_gsum<<<dim3((unsigned)cdiv(L, 256), (unsigned)t), 256, 0, s>>>(dr, denv);
+            }
+            break;
+        }
+        if (qnx != E) {
+            bad = 1;                /* (a chunk: the experts in the GPU's memory only) */
             break;
         }
         if (!nm_tc_on() && !gg_caps.dp4a) {
@@ -2541,6 +2837,12 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
             const int R8 = nm_t8d_on();
             const unsigned nbk = (unsigned)cdiv(rows, 8 * R8), cap = (unsigned)(nv4_sms() * 8);
             const unsigned nb8 = nbk < cap ? nbk : cap;
+            /* (k_nm_t8s: x in shared memory, the magic number's floats; the same bits, RECLANK_NM_T8S=0 the old) */
+            if (R8 == 2 && (type == KQ_NV4 ? nm_t8s_launch<KQ_NV4>(rows, cols, t, x2, s, dr, denv)
+                            : type == KQ_IQ2R ? nm_t8s_launch<KQ_IQ2R>(rows, cols, t, x2, s, dr, denv)
+                                              : nm_t8s_launch<KQ_Q8_0>(rows, cols, t, x2, s, dr, denv)) == 0) {
+                break;
+            }
             if (type == KQ_NV4) {
                 if (R8 == 1) k_nm_t8d<KQ_NV4, 1><<<nb8, 256, 0, s>>>(dr, denv);
                 else if (R8 == 4) k_nm_t8d<KQ_NV4, 4><<<nb8, 256, 0, s>>>(dr, denv);
@@ -2601,6 +2903,16 @@ static int gg_launch(const gg_prog *g, const gp_rec *r, const gp_rec *dr, const 
                 k_nm_gemm8k<KQ_Q8_0, true><<<gr, 256, 0, s>>>(dr, denv);
             } else {
                 bad = 1;
+            }
+        } else if (nm_g8d_on() && (type == KQ_IQ2R || type == KQ_NV4 || type == KQ_Q8_0)) {
+            /* one plane: the next step's words loaded while the step at hand is summed (nm.cu k_nm_gemm8d, the same
+             * bits as k_nm_gemm8k) */
+            if (type == KQ_IQ2R) {
+                nm_g8d_launch<KQ_IQ2R>(rows, t, s, dr, denv);
+            } else if (type == KQ_NV4) {
+                nm_g8d_launch<KQ_NV4>(rows, t, s, dr, denv);
+            } else {
+                nm_g8d_launch<KQ_Q8_0>(rows, t, s, dr, denv);
             }
         } else if (type == KQ_IQ2R) {
             k_nm_gemm8k<KQ_IQ2R, false><<<gr, 256, 0, s>>>(dr, denv);

@@ -419,9 +419,25 @@ class E4B:
         # the int4 kernel of the 12B model. A compressed-tensors file gives its
         # own packed layout. The two need different kernels.
         self._q4 = hasattr(ct, "int4_packed")
+        # A checkpoint folder (ct.Checkpoint): every matrix bfloat16, so the step and group
+        # programs take the bfloat16 copies (as a GGUF file's matrices that are not Q4_0).
+        self._plain = bool(getattr(ct, "bf16_weights", False))
+        # A DFlash drafter (dflash.py): the layers whose outputs it reads (taps), and the callable
+        # tap_sink(rows, pos) that gets them, (tokens, len(taps) x hidden), after each run. The
+        # programs are compiled with the taps (forms.tap_forms): set them before the first run.
+        self.taps = ()
+        self.tap_sink = None
         # The GGUF file has no output head. The head is the token embedding:
         # the two matrices hold the same values in the checkpoint.
-        self.head = (PREFIX + "embed_tokens") if self._q4 else HEAD
+        # A checkpoint of a fine-tune (ct.Checkpoint) names no lm_head either.
+        self.head = HEAD
+        if self._q4:
+            self.head = PREFIX + "embed_tokens"
+        else:
+            try:
+                ct._stored_key(HEAD)        # (.weight_packed, .weight)
+            except KeyError:
+                self.head = PREFIX + "embed_tokens"
         self._head_q6k = None
         self._head_q4 = None
         # The GPU runner, the cache that is on the GPU, and the hidden state
@@ -492,7 +508,8 @@ class E4B:
         if entry is not None:
             return entry if entry is not False else None
         try:
-            entry = self.ct.int4_packed(module + ".weight")
+            # (a compressed-tensors file or a checkpoint folder has no Q4_0 blocks)
+            entry = self.ct.int4_packed(module + ".weight") if self._q4 else False
         except (ValueError, KeyError):
             entry = False
         self._packed[module] = entry
@@ -915,7 +932,7 @@ class E4B:
             from reclank.models.gemma4 import forms
             if ids.size == 1 and not media and forms.e4b_ready(self, cache):
                 return self._gpu_step(ids, cache, int(start_pos))
-            if ids.size > 1 and self._q4 and self.mode == "int4":
+            if ids.size > 1 and (self._q4 or self._plain) and self.mode == "int4":
                 # A prompt, or the verify group of an MTP step.
                 return self._gpu_prefill(ids, cache, int(start_pos), media)
         self._gpu_release(cache)
@@ -939,8 +956,13 @@ class E4B:
                 tok_ids = ids.copy()
             tok_ids[lo - t0:hi - t0] = 0
         per_layer = self.per_layer_inputs(tok_ids, x)
+        taps = {}
         for i in range(cfg.num_hidden_layers):
             x = self.layer(x, per_layer[:, i, :], i, cache, start_pos, hook)
+            if i in self.taps:
+                taps[i] = x.copy()
+        if self.tap_sink is not None and self.taps:
+            self.tap_sink(np.concatenate([taps[i] for i in self.taps], 1), t0)
         return ops.rms_norm(x, self.T(PREFIX + "norm.weight"), cfg.rms_norm_eps)
 
     def _gpu_cached(self):

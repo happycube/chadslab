@@ -146,13 +146,81 @@ class RowPicker:
         return self.pick.draft_ok(self.full()[j], token)
 
 
+class AdaptiveDrafts:
+    """The drafts of each round of stream, in place of a fixed count: the count of ks with the most
+    tokens a second, from the acceptance of the recent rounds and the measured time of a round.
+
+    A drafter that proposes a block at once (DFlash: 7 drafts for the cost of one) leaves only the
+    verify group to choose, and its cost grows with its rows (Bolt E4B on the 3090: a group of 1,
+    4, 8 rows 16.8, 19.9, 31.6 ms), while the late drafts of a block are kept less often (a
+    short chat kept 1.2 a round of any count). The acceptance: a[i] the share of
+    the rounds that reached draft i (drafts 1 .. i-1 kept) that kept it, each round weighed by
+    DECAY after each later one; a draft that no recent round reached takes a[i-1]. A round of k
+    drafts gives 1 + a[1] + a[1] a[2] + .. tokens. The time of a round of k (the draft, the verify
+    of k + 1 rows and the drafter's observe): the median of its last COST_N rounds; a count with
+    fewer than COST_MIN is tried first (its first round builds its programs: the median drops
+    it). A count no recent round took keeps its old time (a shorter context): it is tried again
+    and measured anew."""
+
+    DECAY, COST_N, COST_MIN, PRIOR = 0.85, 9, 3, 2.0 / 3.0
+
+    def __init__(self, ks, start=None):
+        self.ks = sorted({int(k) for k in ks if int(k) > 0})
+        self.start = start if start in self.ks else self.ks[-1]
+        top = self.ks[-1] + 1
+        self.reach, self.hit = np.zeros(top), np.zeros(top)
+        self.times = {k: [] for k in self.ks}
+        self.last = self.start
+
+    def __repr__(self):
+        return "AdaptiveDrafts(%s)" % ", ".join(map(str, self.ks))
+
+    def accept(self):
+        """a[1 ..] (a[0] = 1: the target's own token)."""
+        a, prev = [1.0], self.PRIOR
+        for i in range(1, len(self.reach)):
+            prev = self.hit[i] / self.reach[i] if self.reach[i] >= 0.5 else prev
+            a.append(prev)
+        return a
+
+    def rate(self, k, a=None):
+        """The tokens a second of rounds of k drafts (None: k not measured)."""
+        t = sorted(self.times.get(k, ()))
+        if len(t) < self.COST_MIN:
+            return None
+        a = a or self.accept()
+        return float(np.cumprod(a[:k + 1]).sum()) / t[len(t) // 2]
+
+    def pick(self):
+        """The drafts of the next round."""
+        todo = [k for k in self.ks if len(self.times[k]) < self.COST_MIN]
+        if todo:
+            self.last = self.start if self.start in todo else todo[0]
+        else:
+            a = self.accept()
+            self.last = max(self.ks, key=lambda k: self.rate(k, a))
+        return self.last
+
+    def update(self, k, kept, seconds):
+        """A round of k drafts kept kept of them in seconds."""
+        self.reach *= self.DECAY
+        self.hit *= self.DECAY
+        self.reach[1:min(kept + 1, k) + 1] += 1
+        self.hit[1:kept + 1] += 1
+        if k in self.times:
+            t = self.times[k]
+            t.append(seconds)
+            del t[:-self.COST_N]
+
+
 def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_tokens=1 << 30,
            stats=None, room=None):
     """Yield the new tokens of a speculative decode, one at a time.
 
     The token nxt is the first new token; the target holds the rows before
     pos, not nxt. h is the hidden row of the target that predicted nxt (for
-    a drafter that takes it). pick(logits) selects a token from one row of
+    a drafter that takes it). n_draft: the drafts of a round, or an
+    AdaptiveDrafts. pick(logits) selects a token from one row of
     target logits: the sampler of the plain decode. room(pos), if given,
     limits the drafts of a round (the cache). The optional dict stats gets
     the counts of steps, drafts, accepted drafts (in_set: those that only
@@ -165,6 +233,7 @@ def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_toke
         st.setdefault(key, 0)
     for key in ("draft_s", "verify_s"):
         st.setdefault(key, 0.0)
+    adapt = n_draft if isinstance(n_draft, AdaptiveDrafts) else None
     emitted = 0
     try:
         while True:
@@ -172,7 +241,7 @@ def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_toke
             emitted += 1
             if nxt in eos_ids or emitted >= max_new_tokens:
                 return
-            k = min(n_draft, max_new_tokens - emitted - 1)
+            k = min(adapt.pick() if adapt else n_draft, max_new_tokens - emitted - 1)
             if room is not None:
                 k = min(k, room(pos))
             t0 = time.perf_counter()
@@ -202,7 +271,8 @@ def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_toke
                     break
             st["steps"] += 1
             st["drafts"] += len(d)
-            st["accepted"] += sum(1 for a, b in zip(out, d) if a == b)
+            agree = sum(1 for a, b in zip(out, d) if a == b)
+            st["accepted"] += agree
             st["in_set"] += kept
             # the target keeps the rows of nxt and of the kept drafts
             n = len(out)
@@ -211,6 +281,10 @@ def stream(target, drafter, nxt, h, pos, n_draft, pick, eos_ids=(), max_new_toke
             st["draft_s"] += t1 - t0
             st["verify_s"] += time.perf_counter() - t1
             drafter.observe(out, hid, pos + 1)
+            if adapt is not None and not stop:
+                adapt.update(len(d), agree, time.perf_counter() - t0)
+                by_k = st.setdefault("by_k", {})
+                by_k[len(d)] = by_k.get(len(d), 0) + 1
             pos += n
             for t in out[:-1]:
                 yield t

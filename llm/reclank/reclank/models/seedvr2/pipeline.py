@@ -143,6 +143,55 @@ def wavelet_reconstruction(content, style, levels=5):
     return (high + img).astype(np.float32)
 
 
+# the colour fix of a video's frames on threads of their own (NumPy lets the GIL go in its operations on whole
+# frames), each on the CPUs of the start (RECLANK_START_CPUS: a new thread takes the CPUs of the main thread,
+# which is pinned to one). Not processes: a fork copies the host memory registered with CUDA (the 7B's streamed
+# blocks: its pinned pages are copied at the fork). RECLANK_SEEDVR2_COLOR_PROCS (0: up to 16 of those CPUs;
+# 1: here)
+COLOR_PROCS = int(os.environ.get("RECLANK_SEEDVR2_COLOR_PROCS", "0"))
+_COLOR = None           # (dec, x, fix) of the frames the workers fix
+
+
+def _start_cpus():
+    c = os.environ.get("RECLANK_START_CPUS")
+    return {int(v) for v in c.split(",")} if c else os.sched_getaffinity(0)
+
+
+def _color_worker():
+    os.sched_setaffinity(0, _start_cpus())
+
+
+def _color_frame(f):
+    """Frame f of _COLOR: the colour fix (or none) to uint8 (H, W, 3)."""
+    dec, x, fix = _COLOR
+    fx = wavelet_reconstruction(dec[:, f], x[:, f]) if fix else dec[:, f]
+    return np.round((np.clip(fx, -1, 1) * np.float32(0.5) + np.float32(0.5)) *
+                    np.float32(255)).astype(np.uint8).transpose(1, 2, 0)
+
+
+def color_frames(dec, x, t, fix=True):
+    """The first t frames of dec (3, T, H, W) fixed against x's (wavelet_reconstruction; fix False: none), as
+    uint8 (t, H, W, 3): each frame's bits those of the one-frame computation, on a pool of threads."""
+    global _COLOR
+    out = np.empty((t,) + dec.shape[2:] + (3,), np.uint8)
+    procs = COLOR_PROCS or min(16, len(_start_cpus()))
+    _COLOR = (dec, x, fix)
+    try:
+        if procs <= 1 or t < 4:
+            for f in range(t):
+                out[f] = _color_frame(f)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(f):
+                out[f] = _color_frame(f)
+            with ThreadPoolExecutor(min(procs, t), initializer=_color_worker) as pool:
+                list(pool.map(one, range(t)))
+    finally:
+        _COLOR = None
+    return out
+
+
 class SeedVR2:
     """A SeedVR2 directory (the .safetensors of pt_to_safetensors.py: seedvr2_ema_3b or seedvr2_ema_7b,
     ema_vae, pos_emb). variant: "3b" or "7b" (None: the one whose checkpoint is there; the 3B when
@@ -253,11 +302,100 @@ class SeedVR2:
         lap("decode")
         if self.gpu and not keep:
             self.release(("vae", "vvae"))
+        if parts is None and t > 1:
+            # (a video: the frames fixed in the processes of color_frames, the same bits)
+            out = color_frames(dec, x, t, color_fix == "wavelet")
+            lap("color")
+            self.times = times
+            return out
         fixed = np.stack([wavelet_reconstruction(dec[:, f], x[:, f]) for f in range(t)], 1) \
             if color_fix == "wavelet" else dec
         lap("color")
+        self.times = times      # (the stages' seconds of the last restore)
         if parts is not None:
             parts.update(x=x, mean=mean, logvar=logvar, latent=latent, v=v, x0=x0, dec=dec.transpose(1, 0, 2, 3),
                          fixed=fixed.transpose(1, 0, 2, 3), times=times)
         out = np.round((np.clip(fixed, -1, 1) * np.float32(0.5) + np.float32(0.5)) * np.float32(255))
         return out.astype(np.uint8).transpose(1, 2, 3, 0)
+
+    # ---- a long video (a scene) without batches -----------------------------------------------------
+
+    def restore_long(self, frames, res, seed=0, chunk=30, margin=3, color_fix="wavelet", progress=None):
+        """restore of a video of any length (t, h, w, 3) uint8 at res (res_h, res_w), as one: the VAE's
+        encoder and decoder each one causal pass over all its frames (their caches carry on), the DiT on
+        chunks of `chunk` latent frames (long_chunks: each keeps its central latents, the rest its context;
+        their starts on the grid of the DiT's time windows, so a kept latent sees the windows of one pass
+        over all), the noises of each latent frame its own (the seed and the frame's index: a frame's in
+        every chunk that has it). Return the restored frames (t, H, W, 3) uint8; self.times the stages'.
+        progress(stage, done, total)."""
+        self.video_vae()
+        with RESIDENCY.use(*self.runners().values()):
+            return self._restore_long(frames, res, seed, chunk, margin, color_fix, progress)
+
+    def _restore_long(self, frames, res, seed, chunk, margin, color_fix, progress):
+        t = frames.shape[0]
+        assert t > 1, "restore_long: a video"
+        clock, times = [time.time()], {}
+
+        def lap(stage):
+            now = time.time()
+            times[stage] = now - clock[0]
+            clock[0] = now
+        note = (lambda stage: (lambda i, n: progress(stage, i, n))) if progress is not None else (lambda stage: None)
+        n = max((t - 1 + 3) // 4 + 1, 2)                                 # the latent frames of t
+        plan, n_pad = long_chunks(n, chunk, margin)
+        x = transform(frames, *res)                                       # (3, t, H, W)
+        T = 4 * (n_pad - 1) + 1
+        xp = np.concatenate([x] + [x[:, -1:]] * (T - t), 1) if T > t else x
+        mean, logvar = self.video_vae().encode(xp, progress=note("encode"))
+        del xp
+        lap("encode")
+        if self.gpu:
+            self.release(("vvae",))
+        shape = mean.shape[2:]
+        rngs = [np.random.default_rng([seed, j]) for j in range(n_pad)]
+        pnoise = np.stack([r.standard_normal((16,) + shape).astype(np.float32) for r in rngs], 1)
+        noise = np.stack([r.standard_normal(shape + (16,)).astype(np.float32) for r in rngs], 0)
+        z = SeedVR2VAE.sample(mean, logvar, pnoise)
+        latent = (z.transpose(1, 2, 3, 0) * np.float32(SCALE)).astype(np.float32)     # (n_pad, h, w, 16)
+        vid = np.concatenate([noise, latent, np.ones(latent.shape[:-1] + (1,), np.float32)], -1)
+        x0 = np.empty_like(latent)
+        for k, (a, keep0, keep1) in enumerate(plan):
+            v = self.dit.velocity(vid[a:a + min(chunk, n_pad - a)])
+            x0[keep0:keep1] = noise[keep0:keep1] - v[keep0 - a:keep1 - a]
+            if progress is not None:
+                progress("dit", k + 1, len(plan))
+        lap("dit")
+        if self.gpu:
+            self.release(("dit",))
+        zd = (x0 / np.float32(SCALE)).transpose(3, 0, 1, 2).astype(np.float32)        # (16, n_pad, h, w)
+        dec = self.video_vae().decode(zd, progress=note("decode"))
+        lap("decode")
+        if self.gpu:
+            self.release(("vae", "vvae"))
+        out = color_frames(dec, x, t, color_fix == "wavelet")
+        lap("color")
+        self.times = times
+        self.chunks = plan
+        return out
+
+
+def long_chunks(n, chunk, margin):
+    """The DiT's chunks of n latent frames: ([(start, keep0, keep1)], the padded count). n <= chunk:
+    one chunk of all. Else chunks of `chunk` latents at starts k core (core = chunk - 2 margin, a
+    multiple of the DiT's time window of a chunk: window_slices' ceil(min(chunk, 30) / 4)), each
+    keeping [start + margin, start + chunk - margin) (the first from 0, the last to the end); the
+    latents padded so that the last chunk is whole (its frames the last frame repeated)."""
+    if n <= chunk:
+        return [(0, 0, n)], n
+    wt = math.ceil(min(chunk, 30) / 4)
+    core = chunk - 2 * margin
+    assert core > 0 and core % wt == 0, "chunk %d, margin %d: core %d not a multiple of the window %d" % (
+        chunk, margin, core, wt)
+    k = math.ceil((n - chunk) / core) + 1
+    n_pad = (k - 1) * core + chunk
+    plan = []
+    for i in range(k):
+        a = i * core
+        plan.append((a, 0 if i == 0 else a + margin, n_pad if i == k - 1 else a + chunk - margin))
+    return plan, n_pad

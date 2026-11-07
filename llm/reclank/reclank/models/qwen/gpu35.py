@@ -362,6 +362,13 @@ def _fuse_small(recs):
 
 
 KQ_MXF8 = 66        # (FP4-Local's MXFP8 matrices: their own kernels, not GP_KQ_MULTI)
+KQ_F20 = 68         # (the float32 dense matrices of an NVFP4 Qwen3.6 on the GPU: QwenGPU.dense; not GP_KQ_MULTI)
+# The float32 products of a model whose source asks for it (f20_dense: formats/q35nv_st.py, the FP8 and
+# NVFP4 matrices of an NVFP4 Qwen3.6 as their float32 values) go to the GPU as F20 rows (16 significant
+# bits, 63% of the bytes; the user's choice for the GPU's memory); RECLANK_GPU_F20=0 keeps float32.
+F20_DENSE = os.environ.get("RECLANK_GPU_F20", "1") != "0"
+F20_NAMES = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
+             "attn_gate.weight", "ssm_out.weight", "output.weight")
 KQ_NVX = 53         # (the experts of the contract of FP4-Local: KQ_NVX)
 
 
@@ -389,11 +396,12 @@ def _fuse(prog, t):
                 out.append((P.ADD_RMS, [a[0], a[1], b[1], b[2], b[3], b[4], b[5]]))
                 i += 2
                 continue
-        if op == P.KQ_LINEAR and t <= MT and not P.kq_e3(a[5]) and _lit(a[5]) != KQ_MXF8:
+        if op == P.KQ_LINEAR and t <= MT and not P.kq_e3(a[5]) and _lit(a[5]) not in (KQ_MXF8, KQ_F20):
             group = [a]
             j = i + 1
             while (j < len(recs) and recs[j][0] == P.KQ_LINEAR and recs[j][1][3] == a[3]
-                   and len(group) < 5 and not P.kq_e3(recs[j][1][5]) and _lit(recs[j][1][5]) != KQ_MXF8):
+                   and len(group) < 5 and not P.kq_e3(recs[j][1][5])
+                   and _lit(recs[j][1][5]) not in (KQ_MXF8, KQ_F20)):
                 group.append(recs[j][1])
                 j += 1
             if len(group) > 1:
@@ -439,8 +447,12 @@ class QwenGPU(WarmPool, ProgramLRU):
     warm_mode = WARM        # WarmPool (RECLANK_GPU_WARM)
     warm_short = WARM_SHORT
 
-    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None):
+    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None, free0=None):
+        """The host half here (the experts' copies and registrations, the plan of the hot experts
+        by free0: the free memory now, or the load's at a reload), then the device half
+        (_device_init: a reload after a release makes it again, docs/GPU_SWAP_PLAN.md 3.6)."""
         self.model = model
+        self.free0 = mem_info()[0] if free0 is None else free0
         # more act bits of the CPU experts (KQ_MOE, the parts): GLM-5.3's
         # clamped SwiGLU (512); the GPU kernels take rc_gpu_set_moe_clamp
         self.moe_act = int(getattr(model, "moe_act", 0))
@@ -448,7 +460,7 @@ class QwenGPU(WarmPool, ProgramLRU):
         # int8, unless RECLANK_MOE_X16 says)
         self.moe_x16 = bool(getattr(model, "moe_x16", MOE_X16))
         # the rows of a mixed group (MIX_SIZE, SMALL_MIX on a small GPU)
-        self.mix_size = MIX_SIZE if _MIX_ENV or mem_info()[0] >= SMALL_GPU else min(MIX_SIZE, SMALL_MIX)
+        self.mix_size = MIX_SIZE if _MIX_ENV or self.free0 >= SMALL_GPU else min(MIX_SIZE, SMALL_MIX)
         # without the tensor cores (Pascal): the group records of attention
         # over the quantized caches as compile_qwen_step allows them
         model.attn_mt = has_tc()
@@ -465,32 +477,15 @@ class QwenGPU(WarmPool, ProgramLRU):
         self.profile = counts
         self.xdev = None
         self.graph = graph
-        self._dense = {}
-        self.n_events = 0
-        # the mixed groups of a prompt (mix)
-        self.mix_progs = {}
-        # The programs of the sizes in use, the least recently used first:
-        # (the name of their dict, key). When the GPU memory runs out, a new
-        # program makes room by freeing the oldest (_gpu_program).
-        self._mm_init("qwen%x" % id(self))     # gpumm.ProgramLRU, GpuMem
-        self.pool = None             # the pool of HotCache (ExpertPool)
-        self.mix_cap = 0
-        self.mix_places = None
-        self.mix_desc = {}          # layer -> the desc of GP_MOE_PLAN
-        self.mix_stats = {}         # layer -> the stats of its last plan
-        self._nreal_h = np.zeros(1, np.int64)
         E, L = cfg.num_experts, model.n_layers
         self.E, self.L = E, L
         # the layers with experts (LFM2: the first dense_layers have a dense MLP)
         self.moe_layers = [i for i in range(L) if i >= getattr(cfg, "dense_layers", 0)]
-        self.head_progs = getattr(self, "head_progs", {})
-        self.sel_bufs = getattr(self, "sel_bufs", {})     # t -> the routers' choices of a group (sel_of)
         # the MTP layer (blk.L.nextn; Qwen3.6 with the file of its layer, QwenGGUF mtp): a
         # program of its own (compile_qwen_step mtp), its cache on the GPU (attach), and a
         # store of its experts (_more_stores); Qwen4GPU has its own forms of these
-        self.mtp_progs = getattr(self, "mtp_progs", {})
         self.has_mtp = "blk.%d.nextn.eh_proj.weight" % L in model.g.tensors
-        self.mcache = None
+        self._device_state()
         if not self.moe_layers:
             # a dense model (Qwen3.8-27B): no experts
             self._no_experts(ctx)
@@ -509,7 +504,7 @@ class QwenGPU(WarmPool, ProgramLRU):
             self.ctx = int(ctx or os.environ.get("RECLANK_GPU_CTX", "0") or 0)
             if hot_gb is None:
                 # n slots take L n per; the two buffers take 2 (E - n) per.
-                head = model.M("lm_head").data.nbytes
+                head = self._gpu_bytes("output.weight")
                 # the programs (RECLANK_GPU_PROGRAM_GB): 2 GB, 4.5 with mixed
                 # groups of 4096 rows. With the NVFP4 experts (smaller: 2 E per
                 # leaves less) the graph of the mixed group of 4096 rows did not
@@ -518,7 +513,7 @@ class QwenGPU(WarmPool, ProgramLRU):
                 # server with no encoder failed at its first long prompt.
                 prog_gb = float(os.environ.get("RECLANK_GPU_PROGRAM_GB",
                                                4.5 if self.mix_size >= 4096 else 2.0))
-                room = mem_info()[0] - self._dense_bytes() - head - prog_gb * 1e9 - self._kv_bytes(self.ctx)
+                room = self.free0 - self._dense_bytes() - head - prog_gb * 1e9 - self._kv_bytes(self.ctx)
                 if self.mix_size > 0:
                     # The prompts run as mixed groups, whose copies go to a ring of
                     # the pool (_pool_room): never the large groups of the two
@@ -569,6 +564,39 @@ class QwenGPU(WarmPool, ProgramLRU):
                 self.parts = moe_parts.ExpertParts.make(mats, E, cfg.hidden_size, cfg.moe_inter, on_node)
             self._register_experts()
             self._calib_nodes()
+        self._host_keys = set(self.__dict__)        # the host half (runtime.remake)
+        self._device_init()
+
+    def _device_state(self):
+        """The device half's state of the programs, empty (the load, a reload)."""
+        self._dense = {}
+        self.n_events = 0
+        # the mixed groups of a prompt (mix)
+        self.mix_progs = {}
+        # The programs of the sizes in use, the least recently used first:
+        # (the name of their dict, key). When the GPU memory runs out, a new
+        # program makes room by freeing the oldest (_gpu_program).
+        self._mm_init("qwen%x" % id(self))     # gpumm.ProgramLRU, GpuMem
+        self.pool = None             # the pool of HotCache (ExpertPool)
+        self.mix_cap = 0
+        self.mix_places = None
+        self.mix_desc = {}          # layer -> the desc of GP_MOE_PLAN
+        self.mix_stats = {}         # layer -> the stats of its last plan
+        self._nreal_h = np.zeros(1, np.int64)
+        self.head_progs = {}
+        self.sel_bufs = {}          # t -> the routers' choices of a group (sel_of)
+        self.mtp_progs = {}
+        self.mcache = None
+        self.__dict__.pop("_commit_args", None)
+
+    def _device_init(self):
+        """The device half (docs/GPU_SWAP_PLAN.md 3.6): the pool and its first hot experts (the
+        profile's, n_slots a layer: the load's plan), the stores, the step's program, HotCache.
+        The load runs it; a reload after release runs it again (after _device_state) with no
+        disk read: a fresh server's device state."""
+        cfg, L, n = self.cfg, self.L, self.n_slots
+        counts = self.profile
+        if self.moe_layers:
             # The hot experts are blocks of the pool of HotCache (gpu.ExpertPool,
             # its "hot" segments: n of each layer to start; then they follow the
             # text, with the warm ones, across the layers). A layer whose experts
@@ -590,7 +618,7 @@ class QwenGPU(WarmPool, ProgramLRU):
             self.xdev = qwen_expert_device(self)
         self.arenas = alloc.Arenas(MT)      # the arenas of the temporaries (_pack)
         # RQ8_0 experts: the GPU MoE kernels rotate the act (a state of the process)
-        lib().rc_gpu_set_moe_rot(int(getattr(model, "rot_experts", False)))
+        lib().rc_gpu_set_moe_rot(int(getattr(self.model, "rot_experts", False)))
         # FP4-Local (cfg.b12x): the contract of b12x's W4A16 in the hot experts and the combine of a
         # step or a verify group (the rows form); the CPU parts take it with act bit 1024
         self.b12x = bool(getattr(cfg, "b12x", False))
@@ -598,7 +626,7 @@ class QwenGPU(WarmPool, ProgramLRU):
         lib().rc_gpu_set_moe_contract(3 if self.b12x else 0)
         lib().rc_gpu_set_kv_e4m3(int(getattr(cfg, "kv_form", "") == "e4m3"))
         self.prog = self._compile(1)
-        self.g = GPUProgram(self.prog, graph=graph)
+        self.g = GPUProgram(self.prog, graph=self.graph)
         self.groups = {}        # (t, verify) -> (Program, GPUProgram)
         self.stage = None       # the two buffers of the copies of a large group
         self.tables = {}        # layer -> (gate, up, down tables, ranges)
@@ -751,8 +779,24 @@ class QwenGPU(WarmPool, ProgramLRU):
         n = 0
         for name in g.tensors:
             if "_exps" not in name and name not in ("token_embd.weight", "output.weight"):
-                n += g.raw(name)[0].nbytes
+                n += self._gpu_bytes(name)
         return n
+
+    def _f20(self, gname):
+        """True when the tensor gname goes to the GPU as F20 rows (F20_DENSE)."""
+        g = self.model.g
+        if not (F20_DENSE and getattr(g, "f20_dense", False) and gname.endswith(F20_NAMES)):
+            return False
+        dims, t, _o = g.tensors[gname]
+        return t == 0 and len(dims) == 2 and dims[1] > 1 and dims[0] % 32 == 0
+
+    def _gpu_bytes(self, gname):
+        """The bytes of the GPU's copy of the tensor gname (F20 rows: _f20)."""
+        if self._f20(gname):
+            from reclank.backends.cpu.cops import f20_row_bytes
+            dims = self.model.g.tensors[gname][0]
+            return int(dims[1]) * f20_row_bytes(int(dims[0]))
+        return self.model.g.raw(gname)[0].nbytes
 
     def dense(self, name):
         """A copy of the blocks of a dense matrix, and its type. The GPU
@@ -771,6 +815,12 @@ class QwenGPU(WarmPool, ProgramLRU):
                                     b[:, :, :2].reshape(m.rows, m.cols // 16),
                                     np.zeros((m.rows, pad), np.uint8)], axis=1)
                 e = (np.ascontiguousarray(a).reshape(-1), Q8_R)
+            elif self._f20(self.model.gname(name)):
+                from reclank.backends.cpu.cops import kq_f32_to_f20
+                rows, rep = kq_f32_to_f20(np.asarray(m.data).view(np.float32).reshape(m.rows, m.cols), m.cols)
+                self._f20_rep = getattr(self, "_f20_rep", {})
+                self._f20_rep[name] = rep
+                e = (rows.reshape(-1), KQ_F20)
             else:
                 e = (np.array(m.data), m.type)
             self._dense[name] = e

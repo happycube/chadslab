@@ -189,6 +189,28 @@ WRITES[P.DG_SAMPLE] = ()
 WRITES[P.DG_SPLIT] = (2,)
 WRITES[P.DG_MOE] = (5, 6, 7, 8, 9, 10)      # (17, cidx, when given: wholly too, an array of the model)
 
+# Nemotron's prompt groups (models/nemotron: kq.compile_nemotron_step, gpu.NmEmit; NemotronGPU._prog packs those of
+# more than 16 rows). The int8 planes and scales of x that a record makes for the products after it (QFUSE: the
+# operands q, s, ql after its own, gpu._QAT) are written wholly too. A record skips the padding rows past nreal
+# (NM_MAMBA's scan): what those rows hold reaches no real row (the attention is causal, the experts take the real
+# pairs only), so the packed bytes there change no bit.
+WRITES[P.NM_ADDNORM] = (4, 8, 9, 10)        # (0, H: in place)
+WRITES[P.NM_QX] = (3, 4, 5)
+WRITES[P.KQ_QUANT] = (3, 4, 5)              # (on the GPU no kernel: the products read the float rows)
+WRITES[P.NM_GEMM8] = (7,)
+WRITES[P.NM_IQ2_LIN] = (6,)
+WRITES[P.NM_MAMBA] = (9, 10, 20, 21, 22)    # y, the conv's rows, y's planes; (1, 8: the cache's states)
+WRITES[P.RELU2] = (1, 3, 4, 5)
+WRITES[P.ROUTER_SIG] = (4, 5, 11, 12)       # val, idx (a step's split: cold, its count)
+WRITES[P.NM_PLAN] = (2, 3, 4)
+WRITES[P.NM_SPLIT] = (2, 3)
+WRITES[P.NM_KV] = ()                        # reads k, v; writes the cache
+WRITES[P.NM_ATTN2] = (3,)                   # (9: the device's partial sums, not the program's)
+# the routed experts of a group: x's planes and scales (gqx), the act, its planes and scales, the pairs' outputs, the
+# sums, the sort's counts and order (gsort), with the first record of a layer's chunks
+WRITES[P.NM_GROUP_MOE] = (5, 6, 7, 8, 9, 10, 11, 12, 19, 20)
+WRITES[P.DS_GATHER] = (3,)
+
 # opcode -> (operand, flag operand): the operand is written wholly when the
 # flag operand is set (not 0). TQ_ROT with a source (operand 3; gpu35.
 # _fuse_small of a COPY and the TQ_ROT of the copy) writes x: in place it

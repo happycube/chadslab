@@ -59,6 +59,7 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,),
         P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9, 11), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
         P.CPU_TASK: (0, 1, 2), P.MOE_COMBINE: (5,),     # (MOE_COMBINE: the rows of the CPU, pinned)
+        P.NM_STAGED: (11, 12, 13, 14),            # (its stage's words, pinned, and its buffers)
         P.DS_COMBINE: (3,), P.DS_EMBED: (0,),     # (DS_EMBED: the table in pinned host memory)
         P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,),  # (the CPU's sums of its experts, pinned)
         # the counts of the encoders' records: a count of hundreds of millions (a VAE's pixels
@@ -73,11 +74,12 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.ENC_ATTN_X2C: (8, 9, 10, 11),
         P.ENC_RESIZE: tuple(range(2, 13)), P.ENC_DIBR: (6, 7, 8, 9, 10, 12, 13), P.ENC_PACK_U8: (2,),
         P.ENC_RESIZE_TAPS: (2, 3, 4, 5, 6, 7, 8, 11), P.ENC_UNPACK_U8: (2,),
-        P.ENC_WARP: tuple(range(5, 14)), P.ENC_PRELU: (2, 3), P.ENC_MIX: tuple(range(2, 10)),
-        P.ENC_CONV_MM: (7, 8, 9, 10, 12), P.ENC_RIFE_IN: tuple(range(13, 21)),
+        P.ENC_WARP: tuple(range(5, 14)) + (16,), P.ENC_PRELU: (2, 3), P.ENC_MIX: tuple(range(2, 10)),
+        P.ENC_CONV_MM: (7, 8, 9, 10, 12, 13), P.ENC_RIFE_IN: tuple(range(13, 21)),
         P.ENC_RIFE_OUT: tuple(range(12, 20)), P.ENC_UNPACK_U8P: (2, 3, 4, 5, 6), P.ENC_PACK_U8C: (2, 3, 4, 5),
         P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14)),
-        P.ENC_CONV3: tuple(range(7, 13)),
+        P.ENC_CONV3: tuple(range(7, 13)), P.ENC_BF16_PACK: (2, 3), P.ENC_I16_PACK: (2, 3),
+        P.ENC_ATTN_BLOCKS: (5, 6, 7, 8, 9, 10, 11), P.ENC_BLOCK_MASK: tuple(range(8, 15)),
         P.DG_KV_PUT: (5, 6, 7), P.DG_ATTN: (6, 7, 8, 9), P.DG_SAMPLE: (9, 10, 11),
         P.DG_MOE: (11, 12, 13, 14, 15), P.DG_SPLIT: (3,)}
 
@@ -130,6 +132,7 @@ def lib():
     L.rc_gpu_malloc.restype = vp
     L.rc_gpu_free.argtypes = [vp]
     L.rc_gpu_h2d.argtypes = [vp, vp, sz]
+    L.rc_gpu_h2d_big.argtypes = [vp, vp, sz]
     L.rc_gpu_h2d_rows.argtypes = [i, vp, vp, sz]
     L.rc_gpu_d2h.argtypes = [vp, vp, sz]
     L.rc_gpu_mix_stats_on.argtypes = [i]
@@ -150,6 +153,7 @@ def lib():
     L.rc_gpu_embed_q4.argtypes = [vp, vp, vp, i, ctypes.c_float]
     L.rc_gpu_embed_q4_rows.argtypes = [vp, vp, vp, i, i, ctypes.c_float]
     L.rc_gpu_set_cpu_runner.argtypes = [vp]
+    L.rc_gpu_set_cpu_after.argtypes = [vp]
     L.rc_gpu_host_register_rw.argtypes = [vp, ctypes.c_size_t]
     L.rc_gpu_set_moe_rot.argtypes = [ctypes.c_int]
     L.rc_gpu_set_moe_rot.restype = None
@@ -180,6 +184,9 @@ def lib():
     L.rc_gpu_ko_table.argtypes = [vp, vp, i, i, i]
     L.rc_gpu_zero.argtypes = [vp, sz]
     L.rc_gpu_caps_get.argtypes = [ctypes.POINTER(i), i]
+    L.rc_gpu_shutdown.argtypes = []
+    L.rc_gpu_context_up.argtypes = []
+    L.rc_gpu_epoch.argtypes = [ctypes.POINTER(ctypes.c_double)]
     # The products of a large group: RECLANK_GPU_TC=1 (the default) runs
     # them on the tensor cores with float16 inputs, 8 with int8 inputs (the
     # Q8_0 form: faster, less exact), and 0 with float32 kernels.
@@ -200,6 +207,8 @@ def lib():
             n = int(os.environ.get("OMP_NUM_THREADS", "0") or 0) // 2 if numa.enabled() else 0
         cops._lib.rc_set_task_threads(ctypes.c_int(int(n)))
         L.rc_gpu_set_cpu_runner(ctypes.cast(cops._lib.rc_run_task, ctypes.c_void_p))
+        if hasattr(cops._lib, "rc_er_after"):
+            L.rc_gpu_set_cpu_after(ctypes.cast(cops._lib.rc_er_after, ctypes.c_void_p))
         _place_threads(L)
     _lib = L
     return L
@@ -537,6 +546,49 @@ def _check_scales(prog, done=None):
                                  "float16 scales; the GPU kernels read the float16 scale")
 
 
+# the GPU programs loaded (close_all), and the handles of the C side's programs loaded: a program has no
+# finalizer that unloads it, so the handle of one dropped unclosed stays here (close_all unloads it)
+_LIVE = weakref.WeakSet()
+_HANDLES = set()
+
+
+def close_all():
+    """Free all the device memory of the process (before a release of the context: the GPU
+    sharing, server/gpushare.py): close every GPU program loaded, release every _Runner (its host
+    programs kept), free every Buffer left. The objects that held them must be made again (the
+    engines' reload_device). Return (programs, blocks) freed."""
+    from reclank.backends.cuda.gpumm import mem
+    from reclank.encoders.runtime import RESIDENCY
+    mem().poll(wait=True)
+    for r in list(RESIDENCY.state.keys()):
+        if r.gpu_bytes() > 0:
+            r.release(keep_host=True)
+            RESIDENCY.evicted.add(r)
+    progs = list(_LIVE)
+    for g in progs:
+        g.close()
+    orphans = list(_HANDLES)            # (programs dropped unclosed)
+    for h in orphans:
+        lib().rc_gpu_unload(h)
+    _HANDLES.clear()
+    blocks = list(mem().blocks.values())
+    for b in blocks:
+        b.free()
+    return len(progs) + len(orphans), len(blocks)
+
+
+def remake(obj):
+    """A new object of obj's class with obj's host half (the attributes its __init__ had set before
+    its device half: obj._host_keys) and a new device half (_device_state, _device_init): a reload
+    after close_all, with no attribute of the old device half left (those set later too)."""
+    new = type(obj).__new__(type(obj))
+    new.__dict__.update({k: v for k, v in obj.__dict__.items() if k in obj._host_keys})
+    new._host_keys = obj._host_keys
+    new._device_state()
+    new._device_init()
+    return new
+
+
 class GPUProgram:
     """A Program on the GPU: its records with device addresses, its data, and
     the device buffers of its parameters."""
@@ -573,6 +625,9 @@ class GPUProgram:
                     code[i]["v"][k] = d
         self.handle = lib().rc_gpu_load(buf.ctypes.data, (1 if graph else 0) | (0 if tc else 2) | (4 if i8 else 0) |
                                   (8 if atc else 0) | (16 if i8 == 2 else 0))
+        if self.handle:
+            _LIVE.add(self)
+            _HANDLES.add(self.handle)
         if not self.handle:
             msg = lib().rc_gpu_last_error().decode()
             lib().rc_gpu_clear_error()
@@ -684,7 +739,9 @@ class GPUProgram:
     def close(self):
         if self.handle:
             lib().rc_gpu_unload(self.handle)
+            _HANDLES.discard(self.handle)
             self.handle = None
+            _LIVE.discard(self)
             # who closed it: a run after this is an error that names it
             import traceback
             self.closed_by = "".join(traceback.format_stack(limit=12)[:-1])

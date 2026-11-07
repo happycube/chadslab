@@ -88,6 +88,7 @@ import os
 import numpy as np
 
 from reclank.encoders.runtime import RESIDENCY, gpu_runners, to_bf12_dev
+from reclank.runtime.kept import Kept
 from reclank.formats.gguf import BF16
 from reclank.models.qwen.tokenizer import QwenTokenizer
 from reclank.models.qwen.vision import MERGE, PATCH, QwenVision, patches_of, smart_resize, vision_weights
@@ -173,8 +174,16 @@ class QwenImage21:
         self.cpu_threads = cpu_threads
         self.text_bf12 = os.environ.get("RECLANK_QWEN_TEXT_BF12", "1") != "0" if text_bf12 is None else bool(text_bf12)
         if self.text is not None and self.text_bf12:
-            _bf12([L[k] for L in self.text.layers for k in ("q", "k", "v", "o", "gate", "up", "down")], self.text_gpu,
-                  "text encoder", cpu_threads)
+            # the BF12 linears from the weightkeeper when it holds them (runtime/kept.py), else
+            # converted (and kept)
+            kept = Kept("qwen-image-text", tdir, dict(gpu=self.text_gpu), code=[__name__, "reclank.models.qwen3"])
+            keys = ("q", "k", "v", "o", "gate", "up", "down")
+            if kept.mode != "read":
+                _bf12([L[k] for L in self.text.layers for k in keys], self.text_gpu, "text encoder", cpu_threads)
+            for i, L in enumerate(self.text.layers):
+                for k in keys:
+                    L[k] = kept.linear("layers.%d.%s" % (i, k), lambda L=L, k=k: L[k])
+            kept.done()
         self.dit = QwenImageDiT(os.path.join(path, "transformer"), gpu=gpu, cpu_threads=cpu_threads) \
             if every or "dit" in parts else None
         # an edit's DiT cache in F20 (None: RECLANK_QWEN_CACHE_F20, on unless 0)

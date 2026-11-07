@@ -206,7 +206,11 @@ class NemotronKQ:
             else:
                 m = None
                 if ck.file(name + ".weight").dtype(name + ".weight") == "BF16":
-                    m = bf12_mat(np.ascontiguousarray(w).view(np.uint16).reshape(w.shape[0], -1))
+                    # the bfloat16 bits: the weightkeeper's copy has them, the shard's reader widens them
+                    # to float32 (its uint16 view was two halves a value: Bolt's routers wrong, KL 1.5)
+                    w = np.ascontiguousarray(w)
+                    b16 = (w.view(np.uint32) >> 16).astype(np.uint16) if w.dtype == np.float32 else w.view(np.uint16)
+                    m = bf12_mat(b16.reshape(w.shape[0], -1))
                 if m is None:
                     f = np.ascontiguousarray(self._f32(name + ".weight"))
                     m = Mat(f.reshape(-1), KQ_F32, f.shape[0], f.shape[1])
@@ -374,6 +378,13 @@ class NemotronKQ:
         return out * np.float32(m.scale) if m.scale is not None else out
 
 
+# The programs of at least TAIL_ROWS rows mark their layers (P.F_LAYER): the CUDA runtime runs the layers of a
+# kind on one graph, chained by tail launches (runtime/graphs.cu; Super's program of 384 rows on the GTX 1070: 57
+# MB of graphs -> ~1). A step's program keeps its graphs: a chain costs a few us a layer there (Super's step on the
+# RTX 3060 13.01 -> 12.89 tok/s) for its ~6 MB. RECLANK_NM_TAIL_ROWS=1: the steps too.
+TAIL_ROWS = int(os.environ.get("RECLANK_NM_TAIL_ROWS", "17"))
+
+
 def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
     """A step of t tokens of a NemotronKQ as a program of records. em (the GPU: gpu.NmEmit) gives
     the records of the attention and of the routed experts in its own way (em.attention, em.moe);
@@ -391,19 +402,33 @@ def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
     Imax = max(n for _, n, _ in cfg.moe.values())
     k = max(kk for _, _, kk in cfg.moe.values())
     f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
-    H, hn, xn = f32(t, hid), f32(t, hid), f32(t, hid)
+    # (packed, NemotronGPU._prog: the temporaries of the program in prog.temps, each layer's its own, for ir/alloc.pack
+    # to give those that do not live at once the same bytes)
+    pk = em is not None and getattr(em, "fresh", False)
+    prog.temps = []
+
+    def tmp(*sh, dt=np.float32):
+        # (packed: a map of its own, no memory until written: pack drops the packed ones, the device holds the arena)
+        a = P.lazy_zeros(sh, dt) if pk else np.zeros(sh, dt)
+        if pk:
+            prog.temps.append(a)
+        return a
+
+    H, hn, xn = f32(t, hid), tmp(t, hid), f32(t, hid)
     wide = max(inner, cfg.shared_inner, hid)
-    xq, xs, xm = np.zeros((t, wide), np.int8), f32(t, wide // 32), f32(t, wide // 16)
+    xq, xs, xm = tmp(t, wide, dt=np.int8), tmp(t, wide // 32), tmp(t, wide // 16)
     x16 = X16 and em is None            # (the GPU: its own records, gpu.NmEmit)
     xl = np.zeros((t, wide), np.int8) if x16 else None
     # x as int16 for a prompt group (NM_LIN2's tiled form)
     x16b = np.zeros((t, wide), np.int16) if x16 and t >= 4 else None
-    zxd, y, o = f32(t, inner + conv + nh), f32(t, inner), f32(t, hid)
-    cscr = f32(t, conv)
-    q, kb, vb, qout, att = f32(t, nq * hd), f32(t, nk * hd), f32(t, nk * hd), f32(t, nq * hd), f32(t, nq * hd)
+    def layer_rows():
+        return (tmp(t, inner + conv + nh), tmp(t, inner), tmp(t, hid), tmp(t, conv), tmp(t, nq * hd), tmp(t, nk * hd),
+                tmp(t, nk * hd), tmp(t, nq * hd), tmp(t, Emax), tmp(t, k), tmp(t, k, dt=np.int32), tmp(t, L), tmp(t, L),
+                tmp(t, cfg.shared_inner), tmp(t, hid))
+
+    zxd, y, o, cscr, q, kb, vb, att, logits, val, idx, lat, lato, sh, mo = layer_rows()
+    qout = f32(t, nq * hd)
     sel, dense = np.zeros((t, 1), np.int32), np.full(t, -1, np.int32)
-    logits, val, idx = f32(t, Emax), f32(t, k), np.zeros((t, k), np.int32)
-    lat, lato, sh, mo = f32(t, L), f32(t, L), f32(t, cfg.shared_inner), f32(t, hid)
     mscr = cops.nm_moe_scratch(t, k, L, Imax) if em is None else None
     prog.names.update(H=H, xn=xn)
     pos, scores, nreal = prog.slot("pos"), prog.slot("scores"), prog.slot("nreal")
@@ -457,6 +482,14 @@ def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
             break
         b = BB + "layers.%d." % i
         p = b + "mixer."
+        if pk and i > 0:
+            # (each layer's temporaries its own: the earlier layers' outputs, pend, stay theirs)
+            hn = tmp(t, hid)
+            zxd, y, o, cscr, q, kb, vb, att, logits, val, idx, lat, lato, sh, mo = layer_rows()
+        if em is not None and hasattr(em, "begin_layer"):
+            em.begin_layer(i)
+        if t >= TAIL_ROWS:
+            prog.mark(P.F_LAYER | (i + 1) << P.F_LAYER_SHIFT)
         norm(model.F(b + "norm.weight"), hn)
         if i - 1 in capture:
             fb = prog.names["feat.%d" % (i - 1)] = f32(t, hid)
@@ -492,6 +525,15 @@ def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
             if getattr(model, "count_experts", False):
                 # (the routing profile, P6: each layer's choices in a buffer of its own)
                 idx = prog.names["idx.%d" % i] = np.zeros((t, k), np.int32)
+            pr = em.predict(prog, i, t) if em is not None and hasattr(em, "predict") else None
+            if pr is not None:
+                # (the next MoE layer's router on the residual entering this one: its likely cold experts copied
+                # ahead to the expert device by this layer's CPU task, gpu.NmEmit.predict; the GPU's BF12 rows read
+                # x as it is)
+                i2, plog, hp = pr
+                prog.emit(P.RMS_NORM, H, model.F(BB + "layers.%d.norm.weight" % i2), hp, t, hid, eps)
+                lin(model.M(BB + "layers.%d.mixer.gate" % i2), hp, plog)
+                em.predicted(prog)
             gate = model.M(p + "gate")
             lin(gate, hn, logits)
             # (the latent rows before the router: on the GPU the router, its split and the signal of the
@@ -521,6 +563,8 @@ def compile_nemotron_step(model, t, em=None, upto=None, sub=None):
             quant(lato, L)
             lin(model.M(p + "fc2_latent_proj"), lato, mo)
         pend = (o, mo if kind not in ("mamba", "attention") else None)
+    if t >= TAIL_ROWS:
+        prog.mark(P.F_LAYER_END)
     norm(model.F(BB + "norm_f.weight"), xn)
     prog.keep += [a for a in (dense, sel, mscr) if a is not None]
     prog.tokens = t
@@ -546,15 +590,26 @@ def _compile_nemotron_sub(model, t, em, sb):
     Emax = max(e for e, _, _ in cfg.moe.values())
     k = max(kk for _, _, kk in cfg.moe.values())
     f32 = lambda *sh: np.zeros(sh, np.float32)  # noqa: E731
+    pk = getattr(em, "fresh", False)
+    prog.temps = []
+
+    def tmp(*sh, dt=np.float32):
+        # (packed: a map of its own, no memory until written: pack drops the packed ones, the device holds the arena)
+        a = P.lazy_zeros(sh, dt) if pk else np.zeros(sh, dt)
+        if pk:
+            prog.temps.append(a)
+        return a
+
+    def layer_rows():
+        return (tmp(t, L), tmp(t, L), tmp(t, k), tmp(t, k, dt=np.int32), tmp(sb, hid), tmp(sb, inner + conv + nh),
+                tmp(sb, inner), tmp(sb, hid), tmp(sb, conv), tmp(sb, nq * hd), tmp(sb, nk * hd), tmp(sb, nk * hd),
+                tmp(sb, nq * hd), tmp(sb, Emax), tmp(sb, cfg.shared_inner), tmp(sb, hid))
+
     nsb = t // sb
     H, xn = f32(t, hid), f32(t, hid)
-    lat, lato, val, idx = f32(t, L), f32(t, L), f32(t, k), np.zeros((t, k), np.int32)
-    hn = f32(sb, hid)
+    lat, lato, val, idx, hn, zxd, y, o, cscr, q, kb, vb, att, logits, sh, mo = layer_rows()
     wide = max(inner, cfg.shared_inner, hid)
-    xq, xs, xm = np.zeros((sb, wide), np.int8), f32(sb, wide // 32), f32(sb, wide // 16)
-    zxd, y, o, cscr = f32(sb, inner + conv + nh), f32(sb, inner), f32(sb, hid), f32(sb, conv)
-    q, kb, vb, att = f32(sb, nq * hd), f32(sb, nk * hd), f32(sb, nk * hd), f32(sb, nq * hd)
-    logits, sh, mo = f32(sb, Emax), f32(sb, cfg.shared_inner), f32(sb, hid)
+    xq, xs, xm = tmp(sb, wide, dt=np.int8), tmp(sb, wide // 32), tmp(sb, wide // 16)
     prog.names.update(H=H, xn=xn, hn=hn, zxd=zxd, y=y, logits=logits, lat=lat, sh=sh)
     prog.sub = (nsb, sb)
 
@@ -583,6 +638,12 @@ def _compile_nemotron_sub(model, t, em, sb):
         b = BB + "layers.%d." % i
         p = b + "mixer."
         nw = model.F(b + "norm.weight")
+        if pk and i > 0:
+            lat, lato, val, idx, hn, zxd, y, o, cscr, q, kb, vb, att, logits, sh, mo = layer_rows()
+        if hasattr(em, "begin_layer"):
+            em.begin_layer(i)
+        if t >= TAIL_ROWS:
+            prog.mark(P.F_LAYER | (i + 1) << P.F_LAYER_SHIFT)
         if kind in ("mamba", "attention"):
             for s in range(nsb):
                 hs = rows(H, s)
@@ -630,6 +691,8 @@ def _compile_nemotron_sub(model, t, em, sb):
             quant(ls, L)
             lin(model.M(p + "fc2_latent_proj"), ls, mo)
             add(rows(H, s), mo)
+    if t >= TAIL_ROWS:
+        prog.mark(P.F_LAYER_END)
     prog.emit(P.RMS_NORM, H, model.F(BB + "norm_f.weight"), xn, t, hid, eps)
     prog.tokens = t
     return prog.finish()

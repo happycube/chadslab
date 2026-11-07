@@ -61,7 +61,8 @@ SLOW_CARD_SMS = 8
 def detect(meta):
     # (a checkpoint directory: the original Qwen3.8-Flash-Next, or an EXL3
     # directory of a dense model of the Qwen3.5 architecture, qwen3_5)
-    return meta.get("general.architecture") in ARCHS or meta.get("model_type") in ("qwen4_exp", "qwen3_5")
+    return meta.get("general.architecture") in ARCHS or meta.get("model_type") in ("qwen4_exp", "qwen3_5",
+                                                                                     "qwen3_5_moe")
 
 
 class QwenEngine(Engine):
@@ -491,6 +492,40 @@ class QwenEngine(Engine):
             h0 = H[-1].copy()
         return logits, h0
 
+    # ---- the device half (the GPU sharing: server/gpushare.py, docs/GPU_SWAP_PLAN.md 3.6)
+    _load = None        # load: (opts, lanes, the image encoder's GPU mode)
+
+    def can_release_device(self):
+        """A GPU model with no expert device, and no image encoder whose room is held (reserve,
+        lend)."""
+        return (self.dev is not None and self._load is not None and getattr(self.dev, "xdev", None) is None
+                and not (self.embedder is not None and self._load[2] in ("reserve", "lend")))
+
+    def release_device(self):
+        """Each lane's context to host memory (RowCache: a point at the end of its cache too, so
+        the next turn goes on from it); the device half (dev, lane B) is then forgotten
+        (runtime.close_all frees it), its host half kept for reload_device."""
+        for e in self.lanes:
+            with e.on():
+                if e.cache is not None and e.ids:
+                    e._save(list(e.ids), None, e.h_end)
+                if e.ctxs.live is not None:
+                    e.ctxs._store(e.ctxs.live)
+                    e.ctxs.live = None
+                e.cache, e.ids, e.h_end = None, [], None
+
+    def reload_device(self):
+        """The device half again: a QwenGPU of the host half (remake: the load's plan) and the
+        load's start (_device_up); the contexts come back from host memory with the next prompts."""
+        from reclank.backends.cuda.runtime import remake
+        from reclank.models.base import reload_lanes
+        self.dev = remake(self.dev)
+        self.coop = False
+        reload_lanes(self, lambda: _device_up(self))
+        sch = getattr(self.worker, "lanes", None)
+        if sch is not None:
+            sch.engines = self.lanes            # (lane B's engine is a new one)
+
     def idle(self):
         """Between requests (server/worker.py: no job waits): the expert device's experts by the
         conversation (QwenGPU.refresh_experts)."""
@@ -655,6 +690,30 @@ class QwenEngine(Engine):
         return self.model.logits(self.model.forward([token], self.cache, start_pos=pos))[0]
 
 
+def _device_up(eng):
+    """The start of the device half (the load; a reload after a release: the same steps, so the
+    same state as a fresh server's): lane B, the cache and the programs of a prompt now (so the first
+    request does not wait for them and a context that does not fit fails here), the MTP layer's
+    programs, a warm pair of the lanes."""
+    opts, nl, _mode = eng._load
+    dev, tok = eng.dev, eng.tokenizer
+    if nl > 1:
+        _lanes_up(eng, opts)
+    eng._fresh()
+    if dev is not None:
+        eng._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
+        eng._fresh()
+        if eng.mtp and hasattr(dev, "mtp"):
+            # the verify groups and the MTP layer's programs too (built at the first reply with
+            # drafts, it ran at 47.7 tok/s against 62.2 after on FP4-Local)
+            from reclank.models.qwen.gpu38 import generate_mtp_gpu
+            generate_mtp_gpu(dev, tok.encode("<|im_start|>user\nName three colors.<|im_end|>\n"
+                                             "<|im_start|>assistant\n"), 32, draft=eng.mtp)
+            eng._fresh()
+    if nl > 1:
+        _lanes_warm(eng, tok)
+
+
 def _lanes_up(eng, opts):
     """--lanes 2: lane B (models/qwen/lanes.py Lane: a second decode of the model, its own cache)
     and its engine, which shares the contexts in host memory with lane A's; both hand their runs
@@ -756,6 +815,8 @@ def load(opts, meta, worker=None):
         arch = "qwen4exp"
     if os.path.isdir(path) and meta.get("model_type") == "qwen3_5":
         arch = "qwen35"         # an EXL3 directory (Qwen3.8-27B: QwenEXL3Program)
+    if os.path.isdir(path) and meta.get("model_type") == "qwen3_5_moe":
+        arch = "qwen35moe"      # an NVFP4 checkpoint of ModelOpt (Qwen3.6-35B-A3B: QwenGGUFProgram on it)
     template = opts.template or os.path.join(here, "chat_template.jinja")
     text = None
     if not os.path.exists(template):
@@ -818,7 +879,7 @@ def load(opts, meta, worker=None):
         # "lfm2"), and the dense models (qwen35: Qwen3.8-27B, a GGUF of
         # convert_qwen35_dense_gguf.py or an EXL3 directory) with no experts
         from reclank.models.qwen.qwen35 import QwenCache, QwenEXL3Program, QwenGGUFProgram
-        model = QwenEXL3Program(path) if os.path.isdir(path) else QwenGGUFProgram(path)
+        model = QwenEXL3Program(path) if os.path.isdir(path) and arch == "qwen35" else QwenGGUFProgram(path)
         cache_cls = QwenCache
         if gpu:
             from reclank.models.qwen.gpu35 import QwenGPU
@@ -876,23 +937,8 @@ def load(opts, meta, worker=None):
         eng.video_frames = opts.video_frames or 32
         print("image encoder %s (%s) in %.0f s" % (
             opts.mmproj, ("GPU, " + mode) if eng.embedder.gpu else "CPU", time.time() - t1), flush=True)
-    if nl > 1:
-        _lanes_up(eng, opts)
-    # the cache and the programs of a prompt now, so the first request does
-    # not wait for them and a context that does not fit fails here
-    eng._fresh()
-    if dev is not None:
-        eng._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
-        eng._fresh()
-        if eng.mtp and hasattr(dev, "mtp"):
-            # the verify groups and the MTP layer's programs too (built at the first reply with
-            # drafts, it ran at 47.7 tok/s against 62.2 after on FP4-Local)
-            from reclank.models.qwen.gpu38 import generate_mtp_gpu
-            generate_mtp_gpu(dev, tok.encode("<|im_start|>user\nName three colors.<|im_end|>\n"
-                                             "<|im_start|>assistant\n"), 32, draft=eng.mtp)
-            eng._fresh()
-    if nl > 1:
-        _lanes_warm(eng, tok)
+    eng._load = (opts, nl, mode)
+    _device_up(eng)
     # from here on, an OpenMP team outside the planned ones is reported
     # (reclank.backends.cpu.cops.team_warn: RECLANK_TEAM_WARN, default 5 threads); not with
     # the decode on the CPU, whose teams run while the GPU waits

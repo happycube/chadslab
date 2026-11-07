@@ -24,8 +24,8 @@ block-diffusion text model. The source of truth is transformers'
   table * sqrt(2816)`. At the first step, soft is zero and so is the MLP's
   output.
 - The head is the tied token table with the soft cap of 30.
-- Vision: the Gemma 4 vision tower of 27 layers, at 70 to 1120 tokens an
-  image (not in the first phases).
+- Vision: the Gemma 4 vision tower of 27 layers with DiffusionGemma's own
+  projection, at 70 to 1120 tokens an image (D5; its own mmproj GGUF).
 
 ## 2. Sampling (generation_config.json)
 
@@ -90,7 +90,7 @@ card gives 15 to 20 tokens a pass.
   on the device.
 - D4: the server (an engine family, the chat template from the checkpoint,
   thinking via `<|think|>`) and a CLI.
-- D5: the Q4_K_M forms, and vision.
+- D5: vision (`--mmproj`, DiffusionGemma's own), and the Q4_K_M forms.
 
 ## 5b. D3: the GPU on BF12
 
@@ -273,3 +273,73 @@ positions, 32768 by default):
   (or a file). `--drafts` prints the steps, the tokens under `--low`
   probability in brackets (`--by raw`: of the raw one); `--drafts-json` writes the records. `--chat`
   keeps a conversation from stdin.
+
+
+D5, vision (`--mmproj`):
+
+- The checkpoint holds its own tower (`model.encoder.vision_tower`, 27
+  layers, 1152 wide) and projection (`model.encoder.embed_vision`, to 2816).
+  The tower is the Gemma 4 26B's: its 355 tensors are the Gemma 4 26B
+  mmproj's within 2e-5 (bf16 rounding of a layout change). The projection is
+  not: 1.53 times the norm of the Gemma 4 mmproj's `mm.input_projection`,
+  20% left after the best scale of each row. `scripts/dgemma_mmproj.py`
+  writes DiffusionGemma's mmproj (the Gemma 4 mmproj's keys, names, types
+  and layouts; every value from the checkpoint, bf16 as stored):
+  `diffusiongemma-26B-A4B-it-mmproj.gguf` beside the BF12 GGUF (1.19 GB).
+  The engine warns at load when the mmproj is not DiffusionGemma's.
+- `DGemmaEngine.prompt_ids` renders the Gemma 4 chat with the image part.
+  `encoders/media.expand` puts `<|image>`, the soft rows, and `<image|>` in
+  place of `<|image|>`. `DGemmaGPU.encode(ids, spans)` puts the rows into
+  the encoder's input at those positions. The decoder does not change: it
+  reads the cache as for text.
+- The image mask is Gemma 4's blockwise overlay (transformers'
+  `create_masks_for_generate` with `mm_token_type_ids`, as `generate` runs
+  it; the encoder's plain forward is causal): the tokens of one image see
+  each other in every layer, and text stays causal.
+  `encoders/media.limit_positions` gives the last key of each query; the
+  GPU encoder's `his` and `hif` and the reference's mask use it.
+- The GPU encoder's blocks (`encoders/media.encoder_blocks`): text in blocks
+  of the canvas's 256 rows; a block ends before an image that fits in one;
+  an image that a block of 256 would split takes a block of `P` rows (the
+  program `encP`, built at its first image). `P` is the image budget
+  rounded up to 256, at least 768: 768 holds an image of budget 560 and
+  fits the windowed layers' buffers of 2048 rows (window - 1 + P + 256); a
+  larger `P` makes them larger. An image longer than `P` crosses blocks and
+  the engine says so. Text prompts take the same blocks as before (the same
+  bits).
+- The tower runs on the CPU by default. The 26B tower holds about 2 GB of
+  the GPU after its first image, and the experts already fill a 24 GB card.
+  `RECLANK_MEDIA_GPU=1` or `--mmproj-gpu on` puts it on the GPU.
+  `--image-budget` sets the soft tokens (70, 140, 280, 560, or 1120; 280 by
+  default). The resize is PIL's bicubic, as transformers' PIL image
+  processor: its pixels the same at budgets 140 and 560. Transformers'
+  default torchvision processor puts 0.02 to 0.04% of the values one level
+  (1/255) apart.
+- The cache between requests is off for a prompt with an image: the ids do
+  not tell one image from another, so `DGemmaGPU.reuse` cannot check the
+  rows.
+- Checks (`scripts/check_dgemma_image.py` against transformers' float32 on
+  a line chart, the prompt "Describe this image in one sentence."; the
+  decoder's logits of a fixed canvas after the encoder over the prompt):
+
+  | budget | tokens | image rows | block | soft rows | KL (theirs) | KL (own pixels) | KL, causal mask |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 140 | 153 | 135 | 256 | 2.0e-5 | 0.0000 | 0.0035 | 0.0708 |
+  | 280 | 270 | 252 | 256 | 2.9e-5 | 0.0001 | 0.0180 | 0.1140 |
+  | 560 | 558 | 540 | 768 | 2.6e-5 | 0.0003 | 0.0140 | 0.0455 |
+
+  "theirs": the tower on transformers' pixels (soft rows against
+  transformers'), top-1 1.000 at all three. "own pixels": the engine's
+  resize (soft rows 1.1e-3 to 1.5e-3). The causal mask's column is the KL
+  between transformers' two masks: the image mask matters. With the Gemma
+  4 26B mmproj the soft rows are 0.41 to 0.44 off and the KL 0.017 to
+  0.070.
+- `scripts/check_dgemma_gpu.py`: DG_ATTN with an image's ranges in blocks
+  of 256 to 2048 queries (1.4e-6 at most) and DG_MOE on 256 to 2048 rows
+  (6.7e-7): PASS.
+- The server (`--mmproj` DiffusionGemma's): "This line graph titled
+  "Shadow gamma vs net gamma" displays the dealer gamma in millions of
+  dollars per 1% move across various SPX spot prices for [the chart's
+  date]." (47 tokens, 7 passes, 3.6 s warm); a second turn with the image in the
+  history answered a question on the chart.
+- The detail, the commands, and the traps are in `HANDOFF_DG_VISION.md`.

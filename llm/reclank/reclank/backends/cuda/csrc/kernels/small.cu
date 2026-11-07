@@ -405,9 +405,11 @@ __global__ void k_kv_write(const gp_rec *r, const int64_t *e)
  * cache are E4M3 codes and the scales 1 (K8 = e4m3_rne_satfinite(x / 1.0)); a state of the process
  * (rc_gpu_set_kv_e4m3) that the writes and every reader of the int8 cache take. */
 __device__ int gg_kv_e4m3_d = 0;
+static int gg_kv_e4m3_v;        /* (the host's value: set again in a new context, gg_context_up) */
 
 extern "C" int rc_gpu_set_kv_e4m3(int on)
 {
+    gg_kv_e4m3_v = on;
     return cudaMemcpyToSymbol(gg_kv_e4m3_d, &on, sizeof(int)) == cudaSuccess ? 0 : 1;
 }
 

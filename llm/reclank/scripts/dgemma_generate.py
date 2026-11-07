@@ -4,10 +4,12 @@ denoised by the checkpoint's sampler, optionally around pinned text.
     python scripts/dgemma_generate.py MODEL_DIR --prompt "Why is the sky blue?"
     python scripts/dgemma_generate.py MODEL_DIR --prompt "..." \\
         --response "[[60]]'What lessons do we learn from this fact, comrades? [[200]]"
+    python scripts/dgemma_generate.py MODEL_DIR --prompt "What is this?" --image picture.jpg --mmproj MMPROJ
 
 --response is a template of the answer: its text is pinned where it stands and each [[n]] is n
 free tokens the model writes; after the template the answer goes on freely to an end token or
---max-tokens. Text at the start of the template is a plain prefix. --engine gpu (the default) runs
+--max-tokens. Text at the start of the template is a plain prefix. --image FILE (with --mmproj)
+puts the soft rows of the image at <|image|> in the prompt. --engine gpu (the default) runs
 the BF12 GGUF on the GPU (MODEL_DIR: convert_dgemma_bf12.py's directory; the experts of the layers
 that do not fit on the CPU); bf16 the CPU runtime on the checkpoint's bf16 weights (about 55 GB),
 q4 on our Q4_0 (KL 0.2-0.7 against float32 on the canvas checks: not for use), ref the float32
@@ -36,11 +38,39 @@ def chat_ids(tok, prompt, system=None, think=False):
     return tok.encode(text)
 
 
+def image_prompt(tok, prompt, path, system=None, think=False, budget=280, mmproj=None):
+    """The prompt ids and the image's soft-token spans (encoders/media.Span)."""
+    from reclank.encoders import media as MD
+    from reclank.models.gemma4.chat import render_chat
+    from reclank.models.gemma4.encoders import load_embedder
+    emb = load_embedder(mmproj, gpu=False)
+    with open(path, "rb") as f:
+        data = f.read()
+    rows, _ = emb.image(data, budget)
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.append({"role": "user", "content": [
+        {"type": "image", "image_url": {"url": path}},
+        {"type": "text", "text": prompt}]})
+    parts = []
+    text = render_chat(msgs, add_generation_prompt=True, enable_thinking=think,
+                       empty_thought_block=False, media=parts)
+    items = [MD.Media("image", rows, MD.media_key(data), bidir=getattr(emb, "bidir", True))]
+    ids, spans = MD.expand(tok.encode(text), items)
+    print("image: %d soft rows, %d prompt tokens" % (rows.shape[0], len(ids)),
+          file=sys.stderr, flush=True)
+    return np.asarray(ids), spans
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--system")
+    ap.add_argument("--image", help="an image file (needs --mmproj)")
+    ap.add_argument("--image-budget", type=int, default=280)
+    ap.add_argument("--mmproj", help="DiffusionGemma's mmproj GGUF (scripts/dgemma_mmproj.py)")
     ap.add_argument("--think", action="store_true", help="thinking on (<|think|> in the system turn)")
     ap.add_argument("--response", help="a template of the answer: pinned text and [[n]] free tokens")
     ap.add_argument("--max-tokens", type=int, default=512)
@@ -63,16 +93,24 @@ def main():
     steps = None
     if a.engine == "gpu":
         from reclank.models.dgemma.gpu import DGemmaGPU
-        m = DGemmaGPU(a.model, count=a.count)
+        m = DGemmaGPU(a.model, count=a.count,
+                      prompt_rows=max(768, -(-a.image_budget // 256) * 256) if a.image else None)
         if a.count and os.path.exists(os.path.join(a.model, "expert_counts.npz")):
             m.counts += np.load(os.path.join(a.model, "expert_counts.npz"))["counts"]
         m.reset()
-        encode, decode, steps = m.encode, None, m.steps
+
+        def encode(ids):
+            m.encode(ids, spans=todo.pop() if todo else None)
+
+        decode, steps = None, m.steps
     elif a.engine == "ref":
         from reclank.models.dgemma.model import DGemmaRef
         m = DGemmaRef(a.model)
         cache = m.cache()
-        encode = lambda ids: m.encode(ids, cache)            # noqa: E731
+
+        def encode(ids):
+            m.encode(ids, cache, spans=todo.pop() if todo else None)
+
         decode = lambda c, sc: m.decode(c, cache, sc)        # noqa: E731
     else:
         from reclank.models.dgemma.runtime import DGemma
@@ -81,13 +119,20 @@ def main():
         pos = [0]
 
         def encode(ids):
-            m.encode(ids, cache, pos[0])
+            m.encode(ids, cache, pos[0], spans=todo.pop() if todo else None)
             pos[0] += len(ids)
 
         decode = lambda c, sc: m.decode(c, cache, pos[0], sc)  # noqa: E731
     print("load %.0f s" % (time.time() - t0), file=sys.stderr, flush=True)
 
-    prompt = chat_ids(tok, a.prompt, a.system, a.think)
+    spans = None
+    if a.image:
+        if not a.mmproj:
+            ap.error("--image needs --mmproj (DiffusionGemma's mmproj GGUF: scripts/dgemma_mmproj.py)")
+        prompt, spans = image_prompt(tok, a.prompt, a.image, a.system, a.think, a.image_budget, a.mmproj)
+    else:
+        prompt = chat_ids(tok, a.prompt, a.system, a.think)
+    todo = [spans]
     fixed = S.parse_template(a.response, tok.encode) if a.response else None
     on_step = None
     if a.steps:
@@ -101,6 +146,7 @@ def main():
             cache = m.cache()
             if a.engine != "ref":
                 pos[0] = 0
+        todo[:] = [spans]
         t0 = time.time()
         out, st = S.generate(encode, decode, prompt, a.max_tokens, s, np.random.default_rng(a.seed),
                              on_step=on_step, fixed=fixed, steps=steps)

@@ -60,3 +60,4 @@
 #include "kernels/enc/encoders.cu"
 #include "runtime/api.cu"
 #include "runtime/expert_dev.cu"
+#include "runtime/context.cu"

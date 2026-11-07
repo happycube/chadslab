@@ -171,6 +171,78 @@ def expand_qwen(ids, items):
     return out, spans
 
 
+def limit_positions(positions, spans, start=0, last=None):
+    """The last key position of each query (Gemma 4's _media_limit).
+
+    A query inside a span whose tokens see each other has the last position
+    of that span. The other queries have their own position. positions are
+    absolute; spans are relative to start. A span that ends after the last
+    position keeps its own end; last clips it to the keys that a block has.
+    """
+    limit = np.array(positions, dtype=np.int64)
+    for sp in spans or ():
+        if not getattr(sp, "bidir", False):
+            continue
+        lo = start + sp.start
+        hi = start + sp.end
+        inside = (limit >= lo) & (limit < hi)
+        limit[inside] = hi - 1
+    if last is not None:
+        limit = np.minimum(limit, last)
+    return limit
+
+
+def block_end(start, size, spans):
+    """The end of an encoder block that starts at start and holds size rows.
+
+    End before a span that fits in one block and would cross the block's
+    end. A span longer than the block cannot fit; the block keeps its size.
+    """
+    end = start + size
+    for sp in spans or ():
+        if start < sp.start < end and sp.end > end and sp.end - sp.start <= size:
+            return sp.start
+    return end
+
+
+def encoder_blocks(n, count, size, spans, big=None):
+    """The encoder's blocks of a prompt of count ids whose first id is at
+    position n of the cache: (a, end, rows, limit) of each, the ids a to
+    end - 1 in a block of rows (the padding past end), limit the last key of
+    each row (limit_positions; spans relative to the prompt). A block ends
+    before a span that fits (block_end); one that a block of size rows would
+    split takes a block of big rows when big is given.
+    """
+    out = []
+    spans = list(spans or ())
+    a = 0
+    while a < count:
+        end, rows = block_end(a, size, spans), size
+        if big and any(sp.start < end < sp.end for sp in spans):
+            end, rows = block_end(a, big, spans), big
+        end = min(end, count)
+        pos = n + a + np.arange(rows)
+        limit = limit_positions(pos, spans, start=n, last=n + end - 1) if spans else pos
+        out.append((a, end, rows, limit))
+        a = end
+    return out
+
+
+def place_rows(x, spans, offset=0):
+    """Put the soft rows of each span into x.
+
+    x holds the positions offset to offset + len(x) - 1. A span outside
+    that range is clipped. The rows are float32. A span that crosses the
+    end of x keeps the part inside it; the next block of x takes the rest.
+    """
+    for sp in spans or ():
+        lo = max(sp.start, offset)
+        hi = min(sp.end, offset + len(x))
+        if lo < hi:
+            x[lo - offset:hi - offset] = sp.rows[lo - sp.start:hi - sp.start]
+    return x
+
+
 def mrope_positions(n, spans, start=0):
     """The M-RoPE positions (3, n) of a prompt of n tokens (get_rope_index of
     transformers): a text token has (p, p, p); the token (r, c) of an image

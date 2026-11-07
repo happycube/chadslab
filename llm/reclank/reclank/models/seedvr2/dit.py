@@ -49,13 +49,15 @@ block j - 2; vid_in, txt_in and vid_out stay resident.
 from __future__ import annotations
 
 import ctypes
+import os
 import math
 import mmap
 
 import numpy as np
 
-from reclank.encoders.runtime import F20Lins, _EncCompiler, _Plain, _Runner
+from reclank.encoders.runtime import F20Lins, _EncCompiler, _Plain, _Runner, lin_q
 from reclank.ir import program as P
+from reclank.runtime.kept import Kept
 from reclank.runtime.threads import team_threads
 
 # the variants: width, heads, layers, the layers with their own text weights, the MLP and its width,
@@ -126,6 +128,15 @@ def torch_linspace(start, end, n):
     return tl(start, end, n)
 
 
+# the DiT's F20 matrices on the GPU's tensor cores: x and W in bfloat16 (the official DiT's autocast), float32
+# sums (ENC_LINEAR wbf 5); 0: the float32 products of the F20 values
+DIT_TC = os.environ.get("RECLANK_SEEDVR2_DIT_TC", "1") != "0"
+# the matrices' form on the GPU (RECLANK_SEEDVR2_W16, vae_video's): "bf16" F20 (the products above), "f16" W16H
+# (float16 rows with a scale of each), "i16" W16I (int16 with a scale of each group of 64): encoders.runtime.to_w16,
+# 16 bits a value, on the tensor cores
+W16 = os.environ.get("RECLANK_SEEDVR2_W16", "f16")
+
+
 class SeedVR2DiT:
     """The DiT of a SeedVR2 checkpoint (a SafeTensors or a dict of arrays; variant "3b" or "7b")
     with the text rows txt (58, 5120: pos_emb as float32). velocity(rows of (t, h, w, 33)) runs the
@@ -142,10 +153,16 @@ class SeedVR2DiT:
         assert not self.stream or self.gpu, "the streamed blocks are a GPU mode"
         f20 = self.gpu if f20 is None else bool(f20)
         assert f20 or not self.gpu, "the GPU's DiT is F20"
-        self.f20 = F20Lins(self.gpu, "seedvr2 %s dit" % variant) if f20 else None
+        fmt = W16 if self.gpu and W16 in ("f16", "i16") else "f20"
+        self.f20 = F20Lins(self.gpu, "seedvr2 %s dit" % variant, fmt=fmt) if f20 else None
         self.txt = np.ascontiguousarray(txt, dtype=np.float32)
         self.L = self.txt.shape[0]
-        f = lambda n: np.ascontiguousarray(W.get(n), dtype=np.float32)  # noqa: E731
+        # the arrays and linears from the weightkeeper when it holds them (runtime/kept.py), else made;
+        # not for the streamed blocks (_pack copies them) nor a dict of arrays (no file)
+        path = getattr(W, "path", None)
+        self.kept = k = Kept("seedvr2-%s-dit" % variant, path, dict(gpu=self.gpu, f20=f20, fmt=fmt), code=[__name__]) \
+            if path and not self.stream else Kept.off()
+        f = lambda n: k.array(n, lambda: np.ascontiguousarray(W.get(n), dtype=np.float32))  # noqa: E731
         # the timestep embedding of t = 1000: (D, 2, 3) = (d, layer attn/mlp, shift/scale/gate)
         e = f("emb_in.proj_in.weight") @ timestep_embedding(1000.0) + f("emb_in.proj_in.bias")
         e = f("emb_in.proj_hid.weight") @ _silu(e.astype(np.float32)) + f("emb_in.proj_hid.bias")
@@ -182,8 +199,9 @@ class SeedVR2DiT:
             self.out_w = (f("vid_out_norm.weight") * (emb[:, 0, 1] + f("vid_out_ada.out_scale"))).astype(np.float32)
             self.out_b = (emb[:, 0, 0] + f("vid_out_ada.out_shift")).astype(np.float32)
         self.vid_out = L("vid_out.proj")
-        if self.f20 is not None:
+        if self.f20 is not None and k.mode != "read":
             self.f20.report()
+        k.done()
         if self.stream:
             print("seedvr2 %s dit: %d blocks streamed (%.1f MB a block, %.2f GB in host memory)" % (
                 variant, len(self.packed), self.block_bytes / 1e6, sum(v[1] for v in self.packed.values()) / 1e9),
@@ -195,6 +213,13 @@ class SeedVR2DiT:
         self.runner = _Runner(self._build, keep=2, keep_gpu=1)
 
     def linear(self, name, rows=None, f20=True):
+        lin = self.kept.linear(name if rows is None else "%s@%d:%d" % (name, rows[0], rows[1]),
+                               lambda: self._linear(name, rows, f20))
+        if self.gpu and DIT_TC and getattr(lin, "f20", None) is not None:
+            lin.tc = True       # (ENC_LINEAR's F20 rows on the tensor cores: k_enc_gemm_f20tc)
+        return lin
+
+    def _linear(self, name, rows, f20):
         src = self.W.get(name + ".weight")
         w = src if rows is None else src[rows[0]:rows[1]]
         lin = _Plain(np.ascontiguousarray(w, dtype=np.float32))
@@ -231,18 +256,19 @@ class SeedVR2DiT:
         ALIGN), to be registered with CUDA: self.packed[i] = (address, bytes, array)."""
         offs, tot = {}, 0
         for st, m, lin in self._mats(i):
-            assert getattr(lin, "f20", None) is not None, "a streamed matrix that F20 refused: %d %s %s" % (i, st, m)
+            assert lin_q(lin)[1] is not None, "a streamed matrix that F20 refused: %d %s %s" % (i, st, m)
             offs[(st, m)] = tot
-            tot += (lin.f20.data.nbytes + ALIGN - 1) // ALIGN * ALIGN
+            tot += (lin_q(lin)[1].data.nbytes + ALIGN - 1) // ALIGN * ALIGN
         assert self.offs in (None, offs)
         self.offs, self.block_bytes = offs, tot
         m_ = mmap.mmap(-1, tot, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         buf = np.frombuffer(m_, np.uint8)
         for st, m, lin in self._mats(i):
-            d = lin.f20.data
+            q = lin_q(lin)[1]
+            d = q.data
             v = buf[offs[(st, m)]:offs[(st, m)] + d.nbytes]
             v[...] = d.reshape(-1)
-            lin.f20.data = v.reshape(d.shape)
+            q.data = v.reshape(d.shape)
         self.packed[i] = (buf.ctypes.data, tot, buf)
 
     def _register(self):
@@ -271,8 +297,10 @@ class SeedVR2DiT:
                     src = S[m]
                     p = _Plain(None)
                     p.b, p.shape = src.b, src.shape
-                    p.f20 = _KQ(slot[self.offs[(st, m)]:self.offs[(st, m)] + src.f20.data.nbytes], src.f20.type,
-                                src.f20.rows, src.f20.cols)
+                    a, q = lin_q(src)
+                    setattr(p, a, _KQ(slot[self.offs[(st, m)]:self.offs[(st, m)] + q.data.nbytes], q.type, q.rows,
+                                      q.cols))
+                    p.tc = getattr(src, "tc", False)
                     S2[m] = p
             B["streams"][st] = S2
         return B
@@ -455,7 +483,7 @@ class SeedVR2DiT:
                 r = np.zeros((len(keys), 3), np.int64)
                 for k, (st, m) in enumerate(keys):
                     r[k, 0] = self.packed[j][0] + self.offs[(st, m)]
-                    r[k, 2] = self.blocks[j]["streams"][st][m].f20.data.nbytes
+                    r[k, 2] = lin_q(self.blocks[j]["streams"][st][m])[1].data.nbytes
                 rng.append(r)
             for j in range(min(2, n)):
                 c.p.emit(P.FETCH, rng[j], len(keys), j, j % 2)

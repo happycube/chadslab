@@ -56,6 +56,9 @@ __host__ __device__ __forceinline__ int bt_shape(int type, int rows, int cols)
 /* KQ_MXF8 (FP4-Local): an MXFP8 row, its cols E4M3 codes, then the E8M0 scale of each 32, zeros to
  * 16 bytes (kernels/quant/mxf8.cu) */
 #define KQ_MXF8 66
+/* KQ_F20: rows of float32 values to 16 significant bits (backends/cpu/csrc/kernels/kq/formats.c; the
+ * float32 dense matrices of an NVFP4 Qwen3.6 on the GPU, models/qwen/gpu35.py QwenGPU.dense) */
+#define KQ_F20 68
 /* Q8_0 in rows for the GPU (reclank/models/qwen/gpu35.py): the int8 values of the
  * row, then the float16 scale of each 32 values, then zeros to a multiple
  * of 16 bytes. Thus the values of each row start at a multiple of 16

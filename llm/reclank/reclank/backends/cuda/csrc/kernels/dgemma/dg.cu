@@ -119,10 +119,10 @@ static void dg_attn(const float *q, const float *K, const float *V, float *out, 
                     int t, int heads, int kvh, int hd, cudaStream_t s)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_dg_attn<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * 32 * 256 * 4);
         cudaFuncSetAttribute(k_dg_attn<512>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * 16 * 512 * 4);
-        attr = 1;
+        attr = gg_epoch;
     }
     dim3 grid((unsigned)((t + DG_QB - 1) / DG_QB), (unsigned)heads);
     if (hd == 256) {
@@ -1123,10 +1123,10 @@ static void dg_attn_tiled(const float *q, const float *K, const float *V, float 
     static int attr = 0;
     const int smem256 = (64 * DGA_LD + DGA_BK * DGA_LD + DGA_BK * 256 + DGA_BK * 64) * 4;
     const int smem512 = (32 * DGA_LD + DGA_BK * DGA_LD + DGA_BK * 512 + DGA_BK * 32) * 4;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_dg_attn_t<256, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem256);
         cudaFuncSetAttribute(k_dg_attn_t<512, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem512);
-        attr = 1;
+        attr = gg_epoch;
     }
     const int rep = heads / kvh;
     if (hd == 256) {

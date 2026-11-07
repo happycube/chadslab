@@ -319,6 +319,35 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
+    def _admin(self, path, post):
+        """The GPU sharing's routes (server/gpushare.py): GET /v1/admin/gpu, POST /v1/admin/release
+        and /v1/admin/lock. True when path is one of them (answered)."""
+        if not path.startswith(("/v1/admin/", "/admin/")):
+            return False
+        share = getattr(self.server, "gpu_share", None)
+        name = path.rsplit("/", 1)[-1]
+        if share is None:
+            self._error(404, "this server does not share the GPU (--gpu-peers off, or no GPU)", code="not_found")
+        elif name == "gpu" and not post:
+            self._json(200, share.status())
+        elif name == "release" and post:
+            try:
+                self._raw_body()
+            except _BodyError as exc:
+                self._error(exc.status, str(exc))
+                return True
+            self._json(200, share.release())
+        elif name == "lock" and post:
+            try:
+                self._json(200, share.lock(self._body()))
+            except _BodyError as exc:
+                self._error(exc.status, str(exc))
+            except (ValueError, TypeError) as exc:
+                self._error(400, str(exc))
+        else:
+            self._error(404, "unknown path: " + path, code="not_found")
+        return True
+
     # ---- routes ------------------------------------------------------------
 
     def do_OPTIONS(self):
@@ -339,8 +368,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             return
+        if self._admin(path, False):
+            return
         if path in ("/v1/models", "/models"):
-            self._json(200, {"object": "list", "data": [backend.model_info()]})
+            info = backend.model_info()
+            share = getattr(self.server, "gpu_share", None)
+            if share is not None:
+                info = dict(info, gpu_locked=bool(share.models().get(info.get("id"))))
+            self._json(200, {"object": "list", "data": [info]})
         elif path.startswith("/v1/models/") or path.startswith("/models/"):
             self._json(200, backend.model_info(path.rsplit("/", 1)[-1]))
         else:
@@ -351,6 +386,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True       # the body stays unread
             return
         path = urlsplit(self.path).path.rstrip("/")
+        if self._admin(path, True):
+            return
         if path.endswith("/chat/completions"):
             self._chat()
         elif path.endswith("/completions"):
@@ -779,16 +816,18 @@ class _Server(ThreadingHTTPServer):
 
 
 def make_server(backend, host="127.0.0.1", port=8080, quiet=False, api_key=None,
-                cors_origin=None, max_body=None):
+                cors_origin=None, max_body=None, gpu_share=None):
     """Make the HTTP server. Use port 0 for a free port. api_key: the key
     that each request must give (None or "": no check); cors_origin: the
     origin of the CORS headers (None: no CORS headers)."""
-    httpd = _Server((host, port), _Handler)
+    from server import idle
+    httpd = idle.server(_Server, (host, port), _Handler)
     httpd.backend = backend
     httpd.quiet = quiet
     httpd.api_key = api_key or None
     httpd.cors_origin = cors_origin or None
     httpd.max_body = MAX_BODY if max_body is None else max_body
+    httpd.gpu_share = gpu_share
     return httpd
 
 
@@ -802,19 +841,26 @@ def add_http_args(ap):
                          "web page cannot call the server from a browser")
     ap.add_argument("--max-body-mb", type=float, default=MAX_BODY / (1 << 20),
                     help="the largest request body in MB (default %(default)s)")
+    from server.idle import add_idle_args
+    add_idle_args(ap)
 
 
 def serve(backend, host="127.0.0.1", port=8080, quiet=False, api_key=None, cors_origin=None,
-          max_body=None):
-    """Run the HTTP server until the process stops."""
-    httpd = make_server(backend, host, port, quiet, api_key, cors_origin, max_body)
+          max_body=None, gpu_share=None, idle_exit=None):
+    """Run the HTTP server until the process stops (or, with idle_exit, until it is idle that long:
+    server/idle.py; then return EXIT_IDLE). gpu_share: the server's part of the GPU's sharing
+    (server/gpushare.py: started here, with the port bound)."""
+    from server import idle
+    httpd = make_server(backend, host, port, quiet, api_key, cors_origin, max_body, gpu_share)
+    if gpu_share is not None:
+        gpu_share.start()
     where = "http://%s:%d/v1" % (host, httpd.server_address[1])
     print("reclank server %s  model=%s  key %s  CORS %s" % (
         where, backend.model_id, "required" if httpd.api_key else "OFF",
         httpd.cors_origin or "off"), flush=True)
     try:
-        httpd.serve_forever()
+        return idle.serve(httpd, idle_exit)
     except KeyboardInterrupt:
-        pass
+        return 0
     finally:
         httpd.server_close()

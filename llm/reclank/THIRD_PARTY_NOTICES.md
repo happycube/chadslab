@@ -429,6 +429,64 @@ Each distinct license once. The MIT and BSD texts carry their copyright lines, s
   - `reclank/models/vfi/ref.py`: model/warplayer.py (the grid)
   - `scripts/rife_reference.py`: the v4.25 model's train_log/IFNet_HDv3.py, model/warplayer.py, inference_video.py
 
+## MMEditing
+
+- Source: https://github.com/open-mmlab/mmediting (now open-mmlab/mmagic), tag v0.16.0
+- License: Apache License 2.0 (no NOTICE file)
+- Copyright:
+
+  - Copyright (c) OpenMMLab. All rights reserved.
+  - Copyright 2020 MMEditing Authors. All rights reserved.
+
+- reclank files derived from it:
+
+  - `reclank/models/realbasicvsr/model.py`: mmedit/models/backbones/sr_backbones/real_basicvsr_net.py and
+    basicvsr_net.py (RealBasicVSRNet, BasicVSRNet, SPyNet), mmedit/models/common/flow_warp.py,
+    sr_backbone_utils.py, upsample.py
+
+## RealBasicVSR
+
+- Source: https://github.com/ckkelvinchan/RealBasicVSR
+- License: Apache License 2.0 (no NOTICE file)
+- Copyright:
+
+  - Copyright 2021 Kelvin C.K. Chan. All rights reserved.
+
+- reclank files derived from it:
+
+  - `reclank/models/realbasicvsr/model.py`: inference_realbasicvsr.py (the frames' preprocessing, the output's),
+    configs/realbasicvsr_x4.py (the generator's settings)
+
+## FlashVSR
+
+- Source: https://github.com/OpenImagingLab/FlashVSR (its vendored DiffSynth-Studio package `diffsynth`, Apache
+  License 2.0, and the Wan 2.1 DiT it carries)
+- License: Apache License 2.0 (no NOTICE file)
+- Copyright: no copyright line stated (the LICENSE's appendix left as its template); the authors: OpenImagingLab
+
+- reclank files derived from it:
+
+  - `reclank/models/flashvsr/dit.py`: diffsynth/models/wan_video_dit.py (WanModel, DiTBlock, SelfAttention,
+    generate_draft_block_mask, the local block mask, WindowPartition3D), diffsynth/pipelines/flashvsr_tiny_long.py
+    (model_fn_wan_video)
+  - `reclank/models/flashvsr/lq_proj.py`: examples/WanVSR/utils/utils.py (Causal_LQ4x_Proj)
+  - `reclank/models/flashvsr/tcdecoder.py`: examples/WanVSR/utils/TCDecoder.py
+  - `reclank/models/flashvsr/pipeline.py`: diffsynth/pipelines/flashvsr_tiny_long.py (FlashVSRTinyLongPipeline,
+    the AdaIN colour fix), examples/WanVSR/infer_flashvsr_v1.1_tiny_long_video.py (the input's preparation)
+
+## TAEHV
+
+- Source: https://github.com/madebyollin/taehv
+- License: MIT License
+- Copyright:
+
+  - Copyright (c) 2025 Ollin Boer Bohan
+
+- reclank files derived from it:
+
+  - `reclank/models/flashvsr/tcdecoder.py`: through FlashVSR's examples/WanVSR/utils/TCDecoder.py (TAEHV's decoder,
+    its MemBlock, TGrow, Clamp and sequential application)
+
 ## Pillow
 
 - Source: https://github.com/python-pillow/Pillow
@@ -446,7 +504,7 @@ Each distinct license once. The MIT and BSD texts carry their copyright lines, s
 
 ## Apache License 2.0
 
-diffusers, transformers, the Nemotron checkpoint code, vLLM, FlashInfer (b12x), Speculators, SGLang-Omni, the ACE-Step 1.5 model files, SeedVR, Depth Anything 3, Video Depth Anything, DINOv2, BasicSR.
+diffusers, transformers, the Nemotron checkpoint code, vLLM, FlashInfer (b12x), Speculators, SGLang-Omni, the ACE-Step 1.5 model files, SeedVR, Depth Anything 3, Video Depth Anything, DINOv2, BasicSR, MMEditing, RealBasicVSR, FlashVSR.
 
 ```
                                  Apache License
@@ -896,6 +954,32 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## MIT License (TAEHV)
+
+```
+MIT License
+
+Copyright (c) 2025 Ollin Boer Bohan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## MIT-CMU License (Pillow)

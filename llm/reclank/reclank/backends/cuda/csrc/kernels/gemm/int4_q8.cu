@@ -92,10 +92,27 @@ __global__ void k_quant_x2r(const float *x, int8_t *qh, int8_t *ql, float *xs, s
     }
 }
 
+__device__ __forceinline__ void quant_x2_dev(const float *x, int8_t *qh, int8_t *ql, float *xs, float *xsum,
+                                             size_t blocks);
+
 __global__ void k_quant_x2(const float *x, int8_t *qh, int8_t *ql, float *xs, float *xsum,
                            size_t blocks)
 {
     PDL_START();
+    quant_x2_dev(x, qh, ql, xs, xsum, blocks);
+}
+
+/* k_quant_x2 of operand k of a record (a chain's body reads x there: runtime/graphs.cu) */
+__global__ void k_quant_x2_rec(const gp_rec *rp, const int64_t *re, int k, int8_t *qh, int8_t *ql, float *xs,
+                               float *xsum, size_t blocks)
+{
+    PDL_START();
+    quant_x2_dev((const float *)(intptr_t)di(rp, re, k), qh, ql, xs, xsum, blocks);
+}
+
+__device__ __forceinline__ void quant_x2_dev(const float *x, int8_t *qh, int8_t *ql, float *xs, float *xsum,
+                                             size_t blocks)
+{
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t bi = tid / 8;
     int sub = threadIdx.x % 8;
@@ -534,6 +551,93 @@ __global__ void k_mt_gemv(const float *x, const uint8_t *w, float *out, int t, i
             }
         }
     }
+}
+
+/* A bfloat16 matrix on a verify group of NT tokens, R rows a warp: each row
+ * of each token with the lanes and the order of the terms of k_bf16_linear
+ * (a decode step), so the bits of a step; the x of 8 columns is read once
+ * for the R rows. With one row a warp (k_mt_gemv_bf16) the reads of x (32
+ * bytes a token for 16 bytes of weights) limited the group: Bolt E4B's
+ * products of 8 tokens took 2.1 times one token. */
+template <int NT, int R>
+__global__ void k_mt_bf16_rows(const float *x, const uint16_t *w, float *out, int rows, int cols)
+{
+    PDL_START();
+    int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32) * R;
+    int lane = threadIdx.x % 32;
+    if (row0 >= rows) {
+        return;
+    }
+    const uint4 *wr[R];
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+        wr[i] = (const uint4 *)(w + (size_t)min(row0 + i, rows - 1) * cols);
+    }
+    float sum[R][NT];
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sum[i][j] = 0.f;
+        }
+    }
+    for (int c = lane; c < cols / 8; c += 32) {
+        float wv[R][8];
+        #pragma unroll
+        for (int i = 0; i < R; ++i) {
+            uint4 q = wr[i][c];
+            uint32_t u[4] = {q.x, q.y, q.z, q.w};
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                wv[i][2 * k] = __uint_as_float(u[k] << 16);
+                wv[i][2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const float4 *x4 = (const float4 *)(x + (size_t)j * cols + c * 8);
+            const float4 a = x4[0], b = x4[1];
+            const float xi[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+            #pragma unroll
+            for (int i = 0; i < R; ++i) {
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    sum[i][j] += wv[i][2 * k] * xi[2 * k] + wv[i][2 * k + 1] * xi[2 * k + 1];
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            float v = sum[i][j];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+            }
+            if (lane == 0 && row0 + i < rows) {
+                out[(size_t)j * rows + row0 + i] = v;
+            }
+        }
+    }
+}
+
+/* The rows a warp of k_mt_bf16_rows for a group of t tokens on a matrix of
+ * rows rows; 0: k_mt_gemv_bf16 (RECLANK_GPU_MT_BF16=0). Bolt E4B's group on
+ * the 3090, against one row a warp: 4 rows 2 tokens 21.6 -> 16.3 ms, 4 28.0
+ * -> 19.9, 5 31.7 -> 21.7 (2 rows: 16.6, 20.2, 22.8), 8 2 rows 33.7 (4: 34.7);
+ * the matrices under 2048 rows the same with 1, 2 or 4. */
+static inline int mt_bf16_r(int t, int rows)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_MT_BF16");
+        on = !(v && v[0] == '0');
+    }
+    if (!on) {
+        return 0;
+    }
+    return rows < 2048 || t >= 8 ? 2 : 4;
 }
 
 /* A bfloat16 matrix on a small group: one warp for each row. Each lane reads
