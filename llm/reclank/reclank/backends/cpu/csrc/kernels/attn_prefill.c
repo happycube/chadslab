@@ -363,7 +363,9 @@ void rc_attn_prefill_avx512(const float *q, const float *k, const float *v,
         return;
     }
     const int ld = ((nvis + 15) / 16) * 16;
-    float *kt = (float *)malloc((size_t)kv_heads * hd * ld * sizeof(float));
+    /* + ATTN5_NC: a block of keys reads ATTN5_NC values of kt from j0, past ld in the last block
+     * (masked), so past the end of kt in its last row */
+    float *kt = (float *)malloc(((size_t)kv_heads * hd * ld + ATTN5_NC) * sizeof(float));
     if (kt == NULL) {
         return;
     }
@@ -650,7 +652,8 @@ void rc_attn_prefill_avx2(const float *q, const float *k, const float *v,
         return;
     }
     const int ld = ((nvis + 7) / 8) * 8;
-    float *kt = (float *)malloc((size_t)kv_heads * hd * ld * sizeof(float));
+    /* + ATTN2_NC: the reads of the last block of keys past ld (see rc_attn_prefill_avx512) */
+    float *kt = (float *)malloc(((size_t)kv_heads * hd * ld + ATTN2_NC) * sizeof(float));
     if (kt == NULL) {
         return;
     }
@@ -749,7 +752,12 @@ static void gemma_attn_prefill_region_lim(const float *q, const float *k, const 
     float *kt = NULL;
     #pragma omp single copyprivate(kt)
     {
-        kt = (float *)malloc((size_t)kv_heads * hd * ld * sizeof(float));
+        /* + the block of keys: the reads of the last block past ld (see rc_attn_prefill_avx512) */
+#if defined(__AVX512F__)
+        kt = (float *)malloc(((size_t)kv_heads * hd * ld + ATTN5_NC) * sizeof(float));
+#else
+        kt = (float *)malloc(((size_t)kv_heads * hd * ld + ATTN2_NC) * sizeof(float));
+#endif
         if (kt != NULL) {
             gemma_attn_transpose_k(k, kt, nvis, ld, kv_heads, hd, lo_key);
         }

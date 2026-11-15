@@ -73,7 +73,7 @@ ORDER = [
     "kernels/kq/moe_numa.c", "kernels/kq/exl3_moe.c", "kernels/kq/moe_small.c", "kernels/kq/moe.c",
     "kernels/kq/pack.c",
     "common/deltanet.c", "common/hyperconn.c", "common/qsa.c",
-    "common/ops_qwen.c", "common/nemotron.c", "common/parts.c", "kernels/kq/moe_part.c", "common/interp.c", "common/run.c",
+    "common/ops_qwen.c", "common/nemotron.c", "common/parts.c", "common/rowread.c", "kernels/kq/moe_part.c", "common/interp.c", "common/run.c",
 ]
 
 

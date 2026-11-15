@@ -384,3 +384,84 @@ tokens (the matrices partly in the L3); the 256-bit one 8.0 -> 3.6 and 23.7 -> 8
 On a token the step's NVFP4 records (117 + 48 ms on VNNI, 115 + 45 on AVX2) read about 15 GB/s on both
 tiers, below the 20-23 GB/s of the same kernels on rotating copies in a harness: the step there is no
 longer bound by the kernel's instructions (a software prefetch gave nothing).
+
+**The prompt groups on int8 x, staged, and k_nm_gtile_q2v** (the RTX 3060 of the W-2133 box: PCIe 3.0 at ~8
+GB/s by DMA, 35% of the experts hot; a prompt of 4K tokens runs as 4 groups of 1024). Bolt's prompt was 347
+tok/s against Super's 394 there, both GPU-bound: the routed tiles (k_nm_gtile_tc) 4.5 s of 11.9, the NVFP4
+Mamba products 2.65, the Q8_0 and shared IQ2 products 2.26, the scan 1.5. Three changes:
+- int16 x doubles the mma and the x of every int8 tile, so the prompt groups take int8 x (PROMPT_X16,
+  RECLANK_NM_PROMPT_X16=1 for int16); the steps and the verify groups keep int16 x. Against the float
+  products (RECLANK_NM_I8=0; 4 windows of the docs, prompts of 1024 and 4096 then 64 teacher-forced steps)
+  int16 x KL 2.3e-3 a token, NLL -0.004, int8 x 2.7e-3, -0.003 (to each other 2.6e-3, argmax 248 of 256):
+  347 -> 418 tok/s.
+- With a group of 1024 the tiles read the cold experts across the link inside the kernel (ncu: 10.5-11.3
+  GB/s, ~1 s a group, the link the limit), with one of 4096 the kernel is the limit (~2.7 s on int8 x; a
+  16 x 8 tile a warp, two barriers each 32 columns). Decoding the 32 rows once a block into int8 in shared
+  memory (shared by 4 tiles of pairs) gave the same bits and no speed: the link at 1024, the tile shape at
+  4096. Super's NV4T tiles are int8 mma with a float scale each 16 columns too (bf16 products on GeForce
+  Ampere run at a quarter of the int8 rate with float sums); their speed is the tile shape and the
+  pipeline. A dequantized stage does not fit: a layer of Bolt's experts is 196-672 MB of IQ2_XXS but
+  0.85-2.9 GB as int8 tiles (twice that as bf16), and a layer must be in a buffer while the next one's
+  copies run. So the stage holds the KQ_IQ2R rows as they are and the decode stays in the registers.
+- The stage (BSTAGE; NemotronGPU._bstage_setup): two buffers of half the largest layer's cold experts (249
+  MB here, out of the hot experts), each MoE layer's experts in 1-2 chunks (ranges of ids whose cold experts
+  fit a buffer: operand 23 of NM_GROUP_MOE, x0 | nx << 16; the sort and x's planes with the first, the sums
+  with the last), the copies (GP_FETCH mode 2: DMA, no pull kernel; the pull kernel's 8 blocks took the SMs
+  and DRAM of the products, 518 -> 530 tok/s) of chunk q + 2 after chunk q's tiles, so a layer's copies run
+  behind the Mamba layer before it. The tables (operand 22 = 1) give a hot expert's slot and a cold one's
+  place in its buffer. k_nm_gtile_q2v reads them there: a block 64 rows of an expert x 32 of its pairs, 4
+  warps of 16 rows x 32 pairs (4 m16n8k32 a step, the n tiles past the pairs skipped), each lane's two rows'
+  parts of the next 64 columns in registers during these, its grid index of each part decoded there (the k
+  of the mma in the grid's order: 8 contiguous values a lane in a and b alike, the same int32 sums), the
+  signs from their bits (a table's gathers had the shared banks the limit: 2.7-way conflicts), x by cp.async
+  three stages deep; the float sums in k_nm_gtile_tc's order: the logits bit for bit the same as the mapped
+  path (the prompt's row and 8 steps). The tiles 2.7 -> 0.98 s; the rest of the prompt GPU-bound (NVFP4
+  products 2.25 s, Q8_0 1.72, scan 1.5; the largest layers' copies, ~460 MB at 8 GB/s, wait ~20 ms each).
+- Between the staged prompts the buffers hold more hot experts for the steps (_xhot_pick: the most routed
+  per byte of those not hot, chosen before the expert device's, which takes the ones after them: gpu_held):
+  their copies land during the first steps after a prompt and the steps' tables point at them; a staged run
+  takes the buffers back first. Without them decode lost 3% (the 3060's hot share 35 -> 32%; 5-7% in the
+  drafter's runs).
+
+Results (the 3060; both cards the same for the prompts): 4K 418 -> 535 tok/s, 1K 389 -> 489; decode after the
+4K prompt 24.3-26.6 tok/s (24.2-26.2 before); LiLiCorr 3060 plain 19.6, drafter 28.2, both cards 33.8 / 52.4
+(today's mapped runs 32.5 / 51.8). The server: prompts of 5.2K / 15.7K tokens 457 / 499 tok/s on both cards
+(314 / 328 with int16 x, 370 / 394 with int8 x mapped), 449 / 495 on the 3060; chats 34.8 tok/s on both cards
+(35.3 mapped: noise and the expert device's other set), 18.4 on the 3060 (18.1). Not staged: groups of 256 (232
+-> 223 tok/s: their layers too short to hide the copies) and GPUs without the tensor cores (the 1070 alone 124
+tok/s on int8 x, 96 on int16). Buffers of 128 MB: 501 / 458 tok/s, the same decode (the extra hot experts
+give it back at any size); of 460 MB: 542 / 492 (before those; the hot share 30%).
+
+**The GTX 1070 (Pascal: dp4a, no tensor cores) and the CPU's share of a step's experts** (the W-2133 box; nsys,
+Nsight Compute has no Pascal). Bolt on the 1070 alone ran a prompt of 4K at 125 tok/s (the routed tiles k_nm_gtile
+14.8 s, ~0.9 TOPS of ~26; the dense dp4a tiles k_nm_gemm8k 13.5 s; the scan 1.8, attention 1.2) and decoded 14
+tok/s (73 ms: the routed experts 33 ms, the cold ones across the link at ~9 GB/s; NVFP4 rows 14 ms; Q8_0 rows 12 ms;
+the IQ2 shared experts 5 ms).
+- k_nm_gtile_q2p: k_nm_gtile_q2v's place on dp4a (staged groups, operand 22 = 1; the stage now on any GPU of the
+  int8 tiles): a thread for 2 rows of 256 a block, each part's grid indices decoded once into registers (nm_q2_wl),
+  then 8 dp4a a row, pair and plane on the pairs' x in shared memory (broadcasts), 16 pairs a pass, x by 256
+  columns with the next chunk in registers, the next part's words loaded during each; k_nm_gtile's sums in its
+  order: the same bits (the prompt's row and 8 steps against the mapped path). Forms (RECLANK_NM_Q2P, rows and
+  pairs): 232 179 tok/s, 216 188, 132 187, 116 181, 416 178. The old tiles staged gave nothing (125): on the 1070
+  they were bound by their own work, not the link. The 4K prompt 125 -> 189 tok/s, 1K 124 -> 189; k_nm_gemm8k is
+  now 63% of it.
+- The CPU's share (CPU_SHARE, CPU_SHARE_G; NemotronGPU.cpu_set): in the steps and the verify groups a share of each
+  layer's cold routing goes to the CPU's task (NM_SPLIT, NM_MOE) while the GPU reads the rest across the link; the
+  experts by the routing profile, alternately, so that each side gets busy and quiet ones; with an expert device of
+  those it does not hold (NM_REMOTE_POST leaves them to the CPU). Either alone was no better (the CPU alone 15.3 tok/s
+  against the link's 14.1; the verify groups on the CPU alone slower than the link). The default: the CPU's part of
+  the two rates (1.35 GB/s a thread for a step, 0.55 for a group, against the link). Decode: the 1070 14.1 -> 16.8, the
+  3060 24.8 -> 29.9, both cards the same (40); the drafter 15.8 -> 19.0, 28.1 -> 35.1, 51.5 -> 58.9; the server's
+  chats on the 3060 18.4 -> 25.5, both cards 34.8 -> 37.9. KL against the float products 2.64e-3 (2.68e-3 without).
+- k_kq_linear_i8 of one token on Q8_0 with the type fixed (as Q4_0: 180 -> 96 registers, 2 -> 5 blocks an SM), and the
+  IQ2 rows of a step (k_nm_q2_lin) in form 210 without the tensor cores (Bolt's shared experts 64 -> 55 us on the
+  1070; the 3060 keeps 410): with them the 1070's decode 16.8 -> 17.4. The same bits on the 3060.
+- Totals on the 1070 alone: 4K 189 tok/s, decode 17.2-17.6, the drafter 19.5 (plain 16.5); the server (context 64K,
+  5% hot): chats 16.4 tok/s, prompts of 5.2K / 15.7K 157 / 153.
+
+Super on the 1070 alone works with the defaults (context 8K: a prompt of 1K 22 tok/s, its experts on the CPU; decode
+8.8 tok/s): a step is ~50 ms of the GPU's dense rows (MXFP8 at ~200 GB/s of 256) and the 2.74 GB of a token's experts
+from the host's DRAM (~52 ms at its ~53 GB/s), whoever reads them (NM_TAKE 0, auto and 4: 9.0-9.1). Its dense rows are
+7.01 GB (the Mamba projections 4.52 in MXFP8, the shared experts 1.0 in NVFP4, the head 0.55, the latent projections
+and the gate 0.65 in BF12): no room for hot experts. NVFP4 Mamba projections would free ~2 GB (~11 tok/s), a change
+of the model's numbers not made.

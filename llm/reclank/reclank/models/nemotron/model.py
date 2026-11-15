@@ -4,6 +4,11 @@ forward of the checkpoint's modeling_nemotron_h.py op for op, in float32, from t
 decoded in NumPy (IQ2_XXS: reclank/formats/iq2.py; NVFP4, FP8 with a tensor scale and Q8_0 here).
 The slow reference of the runtime: the engines' checks compare against it.
 
+Ported from the Nemotron 3.5 checkpoints' code (modeling_nemotron_h.py; Apache License 2.0;
+Copyright 2024 The HuggingFace Inc. team; Copyright (c) 2025, NVIDIA CORPORATION) and, the MTP
+block, vLLM (vllm/model_executor/models/nemotron_h_mtp.py; Apache License 2.0; Copyright
+contributors to the vLLM project). See THIRD_PARTY_NOTICES.md.
+
 - each of the 88 blocks: x + mixer(rmsnorm(x));
 - Mamba-2 (40): in_proj -> z, xBC, dt; a causal conv of 4 + bias + silu over xBC; 128 heads of
   64 with B and C of 8 groups (16 heads a group), state 128; dt = softplus(dt + dt_bias) (no

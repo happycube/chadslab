@@ -1,5 +1,11 @@
 """Qwen3.8-Flash-Next (qwen4exp, a preview of Qwen4), in NumPy.
 
+Ported from transformers
+(src/transformers/models/qwen4_exp/modeling_qwen4_exp.py; Apache License 2.0;
+Copyright 2026 The Qwen Team and The HuggingFace Inc. team) and, the MTP layer,
+llama.cpp (src/models/qwen4exp.cpp; MIT License; Copyright (c) 2023-2026 The
+ggml authors). See THIRD_PARTY_NOTICES.md.
+
 QWEN38_PLAN.md, phase 1. This is the reference of this runtime for the
 model. It reads the GGUF file of Unsloth with open_gguf (split files). It
 dequantizes each weight when it uses it. transformers (models/qwen4_exp)
@@ -604,6 +610,17 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
                 tmp(t * cd + (cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim if verify else 0)))
     (hn, g, lo, loa, mixed, inj, o1, o2, o3, o4, o5, att, gate, qout, kbuf, iq, ik, sel, cnt,
      keyn, qn, gated, mo, logits, mixr, val, idx, slog, gscr) = layer_buffers()
+
+    def own(buf, gname):
+        """The output of the product gname: with pack_temps a temporary of its own of exactly its
+        columns (the packer places each by its liveness), else buf (the layer's widest row, shared:
+        a DeltaNet layer's beta and alpha of 48 columns and its gate took 288 KB a row of a mixed
+        group of the GPU at the arena's peak)."""
+        if not fresh:
+            return buf
+        a = P.lazy_zeros((t, model.K(gname).rows))
+        prog.temps.append(a)
+        return a
     prog.names.update(H=H, ple=ple, xn=xn)
     pos, cos, sin, scores = prog.slot("pos"), prog.slot("cos"), prog.slot("sin"), prog.slot("scores")
     cur = {}
@@ -653,6 +670,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
 
     def attention(i):
         b = "blk.%d." % i
+        o1, o2, o3 = (own(o, b + n) for o, n in ((o1_, "attn_q.weight"), (o2_, "attn_k.weight"),
+                                                  (o3_, "attn_v.weight")))
+        o5 = own(o5_, b + "attn_output.weight")
         lin(b + "attn_q.weight", o1)
         lin(b + "attn_k.weight", o2)
         lin(b + "attn_v.weight", o3)
@@ -696,7 +716,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
             prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
             lin(b + "attn_output.weight", o5)
-            return
+            return o5
         # QSA: the indexer selects the keys of each query (backends/cpu/csrc/common/qsa.c).
         lin(b + "indexer.q_proj.weight", iq)
         lin(b + "indexer.k_proj.weight", ik)
@@ -709,9 +729,13 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
         quant(att, nq * hd)
         lin(b + "attn_output.weight", o5)
+        return o5
 
     def deltanet(i):
         b = "blk.%d." % i
+        o1, o2, o3, o4, o5 = (own(o, b + n) for o, n in (
+            (o1_, "attn_qkv.weight"), (o2_, "attn_gate.weight"), (o3_, "ssm_beta.weight"),
+            (o4_, "ssm_alpha.weight"), (o5_, "ssm_out.weight")))
         lin(b + "attn_qkv.weight", o1)
         lin(b + "attn_gate.weight", o2)
         lin(b + "ssm_beta.weight", o3)
@@ -728,10 +752,15 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
                   gdn_flags(cfg), prog.slot("nreal"))
         quant(att, vd)
         lin(b + "ssm_out.weight", o5)
+        return o5
 
     def ple_layer(i):
         b = "blk.%d.ple_" % i
-        gn = f32(t, HD)
+        o1, o2 = own(o1_, b + "key.weight"), own(o2_, b + "value.weight")
+        # (the inputs of the convolution: a verify group keeps them for the commit, else a temporary)
+        gn = f32(t, HD) if verify or not fresh else P.lazy_zeros((t, HD))
+        if fresh and not verify:
+            prog.temps.append(gn)
         quant(ple, hid)
         lin(b + "key.weight", o1)
         lin(b + "value.weight", o2)
@@ -739,7 +768,8 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         prog.emit(P.HC_NORM, H, model.F(b + "norm_query.weight"), qn, t, hc, hid, eps)
         prog.emit(P.PLE_GATE, keyn, qn, o2, gated, t, hc, hid)
         prog.emit(P.HC_NORM, gated, model.F(b + "norm_conv.weight"), gn, t, hc, hid, eps)
-        prog.names["gn.%d" % i] = gn
+        if verify or not fresh:
+            prog.names["gn.%d" % i] = gn
         # nreal rows: the padding rows of a GPU group do not go to the state.
         prog.emit(P.PLE_CONV, gn, gated, H, prog.slot("pleconv.%d" % i),
                   model.F(b + "conv1d.weight", (HD, cfg.ple_conv_kernel)), prog.slot("nreal"), HD,
@@ -767,6 +797,7 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
         if fresh and n > 0:
             (hn, g, lo, loa, mixed, inj, o1, o2, o3, o4, o5, att, gate, qout, kbuf, iq, ik, sel,
              cnt, keyn, qn, gated, mo, logits, mixr, val, idx, slog, gscr) = layer_buffers()
+        o1_, o2_, o3_, o4_, o5_ = o1, o2, o3, o4, o5
         if layer_begin is not None:
             layer_begin(prog, i)
         if i in cfg.ple_layers:
@@ -776,9 +807,9 @@ def compile_qwen4_step(model, t, verify=False, mtp=False):
             prog.emit(P.BF16_ROUND, mixed, t * hid)
         quant(mixed, hid)
         if i >= len(cfg.layer_types) or cfg.layer_types[i] == "full_attention":
-            attention(i)
+            o5 = attention(i)
         else:
-            deltanet(i)
+            o5 = deltanet(i)
         prog.emit(P.HC_ADD, H, o5, inj, t, hc, hid, 1.0 / hc)
         hc_pre(b + "hc_ffn", mixed)
         if b12x:

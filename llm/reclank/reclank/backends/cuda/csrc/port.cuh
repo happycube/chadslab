@@ -42,6 +42,25 @@
 
 __device__ int rc_dp4a_emu_d;      /* 1: the scalar dp4a runs, 0: it traps (RECLANK_GPU_DP4A_EMU) */
 
+/* __match_any_sync (sm_70 on): the lanes of mask whose v is the lane's. Before sm_70 (Pascal, Maxwell) each lane of
+ * mask shows its v in turn (the lanes calling are those of mask, as __match_any_sync asks). */
+__device__ __forceinline__ unsigned rc_match_any(unsigned mask, int v)
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    return __match_any_sync(mask, v);
+#else
+    unsigned peers = 0;
+    for (int src = 0; src < 32; ++src) {
+        if ((mask >> src) & 1u) {
+            if (__shfl_sync(mask, v, src) == v) {
+                peers |= 1u << src;
+            }
+        }
+    }
+    return peers;
+#endif
+}
+
 __device__ __forceinline__ int rc_dp4a(int a, int b, int c)
 {
 #if RC_DP4A

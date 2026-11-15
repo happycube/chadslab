@@ -212,9 +212,55 @@ def _note(media, part):
         media.append(part)
 
 
+# the system text of NVIDIA's conversational mode (conversational_mode of its template)
+SPOKEN = ("You are having a spoken conversation with the user. Respond as briefly as possible while "
+          "still addressing their questions fully.")
+
+
+def _captured(message, role, media):
+    """The content of a message as the template writes it: a model's without its thinking, the
+    others' trimmed, a media part as its placeholder (noted in media)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return strip_thinking(content) if role == "model" else content.strip()
+    parts = []
+    for item in (content or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            t = str(item.get("text") or "")
+            parts.append(strip_thinking(t) if role == "model" else t.strip())
+        elif item.get("type") in ("image", "image_url"):
+            parts.append("<|image|>")
+            _note(media, item)
+        elif item.get("type") in ("audio", "input_audio"):
+            parts.append("<|audio|>")
+            _note(media, item)
+        elif item.get("type") in ("video", "video_url"):
+            parts.append("<|video|>")
+            _note(media, item)
+    return "".join(parts)
+
+
+def _spoken(messages):
+    """NVIDIA's conversational mode: SPOKEN added to the system message's text (or the system
+    message SPOKEN before the others)."""
+    if messages and messages[0].get("role") in ("system", "developer"):
+        c = messages[0].get("content")
+        if isinstance(c, str):
+            text = c.strip()
+        else:
+            text = "".join(str(p.get("text") or "").strip() + " " for p in (c or []) if isinstance(p, dict)).strip()
+        if text != SPOKEN:
+            text = (text + "\n\n" if text else "") + SPOKEN
+        return [{"role": messages[0]["role"], "content": text}] + list(messages[1:])
+    return [{"role": "system", "content": SPOKEN}] + list(messages)
+
+
 def render_chat(messages, tools=None, add_generation_prompt=True,
                 enable_thinking=False, preserve_thinking=False,
-                bos_token="<bos>", empty_thought_block=True, media=None):
+                bos_token="<bos>", empty_thought_block=True, media=None,
+                content_first=False, conversational=False):
     """Return the chat prompt text.
 
     messages follows the OpenAI shape. A tool call takes an arguments mapping
@@ -228,8 +274,15 @@ def render_chat(messages, tools=None, add_generation_prompt=True,
     `<|channel>thought\\n<channel|>` block. The E2B and E4B models do not: they
     go straight to the answer. The model card states the difference under
     "Disabled Thinking Behavior".
+
+    NVIDIA's template of its Gemma 4 fine-tunes (Nemotron 3.5 Bolt E4B) differs
+    in two points: content_first puts a model message's content before its
+    tool calls (Google's after its tool responses), and conversational (its
+    conversational_mode) adds SPOKEN to the system turn.
     """
     messages = list(messages or [])
+    if conversational:
+        messages = _spoken(messages)
     loop = messages
     out = [bos_token]
     last_type = None
@@ -271,6 +324,10 @@ def render_chat(messages, tools=None, add_generation_prompt=True,
         if thinking and (idx > last_user or (preserve_thinking and message.get("tool_calls"))):
             out.append("<|channel>thought\n" + str(thinking) + "\n<channel|>")
         calls = message.get("tool_calls") or []
+        early = content_first and role == "model" and bool(calls)
+        if early:
+            captured = _captured(message, role, media)
+            out.append(captured)
         for tc in calls:
             fn = tc.get("function", {})
             args = fn.get("arguments")
@@ -332,28 +389,9 @@ def render_chat(messages, tools=None, add_generation_prompt=True,
                 tr_flag = True
                 last_type = "tool_response"
 
-        content = message.get("content")
-        if isinstance(content, str):
-            captured = strip_thinking(content) if role == "model" else content.strip()
-        else:
-            parts = []
-            for item in (content or []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "text":
-                    t = str(item.get("text") or "")
-                    parts.append(strip_thinking(t) if role == "model" else t.strip())
-                elif item.get("type") in ("image", "image_url"):
-                    parts.append("<|image|>")
-                    _note(media, item)
-                elif item.get("type") in ("audio", "input_audio"):
-                    parts.append("<|audio|>")
-                    _note(media, item)
-                elif item.get("type") in ("video", "video_url"):
-                    parts.append("<|video|>")
-                    _note(media, item)
-            captured = "".join(parts)
-        out.append(captured)
+        if not early:
+            captured = _captured(message, role, media)
+            out.append(captured)
         has_content = len(captured.strip()) > 0
 
         next_role = None
@@ -522,6 +560,9 @@ def parse_output(text):
     hold it back.
     """
     body = str(text)
+    if body.endswith("<eos>"):
+        # the end of a generation (NVIDIA's fine-tunes end an answer with <eos>, not <turn|>)
+        body = body[:-len("<eos>")]
     # A model that waits for a tool result repeats the empty thought channel.
     # Remove every channel, not only the first. The label of a channel (the
     # text after <|channel> to the newline: "thought") is not read: every

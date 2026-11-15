@@ -1,5 +1,11 @@
 """The Qwen3.5 / Qwen3.6 mixture-of-experts text model (qwen3_5_moe), in NumPy.
 
+Ported from transformers
+(src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py and
+models/qwen3_5/modeling_qwen3_5.py, Copyright 2025 The Qwen Team and The
+HuggingFace Inc. team; models/lfm2_moe/modeling_lfm2_moe.py, Copyright 2025 The
+HuggingFace Team; Apache License 2.0). See THIRD_PARTY_NOTICES.md.
+
 QWEN_PLAN.md, phase 1. This module reads the MLX files of the model
 (mlx-community, affine 4-bit and 8-bit weights) and runs the text model in
 float32 NumPy. It is the reference of this runtime for this model; the C and
@@ -129,7 +135,8 @@ class QwenConfig:
             return m.get("%s.%s" % (a, name), default)
 
         cfg = cls.__new__(cls)
-        n = int(k("block_count"))
+        # (llama.cpp's files count the MTP layers in block_count: nextn_predict_layers of them, blk.<n>.nextn)
+        n = int(k("block_count")) - int(k("nextn_predict_layers", 0))
         every = int(k("full_attention_interval", 4))
         cfg.raw = {}
         cfg.hidden_size = int(k("embedding_length"))
@@ -266,13 +273,22 @@ QUANT_FORMS = ("int16", "int8", "k16v8", "tq6", "rq8", "rk8v8", "e4m3")
 KEY_ROT = ("tq6", "rq8", "rk8v8")       # rotated keys: the queries rotated
 VAL_ROT = ("tq6", "rq8")                # rotated values: the output back
 # RECLANK_QWEN_KV_FIRST: the form of the first full attention layer under a
-# quantized form of the cache: "f32" (the default), a quantized form, or
-# "same". Rounding that one layer gives most of the error of the cache: over
+# quantized form of the cache: "f20" (the default), "f32", a quantized form, or
+# "same". F20 keeps 16 significant bits of each value in 20 (and a byte of the
+# exponent a group of 32: 5248 bytes a token of Qwen3.8-27B's layer, against
+# 8192 for float32) where the GPU's kernels read it (QwenGPU on the tensor
+# cores, head_dim 256, the qwen family: cfg.kv_f20), float32 elsewhere; its
+# values are those of RECLANK_QWEN_KV_F20SIM. Rounding that one layer gives most of the error of the cache: over
 # 25766 positions of a chat text with Qwen3.6-35B-A3B, the KL (top 64)
 # against a float cache is 3.10e-3 for int8 with this layer float32, 3.64e-3
 # with it int16, 3.81e-3 with it float16, and 4.32e-3 for int8 in every
 # layer; int16 in every layer gives 3.68e-3 (QWEN_PLAN.md).
-KV_FIRST = os.environ.get("RECLANK_QWEN_KV_FIRST", "f32")
+KV_FIRST = os.environ.get("RECLANK_QWEN_KV_FIRST", "f20")
+# RECLANK_QWEN_KV_F20SIM=1 (a trial, the GPU): the float32 rows of the cache (that first layer) keep the
+# values an F20 row would (ATTN_PREP operand 21), to measure the quality of F20 rows before the form exists
+KV_F20SIM = os.environ.get("RECLANK_QWEN_KV_F20SIM", "0") == "1"
+# RECLANK_QWEN_KV_ULPSIM=1 (a control of the trials): the last bit of each value of that layer flipped
+KV_ULPSIM = os.environ.get("RECLANK_QWEN_KV_ULPSIM", "0") == "1"
 
 
 def layer_kv_form(form, cfg, i):
@@ -283,7 +299,7 @@ def layer_kv_form(form, cfg, i):
         # reference left it at row 253: KL 2.6e-2 against 1.5e-3)
         first = next(j for j, t in enumerate(cfg.layer_types) if t == "full_attention")
         if i == first:
-            return KV_FIRST
+            return "f32" if KV_FIRST == "f20" and not getattr(cfg, "kv_f20", False) else KV_FIRST
     return form
 
 
@@ -341,6 +357,10 @@ class QwenCache:
             if lf in QUANT_FORMS:
                 # (kq, ks, vq, vs) of the form of the layer (layer_kv_form)
                 self.kv[i] = kv_arrays(lf, max_len, per)
+            elif lf == "f20":
+                # F20 rows (positions, kv heads, the row of a head: cops.f20_row_bytes)
+                shape = (max_len, cfg.num_kv_heads, cops.f20_row_bytes(cfg.head_dim))
+                self.kv[i] = [np.zeros(shape, np.uint8), np.zeros(shape, np.uint8)]
             elif t == "full_attention":
                 # position-major (positions, kv heads, head_dim), as all the caches
                 shape = (max_len, cfg.num_kv_heads, cfg.head_dim)
@@ -426,6 +446,12 @@ def kv_store(cache, i, k, v, pos):
             sc[pos:pos + t] = b.reshape(t, -1)
         return
     K, V = cache.kv[i]
+    if cache.layer_form.get(i) == "f20":
+        hd = k.shape[-1]
+        for src, dst in ((k, K), (v, V)):
+            rows, _rep = cops.kq_f32_to_f20(np.ascontiguousarray(src, np.float32).reshape(-1, hd), hd)
+            dst[pos:pos + t] = rows.reshape(t, -1, dst.shape[2])
+        return
     K[pos:pos + t] = k
     V[pos:pos + t] = v
 
@@ -450,6 +476,11 @@ def kv_rows(cache, i, n):
             out.append(x.reshape(n, cfg.num_kv_heads, cfg.head_dim).transpose(1, 0, 2))
         return out
     K, V = cache.kv[i]
+    if cache.layer_form.get(i) == "f20":
+        cfg = cache.cfg
+        nk, hd = cfg.num_kv_heads, cfg.head_dim
+        return [cops.kq_f20_to_f32(a[:n].reshape(n * nk, -1), n * nk, hd).reshape(n, nk, hd).transpose(1, 0, 2)
+                for a in (K, V)]
     return K[:n].transpose(1, 0, 2), V[:n].transpose(1, 0, 2)
 
 
@@ -777,9 +808,8 @@ class QwenCPU(Qwen):
                 o[j] = ops.attn_decode(np.ascontiguousarray(q[j]), kq, ks, vq, vs, nq, nk,
                                        hd, n)
             else:
-                K, V = cache.kv[i]
-                o[j] = ops.attn_decode_f32(q[j], K[:n].transpose(1, 0, 2),
-                                           V[:n].transpose(1, 0, 2), pos + j)
+                Kh, Vh = kv_rows(cache, i, n)
+                o[j] = ops.attn_decode_f32(q[j], Kh, Vh, pos + j)
         if lf == "rq8":
             o = tq6.unrotate(o.reshape(t, -1))
         o = o.reshape(t, nq * hd) * sigmoid(gate)
@@ -878,7 +908,7 @@ def compile_qwen_step(model, t, verify=False, mtp=False):
             gn = 0
         else:
             o = [cd, vd, cfg.lin_v_heads, hid, cfg.lin_v_heads, vd, 0]
-        if fresh and not lfm and i < dense_n:
+        if fresh and not lfm and (i < dense_n or not E):
             # a dense model: the gate, up, and act of the MLP in o1, o2, o3
             o[:3] = [max(n, cfg.dense_inter) for n in o[:3]]
         return (tmp(t, hid), *[tmp(t, n) if n else None for n in o], tmp(t, hid), tmp(t, max(E, 1)),
@@ -920,6 +950,7 @@ def compile_qwen_step(model, t, verify=False, mtp=False):
     # the quantized layers (layer_kv_form): the first full layer can keep
     # float32 rows
     quant_layer = lambda i: layer_kv_form(form, cfg, i) in QUANT_FORMS  # noqa: E731
+    f20_layer = lambda i: layer_kv_form(form, cfg, i) == "f20"  # noqa: E731
     kv16 = any(quant_layer(i) for i, t in enumerate(cfg.layer_types) if t == "full_attention")
     per = nk * hd
     h, o1, o2, o3, o4, att, gate, qout, mo, logits, val, idx, slog, gscr, kbuf = layer_buffers(0)
@@ -1032,15 +1063,17 @@ def compile_qwen_step(model, t, verify=False, mtp=False):
                 prog.emit(P.ATTN_PREP, o1, o2, o3, model.F(a + "q_norm.weight"),
                           model.F(a + "k_norm.weight"), cos, sin, prog.slot("K.%d" % i),
                           prog.slot("V.%d" % i), hs, pos, t, nq, nk, hd, cfg.rotary_dim, eps,
-                          float(hd ** -0.5), qout, gate if gated else None)
+                          float(hd ** -0.5), qout, gate if gated else None,
+                          *((None, 2) if f20_layer(i) else (None, 1) if KV_F20SIM else
+                            (None, 3) if KV_ULPSIM else ()))
             if quant_layer(i):
                 pass
             elif hasattr(model, "emit_attn"):
                 model.emit_attn(prog, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i), scores,
-                                att, nq, nk, hd, t, pos, hs)
+                                att, nq, nk, hd, t, pos, hs, f20=f20_layer(i))
             else:
                 prog.emit(P.ATTN_F32H, qout, prog.slot("K.%d" % i), prog.slot("V.%d" % i),
-                          scores, att, nq, nk, hd, t, pos, hs, 0, 0)
+                          scores, att, nq, nk, hd, t, pos, hs, 0, 0, *((None, 1) if f20_layer(i) else ()))
             if gated:
                 prog.emit(P.SIGMUL, att, gate, att, t * nq * hd)
             quant(att, nq * hd)
@@ -1073,9 +1106,9 @@ def compile_qwen_step(model, t, verify=False, mtp=False):
         prog.emit(P.RMS_NORM, x, model.F(p + "post_attention_layernorm.weight"), h, t, hid, eps)
         quant(h, hid)
         m = p + "mlp."
-        if i < dense_n:
+        if i < dense_n or not E:
             # the dense SwiGLU MLP (LFM2: of the first layers; a dense model:
-            # of every layer)
+            # of every layer, and of its MTP layer)
             di = cfg.dense_inter
             lin(m + "gate_proj", o1)
             lin(m + "up_proj", o2)
@@ -1148,7 +1181,8 @@ def cache_params(model, cache):
         elif cfg.layer_types[i] == "full_attention":
             K, V = cache.kv[i]
             kw["K.%d" % i], kw["V.%d" % i] = K, V
-            kw["hs"] = K.shape[2]           # position-major: a head stride of head_dim
+            # position-major: a head stride of head_dim (F20 rows: the kernels take their own)
+            kw["hs"] = cfg.head_dim if cache.layer_form.get(i) == "f20" else K.shape[2]
         elif cfg.layer_types[i] == "conv":
             kw["conv.%d" % i] = cache.conv[i]
         else:
@@ -1342,9 +1376,21 @@ class QwenGGUF(Qwen):
         from reclank.formats.gguf import GGUF, GGUFAttached
         from reclank.models.qwen import keep
         self.path = path
+        if os.path.isdir(path):
+            # an NVFP4 checkpoint of ModelOpt (reclank/formats/q35nv_st.py): the weightkeeper's
+            # tensors when it holds it (models/qwen/keep_q35nv.py), else the checkpoint itself
+            from reclank.formats.q35nv_st import Q35NVSource
+            from reclank.models.qwen.keep_q35nv import KeptQ35NV
+            self.g = KeptQ35NV(path) if keep.holds(path) else Q35NVSource(path)
+            if getattr(self.g, "kept", False):
+                print("the tensors from the weightkeeper (pid %s)" % self.g.w.index.get("pid"), flush=True)
+            cfg = cfg or self.g.config()
         # the weightkeeper's tensors when it holds the file (scripts/weightkeeper.py
         # FILE.gguf: loaded once, mapped by each run), else the file
-        self.g = keep.KeptGGUF(path) if path.endswith(".gguf") and keep.holds(path) else GGUF(path)
+        elif path.endswith(".gguf") and keep.holds(path):
+            self.g = keep.KeptGGUF(path)
+        else:
+            self.g = GGUF(path)
         if mtp is not None:
             # the MTP layer in a file of its own (unsloth's quant drops it from the model's file)
             self.g = GGUFAttached(self.g, [mtp])
@@ -1423,6 +1469,11 @@ class KX:
         self.xs = np.empty((self.t, cols // 32), np.float32)
         self.xm = np.empty((self.t, cols // 16), np.float32)
         cops.kq_quant_x(self.x, self.xq, self.xs, self.xm)
+
+
+# the types of the embeddings that the C kernels (cops.kq_rows) do not read: the other blocks of Unsloth's UD
+# files (the UD-IQ3_XXS of Qwen3.8-27B: Q2_K embeddings), dequantized by gguf.py
+_PY_ROWS = (10, 11, 17, 18, 19, 21, 22, 23, 29)      # Q2_K Q3_K IQ2_XS IQ3_XXS IQ1_S IQ3_S IQ2_S IQ4_XS IQ1_M
 
 
 class QwenGGUFCPU(QwenCPU):
@@ -1506,6 +1557,8 @@ class QwenGGUFCPU(QwenCPU):
 
     def embed(self, ids):
         m = self.M("embed_tokens")
+        if m.type in _PY_ROWS:
+            return self.g.dequant(self.gname("embed_tokens"), rows=np.asarray(ids, np.int64))
         return cops.kq_rows(m.data, m.type, m.cols, ids)
 
     def logits(self, h, chunk=None):
@@ -1535,8 +1588,11 @@ class QwenGGUFCPU(QwenCPU):
         # x and the act with the precision of int16 (two int8 planes, act bit
         # 32 of KQ_MOE, as Qwen4CPU): the GPU reads float32 x, and with int8
         # x the CPU left the GPU at row 9 of a prompt
-        extra = ((None, 0, xb["src"]) if self.M(p + "switch_mlp.gate_proj").type == BF12 else
-                 (None, 32, xb["src"]) if getattr(self, "rot_experts", False) else ())
+        # KQ_NVX experts (an NVFP4 checkpoint of ModelOpt: formats/q35nv_st.py) take x as int16
+        # only (two int8 planes of the float32 rows, as qwen38.emit_moe4)
+        t = self.M(p + "switch_mlp.gate_proj").type
+        extra = ((None, 0, xb["src"]) if t == BF12 else
+                 (None, 32, xb["src"]) if getattr(self, "rot_experts", False) or t == 53 else ())
         prog.emit(P.KQ_MOE, xb["xq"], xb["xs"], xb["xm"], idx, val, xb["t"], cfg.top_k,
                   cfg.num_experts, self.moe_mats(p), slog, cfg.hidden_size, cfg.moe_inter,
                   scratch, out, *extra)
@@ -1567,6 +1623,10 @@ class _FMat:
 # the RMSNorm weights that the checkpoint keeps as w - 1 (transformers adds
 # the 1; the GGUF files hold 1 + w): not the gated norm of the DeltaNet
 _PLUS1 = ("input_layernorm.weight", "post_attention_layernorm.weight", "q_norm.weight", "k_norm.weight")
+# the MTP layer's own tensors: its names in the checkpoint (as vLLM's Qwen3-Next MTP), its norms with their 1 too
+_EXL3_MTP = {"nextn.eh_proj": "mtp.fc", "nextn.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
+             "nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight", "nextn.shared_head_norm.weight": "mtp.norm.weight"}
+_EXL3_MTP_NORMS = ("nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight")
 
 
 class QwenEXL3CPU(QwenGGUFCPU):
@@ -1590,10 +1650,21 @@ class QwenEXL3CPU(QwenGGUFCPU):
         self.rot_experts = False
         cops.kq_set_moe_rot(False)
 
-    @staticmethod
-    def key(name):
-        """The checkpoint name of a weight of this module."""
-        return name if name == "lm_head" else "model.language_model." + name
+    def key(self, name):
+        """The checkpoint name of a weight of this module (the MTP layer,
+        layers.<layers>: mtp.layers.0 and _EXL3_MTP)."""
+        if name == "lm_head":
+            return name
+        m = "layers.%d." % self.cfg.num_hidden_layers
+        if name.startswith(m):
+            r = name[len(m):]
+            return _EXL3_MTP.get(r, "mtp.layers.0." + r)
+        return "model.language_model." + name
+
+    @property
+    def mtp_layer(self):
+        """True when the directory has the MTP layer (mtp.fc)."""
+        return self.d.is_e3("mtp.fc")
 
     def M(self, name, full=None):
         m = self._m.get(name)
@@ -1605,7 +1676,7 @@ class QwenEXL3CPU(QwenGGUFCPU):
 
     def t(self, name):
         w = np.asarray(self.d.get(self.key(name)), np.float32)
-        if name == "norm.weight" or name.endswith(_PLUS1):
+        if name == "norm.weight" or name.endswith(_PLUS1) or name.endswith(_EXL3_MTP_NORMS):
             w = w + 1.0
         return w
 

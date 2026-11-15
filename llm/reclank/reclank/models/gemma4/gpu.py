@@ -16,7 +16,7 @@ from reclank.models.gemma4 import forms
 from reclank.backends.cuda.gpumm import Buffer, DeviceCache, ProgramLRU, mem, mem_info, pinned
 from reclank.models.gemma4.model import KV_KEEP
 from reclank.backends.cuda.runtime import (  # noqa: F401
-    GPUCache, GPUProgram, HotCache, MT_CPU, PoolCompiler, WarmPool, _argmax_rows,
+    GPUCache, GPUProgram, caps, HotCache, MT_CPU, PoolCompiler, WarmPool, _argmax_rows,
     _check, _topk_rows, expert_host, fill_chunks, fill_tables, has_tc, int8_tiles, lib, q4s_experts, stage_room)
 
 
@@ -41,12 +41,23 @@ class E4BGroupCompiler(PoolCompiler):
         out = self.buffer((t, qh * hd))
         s = lambda name: self.p.slot("%s.%d" % (name, plan.source))  # noqa: E731
         slide = 1 if os.environ.get("RECLANK_SLIDE", "1") == "1" else 0
+        if ATTN_STEPS:
+            # one record: the GPU runs each query as a step, all in one launch (operand 13)
+            self.p.emit(P.ATTN_F32H, q, s("k"), s("v"), self.p.slot("scores"), out, qh,
+                        plan.num_kv_heads, hd, t, self.p.slot("pos"), s("hs"), plan.window, slide, 1)
+            return out
         for j in range(t):
             pos_j = self.scalar("+", [self.p.slot("pos"), j])
             self.p.emit(P.ATTN_F32H, q[j:j + 1], s("k"), s("v"), self.p.slot("scores"),
                         out[j:j + 1], qh, plan.num_kv_heads, hd, 1, pos_j, s("hs"),
                         plan.window, slide)
         return out
+
+
+# 1: the attention of an E4B verify group is one ATTN_F32H record with operand 13 (attn_steps_launch:
+# each query with the kernels and the bits of a step, in one launch; Bolt E4B's group of 8 on the
+# 3090: its attention 11.8 -> 9.2 ms, the group 33.7 -> 31.6); 0: a record for each query.
+ATTN_STEPS = os.environ.get("RECLANK_GPU_ATTN_STEPS", "1") != "0"
 
 
 def _fuse_kq(prog):
@@ -103,7 +114,10 @@ def q4_i8_dense(model):
     model take int8 x (Q4_I8_DENSE)."""
     if Q4_I8_DENSE is not None:
         return Q4_I8_DENSE == "1"
-    return not model.cfg.enable_moe_block
+    # Without dp4a (Maxwell) GP_KQ_* has only the generic float kernels: the
+    # 12B's int4 records (Q4S, k_int4_linear_s) decode 54.9 tok/s against
+    # about 41 on the 3090 as Maxwell (RECLANK_GPU_CC=52)
+    return not model.cfg.enable_moe_block and bool(caps().get("dp4a", 0))
 
 
 # The groups of up to this many tokens start the head right after the step
@@ -126,6 +140,7 @@ def compile_e4b_group(model, t, arena=None):
     c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
+    forms.tap_env(c, model, t)
     c.p.slot("pos")
     c.compile(forms.e4b_step_form(model, fused=2 if small else True))
     c.p.tokens = t
@@ -138,9 +153,11 @@ class E4BGPU(ProgramLRU):
     """The decode step, the groups of tokens, and the prompt pass of the
     E4B model on the GPU. See the module text."""
 
-    def __init__(self, model, graph=True):
+    def __init__(self, model, graph=True, free0=None):
         self.model = model
-        self.chunk = chunk_for(mem_info()[0])
+        # free0: the free memory the plan is made for (a reload: the load's)
+        self.free0 = mem_info()[0] if free0 is None else free0
+        self.chunk = chunk_for(self.free0)
         progs = model.__dict__.setdefault("_programs", {})
         # The GPU step has the fused operations; the CPU step (key 1) has not.
         prog = progs.get("gpu1")
@@ -153,6 +170,13 @@ class E4BGPU(ProgramLRU):
         self.arenas = alloc.Arenas(MT_CPU)
         self.arenas.keep(1, prog)
         self.g = GPUProgram(prog, graph=graph)
+        if getattr(model, "_plain", False) and not _CHUNK_ENV:
+            # A checkpoint folder's bfloat16 matrices take 9.4 GB of the card (a GGUF file's
+            # about 4); a group of a prompt takes about GROUP_ROW_BYTES a row more: the chunk
+            # halves until its group fits in what the weights leave (2048 -> 1024 on 24 GB).
+            room = mem_info()[0] - GROUP_RESERVE
+            while self.chunk > 256 and self.chunk * GROUP_ROW_BYTES > room:
+                self.chunk //= 2
         self.graph = graph
         self.cache = GPUCache()
         self.head = None
@@ -192,7 +216,17 @@ class E4BGPU(ProgramLRU):
         self.rows = 1
         self._head_ahead(1)
         self.g.download("xn")
+        self._taps(self.g, names, 1, pos)
         return names["xn"].copy()
+
+    def _taps(self, g, names, t, pos):
+        """The DFlash drafter's taps of a run (forms.tap_forms) to model.tap_sink."""
+        sink = getattr(self.model, "tap_sink", None)
+        if sink is None:
+            return
+        for k in range(len(self.model.taps)):
+            g.download("tap%d" % k)
+        sink(forms.tap_rows(names, self.model, t), pos)
 
     def _group(self, t):
         e = self.groups.get(t)
@@ -248,6 +282,7 @@ class E4BGPU(ProgramLRU):
         if size == t and t <= HEAD_AHEAD:
             self._head_ahead(t)       # an MTP verify group reads every row
         g.download("xn")
+        self._taps(g, names, t, pos)
         return names["xn"][:t].copy()
 
     def _ensure(self, cache):
@@ -362,26 +397,32 @@ class E4BGPU(ProgramLRU):
         files of the E2B and the E4B keep it in Q5_K) on the last rows rows:
         a program of one GP_KQ_LINEAR, the soft cap (GP_SOFTCAP), and the
         best token of each row (GP_ARGMAX, the first index of the largest
-        value, as np.argmax). Return the Program and the GPUProgram; the
-        logits are "out" and the tokens "tok"."""
+        value, as np.argmax). A checkpoint folder's table (bfloat16, as
+        stored) takes GP_BF16_LINEAR instead. Return the Program and the
+        GPUProgram; the logits are "out" and the tokens "tok"."""
         model, cfg = self.model, self.model.cfg
         progs = self.__dict__.setdefault("kq_heads", {})
         e = progs.get(rows)
         if e is None:
             k = model.kq(model.head)
-            if k is None:
-                raise RuntimeError("the GPU head needs a Q6_K or a K quant head")
+            w16 = None if k is not None else model.W16(model.head)
+            if k is None and w16 is None:
+                raise RuntimeError("the GPU head needs a Q6_K, a K quant or a bfloat16 head")
+            vocab = k.rows if k is not None else w16.shape[0]
             hp = P.Program()
             hx = np.zeros((rows, cfg.hidden_size), np.float32)
-            out = np.zeros((rows, k.rows), np.float32)
+            out = np.zeros((rows, vocab), np.float32)
             tok = np.zeros(rows, np.int32)
             hp.names.update(x=hx, out=out, tok=tok)
-            hp.emit(P.KQ_LINEAR, None, None, None, hx, k.data, k.type, k.rows, k.cols, rows, out)
+            if k is not None:
+                hp.emit(P.KQ_LINEAR, None, None, None, hx, k.data, k.type, k.rows, k.cols, rows, out)
+            else:
+                hp.emit(P.BF16_LINEAR, hx, w16, out, vocab, cfg.hidden_size, rows)
             cap = cfg.final_logit_softcapping
             if cap:
                 hp.emit(P.SOFTCAP, out, out.size, float(cap))
             for j in range(rows):
-                hp.emit(P.ARGMAX, out[j], k.rows, tok[j:j + 1])
+                hp.emit(P.ARGMAX, out[j], vocab, tok[j:j + 1])
             hp = hp.finish()
             e = progs[rows] = (hp, GPUProgram(hp, graph=self.graph, mirror=self.g.mirror))
         hp, hg = e
@@ -509,6 +550,12 @@ class SplitCompiler(PoolCompiler):
         if head == "moe":
             assert out is None
             return self.moe(*vals)
+        if head == "gelu_mul_int4" and vals[0].shape[0] > MT_CPU and GELU_IN_PLACE:
+            # a large group: gelu(g) * u into g (GELU_MUL_ROWS: each value is read before it is written), then
+            # the down matrix on it; one buffer of the inner width less at the peak of a layer
+            g, u, mat = vals
+            self.p.emit(P.GELU_MUL_ROWS, g, u, g, g.shape[0], g.shape[1])
+            return P.k_int4(self, mat, g, out)
         if head == "ffn_out" and self.fused:
             m, w1, e, w2, w, x, s, wn = vals
             out2 = self.buffer(x.shape) if wn is not None else None
@@ -710,6 +757,18 @@ class SplitCompiler(PoolCompiler):
         _tgu, _tdn, ranges = self.tables(layer)
         self.p.emit(P.FETCH, ranges, len(ranges), layer, layer % 2)
 
+    def moe_win(self, pairs, q4x):
+        """Operand 23 of GP_MOE_GPU: the pairs of a window (MOE_WIN) for the KQ_Q4X experts (q4x 1) of a
+        group of more pairs (and at most 4096 tokens: group.cu k_moe_order), else none."""
+        t = pairs // self.cfg.top_k_experts
+        return (MOE_WIN,) if q4x == 1 and 0 < MOE_WIN < pairs and t <= 4096 else ()
+
+    def moe_scratch(self, pairs, gu_rows, inner, dn_rows, q4x):
+        """act, act2 and de of GP_MOE_GPU: the gate and up rows, the GELU and the down rows of each pair, or
+        with a window (moe_win) of a window's pairs and the slack of a tile (64)."""
+        n = min(pairs, MOE_WIN + 64) if self.moe_win(pairs, q4x) else pairs
+        return self.buffer((n, gu_rows)), self.buffer((n, inner)), self.buffer((n, dn_rows))
+
     def moe_group_gpu(self, h, val, idx, layer):
         """The experts of a large group on the GPU (GP_MOE_GPU). All the
         experts of the layer come to a device buffer with GP_FETCH. The copy
@@ -728,9 +787,8 @@ class SplitCompiler(PoolCompiler):
         q4x = 1 if expert_host(self.model, layer)[2] else 0
         self.p.emit(P.MOE_GPU, h, val, idx, t, top_k, q4x, 0, gu_q.shape[1], hidden,
                     dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
-                    i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
-                    self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), out,
-                    tgu, tdn)
+                    i32(1 + 2 * (pairs // 64 + 129)), *self.moe_scratch(pairs, gu_q.shape[1], inner, dn_q.shape[1],
+                                                                        q4x), out, tgu, tdn, *self.moe_win(pairs, q4x))
         self.p.emit(P.FETCH_DONE, layer % 2)
         if layer + 2 < self.cfg.num_hidden_layers:
             self.fetch(layer + 2)
@@ -785,9 +843,9 @@ class SplitCompiler(PoolCompiler):
             dst = out if c == 0 else part
             self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, q4x, 0, gu_q.shape[1], hidden,
                         dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
-                        i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
-                        self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), dst,
-                        tgu, tdn)
+                        i32(1 + 2 * (pairs // 64 + 129)), *self.moe_scratch(pairs, gu_q.shape[1], inner,
+                                                                            dn_q.shape[1], q4x), dst, tgu, tdn,
+                        *self.moe_win(pairs, q4x))
             self.p.emit(P.FETCH_DONE, k % 2)
             if k + 2 < total:
                 self.fetch_chunk(k + 2)
@@ -818,16 +876,18 @@ class SplitCompiler(PoolCompiler):
         gslots = self.gslots_of[layer]
         i32 = lambda n: self.buffer((n,), np.int32)  # noqa: E731
         q4x = P.ops._Q4X_MOE.get(gu_q.ctypes.data)
+        from reclank.backends.cpu import cops
+        x16 = q4x is not None and MIX_X16 and cops.kq_q16_ok()
         if self.mix_bufs is None:
             self.mix_bufs = dict(
                 hp=pinned((t, hidden), free=True), vp=pinned((t, top_k), free=True),
                 ip=pinned((t, top_k), np.int32, free=True), out=pinned((t, hidden), free=True))
             if q4x is not None:
-                from reclank.backends.cpu import cops
+                self.mix_bufs.update(scratch=cops.kq_moe_scratch(t, top_k, E, hidden, inner))
+            if q4x is not None and not x16:
                 self.mix_bufs.update(
                     xq=np.zeros((t, hidden), np.int8), xs=np.zeros((t, hidden // 32), np.float32),
-                    xm=np.zeros((t, hidden // 16), np.float32),
-                    scratch=cops.kq_moe_scratch(t, top_k, E, hidden, inner))
+                    xm=np.zeros((t, hidden // 16), np.float32))
         b = self.mix_bufs
         cold, cold_val, gidx = i32(pairs), self.buffer((pairs,)), i32(pairs)
         # The split and the copy to the host do not need the copies of the
@@ -843,9 +903,14 @@ class SplitCompiler(PoolCompiler):
         if q4x is not None:
             mats = P.ops.q4x_moe_mats(q4x)
             cc.p.keep.append(mats)
-            cc.p.emit(P.KQ_QUANT, b["hp"], t, hidden, b["xq"], b["xs"], b["xm"], b["ip"], top_k)
-            cc.p.emit(P.KQ_MOE, b["xq"], b["xs"], b["xm"], b["ip"], b["vp"], t, top_k, E, mats, None,
-                      hidden, inner, b["scratch"], b["out"], None, 1, None)
+            if x16:
+                # int16 x from the float rows (act bit 2; KQ_MOE skips the GPU's pairs, -1 in ip)
+                cc.p.emit(P.KQ_MOE, None, None, None, b["ip"], b["vp"], t, top_k, E, mats, None,
+                          hidden, inner, b["scratch"], b["out"], None, 1 | 4, b["hp"])
+            else:
+                cc.p.emit(P.KQ_QUANT, b["hp"], t, hidden, b["xq"], b["xs"], b["xm"], b["ip"], top_k)
+                cc.p.emit(P.KQ_MOE, b["xq"], b["xs"], b["xm"], b["ip"], b["vp"], t, top_k, E, mats, None,
+                          hidden, inner, b["scratch"], b["out"], None, 1, None)
         else:
             # the int4 experts (MOE_MT skips the pairs of the GPU: -1 in ip)
             host_out = P.k_moe(cc, b["hp"], b["vp"], b["ip"], layer)
@@ -855,11 +920,11 @@ class SplitCompiler(PoolCompiler):
         self.p.emit(P.CPU_START, cpu.buf, ev)
         self.p.emit(P.FETCH_WAIT, layer)
         gpu_part = self.buffer(h.shape)
-        self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, 1 if q4x is not None else 0, 0, gu_q.shape[1], hidden,
+        mq = 1 if q4x is not None else 0
+        self.p.emit(P.MOE_GPU, h, val, gidx, t, top_k, mq, 0, gu_q.shape[1], hidden,
                     dn_q.shape[1], inner, i32(256), i32(257), i32(256), i32(pairs), i32(pairs),
-                    i32(1 + 2 * (pairs // 64 + 129)), self.buffer((pairs, gu_q.shape[1])),
-                    self.buffer((pairs, inner)), self.buffer((pairs, dn_q.shape[1])), gpu_part,
-                    tgu, tdn)
+                    i32(1 + 2 * (pairs // 64 + 129)), *self.moe_scratch(pairs, gu_q.shape[1], inner, dn_q.shape[1],
+                                                                        mq), gpu_part, tgu, tdn, *self.moe_win(pairs, mq))
         self.p.emit(P.FETCH_DONE, layer % 2)
         if layer + 2 < self.cfg.num_hidden_layers:
             self.fetch(layer + 2)
@@ -1007,17 +1072,29 @@ class SplitCompiler(PoolCompiler):
             ip, vp = lidx, lval
         q4x = P.ops._Q4X_MOE.get(gu_q.ctypes.data)
         if q4x is not None:
-            # The cold experts in groups of 16 rows (KQ_Q4X), float32
-            # activations: GP_KQ_MOE with the count in memory (cold_idx[top_k])
-            # gives the products of GP_MOE_N to 4e-6, in less time.
+            # The cold experts in groups of 16 rows (KQ_Q4X): GP_KQ_MOE with
+            # the count in memory (cold_idx[top_k]), the activations of the
+            # CPU's own decode (P.k_moe). Float32 on AVX-512 gives the products
+            # of GP_MOE_N to 4e-6, in less time. AVX2 has no float form of
+            # kq_q4x_rows_f (a scalar loop: on the W-2133 with the Quadro P1000,
+            # 14.3 ms a layer of k_await, decode 2.2 tok/s), so int16 x
+            # (DECODE_X16) or int8 x there.
             from reclank.backends.cpu import cops
             E = gu_q.shape[0]
             mats = P.ops.q4x_moe_mats(q4x)
             cc.p.keep.append(mats)
-            cc.p.emit(P.KQ_MOE, np.zeros((1, hidden), np.int8), np.zeros((1, hidden // 32), np.float32),
-                      np.zeros((1, hidden // 16), np.float32), ip, vp, 1, top_k, E, mats, None,
-                      hidden, inner, cops.kq_moe_scratch(1, top_k, E, hidden, inner), host_out,
-                      ip[top_k:], 3, hp)
+            scratch = cops.kq_moe_scratch(1, top_k, E, hidden, inner)
+            if P.ops.DECODE_X16:
+                cc.p.emit(P.KQ_MOE, None, None, None, ip, vp, 1, top_k, E, mats, None,
+                          hidden, inner, scratch, host_out, ip[top_k:], 1 | 4, hp)
+            elif P.ops.Q4X_INT8_DECODE:
+                hq, hs, hm = P.k_kq_quant(cc, hp)
+                cc.p.emit(P.KQ_MOE, hq, hs, hm, ip, vp, 1, top_k, E, mats, None,
+                          hidden, inner, scratch, host_out, ip[top_k:], 1, None)
+            else:
+                cc.p.emit(P.KQ_MOE, np.zeros((1, hidden), np.int8), np.zeros((1, hidden // 32), np.float32),
+                          np.zeros((1, hidden // 16), np.float32), ip, vp, 1, top_k, E, mats, None,
+                          hidden, inner, scratch, host_out, ip[top_k:], 3, hp)
         else:
             cc.p.emit(P.MOE_N, hp, vp, ip, ip[top_k:], gu_q, gu_s, dn_q, dn_s, gu_q.shape[1],
                       hidden, dn_q.shape[1], inner, np.zeros(top_k, dtype=np.int32),
@@ -1103,6 +1180,10 @@ _CHUNK_ENV = os.environ.get("RECLANK_GPU_CHUNK")
 CHUNK = int(_CHUNK_ENV or "2048")
 SMALL_GPU = 7e9
 SMALL_CHUNK = 1024
+# the device bytes of a row of an E4B prompt group (measured: 1024 rows of Nemotron 3.5 Bolt E4B's
+# took 9.3 GB) and what is left free beside a group (E4BGPU's chunk of a checkpoint folder)
+GROUP_ROW_BYTES = 9.2e6
+GROUP_RESERVE = 1e9
 
 
 def chunk_for(free):
@@ -1136,6 +1217,12 @@ PREFILL_MIN = int(os.environ.get("RECLANK_GPU_PREFILL_MIN", "128"))
 # the count of copied experts of each layer (-1: all); the default (auto)
 # takes the count of the least time in the model of ModelGPU.plan_mix.
 MIX = os.environ.get("RECLANK_GPU_MIX", "1") != "0"   # (the Qwen models read a size)
+# The CPU's pairs of a mixed group of KQ_Q4X experts: int16 x and GELU (KQ_MOE act bit 2: two int8 planes,
+# hi and lo, on AVX2), as the GPU's pairs (runner.cu GP_MOE_GPU, k_quant_x2). int8 x on both sides gave the
+# last token of a prompt of 1024 KL 0.049 to the float32 experts (the Quadro P1000 and AVX2), int16 0.006;
+# the int16 of the CPU's pairs costs ~5% of the prompt (149 against 157 tok/s at 1024, 4 threads).
+# RECLANK_GPU_MIX_X16=0: int8 x (KQ_QUANT).
+MIX_X16 = os.environ.get("RECLANK_GPU_MIX_X16", "1") != "0"
 # RECLANK_GPU_STAGE_MIN (8): the fewest cold experts a layer that the buffers
 # of a mixed group hold (ModelGPU._stage) before the large groups go without
 # them (all their cold experts on the CPU).
@@ -1145,6 +1232,11 @@ STAGE_MIN = int(os.environ.get("RECLANK_GPU_STAGE_MIN", "8"))
 # that hold fewer, one piece after another), before the mixed groups take the
 # rest to the CPU. 30 layers of 8 pieces stay under GG_FETCH_MAX (256).
 CHUNK_MAX = int(os.environ.get("RECLANK_GPU_CHUNK_MAX", "8"))
+# RECLANK_GPU_MOE_WIN (4096): the experts of a large group (GP_MOE_GPU, the KQ_Q4X experts) in windows of this
+# many of the pairs sorted by expert: the gate and up rows, the GELU and the down rows of a window's pairs
+# (20 KB a pair), each window's outputs added to the tokens' rows after it (kernels/moe/group.cu). In
+# place of every pair's: the 26B's group of 2048 tokens 369 -> ~130 MB. 0: every pair's.
+MOE_WIN = int(os.environ.get("RECLANK_GPU_MOE_WIN", "4096"))
 
 # The handoff to the CPU of a decode step inside its graph (SplitCompiler.
 # to_cpu and join, GP_SIGNAL and GP_AWAIT): the step is one graph, and the
@@ -1207,6 +1299,17 @@ GROUP_FUSED = os.environ.get("RECLANK_GPU_GROUP_FUSED", "1") == "1"
 # a dense model too (a prompt pass of the 12B): fewer kernels for the norms,
 # the adds, and the int8 x of the products.
 PREFILL_FUSED = os.environ.get("RECLANK_GPU_PREFILL_FUSED", "1") == "1"
+
+# RECLANK_GPU_ONE_ARENA (1): when a large group's program takes a larger arena of temporaries than the large
+# groups had (ir/alloc.Arenas: it was made after smaller ones), the programs on the old arena go (ModelGPU._group;
+# a later use makes them again on the new one): the 26B on the 3090 after prompts of 1024 then 4096 tokens held
+# the arenas of both (0.18 and 0.37 GB). 0: they stay until the memory runs short.
+ONE_ARENA = os.environ.get("RECLANK_GPU_ONE_ARENA", "1") != "0"
+
+# RECLANK_GPU_GELU_IN_PLACE (1): the GELU of the dense feed-forward part of a large group into the gate's
+# rows (SplitCompiler.kernel), in place of a buffer of its own: the 12B's group of 2048 tokens 409 -> 284 MB
+# (the gate, the up and the GELU rows were 61 KB a row each, live at once). The same values. 0: its own.
+GELU_IN_PLACE = os.environ.get("RECLANK_GPU_GELU_IN_PLACE", "1") != "0"
 
 # The rows of the tokens of a large group (a prompt pass) from the Q4_0 token
 # table on the GPU (ModelGPU._embed_gpu), not from Model.embed and a copy of
@@ -1385,6 +1488,8 @@ def ko_table(cfg):
         tabs.append(b)
     _check(lib().rc_gpu_ko_table(tabs[0].ptr, tabs[1].ptr, rd, half, nhi))
     _KO.update(key=key, bufs=tabs)
+    from reclank.backends.cuda.gpumm import on_context_release
+    on_context_release(_KO.clear)
 
 
 class GPUKV(DeviceCache):
@@ -1696,7 +1801,7 @@ class ModelGPU(WarmPool, ProgramLRU):
     warm_regrow = True
     hot_run = True          # HotCache: the uses of the conversation decide the copies
 
-    def __init__(self, model, graph=True, hot=None, kv=None, resident=False):
+    def __init__(self, model, graph=True, hot=None, kv=None, resident=False, free0=None):
         """hot is a dict layer -> experts (see pick_hot), or None. resident
         puts every expert on the GPU (the resident mode, REFACTOR_PLAN.md
         section 4.6): no CPU part, no HotCache, no copies of experts;
@@ -1709,11 +1814,13 @@ class ModelGPU(WarmPool, ProgramLRU):
         gives the budget in GB. The default budget is the free memory of the
         GPU less 6 GB: the step, its head, and a cache of 4096 tokens take
         about 2.7 GB, a prompt pass takes about 1.3 GB more, and the display
-        needs some memory too.
+        needs some memory too. free0: the free memory the plan is made for
+        (None: now; a reload of the device half: the load's).
         """
         self.model = model
         self.resident = bool(resident and model.cfg.enable_moe_block)
-        free0 = mem_info()[0]       # (the memory before the weights)
+        free0 = mem_info()[0] if free0 is None else free0      # (the memory before the weights)
+        self.free0 = free0
         self.chunk = chunk_for(free0)
         gb = os.environ.get("RECLANK_GPU_HOT_GB")
         budget = float(gb) * 1e9 if gb else max(0.0, free0 - 6.0e9)
@@ -1775,9 +1882,14 @@ class ModelGPU(WarmPool, ProgramLRU):
             from reclank.backends.cuda.devices import expert_device
             xdev = expert_device(self.model)
             if xdev is not None:
-                # exclusive caching: the slots do not take the expert device's experts
-                self.hot_cache.exclude = np.stack([xdev.held[e["layer"]].astype(bool)
-                                                   for e in self.hot_cache.layers])
+                self.hot_cache.remote = np.stack([xdev.held[e["layer"]].astype(bool)
+                                                  for e in self.hot_cache.layers])
+                if os.environ.get("RECLANK_EXPERT_EXCLUSIVE", "0") == "1":
+                    # (RECLANK_EXPERT_EXCLUSIVE=1: the slots leave out the expert device's experts.
+                    # Else they take any expert, and the device runs those of its experts they lack:
+                    # the 3060's full pool (2600 experts, not 2358); with a P1000, a chat's decode
+                    # 65.9 -> 69.3 tok/s, the 3060 alone 66.7)
+                    self.hot_cache.exclude = self.hot_cache.remote
         if self.pooled and self.hot_cache is not None:
             self._pool_first(hot_init)
         self._mm_freeze()       # GpuMem: the weights, the stores, the step stay
@@ -1937,9 +2049,11 @@ class ModelGPU(WarmPool, ProgramLRU):
             # the CPU takes the cold experts they do not hold). The plain
             # large group with all of them is 4% faster there (370 against
             # 385 tok/s for 8K tokens on the GTX 1070).
-            can_mix = MIX and not self.resident
+            # The 12B has no experts: no mixed groups, no staging.
+            moe_model = self.model.cfg.enable_moe_block
+            can_mix = MIX and not self.resident and moe_model
             mix = can_mix and (expert_host(self.model, 0)[2] or getattr(self, "mix_short", False))
-            n = self.model._layers[0]["experts.gate_up_proj"][0].shape[0]
+            n = self.model._layers[0]["experts.gate_up_proj"][0].shape[0] if moe_model else 0
             least = -(-n // CHUNK_MAX)      # the fewest places of chunked staging
             cap = getattr(self, "stage_cap", None)
             chunks = 1
@@ -1974,13 +2088,21 @@ class ModelGPU(WarmPool, ProgramLRU):
                         # fewer places than cold experts: pieces (every expert
                         # of a layer may be cold when HotCache moves them)
                         chunks = -(-n // room)
+            old = self.arenas.arena_for(t)
             prog = compile_split_group(self.model, t, kv=self.kv_form, stage=stage,
                                        hot_stores=self._hot_devices() if stage else None,
                                        hot_host=self.prog.hot_stores,
                                        counts=self.hot_cache.counts if self.hot_cache else None,
                                        mix=mix, resident=self.resident,
-                                       pool=self.pool, arena=self.arenas.arena_for(t), chunks=chunks)
+                                       pool=self.pool, arena=old, chunks=chunks)
             self.arenas.keep(t, prog)
+            if ONE_ARENA and t > MT_CPU and old is not None and getattr(prog, "arena", old) is not old:
+                # a larger arena than the large groups had: those on the old one go (a later use makes them
+                # again, on this one), so the GPU holds one arena of the large groups
+                for t2 in [k for k, (p2, _g) in self.groups.items()
+                           if k > MT_CPU and getattr(p2, "arena", None) is old]:
+                    self._lru.pop(("groups", t2), None)
+                    self._free_program(*self.groups.pop(t2))
             # The tensor cores round the input of a product to float16. The
             # router of the experts then selects another expert more often:
             # 93% of the top tokens agree with the CPU, against 98% with the
@@ -2474,7 +2596,7 @@ class ModelGPU(WarmPool, ProgramLRU):
         return vocab
 
 
-def offload(model, experts_gb=0.0, resident=False):
+def offload(model, experts_gb=0.0, resident=False, free0=None):
     """Put the weights of a Model outside the experts, and its output head, on
     the GPU. The decode steps of one token then run there (RECLANK_GPU=1).
 
@@ -2487,14 +2609,15 @@ def offload(model, experts_gb=0.0, resident=False):
     has no effect, because the E4B has no experts. Return the E4BGPU.
 
     resident puts every expert on the GPU (ModelGPU); experts_gb then has no
-    effect. A dense model is resident anyway.
+    effect. A dense model is resident anyway. free0: the free memory of the
+    plan (a reload of the device half: the load's, g.free0).
     """
     from reclank.models.gemma4 import model as model_mod
     os.environ["RECLANK_GPU"] = "1"
     if hasattr(model, "mode"):
         from reclank.models.gemma4 import e4b as e4b_mod
         e4b_mod._GPU = True
-        g = E4BGPU(model)
+        g = E4BGPU(model, free0=free0)
         g.logits()      # copies the head to the GPU
         model._gpu, model._gpu_cache, model._gpu_xn = g, None, None
         return g
@@ -2505,7 +2628,7 @@ def offload(model, experts_gb=0.0, resident=False):
     elif experts_gb > 0 and model.cfg.enable_moe_block and not resident:
         counts = hot_counts(model)
         hot = pick_hot(model, counts, experts_gb * 1e9) if counts is not None else {}
-    g = ModelGPU(model, hot=hot, resident=resident)
+    g = ModelGPU(model, hot=hot, resident=resident, free0=free0)
     g.logits()          # copies the head to the GPU
     model._gpu = g
     model._gpu_cache = None
@@ -2537,7 +2660,8 @@ def room(g):
     used, _ = mem().usage()
     free = mem_info()[0] - mem().c_reserve + used.get("pool", 0)
     model = getattr(g, "model", None)
-    if getattr(g, "head", True) is None and model is not None:
+    if getattr(g, "head", True) is None and model is not None and hasattr(model, "_embed_q6k"):
+        # (an E4B's head program of _kq_head is on the GPU from the offload on)
         w = model._embed_q6k_bytes if model._embed_q6k is not None else model._embed_q
         free -= getattr(w, "nbytes", 0) or 0
     return max(0, free)
@@ -2684,6 +2808,12 @@ class GPUDrafter:
                                     rot=(False, False) if self.e4b else _model_mod.kv_rot(),
                                     prob=self.stop > 0)
         self.g = None
+
+    def release(self):
+        """The device half forgotten (a release of the GPU: GemmaEngine.release_device): the
+        program and the chain's device array made again at the next draft."""
+        self.g = None
+        self.chain_out = None
 
     def draft(self, target, token, h, pos, cache, n, eos_ids=()):
         target._gpu_attach(cache)

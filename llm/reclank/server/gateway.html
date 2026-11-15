@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reclank models</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #677085; --line: #dfe3ea;
+  --accent: #2f6fe4; --ok: #1f9d55; --warn: #c27c0e; --bad: #d14343; --idle: #8a93a6;
+  --bar: #e8ecf2; --chip: #eef2f8; --chip-on: #2f6fe4; --chip-on-ink: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1a1e26; --ink: #e5e8ee; --muted: #98a1b3; --line: #2b313d;
+    --accent: #6e9bff; --ok: #3cc47c; --warn: #e3a33a; --bad: #f06a6a; --idle: #7d8699;
+    --bar: #262c37; --chip: #262c37; --chip-on: #6e9bff; --chip-on-ink: #0d1016;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line);
+         background: var(--panel); position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+header .sub { color: var(--muted); font-size: 13px; }
+header .spacer { flex: 1; }
+main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 40px; }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase;
+           letter-spacing: .04em; }
+.meter { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 6px 0 4px; }
+.meter > div { height: 100%; background: var(--accent); }
+.num { font-variant-numeric: tabular-nums; }
+.servers { display: flex; flex-direction: column; gap: 10px; }
+.srv { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+       display: grid; grid-template-columns: minmax(200px, 1.3fr) minmax(180px, 1fr) 430px; gap: 10px 18px;
+       align-items: start; }
+@media (max-width: 820px) { .srv { grid-template-columns: 1fr; } }
+.srv > div { min-width: 0; }
+@media (max-width: 600px) { header .sub { display: none; } header { padding: 12px 16px; } input[type=password] { width: 140px; } }
+.srv .name { font-weight: 650; font-size: 15px; }
+.kind { font-size: 11px; padding: 1px 7px; border-radius: 9px; background: var(--chip); color: var(--muted);
+        margin-left: 6px; vertical-align: 2px; }
+.models { margin-top: 4px; color: var(--muted); font-size: 13px; word-break: break-word; }
+.models code { background: var(--chip); padding: 1px 5px; border-radius: 4px; color: var(--ink); font-size: 12px; }
+.model { display: inline-flex; align-items: center; gap: 3px; margin: 1px 6px 1px 0; }
+.lockbtn { padding: 2px 4px; border-radius: 5px; line-height: 0; color: var(--muted); border-color: transparent;
+           background: transparent; }
+.lockbtn.on { color: var(--warn); }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); }
+.st-ready .dot { background: var(--ok); }
+.st-starting .dot, .st-stopping .dot { background: var(--warn); animation: blink 1s infinite; }
+.st-failed .dot { background: var(--bad); }
+@keyframes blink { 50% { opacity: .3; } }
+.facts { font-size: 13px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+.facts b { color: var(--ink); font-weight: 500; }
+.err { color: var(--bad); font-size: 12px; margin-top: 4px; word-break: break-word; }
+.note { color: var(--warn); font-size: 12px; margin-top: 4px; }
+.ctl { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+@media (max-width: 820px) { .ctl { align-items: flex-start; } }
+.btns, .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+button { font: inherit; font-size: 13px; padding: 5px 11px; border-radius: 7px; border: 1px solid var(--line);
+         background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--chip-on-ink); }
+.chip { padding: 3px 10px; border-radius: 14px; background: var(--chip); border: 1px solid transparent; font-size: 12px; }
+.chip.on { background: var(--chip-on); color: var(--chip-on-ink); }
+.lbl { font-size: 11px; color: var(--muted); margin-right: 2px; align-self: center; }
+.toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink);
+         width: min(980px, 94vw); padding: 0; }
+dialog .hd { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px;
+             border-bottom: 1px solid var(--line); }
+dialog pre { margin: 0; padding: 12px 14px; max-height: 70vh; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+input[type=password] { font: inherit; padding: 5px 8px; border-radius: 7px; border: 1px solid var(--line);
+                       background: var(--bg); color: var(--ink); width: 180px; }
+#msg { font-size: 13px; color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>reclank models</h1>
+  <span class="sub">one port, the model by the request's <code>model</code></span>
+  <span class="spacer"></span>
+  <span id="msg"></span>
+  <input id="key" type="password" placeholder="API key" autocomplete="off">
+</header>
+<main>
+  <div class="row" id="top"></div>
+  <div class="servers" id="servers"></div>
+</main>
+<dialog id="logdlg"><div class="hd"><b id="logtitle"></b><button onclick="logdlg.close()">Close</button></div>
+<pre id="logtext"></pre></dialog>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let KEY = "";
+try { KEY = localStorage.getItem("reclank-key") || ""; } catch (e) {}
+// a link /#key=... gives the key once (the fragment stays in the browser); it is kept, then cleared
+const fromHash = new URLSearchParams(location.hash.slice(1)).get("key");
+if (fromHash) {
+  KEY = fromHash;
+  try { localStorage.setItem("reclank-key", KEY); } catch (e) {}
+  history.replaceState(null, "", location.pathname);
+}
+$("key").value = KEY;
+$("key").addEventListener("change", () => {
+  KEY = $("key").value;
+  try { localStorage.setItem("reclank-key", KEY); } catch (e) {}
+  refresh();
+});
+const busy = new Set();          // the servers with an action in progress
+
+async function api(path, body) {
+  const opt = { headers: { "Authorization": "Bearer " + KEY } };
+  if (body !== undefined) { opt.method = "POST"; opt.body = JSON.stringify(body);
+                            opt.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, opt);
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) { data = text; }
+  if (!r.ok) throw new Error((data && data.error && data.error.message) || ("HTTP " + r.status));
+  return data;
+}
+
+const gb = (b) => (b / 1e9).toFixed(1) + " GB";
+function ago(t) {
+  if (!t) return "never";
+  const s = Date.now() / 1000 - t;
+  if (s < 60) return Math.round(s) + " s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  return (s / 3600).toFixed(1) + " h ago";
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+
+function meter(frac) { return '<div class="meter"><div style="width:' + Math.min(100, Math.max(0, frac * 100)).toFixed(1) + '%"></div></div>'; }
+
+function renderTop(st) {
+  let h = '<div class="card"><h3>Host memory</h3>' + meter(st.ram.held_gb / st.ram.budget_gb) +
+          '<div class="num">' + st.ram.held_gb.toFixed(0) + ' of ' + st.ram.budget_gb.toFixed(0) +
+          ' GB held by running servers <span style="color:var(--muted)">(' + st.ram.total_gb.toFixed(0) + ' GB in all)</span></div></div>';
+  if (!st.gpus.length) h += '<div class="card"><h3>GPUs</h3>none found (nvidia-smi)</div>';
+  for (const g of st.gpus) {
+    const used = g.used_mib || 0, tot = g.total_mib || 1;
+    h += '<div class="card"><h3>GPU ' + g.index + ' · ' + esc(g.name) + '</h3>' + meter(used / tot) +
+         '<div class="num">' + (used / 1024).toFixed(1) + ' of ' + (tot / 1024).toFixed(1) + ' GiB · ' +
+         (g.util == null ? '' : g.util + '% busy') + '</div></div>';
+  }
+  $("top").innerHTML = h;
+}
+
+function gpuChips(s, gpus) {
+  const cur = s.gpus;
+  const isOn = (v) => JSON.stringify(cur) === JSON.stringify(v);
+  let h = '<span class="lbl">GPUs</span>';
+  h += '<button class="chip' + (isOn("all") ? " on" : "") + '" data-act="gpus" data-arg=\'"all"\'>all</button>';
+  if (gpus.length > 1) for (const g of gpus) {
+    const sel = Array.isArray(cur) && cur.includes(g.index);
+    let next = Array.isArray(cur) ? cur.slice() : [];
+    next = sel ? next.filter((i) => i !== g.index) : next.concat([g.index]);
+    h += '<button class="chip' + (sel ? " on" : "") + '" data-act="gpus" data-arg=\'' +
+         (next.length ? JSON.stringify(next) : '"all"') + '\'>' + g.index + '</button>';
+  }
+  if (s.cpu) h += '<button class="chip' + (isOn("cpu") ? " on" : "") + '" data-act="gpus" data-arg=\'"cpu"\'>CPU only</button>';
+  return h;
+}
+
+const LOCK = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="currentColor"/><path d="M5 7V5a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>';
+const UNLOCK = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 7V5a3 3 0 0 1 5.8-1" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>';
+
+function renderServers(st) {
+  let h = "";
+  for (const s of st.servers) {
+    const run = s.state === "ready";
+    const g = s.gpu || null;
+    const svc = s.kind === "service";
+    const all = s.locked.includes("*");
+    const isLocked = (m) => all || s.locked.includes(m);
+    const dis = busy.has(s.id) ? " disabled" : "";
+    const defaults = Object.values(st.defaults || {});
+    const users = st.servers.filter((d) => (d.requires || []).includes(s.id)).map((d) => d.id);
+    h += '<div class="srv" data-id="' + esc(s.id) + '">';
+    h += '<div><div class="name">' + esc(s.id) + '<span class="kind">' + s.kind + '</span></div>';
+    if (svc) h += '<div class="models">for ' + (users.length ? users.map(esc).join(", ") : "no server") + '</div>';
+    else h += '<div class="models">' + (s.models.length ? s.models.map((m) => '<span class="model">' +
+         '<button class="lockbtn' + (isLocked(m) ? ' on' : '') + '" data-act="lockmodel" data-model="' + esc(m) +
+         '" title="' + (isLocked(m) ? 'locked: never freed (click to unlock)' : 'lock: never freed') + '"' + dis + '>' +
+         (isLocked(m) ? LOCK : UNLOCK) + '</button><code>' + esc(m) + '</code>' +
+         (defaults.includes(m) ? ' <span class="kind">default</span>' : '') + '</span>').join(" ") : 'models: asked when it runs') + '</div>';
+    if (s.requires && s.requires.length) h += '<div class="models">needs ' + s.requires.map(esc).join(", ") + '</div>';
+    if (s.error && s.state === "failed") h += '<div class="err">' + esc(s.error) + '</div>';
+    if (s.pending_restart) h += '<div class="note">restarts with its new GPUs when idle</div>';
+    h += '</div>';
+    h += '<div><div class="pill st-' + s.state + '"><span class="dot"></span>' + s.state +
+         (s.pid ? ' <span style="color:var(--muted);font-weight:400">pid ' + s.pid + '</span>' : '') + '</div>';
+    h += '<div class="facts">';
+    h += '<span>host</span><b class="num">' + s.ram_gb + ' GB</b>';
+    if (g) h += '<span>GPU</span><b class="num">' + gb(g.bytes) + (g.locked ? ' (' + gb(g.locked) + ' locked)' : '') +
+                (g.busy ? ' · in a job' : '') + '</b>';
+    h += '<span>requests</span><b class="num">' + s.inflight + ' now · last ' + ago(s.last_used) + '</b>';
+    if (s.idle_stop) h += '<span>idle stop</span><b class="num">' + s.idle_stop + ' s</b>';
+    h += '</div></div>';
+    h += '<div class="ctl">';
+    h += '<div class="btns">';
+    if (run || s.state === "starting") h += '<button data-act="stop"' + dis + '>Stop</button><button data-act="restart"' + dis + '>Restart</button>';
+    else h += '<button class="primary" data-act="start"' + dis + '>Start</button>';
+    if (!svc) {
+      h += '<button data-act="release"' + (run ? dis : " disabled") + ' title="give back its GPU memory now (it reloads on its next request)">Release GPU</button>';
+      h += '<button data-act="' + (s.locked.length ? "unlock" : "lock") + '"' + dis +
+           ' title="locked: never freed (not stopped for room or when idle; its GPU memory locked at each start)">' +
+           (s.locked.length ? "Unlock all" : "Lock all") + '</button>';
+    }
+    h += '<button data-act="log">Log</button></div>';
+    if (!svc) h += '<div class="chips">' + gpuChips(s, st.gpus) + '</div>';
+    h += '<label class="toggle"><input type="checkbox" data-act="keep"' + (s.keep ? " checked" : "") + dis +
+         '> keep loaded</label>';
+    h += '</div></div>';
+  }
+  $("servers").innerHTML = h;
+}
+
+async function act(id, a, arg) {
+  if (a === "log") {
+    $("logtitle").textContent = id + " log";
+    $("logtext").textContent = "…";
+    $("logdlg").showModal();
+    try {
+      const r = await fetch("/gateway/servers/" + encodeURIComponent(id) + "/log", { headers: { "Authorization": "Bearer " + KEY } });
+      $("logtext").textContent = await r.text();
+      $("logtext").scrollTop = $("logtext").scrollHeight;
+    } catch (e) { $("logtext").textContent = String(e); }
+    return;
+  }
+  busy.add(id);
+  refresh();
+  try {
+    await api("/gateway/servers/" + encodeURIComponent(id) + "/" + a, arg === undefined ? {} : arg);
+    $("msg").textContent = "";
+  } catch (e) { $("msg").textContent = id + ": " + e.message; }
+  busy.delete(id);
+  refresh();
+}
+
+$("servers").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-act]");
+  if (!b) return;
+  const id = b.closest("[data-id]").dataset.id;
+  const a = b.dataset.act;
+  if (a === "gpus") return act(id, "gpus", { gpus: JSON.parse(b.dataset.arg) });
+  if (a === "lockmodel") return act(id, b.classList.contains("on") ? "unlock" : "lock", { model: b.dataset.model });
+  if (a === "stop" && !confirm("Stop " + id + "?")) return;
+  act(id, a);
+});
+$("servers").addEventListener("change", (ev) => {
+  const c = ev.target.closest("input[data-act=keep]");
+  if (c) act(c.closest("[data-id]").dataset.id, "keep", { on: c.checked });
+});
+
+let last = null;
+async function refresh() {
+  if (!KEY && last === null) { $("msg").textContent = "enter the API key"; }
+  try {
+    const st = await api("/gateway/state");
+    last = st;
+    renderTop(st);
+    renderServers(st);
+    if ($("msg").textContent === "enter the API key") $("msg").textContent = "";
+  } catch (e) { $("msg").textContent = e.message; }
+}
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 2000);
+</script>
+</body>
+</html>

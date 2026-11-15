@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 
 /* The host clock, in s. */
@@ -71,9 +72,40 @@ static cudaStream_t gg_main_stream;
  * select it first, as CUDA gives a new thread device 0 (the 3060 and the 1070
  * of a box both visible, the steps on the 3060: a copy worker on the 1070). */
 static int gg_device;
+/* The context's epoch (docs/GPU_SWAP_PLAN.md 3.6): rc_gpu_shutdown releases the context
+ * (cudaDeviceReset) and adds 1. What a context holds (the streams, the events, the kernels'
+ * attributes, the C side's buffers) is made again, lazily, where the epoch it was made in is not
+ * this one; nothing of an old epoch is freed (the reset freed it). */
+static int gg_epoch = 1;
+/* lane B's stream (rc_gpu_lane, runtime/host_cpu.cu), and the epoch it was made in */
+static cudaStream_t gg_lane_stream;
+static int gg_lane_ep;
 static __thread cudaStream_t gg_tstream;
-#define gg_stream (gg_tstream != NULL ? gg_tstream : gg_main_stream)
+static __thread int gg_tstream_ep;
 static char gg_error[256];
+
+/* The stream of the calling thread's programs: lane B's (made again in a new epoch) or the
+ * model's (made again after rc_gpu_shutdown). */
+static inline cudaStream_t gg_stream_now(void)
+{
+    if (gg_tstream != NULL) {
+        if (gg_tstream_ep != gg_epoch) {
+            if (gg_lane_ep != gg_epoch) {
+                cudaStreamCreateWithFlags(&gg_lane_stream, cudaStreamNonBlocking);
+                gg_lane_ep = gg_epoch;
+            }
+            gg_tstream = gg_lane_stream;
+            gg_tstream_ep = gg_epoch;
+        }
+        return gg_tstream;
+    }
+    if (gg_main_stream == NULL) {
+        cudaSetDevice(gg_device);
+        cudaStreamCreateWithFlags(&gg_main_stream, cudaStreamNonBlocking);
+    }
+    return gg_main_stream;
+}
+#define gg_stream gg_stream_now()
 
 #define CK(x)                                                                   \
     do {                                                                        \

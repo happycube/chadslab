@@ -400,3 +400,261 @@ Order: S0-S3 make a reference and the CPU path whole; S4-S6 the speed; S7-S9 the
   - Groups of 8192 rows gave no more (659 tok/s against 680 at 16K). GROUP_COST 2048 3.75 s, 4096 4.67.
   - A prompt of 8192 tokens 514 -> 772 tok/s (the bench); the copies (~4.5 s a group of 4096) are now about
     the compute's time: the ceiling ~900 tok/s.
+- **Prompts on Pascal (dp4a, no tensor cores; the GTX 1070 of the W-2133 box).** Super ran there with the defaults
+  (an 8 GB card: no hot experts, groups of at most 256 rows) but its prompt groups put every pair on the CPU and
+  the MXFP8 rows in k_mxf8_gemv's passes of 8 tokens: a prompt of 1K 22 tok/s. Now:
+  - k_nm_gtile_nv4p (NM_GROUP_MOE of KQ_NV4 without the tensor cores): a block for an expert and 32 rows of up
+    (16 of down: Pascal's 48 KB a block), the raw rows in shared memory once (each expert crosses PCIe once for
+    the group), each 128 columns decoded to int8 (nm_e2m1x4) with the scale of each 16, the pairs' x into shared
+    memory with the next 128 columns' in registers, a thread's rows x 4 pairs by dp4a; k_nm_gtile_nv4's sums in its
+    order: on the RTX 3060 (RECLANK_NM_NV4P=1, the mapped path) the logits bit for bit those of k_nm_gtile_nv4
+    (the prompt's row and 8 steps). The mapped tables for KQ_NV4 on any GPU of dp4a; the stage stays the tensor
+    cores' (NemotronGPU.staged).
+  - k_mxf8_gemm_f (KQ_LINEAR of KQ_MXF8 on more than 8 tokens without the tensor cores): 64 rows x 64 tokens a
+    block in float32, 4 x 4 a thread, the E4M3 values and the bfloat16 x of each 32 columns in shared memory, the
+    sum of each 32 times the row's scale as k_mxf8_tc (scripts/check_mxf8.py: within 0.5 bfloat16 step of float64
+    at 64 and 600 tokens). The dense rows of a prompt of 1K 12.4 -> 3.6 s (~3 TFLOPS).
+  - NM_PLAN's cost of a CPU pair from the CPU (plan_cpu: 12600 ns at the 3090 box's 22 threads with VNNI, times 22
+    over the team, 3 times without VNNI; the cut is the ratio to PLAN_GPU): the W-2133's 11 threads 75600. A prompt
+    of 256 on the RTX 3060 50 -> 80 tok/s (its groups of 1024 up are staged: unchanged, 1K 170, 4K 391).
+  - The GTX 1070 alone: a prompt of 1K 22 -> 56 tok/s, 4K 55 (groups of 256: every expert across the link for each,
+    the GPU's ~38 GB a group at ~13 GB/s, the CPU's quarter of the pairs beside); decode 8.8 (unchanged). The logits
+    against the CPU's experts: KL 4e-5 to 1.4e-2 a row, argmax 9/9. check_nemotron_super_spec PASS on both cards.
+- **Prompts on the RTX 3060, then with the GTX 1070 beside it.** Where a prompt's time went (nsys of the timed
+  prompt alone): a group of 1024 is link-bound (5.41 s of 5.46 copying ~59 GB of cold experts at ~11 GB/s, the
+  compute 2.8 s); a group of 4096 is compute-bound (9.3 s: the NV4T tiles 3.06, the MXFP8 rows on bfloat16 tensor
+  cores 2.9, the Mamba scan 1.49, the shared expert 1.28).
+  - The scan (k_nm_scanm, nm.cu): k_nm_scan's warps (one a value of hdim, 8192) each read their group's B and C for
+    every token, ~34 GB of L1/L2 traffic a layer at 4096 rows (Nsight Compute: L1 91% busy). Now a block of 4 warps
+    of one head, 8 values of hdim a warp: each chunk of 16 tokens' B, C, x, dt and dA in shared memory once for the
+    block, a token's B and C read once a warp for its 8 values, their 8 dot products through one butterfly
+    (nm_multi_bfly: each level keeps half of a lane's values, so each sum adds k_nm_scan's pairs in its order), 2
+    tokens a step, y out by rows. The state's contractions written out as nvcc made k_nm_scan's: y and the state
+    bit for bit k_nm_scan's at 2 to 4096 rows (a standalone check), and the logits too (Super 4K on the 3060, 1K on
+    the 1070). A layer of 4096 rows 37 -> 6.8 ms on the 3060, 46 -> 11.9 on the 1070; of 1024 9.7 -> 1.8. The 3060's
+    4K prompt 401 -> 449 tok/s; 1K the same (link-bound). RECLANK_NM_SCAN=1: k_nm_scan.
+  - The 1070's share of a group's experts (XSPLIT, NemotronGPU.xgroup / xgsplit / _xg_fill; the expert device's group
+    job, runtime/expert_dev.cu rc_gpu_ex_nm_gpost; GP_NM_REMOTE_POST's group form, operands 9-11). In each MoE layer of
+    a staged group of 1024 rows, NM_SPLIT gives the 1070 the pairs of its share: the CPU's task posts them with the
+    group's rows (the SIGNAL's pinned buffers) and the 1070 runs them as it runs a prompt alone (NM_GROUP_MOE on
+    k_nm_gtile_nv4p in 8 chunks of the experts and windows of pairs, each expert from its slot or through the map
+    from the keeper's pages, registered portable by the 3060's library); the join adds its sums, the AWAIT adds them
+    to the 3060's. The 3060's stage copies nothing of the 1070's experts (zero-byte ranges, stage_fill). The share,
+    from a cost model by the routing profile: an expert costs the 3060 its bytes over its link, the 1070 its pairs
+    (~10 us a pair beside the 3060's copies; dp4a, the 1070's bound) and, unless it holds it, its bytes over its link
+    (~5 GB/s beside the 3060's); the 1070 takes the experts of the lowest ratio of its cost to the 3060's while its
+    time stays under the 3060's. The experts the 1070 holds for decode are the most routed, so it gives most of them
+    back: about 200 experts a layer and 30% of the pairs go to it.
+  - A prompt of 1K on both cards: 172 -> 207 tok/s (the 3060's copies 5.41 -> ~2.8 s, the 1070's jobs ~3.7 s). The
+    groups of 2048 and 4096 do not gain (334 -> 333, 451 -> 434: their copies overlap the Mamba layers, and the
+    1070's pairs cost it 10 times the 3060's), so XSPLIT_MAX is 1024. Logits against the unsplit run: KL 4e-5 to
+    1.7e-2 a row (each token's pairs summed in two parts), argmax 9/9; check_nemotron_super_spec PASS on both cards.
+    The bound: both links' copies (~11 + ~6.5 GB/s together) and the 1070's tiles (~1.4 TOPS of its 26).
+  - Why the 1070's tiles (k_nm_gtile_nv4p) are slow, one layer of 1024 rows alone (a standalone harness: the library's
+    NM_GROUP_MOE on synthetic KQ_NV4 experts; nsys, and the SASS: Nsight Compute has no Pascal). From the GPU's memory
+    165 ms (1.5 TOPS of products, 3 of dp4a with x's two planes: 12% of the 1070's ~26), mapped 225: the kernel more
+    than the link. x's two planes cost 1.5 times (one plane 111 ms). Of down's 100 ms: ~19 the blocks' fixed part
+    (the raw rows' load, the barriers), ~20-30 the decode of the rows for each 128 columns and each batch of 32 pairs
+    and x's staging, the rest the products at ~22% of dp4a's rate. Not the cause: the int to float conversions (2%), a
+    branch around the loads of x (none), the grid's order (2-3%).
+    - Down was bound by shared memory (a thread 1 row x 4 pairs: 18 reads of 128 bytes for 64 dp4a). Now a warp all 16
+      rows of 8 pairs, a thread 4 rows x 1 pair (12 reads), and the grid's x the blocks of rows, y the experts: the
+      same bits; down 100 -> 80 ms, the layer 165 -> 143 (a share of 196 experts 64 -> 55, mapped 99 -> 85). The 1070
+      alone, a prompt of 1K: 74 -> 78 tok/s (the logits bit for bit); the split: 207 -> 209 (its share mostly mapped:
+      up is the link's there, 110 ms mapped against 63).
+    - The occupancy: 2 blocks of 4 warps an SM (37-39 KB of shared memory a block, most of it the raw rows, kept for
+      each batch of pairs). With the raw rows read from global memory instead (a measure), down 80 -> 63 ms. Left: the
+      columns outer and the batches inner (each 128 columns' rows read and decoded once for all the expert's pairs, no
+      copy of the rows), and for the split the 1070's cold share by DMA (~12 GB/s, its own stage) rather than mapped
+      (~5-7 beside the 3060's copies).
+    - The columns outer (k_nm_gtile_nv4pc): each 128 columns' slice of the block's rows loaded into registers a step
+      ahead (16-byte pieces) and decoded once for up to NB batches of 32 pairs (up 2, down 1), no copy of the rows in
+      shared memory: the occupancy. The same bits. A layer of 1024 rows from the 1070's memory 143 -> 99.6 ms (half its
+      experts there, half mapped: 181 -> 159); mapped, much slower (a step's slices too small a read across the link:
+      down 108 -> 810 ms), so it takes only the experts in the GPU's memory: operand 22 = 3, operand 7 a slot table
+      (the pool's; an expert device's group job, its held ones), k_nm_gtile_nv4p the others (a slot out of date only
+      changes which kernel runs an expert). Today little of the 1070's prompt work is in its memory (alone: no pool
+      beside its 7 GB of dense rows; the split: its held experts are the most routed, mostly given back): the 1070
+      alone 1K 78 -> 77 tok/s, the split 209 -> 208, the logits bit for bit. Its share staged into its memory by DMA
+      would put all of it there.
+  - The 1070's share by DMA (expert_dev.cu ex_gstage_job; RECLANK_EX_STAGE=0: mapped as before). Its group job copies
+    the cold experts of its share into two stage buffers of 48 experts in its memory (2 x 149 MB), on a copy stream
+    from the keeper's pages (cudaMemcpyAsync, ~7.8 GB/s beside the 3060's copies; the map's reads ~5-6.5), each chunk's
+    records after its copies and each buffer's copies after its last chunk ran; every expert of the job is then in its
+    memory (operand 22 = 3 and a slot table of zeros: k_nm_gtile_nv4pc). The local ids follow the job's groups
+    (NM_GROUP_MOE quantizes x and sorts the pairs on the record of x0 0, sums on the one of x0 + nx = E). No room for
+    the stage: mapped. A prompt of 1K on both cards 209 -> 254 tok/s (252 with these ids); the logits against the
+    mapped split KL <= 1.3e-2 (each token's pairs summed in another order), argmax 9/9.
+  - The next layer's first chunks ahead (RECLANK_EX_PREFETCH=0: none). _xg_fill sends each layer's cold share to the
+    device (devices.py gmask, rc_gpu_ex_nm_gmask), the most routed first; a job then copies the next layer's first
+    two chunks once its own last chunks free the buffers, during the 3060's layers between. The next job checks those
+    experts against its own (a share or a held set changed since: copied again), runs them first, then its held
+    experts (their ~20 ms beside the copies of its next two chunks), then the rest. Only experts with pairs are
+    copied otherwise (a share's every expert: 11 a layer more, 1.2 GB at 1K: 252 -> 244). The order mattered: with
+    the held experts first the copy engine sat idle while they ran (both buffers full), 244 -> 253 only; with them
+    after the chunks copied ahead 252 -> 261, and the 1070 then takes more of the experts: XS_L7 5e9 -> 6e9, XS_C7
+    10e-6 -> 8.5e-6 (a sweep: 6e9 and 7-8.5e-6 273-274, 7e9 and 10e-6 267, 4.5e9 and 11e-6 255). Without the copies
+    ahead at those rates 236.
+  - Both cards now: a prompt of 1K 172 (not split) -> 209 (mapped) -> 274; 2K 334 -> 401-403 (split now: XSPLIT_MAX
+    2048); 4K 452 -> 458 split, so not (the 3060's pairs more than its link there). Stage buffers of 32 / 48 / 64
+    experts: 1K 274 / 274 / 242, 2K 391 / 403 / 402. Logits against no split, 1K: KL mean 8.1e-3, max 1.9e-2, argmax
+    9/9; 2K: the prompt's row 1e-6, the steps after it diverge at an exact tie in the unsplit run (step 3: two tokens
+    at 65.612, a bfloat16 step 0.31), as any change of order does there. The prefetch's job against the same job
+    with every chunk copied, in one run: max |d| 2.4e-7 at |out| 1-3. check_nemotron_super_spec PASS on both cards.
+    Where 1K goes now (nsys, span 3.18 s): the 3060's copies 3.13 s (its link the bound, ~11 GB/s), the 1070's jobs
+    39.5 ms a layer (55.8 before the copies ahead; its copies 18.7 GB at 7.8 GB/s, its copy engine 75% busy), the
+    3060's wait for them 8.7 ms a layer (25.9). docs/NEMOTRON_SPLIT_LESSONS.md has the lessons.
+- **Decode on both cards: the next MoE layer's cold experts predicted and copied ahead to the 1070.** A step (~71 ms
+  after a prompt of 1K): each MoE layer's ~12 cold experts a token on the CPU (~1 ms at ~37 GB/s) while the GPUs wait,
+  then the 3060's Mamba and attention layers (~0.7 ms) while the CPU waits.
+  - What predicts them (the NumPy reference on a real prompt, 64 tokens; "cold": neither GPU holds it, ~13.5 of a
+    token's 22): the next MoE layer's router on the residual entering the MoE layer before picks its top 4 cold
+    experts 92% right, 6 88%, 8 83%; on the residual after that layer 95% / 92% / 88%; two MoE layers ahead 84% of 4.
+    The previous token's experts 38%. The 1070's held experts refreshed from the prompt's routing (refresh_experts after
+    it): its share of the pairs 18-20% -> 20-21%, the steps 14.2 -> 14.1 tok/s.
+  - Built (RECLANK_NM_PREDICT, default 3): in a step's MoE layer j (kq.compile_nemotron_step, NmEmit.predict) the 3060
+    norms the residual entering j by the next MoE layer i's norm, runs i's router (BF12, ~10 us) and copies its logits
+    to pinned memory before j's signal; j's CPU task (GP_NM_REMOTE_POST operands 12-18) picks i's experts neither GPU
+    holds by the router's choice (sigmoid + bias) and hands the top 3 to the 1070 (rc_gpu_ex_nm_prefetch: DMA on a copy
+    stream into one of two buffers of its decode stage, an event an expert, stg the host's marks); i's CPU task first
+    drops the experts whose copies have not ended (rc_gpu_ex_nm_settle) and posts the pairs of the others to the 1070,
+    whose job reads their rows in the stage. The 3060's TAKE is off for steps then.
+  - What it took: the first version slowed the steps (14.2 -> 11.5): the 1070's job uploads (its record, pairs and x,
+    ~20 KB, DMA) queued behind the copies on its one copy engine (their start after issue: p90 28 us -> ~2 ms); they
+    are read by a kernel now (ex_h2d, k_ex_pull16), 14.0. The host's DRAM is shared: the CPU's ~37 GB/s and the 3060's
+    TAKE pulls (~12) beside it already near its ~53; with the TAKE off the 1070's copies pay: 2 experts 14.6, 3 14.7
+    (78% of the copies read, 14% late), 4 14.2 (59% late: the link's ~7.6 GB/s a MoE layer's ~1.8 ms). Copied after
+    the CPU's pairs (the DRAM free, RECLANK_NM_PREDICT_AT=1) the gap is too short: 13.9.
+  - Results: decode after a prompt of 1K 14.2 -> 14.6-14.7 tok/s; the server's plain chats 14.12 -> 14.47 (every turn
+    faster); with MTP 3 drafts the same (15.97 -> 15.88). A verify group can predict too (RECLANK_NM_PREDICT_G, the
+    largest of its rows' choices; off by default): with the TAKE 15.71, without 14.82 (4) and 15.32 (6), so the 3060's
+    pulls of a group's experts are worth more. Logits against no prediction: KL <= 1e-2, argmax 9/9 (as the TAKE's own
+    change); which pairs the 1070 runs depends on the copies' timing, so the steps are not bit-for-bit from run to
+    run. check_nemotron_super_spec PASS on both cards. The bound now: the DRAM, a step's ~1.7 GB of cold experts at
+    ~53 GB/s ~32 ms against the CPU's window (~40 ms) and the dense layers (~31) in series; the next lever would be the
+    3060 copying the predicted experts during its dense layers (its link and the DRAM idle then).
+  - The 3060's share (RECLANK_NM_PF3, default 1): of the predicted cold experts, the next one after the 1070's is
+    copied across the 3060's own link into a stage of two buffers (rc_gpu_pf3_issue: DMA on its own stream, the
+    flag of each copy set by a one-thread kernel after it, k_pf3_flag) by the runner after the CPU's task's flag out
+    (rc_gpu_set_cpu_after, the CPU library's rc_er_after: the CPU's pairs done, the DRAM free, the issue off the GPU's
+    wait); the next layer's NM_STAGED (opcode 380, k_nm_staged: one block, both buffers' words read once into shared
+    memory) gives the 3060 the pairs of those whose copies ended, as NM_TAKE's tables do. What it took: a host
+    function's flags came too late (its thread beside the CPU's spinning team: 15 of 7566 copies used); the stage's
+    words read by every thread across PCIe (65 us a layer, < 10 after); the issue before the task's flag (the GPU
+    waited for its calls). Decode after a prompt of 1K: none 14.5 tok/s, 1 expert 14.8-15.0 (94% of them used), 2
+    14.6 (45%: the gap of ~0.7 ms fits one 3.1 MB copy at ~7.4 GB/s), 3 13.6; the 1070's 2 / 3 / 4 beside one of the
+    3060's 14.6 / 14.9 / 14.1. The server's plain chats 14.43 -> 14.74 (14.12 with neither); its MTP chats in the
+    noise of their texts (15.6-16.1 in six runs, either way). KL against no prediction <= 1e-2, argmax 9/9;
+    check_nemotron_super_spec PASS on both cards.
+- A Quadro P6000 alone (GP102, sm_61, 24 GB, 30 SMs, 432 GB/s; in a PCIe 3.0 x8 slot here: the host link 6.2 GB/s).
+  Super holds 17.0 GB of hot experts (26%): prompts of 1K / 2K / 4K 97 / 126 / 150 tok/s, decode 13.4-13.7; Bolt holds
+  every expert (17.1 GB): 1K / 4K 291 / 296, decode 33.3-34.5, its drafter 51.6. A step of Super (nsys, 75 ms): the
+  dense layers 30.3 ms (k_mxf8_gemv 18.8: ~270 GB/s), the hot pairs 10.9 (k_nm_hot_nv4b, ~140 GB/s), the TAKE's pulls
+  21.0 and the wait for the CPU 6.3.
+  - k_nm_hot_nv4b on Pascal (runner.cu: no tensor cores; the tensor-core GPUs keep their shapes): blocks of 16 rows, the
+    registers capped by __launch_bounds__ (up: 2 rows a warp, 8 blocks an SM; down: 1 row a warp, 2 sets, 4 blocks, at
+    8 it spills), the first rows' loads before x's staging and each next set's before the sums of the set at hand. A
+    layer's 12 hot pairs of 22 (a bench of the kernel alone): up 104 -> 69 us, down 97 -> 87 (loads alone 66 / 53,
+    sums alone 45 / 40: the old shapes ran them one after the other). The same sums in the same order: the logits
+    bit-equal. Decode after 1K 13.4-13.5 -> 13.8-13.9 tok/s.
+  - Bolt's steps with every expert in the GPU's memory: the CPU's share (cpu_set) is empty, so no signal, task or wait
+    (gpu.py _moe: the pairs on the zero-copy tables, an expert that leaves the memory later through the map); k_signal
+    waited ~40 us a layer for the empty task. Decode 34.1-34.3 -> 35.2-35.3, the drafter 51.5 -> 52.2; logits bit-equal.
+  - Super's MTP on the P6000: a round of 3 drafts ~215 ms, its verify (4 rows) ~192: the TAKE's pulls 82 ms (4 experts a
+    layer at the x8 link's ~0.5 ms each), the CPU's cold pairs behind them (30 ms of wait), the 4-row dense products
+    (k_mxf8_gemv_s) 35 ms against a step's 19, the hot pairs 31 (each pair reads its expert's rows). The check's two
+    prompts: 3 drafts 16.8 / 13.2 tok/s, 2 drafts 17.1 / 16.4, 1 15.5 / 14.8 (plain 13.0), so the server takes 2 drafts
+    on a GPU without tensor cores (engine.py; --mtp still sets it): chats 15.11 (3) -> 15.55 (2), plain 13.81.
+  - Bolt's prompt on the P6000: its dp4a products (k_nm_gemm8k, one x plane) were 2.16 s of a 1K prompt's 3.28 (the
+    NVFP4 Mamba in 1.00, out 0.45, the IQ2 shared expert 0.46, Q8_0 0.24) at 6-8 TOPS of ~51. A step's 128 columns
+    took ~10 us against ~1-2 of sums: its words were loaded after the barrier and waited for. k_nm_gemm8d (nm.cu) loads
+    the next step's words into registers while the step at hand is summed and decodes them into shared memory at the
+    top of the next; tiles of 4 x 4 a thread and 4 parts a step, or 8 x 4 and 1 part for 2048-8192 rows; the int sums
+    to float by the magic number (exact); the same float steps, so the same bits (RECLANK_NM_G8D=0: the old kernel).
+    The bench of the kernel alone: Mamba in 25.1 -> 16.0 ms, out 11.2 -> 7.0, the shared expert 5.5 / 5.9 -> 4.5 / 4.4,
+    Q8_0 q / o 7.2 -> 4.0. Bolt's prompts of 1K / 4K 292 / 296 -> 366 / 371 tok/s, logits bit-equal. What did not pay:
+    the int sums' I2F alone (-5%; I2F is quarter rate on Pascal, but the loads were the wait), larger tiles without the
+    prefetch (8 x 8 spills; 8 x 4 +0-30%). Super's prompt takes its two-plane form (X2): unchanged.
+- Super on the P6000, again (slight differences allowed for the prompts):
+  - Its prompt groups take int8 x in every int8 tile on a GPU without tensor cores (gpu.py x16_for: the routed experts'
+    tiles too, not only the shared experts' as on the tensor cores; the steps and verify groups keep int16 x): 1K / 4K
+    97 / 150 -> 105 / 170 tok/s.
+  - Its dense MXFP8 rows of a prompt group on dp4a (mxf8.cu k_mxf8_g8, RECLANK_GPU_MXF8_G8=0: k_mxf8_gemm_f in float32):
+    each 32 of a row's E4M3 values and of a token's x to int8 by their largest |value| in the loader, the next step's
+    words in registers (as k_nm_gemm8d), a part's 32 terms one int sum times the two scales; 0.8% relative RMS against
+    the float32 kernel on random rows. At 4K tokens: the Mamba in 133 -> 77 ms, out 59 -> 28.5, attention q / o 29.7 ->
+    14.7. Prompts of 1K / 4K 105 / 170 -> 116 / 201 tok/s.
+  - Both against the float32, int16-x prompt (a prompt of the docs, then 64 steps teacher-forced on its next tokens):
+    1K the prompt's row KL 1.25e-2, the steps' KL mean 9.2e-3, argmax 61 of 64, NLL 2.032 -> 2.028; 4K the prompt's row
+    8.7e-7, the steps' 5.1e-3, argmax 63 of 64, NLL 1.186 -> 1.169. check_nemotron_super_spec PASS.
+  - The steps: NM_TAKE off when the pool holds TAKE_HOT_MAX (0.15) of the experts or more (gpu.py take; a verify group
+    keeps it): the CPU's few cold pairs ran slower beside the pulls' reads of the host's memory (a layer's window 0.75 ->
+    0.87 ms with one pull). k_mxf8_gemv R 1 for Pascal's steps (R 2 for its groups: k_mxf8_gemv_s's verify 156 -> 168
+    ms at R 1). Decode after 1K 13.8-13.9 -> 15.4-15.7 tok/s; the server's plain chats 13.81 -> 15.05, MTP (2 drafts)
+    15.51 (verify ~155 ms, still the CPU's cold pairs).
+  - What did not pay: NM_PLAN's link cost a cold expert at the x8 link's 510 us (more of them the CPU's: 1K 116 -> 103)
+    or 150 us (109), none to the CPU (92); the experts in the GPU's memory (k_nm_gtile_nv4pc) on a side stream beside the
+    mapped ones (k_nm_gtile_nv4p, bound by the link): 189 ms of 1073 overlapped, the mapped kernel's blocks hold every
+    SM's slots while they wait on the link (116 -> 117); groups of 8192 (RECLANK_NM_BIG_GROUPS) not taken (the room).
+    Left: the link (7.1 of a 4K prompt's 20.4 s; an x16 slot ~8 GB/s), the cold experts staged by DMA beside the tiles
+    (as the 1070's expert jobs: the copy engine, not the SMs' slots) to hide the 2.9 s of the GPU's own experts.
+- Super's prompt groups staged on Pascal (gpu.py STAGE_P, stage_p; RECLANK_NM_STAGE_P=0: mapped as before): each MoE
+  layer's experts in STAGE_P_C (2) chunks, a chunk's cold experts copied by DMA (GP_FETCH mode 2: the copy worker's
+  cudaMemcpyAsync from the registered host pages, the copy engine) into its stage buffer at their places in row format
+  while the chunk before is summed; a held expert's table its slot (its range 0 bytes); NM_GROUP_MOE with operand 22
+  = 3 and operand 7 all_res (every expert in the GPU's memory): k_nm_gtile_nv4pc for all of them. No change to the
+  runtime: the mapped path's chunk and window operand (23), stage_fill's tables and ranges, the first two copies at
+  the program's start. The P6000 (x8 link): prompts of 1K / 2K / 4K / 8K 116 / 160 / 201 / 168 -> 118 / 230 / 270 /
+  264 tok/s, the logits bit-equal to the mapped path with every pair on the GPU. Chunks: 1 113 / 222 / 274 (3 GB of
+  buffers from the pool), 2 118 / 230 / 270 (1.5 GB), 4 120 / 197 / 249, 8 112 / 175 / 238: each chunk is a boundary
+  of the program (the host waits there for the copy worker), and the mapped kernel's few-pair experts on the CPU
+  (NM_PLAN) are off while staged. Decode after a staged prompt as before (15-16 tok/s); check_nemotron_super_spec
+  PASS.
+- Bolt's drafter on the P6000 (slight differences allowed in the verify group): plain 35.2 tok/s, the drafter
+  51.9 -> 80.2 (a round: the draft 17.9 -> 9.8 ms, the verify group 76.5 -> 56.3). A round before (nsys): the verify
+  group 78 ms = its dense rows 37.7 (k_nm_t8d: 2.5 times a step's), the routed experts 22.6 (k_nm_hg_*), the head 5.3
+  (k_kq_linear_i8's general form of 5 to 8 tokens, 184 registers; a step's head 2.0); the draft 18 ms = the head 4.8,
+  the bfloat16 attention rows 3.9 (k_mt_gemv_bf16), the NVFP4 MLPs 3.7, the lattice's ENC_LINEAR 2.3 (k_enc_gemm on 16
+  blocks of 30 SMs). k_nm_t8d was bound by its x reads (every warp of a block read the same x through L1: 1 row a warp
+  105 ms a verify group, 2 76, 4 91) and by I2F (a quarter of the rate; two a token, a row and a block of 32).
+  - k_nm_t8s (nm.cu): k_nm_t8d's products and sums with x of all the tokens staged in shared memory once a block (the
+    halves of a lane's 32 bytes a tile apart: no bank conflicts), in tiles of a multiple of 32 blocks when it does not
+    fit in 48 KB, and the int sums to float by the magic number (exact; with two planes fma(h, 256, l), rounded once as
+    the int's conversion): the same bits. The bench of the kernel alone (8 tokens, one plane): Mamba in 305 -> 201 us,
+    out (two tiles) 178 -> 142, the IQ2 shared expert 118 / 140 -> 73 / 98, Q8_0 4096 x 4096 139 -> 77, the head 3.9 ->
+    1.6 ms. Either change alone gave little (shared memory 303 -> 302, the magic number 303 -> 335). Two planes in tiles
+    were slower (Mamba in 350 -> 433): k_nm_t8d keeps them (RECLANK_NM_T8S=0: k_nm_t8d for all).
+  - The head of 2 to 8 rows on Pascal (gpu.py emit_head: the verify group's and the draft's) by NM_QX + NM_GEMM8 (k_nm_t8s)
+    in place of KQ_LINEAR: 4.8 -> 1.6 ms each (RECLANK_NM_HEAD8=0: KQ_LINEAR).
+  - Bolt's verify group on int8 x on Pascal (spec.py _vprog: x16_for, as its prompt groups; the tensor cores keep two
+    planes): k_nm_t8s in one tile, and k_nm_hg_* with the planes at compile time (X2: one plane does no products of a
+    low one) and the magic number (the same bits for either). Against the plain steps on the same tokens (3 chats, 768
+    rows): KL mean 1.85e-3 (two planes 1.27e-3: the verify group's kernels were never a step's), the argmax the same 754
+    of 768 (759), the step's top-2 margin at the others 0.007-0.27. The drafter's text leaves the plain one at token 99
+    of the code prompt (two planes: the same 256 tokens), and 4.63 of 7 drafts are taken a round there (4.12).
+    RECLANK_NM_VERIFY_X16=1 keeps two planes: 58.1 tok/s, the same tokens as plain (the verify group 72.8 ms: two
+    planes take k_nm_t8d in tiles).
+  - The drafter on Pascal (lilicorr.py LILI_PASCAL; only the drafts change, the verify group decides the tokens): its
+    products on one plane, its bfloat16 matrices as Q8_0 rows (the int8 products in place of k_mt_gemv_bf16), the
+    lattice's ENC_LINEAR on float32 rows (k_enc_sgemm's tiles fill the SMs): the draft 15.2 -> 9.8 ms, 74.0 -> 80.2
+    tok/s (RECLANK_LILI_PASCAL=0: the old).
+  - The server runs Bolt's drafter with --drafter DIR (engine.py; spec.py LiLiCorrRounds, the GpuRunner interface of
+    Super's MTP: after each run of a prompt or a plain step the captured layers' rows of that run's program go into the
+    drafter's context; the target's programs capture them from the load; 1.5 GB for the drafter, RECLANK_NM_LILI_GB;
+    one lane; --mtp 0: off). The verify group now runs NemotronGPU.after_run as Super's does. The drafter's context is
+    not in the saved contexts: after another conversation's point it drafts on that one's positions until new ones
+    replace them (fewer drafts taken, the tokens the verify group's). Chats (chat_turns.py, greedy, 256 tokens a
+    turn): plain 35.03 tok/s, the drafter 50.23 (code 68.6 / 73.3, the story 34.7 / 39.9, the hash map 49.1 / 58.9;
+    2.4-5.3 tokens a round); its answers leave the plain ones (the verify group's int8 x).
+  - Bolt's images: its checkpoint has its own RADIO tower and mlp1 (the shapes of Super's, other weights) and no final
+    layer norm (config vision_final_layernorm False; modeling_nemotron_h_omni.py takes the field, else the LLM's MTP
+    layers). radio.py follows the same rule; the engine takes images when mlp1 is in the checkpoint (it had looked for
+    the final layer norm's tensor). --mmproj-gpu off: the encoder's programs in C on the CPU (RadioGPU gpu=False), none
+    of the GPU's memory (VISION_GB not reserved; Bolt keeps 93% of its experts hot at 262144 positions). Against the
+    NumPy float32 path on the checkpoint's accuracy chart: rel 3.3e-6, every row's cosine 1.000000. The W-2133 (6
+    cores): 253 rows 5.3 s, 495 rows 11.5 s, 1012 rows (the image budget 1024) 29.3 s. Through the server Bolt reads
+    the chart's title, its four models and its 13 benchmarks, and the shapes, colors and text of a drawn image.
+  - scripts/serve_bolt.sh starts Bolt's server so (the drafter, the encoder on the CPU, 262144 positions): Bolt's
+    keeper started when it is not running and the keepers of other models stopped (their memory), a reclank server
+    on the port stopped first (the restart); -d detaches and waits until it serves. A machine's CUDA settings in
+    ~/.config/reclank/env.

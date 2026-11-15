@@ -28,7 +28,8 @@ __device__ __forceinline__ void nm_lt_warp_best(float *v, int *i)
 }
 
 /* the k best of the sorted lists (tv, ti) of the lanes: k rounds, the winner's list moves up */
-__device__ __forceinline__ void nm_lt_merge(float (&tv)[NM_LK], int (&ti)[NM_LK], int k, float *ov, int *oi)
+template <int LK>
+__device__ __forceinline__ void nm_lt_merge(float (&tv)[LK], int (&ti)[LK], int k, float *ov, int *oi)
 {
     for (int q = 0; q < k; ++q) {
         float bv = tv[0];
@@ -38,31 +39,33 @@ __device__ __forceinline__ void nm_lt_merge(float (&tv)[NM_LK], int (&ti)[NM_LK]
         oi[q] = bi;
         if (ti[0] == bi) {
 #pragma unroll
-            for (int u = 0; u < NM_LK - 1; ++u) {
+            for (int u = 0; u < LK - 1; ++u) {
                 tv[u] = tv[u + 1];
                 ti[u] = ti[u + 1];
             }
-            tv[NM_LK - 1] = -INFINITY;
-            ti[NM_LK - 1] = INT_MAX;
+            tv[LK - 1] = -INFINITY;
+            ti[LK - 1] = INT_MAX;
         }
     }
 }
 
 /* GP_NM_LTOPK: logits (S x V), S, V, k, cand (S x k int32), feat (S k x 5): the k best of each slot
  * (by logit, then index) and their features [log p, p, log p - log p0, rank / (k - 1), rank == 0]
- * (p of the softmax of the slot). A block a slot: each thread's k best, the warps', the block's. */
+ * (p of the softmax of the slot). A block a slot: each thread's k best, the warps', the block's. LK: the most
+ * candidates (8: LiLiCorr, 16: DFlash 2's selector, models/qwen/dflash2.py). */
+template <int LK>
 __global__ void __launch_bounds__(1024) k_nm_ltopk(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
-    __shared__ float red[32], wv[32][NM_LK];
-    __shared__ int wi[32][NM_LK];
+    __shared__ float red[32], wv[32][LK];
+    __shared__ int wi[32][LK];
     const int s = blockIdx.x, V = DI(2), k = DI(3), tid = threadIdx.x, lane = tid % 32, w = tid / 32;
     const int nw = blockDim.x / 32;
     const float *x = DP(const float, 0) + (size_t)s * V;
-    float tv[NM_LK];
-    int ti[NM_LK];
+    float tv[LK];
+    int ti[LK];
 #pragma unroll
-    for (int q = 0; q < NM_LK; ++q) {
+    for (int q = 0; q < LK; ++q) {
         tv[q] = -INFINITY;
         ti[q] = INT_MAX;
     }
@@ -71,10 +74,10 @@ __global__ void __launch_bounds__(1024) k_nm_ltopk(const gp_rec *r, const int64_
         float cv = x[i];
         int ci = i;
         mx = fmaxf(mx, cv);
-        if (cv > tv[NM_LK - 1]) {
+        if (cv > tv[LK - 1]) {
             /* (the indices of a thread rise: an equal value stays behind the earlier one) */
 #pragma unroll
-            for (int q = 0; q < NM_LK; ++q) {
+            for (int q = 0; q < LK; ++q) {
                 if (cv > tv[q]) {
                     const float t = tv[q];
                     const int u = ti[q];
@@ -108,8 +111,8 @@ __global__ void __launch_bounds__(1024) k_nm_ltopk(const gp_rec *r, const int64_
     if (lane == 0) {
         red[w] = sum;
     }
-    float ov[NM_LK];
-    int oi[NM_LK];
+    float ov[LK];
+    int oi[LK];
     nm_lt_merge(tv, ti, k, ov, oi);
     if (lane == 0) {
         for (int q = 0; q < k; ++q) {
@@ -127,7 +130,7 @@ __global__ void __launch_bounds__(1024) k_nm_ltopk(const gp_rec *r, const int64_
     }
     const float lse = mx + logf(sum);
 #pragma unroll
-    for (int q = 0; q < NM_LK; ++q) {
+    for (int q = 0; q < LK; ++q) {
         tv[q] = lane < nw && q < k ? wv[lane][q] : -INFINITY;
         ti[q] = lane < nw && q < k ? wi[lane][q] : INT_MAX;
     }
@@ -136,7 +139,7 @@ __global__ void __launch_bounds__(1024) k_nm_ltopk(const gp_rec *r, const int64_
         float v = ov[0];
         int ix = oi[0];
 #pragma unroll
-        for (int q = 1; q < NM_LK; ++q) {
+        for (int q = 1; q < LK; ++q) {
             if (lane == q) {
                 v = ov[q];
                 ix = oi[q];

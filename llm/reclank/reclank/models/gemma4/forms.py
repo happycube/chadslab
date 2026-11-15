@@ -417,6 +417,25 @@ def e4b_layer_def(model, fused=False):
              *tail))
 
 
+def tap_forms(model):
+    """The forms after a layer that copy x (the layer's output, transformers' hidden_states[i + 1])
+    into "tap<k>" for each layer of model.taps (a DFlash drafter's target layers: dflash.py)."""
+    return tuple(("if", ("=", "i", int(L)), ("set", "tap%d" % k, ("copy", "x")))
+                 for k, L in enumerate(getattr(model, "taps", ()) or ()))
+
+
+def tap_env(c, model, t):
+    """The buffers of tap_forms in the compiler's env: (t, hidden) each."""
+    for k in range(len(getattr(model, "taps", ()) or ())):
+        c.env["tap%d" % k] = np.zeros((t, model.cfg.hidden_size), dtype=np.float32)
+
+
+def tap_rows(names, model, t):
+    """The taps of a program's run (names: its arrays): (t, len(taps) x hidden), or None."""
+    n = len(getattr(model, "taps", ()) or ())
+    return np.concatenate([names["tap%d" % k][:t] for k in range(n)], 1) if n else None
+
+
 def e4b_step_form(model, fused=False):
     """Return a whole step of the E4B model.
 
@@ -434,7 +453,7 @@ def e4b_step_form(model, fused=False):
                            ("t", E4B_PREFIX + "per_layer_projection_norm.weight"))),
             ("let", "pl", ("mul", ("add", "pn", "tok"), cfg.per_layer_input_scale)),
             e4b_layer_def(model, fused),
-            ("for", "i", 0, cfg.num_hidden_layers, ("layer", "i", (E4B_LAYER_FN, "i"))),
+            ("for", "i", 0, cfg.num_hidden_layers, ("layer", "i", (E4B_LAYER_FN, "i"), *tap_forms(model))),
             *(() if fused == 2 else
               (("let", "xn", ("rms_norm", "x", ("t", E4B_PREFIX + "norm.weight"))),)))
 
@@ -450,6 +469,7 @@ def compile_e4b_step(model, t=1, fused=False, q4_kq=False):
     c.env["x"] = np.zeros((t, cfg.hidden_size), dtype=np.float32)
     c.env["tok"] = np.zeros((t, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input),
                             dtype=np.float32)
+    tap_env(c, model, t)
     c.p.slot("pos")
     c.compile(e4b_step_form(model, fused))
     c.p.tokens = t
@@ -460,9 +480,11 @@ def e4b_ready(model, cache):
     """Return True when an E4B step can run as a program.
 
     The program uses the fused float attention and the int4 blocks of a GGUF
-    file. The cache must hold the buffers of every layer that stores a key.
+    file (or the bfloat16 matrices of a checkpoint folder). The cache must hold
+    the buffers of every layer that stores a key.
     """
-    if not (ops.attn_ready() and model.mode == "int4" and model._q4 and cache.n > 0):
+    if not (ops.attn_ready() and model.mode == "int4" and (model._q4 or getattr(model, "_plain", False))
+            and cache.n > 0):
         return False
     return all(i in cache.kv for i, p in enumerate(model.cfg.plan) if not p.shared)
 
@@ -499,7 +521,8 @@ def e4b_step_params(prog, model, cache, pos, rope=None):
         keep += [cos, sin]
         kw["cos." + kind] = cos
         kw["sin." + kind] = sin
-    need = max(p.num_q_heads * (pos + t) for p in model.cfg.plan)
+    # (a verify group's queries as steps keep their scores apart: gpu.ATTN_STEPS)
+    need = t * max(p.num_q_heads * (pos + t) for p in model.cfg.plan)
     sc = getattr(prog, "scores", None)
     if sc is None or sc.size < need:
         sc = np.zeros(max(need, 2 * (sc.size if sc is not None else 0)), dtype=np.float32)
@@ -524,4 +547,6 @@ def decode_step_e4b(model, cache, tokens, pos):
     tok = model.embed_rows(E4B_PREFIX + "embed_tokens_per_layer", ids)
     prog.names["tok"][:] = (tok * cfg.per_layer_embed_scale).reshape(ids.size, -1)
     prog.run()
+    if getattr(model, "tap_sink", None) is not None:
+        model.tap_sink(tap_rows(prog.names, model, ids.size), pos)
     return prog.names["xn"].copy()

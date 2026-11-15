@@ -239,7 +239,7 @@ class Tokenizer:
     # ---- chat --------------------------------------------------------------
     def apply_chat_template(self, messages, add_generation_prompt=True, thinking=False,
                             tools=None, preserve_thinking=False,
-                            empty_thought_block=True, media=None):
+                            empty_thought_block=True, media=None, **form):
         """Build the chat prompt from the message list.
 
         Use the canonical Gemma 4 template of reclank/models/gemma4/chat_template.jinja. Give
@@ -248,7 +248,7 @@ class Tokenizer:
         field tool_calls and a result uses the role tool.
 
         Set empty_thought_block to False for the E2B and E4B models. See
-        render_chat.
+        render_chat (and its NVIDIA forms: form).
         """
         from reclank.models.gemma4.chat import render_chat
 
@@ -256,4 +256,4 @@ class Tokenizer:
                            add_generation_prompt=add_generation_prompt,
                            enable_thinking=thinking,
                            preserve_thinking=preserve_thinking,
-                           empty_thought_block=empty_thought_block, media=media)
+                           empty_thought_block=empty_thought_block, media=media, **form)

@@ -4,6 +4,9 @@ glm5_next (Glm5NextTextModel) op for op, in float32, with the EXL3 products of t
 the float16 / float32 tensors as stored. The slow reference of the runtime: the GPU model's checks
 compare against it.
 
+Ported from transformers (src/transformers/models/glm5_next/modeling_glm5_next.py; Apache License
+2.0; Copyright 2026 the HuggingFace Team). See THIRD_PARTY_NOTICES.md.
+
 - KDA (Kimi Delta Attention, 34 layers): qkv, a short causal conv (4) + SiLU, l2-normed q and k,
   a decay for each channel g = -5 sigmoid(exp(A_log) (f_b f_a x + dt_bias)), beta = sigmoid(b x),
   the recurrent form of the delta rule on a 128 x 128 state of each of 64 heads (the prompt too:

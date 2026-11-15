@@ -16,6 +16,7 @@ Functions:
 from __future__ import annotations
 
 import os
+import threading
 
 import numpy as np
 
@@ -1007,7 +1008,38 @@ _INT4_GEMM_TOKENS = int(os.environ.get("RECLANK_INT4_GEMM_TOKENS", "64"))
 # lane of vpdpbusd is a row, as KQ_NVX of Qwen3.8. The prompt of the 26B:
 # the experts of a layer with 512 tokens take 18 ms, not 67. The copy is in
 # memory (the int4 bytes again). RECLANK_Q4X=0 turns it off.
-_Q4X = {}          # the address of an int4 matrix -> its KQ_Q4X bytes
+
+
+class _Q4XCopies(dict):
+    """The address of an int4 matrix -> its KQ_Q4X bytes. The copy of a Q4_0
+    matrix (later) is made at its first read (get), on the CPU: a GPU reads
+    the Q4_0 bytes, so a run on the GPU makes none (the dense matrices of the
+    26B from the file, beside the weightkeeper's KQ_Q4X experts: 0.93 GB)."""
+
+    def __init__(self):
+        super().__init__()
+        self.todo = {}
+        self.lock = threading.Lock()
+
+    def later(self, q, s):
+        self.todo[q.ctypes.data] = (q, s)
+
+    def get(self, key, default=None):
+        v = dict.get(self, key)
+        if v is None and key in self.todo:
+            with self.lock:
+                v = dict.get(self, key)
+                if v is None:
+                    # (out of todo once in the table: another reader waits on the lock, then finds it)
+                    v = self[key] = _cops.kq_q4x_pack(*self.todo[key])
+                    del self.todo[key]
+        return default if v is None else v
+
+    def __bool__(self):
+        return dict.__len__(self) > 0 or bool(self.todo)
+
+
+_Q4X = _Q4XCopies()  # the address of an int4 matrix -> its KQ_Q4X bytes
 _Q4X_MOE = {}      # the address of the gate and up stack -> (gate and up, down, inner)
 _Q4X_SCRATCH = {}  # the scratch of kq_moe for a count of tokens
 _Q4X_HEAD = {}     # the address of a Q4_0 token table (the tied head) -> its KQ_Q4X bytes
@@ -1036,11 +1068,60 @@ def _q4x_ok(packed, scales):
             and packed.shape[-1] == 18 and packed.size // (packed.shape[-2] * 18) % 16 == 0)
 
 
+def q4x_only(model):
+    """True when the int4 matrices of model are KQ_Q4X bytes, with no Q4_0
+    copy and no scales (a matrix (packed, None): the weightkeeper's Q4X,
+    reclank.formats.gguf): every reader of them takes the KQ_Q4X forms."""
+    for w in model._layers.values():
+        if isinstance(w, dict):
+            for v in w.values():
+                if isinstance(v, tuple) and len(v) == 2 and v[1] is None and _q4x_ok(*v):
+                    return True
+    return False
+
+
+# the dense int4 matrices whose bytes are KQ_Q4X (q4x_only): their address ->
+# (bytes, blocks of a row). The GPU's mirror uploads their Q4_0 form
+# (q4x_to_q40), which its kernels of dense matrices read (the experts'
+# kernels read KQ_Q4X: expert_host)
+_Q4X_SELF = {}
+
+
+def _q4x_bytes(q, s):
+    """The KQ_Q4X bytes of an int4 matrix: q itself when it holds them (no
+    scales: the weightkeeper's Q4X), else a packed copy of it."""
+    return q.reshape(-1) if s is None else _cops.kq_q4x_pack(q, s)
+
+
+def q4x_to_q40(a):
+    """The Q4_0 blocks of the KQ_Q4X bytes a (rows x blocks x 18, rows a
+    multiple of 16), in the same shape: rc_kq_q4x_pack backwards (byte
+    32 s + 4 (r % 8) + u of a block of a group holds value 4 s + u of row r,
+    in the low 4 bits for r < 8; then the float16 scales of the 16 rows)."""
+    if _COPS_READY:
+        return _cops.kq_q4x_unpack(a)
+    a = np.ascontiguousarray(a).view(np.uint8)
+    nb = a.shape[-2]
+    rows = a.size // (nb * 18)
+    g = a.reshape(rows // 16, nb, 288)
+    c = g[:, :, :256].reshape(rows // 16, nb, 8, 8, 4)
+    v = np.stack((c & 15, c >> 4), axis=2).transpose(0, 2, 4, 1, 3, 5).reshape(rows, nb, 32)
+    out = np.empty((rows, nb, 18), np.uint8)
+    out[..., 2:] = v[..., :16] | (v[..., 16:] << 4)
+    out[..., :2] = g[:, :, 256:].reshape(rows // 16, nb, 16, 2).transpose(0, 2, 1, 3).reshape(rows, nb, 2)
+    return out.reshape(a.shape)
+
+
 def q4x_pack_model(model):
     """The KQ_Q4X copies of the int4 matrices of the layers of model: the
     dense matrices, and the experts (the gate and up stack as two stacks).
-    Return the count of the bytes."""
-    if not _Q4X_ON:
+    Matrices that are KQ_Q4X already (q4x_only) are their own copy, on every
+    CPU. A dense Q4_0 matrix gets its copy at its first read (_Q4XCopies):
+    with the weightkeeper's KQ_Q4X experts the dense matrices come from the
+    file (keep.layout_gguf), and a GPU reads them as Q4_0. Return the count
+    of the bytes of the new copies of the experts and the head."""
+    model._q4x_only = q4x_only(model)
+    if not (_Q4X_ON or model._q4x_only):
         return 0
     n = 0
     for w in model._layers.values():
@@ -1058,12 +1139,15 @@ def q4x_pack_model(model):
                 # expert): one copy for the CPU (kq_moe with no up matrix)
                 # and the GPU (the bytes of an expert are those of the int4
                 # expert, so its tables and copies do not change)
-                e = (_cops.kq_q4x_pack(q, s), _cops.kq_q4x_pack(*d), q.shape[1] // 2)
+                e = (_q4x_bytes(q, s), _q4x_bytes(*d), q.shape[1] // 2)
                 _Q4X_MOE[q.ctypes.data] = e
-                n += e[0].nbytes + e[1].nbytes
+                n += (e[0].nbytes if s is not None else 0) + (e[1].nbytes if d[1] is not None else 0)
             elif key != "experts.down_proj" and q.ndim == 3:
-                _Q4X[q.ctypes.data] = _cops.kq_q4x_pack(q, s)
-                n += _Q4X[q.ctypes.data].nbytes
+                if s is None:
+                    _Q4X_SELF[q.ctypes.data] = (q.nbytes, q.shape[-2])
+                    _Q4X[q.ctypes.data] = q.reshape(-1)
+                else:
+                    _Q4X.later(q, s)
     # The head of a Q4_0 token table (the Unsloth files): the copy for every
     # token count, with int8 x. The 26B, AVX2 and 6 threads: 16.6 -> 7.7 ms
     # for a token, 65.9 -> 13.4 ms for 4 (the int4 head there took int8 x

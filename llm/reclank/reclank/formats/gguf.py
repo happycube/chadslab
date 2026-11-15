@@ -1,5 +1,9 @@
 """Read GGUF files with NumPy only.
 
+The block formats ported from ggml (ggml/src/ggml-common.h,
+ggml/src/ggml-quants.c; MIT License; Copyright (c) 2023-2026 The ggml authors).
+See THIRD_PARTY_NOTICES.md.
+
 The GGUF format holds quantized blocks. This module does four tasks:
 
 1. Read the metadata and the tensor directory.
@@ -29,8 +33,11 @@ from reclank.core.ops import to_bf16
 F32, F16, Q4_0, Q4_1 = 0, 1, 2, 3
 Q5_0, Q5_1, Q8_0, Q8_1 = 6, 7, 8, 9
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K = 10, 11, 12, 13, 14, 15
+IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S = 16, 17, 18, 19
 IQ4_NL = 20
+IQ3_S, IQ2_S = 21, 22
 IQ4_XS = 23
+IQ1_M = 29
 BF16 = 30
 # The types of this runtime (not of ggml), in files of
 # scripts/convert_nvfp4_gguf.py: NVFP4 in the rows of KQ_NV4 (backends/cpu/csrc/kernels/kq:
@@ -63,14 +70,25 @@ ROT_BASE = {RQ8_0: 8, RQ6_K: 14, RQ4_K: 12, RQ5_K: 13}
 # the group (4 bits), and that largest exponent (a byte); the row padded to
 # 16 bytes. Sign 1, gap 15, mantissa 0 is the zero code. cops.kq_bf16_to_bf12.
 BF12 = 57
+# F20 (backends/cpu/csrc/kernels/kq/formats.c KQ_F20): float32 values to 16 significant bits
+# (to nearest, even) in BF12's groups of 32: a uint16 of the sign and 15 bits of the mantissa a
+# value, its exponent gap (4 bits) and the group's largest exponent (a byte), 20.25 bits a value;
+# zero more than 15 binades under the largest of the group. cops.kq_f32_to_f20.
+F20 = 68
 # MXF8 (FP4-Local, docs/FP4LOCAL_PLAN.md): an MXFP8 row, its E4M3 codes, then an E8M0 scale for
 # each 32 (e4m3 2^(s - 127)), zeros to 16 bytes (backends/cpu/csrc/kernels/kq KQ_MXF8)
 MXF8 = 66
+# Q4X (KQ_Q4X of backends/cpu/csrc/kernels/kq/formats.c): Q4_0 in groups of 16 rows, the same 18 bytes
+# for each 32 values; for each block of 32 columns of a group 288 bytes (the codes of the 16 rows in 8
+# steps, then their float16 scales). Not in a file: the weightkeeper holds the Q4_0 matrices of a Gemma 4
+# file so (reclank/models/qwen/keep.py layout_gguf), the only copy of them in memory.
+Q4X = 54
 _ROW_BYTES = {NV4: lambda cols: (cols // 2 + cols // 16 + 4 + 15) // 16 * 16,
               MXF8: lambda cols: (cols + cols // 32 + 15) // 16 * 16,
               E4M3_ROWS: lambda cols: cols,
               NVX: lambda cols: cols // 32 * 18 + 1,
-              BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16}
+              BF12: lambda cols: (cols + cols // 2 + cols // 32 + 15) // 16 * 16,
+              F20: lambda cols: (2 * cols + cols // 2 + cols // 32 + 15) // 16 * 16}
 
 
 def _e4m3_values():
@@ -91,14 +109,16 @@ _BLOCK = {
     F32: (1, 4), F16: (1, 2), BF16: (1, 2),
     Q4_0: (32, 18), Q4_1: (32, 20), Q5_0: (32, 22), Q5_1: (32, 24),
     Q8_0: (32, 34), Q8_1: (32, 36), Q6_K: (256, 210), Q4_K: (256, 144), Q5_K: (256, 176),
-    IQ4_NL: (32, 18), IQ4_XS: (256, 136), RQ8_0: (32, 34), RQ6_K: (256, 210),
-    RQ4_K: (256, 144), RQ5_K: (256, 176),
+    IQ4_NL: (32, 18), IQ4_XS: (256, 136), Q3_K: (256, 110), IQ3_S: (256, 110), IQ3_XXS: (256, 98), Q2_K: (256, 84), IQ2_XXS: (256, 66),
+    IQ2_XS: (256, 74), IQ2_S: (256, 82), IQ1_S: (256, 50), IQ1_M: (256, 56), RQ8_0: (32, 34), RQ6_K: (256, 210),
+    RQ4_K: (256, 144), RQ5_K: (256, 176), Q4X: (32, 18),
 }
 _TYPE_NAME = {
     F32: "F32", F16: "F16", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1",
     Q5_0: "Q5_0", Q5_1: "Q5_1", Q8_0: "Q8_0", Q8_1: "Q8_1", Q6_K: "Q6_K",
-    Q4_K: "Q4_K", Q5_K: "Q5_K", IQ4_NL: "IQ4_NL", IQ4_XS: "IQ4_XS", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
-    RQ8_0: "RQ8_0", RQ6_K: "RQ6_K", RQ4_K: "RQ4_K", RQ5_K: "RQ5_K", BF12: "BF12",
+    Q4_K: "Q4_K", Q5_K: "Q5_K", Q3_K: "Q3_K", IQ4_NL: "IQ4_NL", IQ4_XS: "IQ4_XS", IQ3_S: "IQ3_S", IQ3_XXS: "IQ3_XXS", Q2_K: "Q2_K",
+    IQ2_XXS: "IQ2_XXS", IQ2_XS: "IQ2_XS", IQ2_S: "IQ2_S", IQ1_S: "IQ1_S", IQ1_M: "IQ1_M", NV4: "NV4", NVX: "NVX", E4M3_ROWS: "E4M3_ROWS",
+    RQ8_0: "RQ8_0", RQ6_K: "RQ6_K", RQ4_K: "RQ4_K", RQ5_K: "RQ5_K", BF12: "BF12", F20: "F20", Q4X: "Q4X",
 }
 
 # The NumPy dtype of one block for the implemented types.
@@ -113,17 +133,66 @@ _BLOCK_DT = {
     RQ8_0: np.dtype([("d", "<f2"), ("qs", "i1", (32,))]),
     RQ6_K: np.dtype([("ql", "u1", (128,)), ("qh", "u1", (64,)),
                      ("sc", "i1", (16,)), ("d", "<f2")]),
+    Q5_0: np.dtype([("d", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
     Q5_1: np.dtype([("d", "<f2"), ("m", "<f2"), ("qh", "<u4"), ("qs", "u1", (16,))]),
     IQ4_NL: np.dtype([("d", "<f2"), ("qs", "u1", (16,))]),
     # ggml block_iq4_xs: d, the high 2 bits of the 8 scales, their low 4 bits
     # (2 in a byte), and the codes of 256 values.
     IQ4_XS: np.dtype([("d", "<f2"), ("sh", "<u2"), ("sl", "u1", (4,)), ("qs", "u1", (128,))]),
     Q4_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qs", "u1", (128,))]),
+    # ggml block_q3_K: the high bit of each value (bit k of byte l: value 32 k + l), the low 2 bits
+    # (bits 2 j of byte 32 h + l: value 128 h + 32 j + l), the 16 scales of 6 bits, d
+    Q3_K: np.dtype([("hm", "u1", (32,)), ("qs", "u1", (64,)), ("sc", "u1", (12,)), ("d", "<f2")]),
+    # ggml block_iq3_xxs and block_iq3_s (backends/include/iq_tables.h)
+    IQ3_XXS: np.dtype([("d", "<f2"), ("qs", "u1", (64,)), ("ss", "<u4", (8,))]),
+    # ggml block_q2_K: the scale (low 4 bits) and min (high 4 bits) of each 16, the 2-bit values (as Q3_K's
+    # low bits), d, dmin
+    Q2_K: np.dtype([("sc", "u1", (16,)), ("qs", "u1", (64,)), ("d", "<f2"), ("dmin", "<f2")]),
+    IQ2_XXS: np.dtype([("b", "u1", (66,))]),            # (reclank/formats/iq2.py)
+    # ggml block_iq2_xs, block_iq2_s, block_iq1_s, block_iq1_m (backends/include/iq_tables.h)
+    IQ2_XS: np.dtype([("d", "<f2"), ("qs", "<u2", (32,)), ("sc", "u1", (8,))]),
+    IQ2_S: np.dtype([("d", "<f2"), ("qs", "u1", (32,)), ("signs", "u1", (32,)), ("qh", "u1", (8,)),
+                     ("sc", "u1", (8,))]),
+    IQ1_S: np.dtype([("d", "<f2"), ("qs", "u1", (32,)), ("qh", "<u2", (8,))]),
+    IQ1_M: np.dtype([("qs", "u1", (32,)), ("qh", "u1", (16,)), ("sc", "<u2", (4,))]),
+    IQ3_S: np.dtype([("d", "<f2"), ("qs", "u1", (64,)), ("qh", "u1", (8,)), ("signs", "u1", (32,)),
+                     ("sc", "u1", (4,))]),
     Q5_K: np.dtype([("d", "<f2"), ("dmin", "<f2"), ("sc", "u1", (12,)), ("qh", "u1", (32,)),
                     ("qs", "u1", (128,))]),
 }
 _BLOCK_DT[RQ4_K] = _BLOCK_DT[Q4_K]
 _BLOCK_DT[RQ5_K] = _BLOCK_DT[Q5_K]
+_BLOCK_DT[Q4X] = np.dtype([("b", "u1", (18,))])     # (the bytes of a group's rows: no block of its own)
+
+
+_IQ3 = {}
+
+
+def _iq_grid64(name, n):
+    """The n uint64 entries of the grid name of backends/include/iq_tables.h as (n, 8) uint8 values."""
+    if name not in _IQ3:
+        h = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backends", "include", "iq_tables.h")
+        text = open(h).read()
+        body = text[text.index("#define " + name):]
+        body = body[:body.index("}")]
+        w = np.array([int(x, 16) for x in re.findall(r"0x([0-9a-f]{16})ull", body)], np.uint64)
+        assert w.size == n, (name, w.size)
+        _IQ3[name] = w.view(np.uint8).reshape(n, 8)
+    return _IQ3[name]
+
+
+def _iq3_grid(name, n):
+    """The n entries of the grid name of backends/include/iq_tables.h (the one copy) as (n, 4)
+    uint8 values."""
+    if name not in _IQ3:
+        h = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backends", "include", "iq_tables.h")
+        text = open(h).read()
+        body = text[text.index("#define " + name):]
+        body = body[:body.index("}")]
+        w = np.array([int(x, 16) for x in re.findall(r"0x([0-9a-f]{8})", body)], np.uint32)
+        assert w.size == n, (name, w.size)
+        _IQ3[name] = w.view(np.uint8).reshape(n, 4)
+    return _IQ3[name]
 
 
 def _k_scales(sc):
@@ -245,6 +314,15 @@ def _dequant(raw, t, count):
         hi = (q >> 4).astype(np.float32) - 8.0
         out = np.concatenate([lo, hi], axis=1) * d[:, None]
         return out.reshape(-1)[:count]
+    if t == Q5_0:
+        # As Q5_1 with no offset: the 5-bit value minus 16, times d.
+        q = raw["qs"]
+        qh = raw["qh"].astype(np.uint32)[:, None]
+        bits = np.arange(16, dtype=np.uint32)[None, :]
+        lo = (q & 0x0F).astype(np.uint32) | (((qh >> bits) & 1) << 4)
+        hi = (q >> 4).astype(np.uint32) | (((qh >> (bits + 16)) & 1) << 4)
+        v = np.concatenate([lo, hi], axis=1).astype(np.float32) - 16.0
+        return (v * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
     if t == Q5_1:
         # Value j (j < 16): the low 4 bits of byte j and bit j of qh; value
         # j + 16: the high 4 bits of byte j and bit j + 16 of qh. d q + m.
@@ -275,6 +353,112 @@ def _dequant(raw, t, count):
         q = raw["qs"].reshape(nb, 8, 16)
         v = np.concatenate([_IQ4_NL_VALUES[q & 0x0F], _IQ4_NL_VALUES[q >> 4]], axis=2)
         out = v * (raw["d"].astype(np.float32)[:, None] * ls)[:, :, None]
+        return out.astype(np.float32).reshape(-1)[:count]
+    if t == Q3_K:
+        # value v: the 2 bits (qs[32 (v // 128) + v % 32] >> 2 ((v % 128) // 32)) & 3, minus 4
+        # where bit v // 32 of hm[v % 32] is 0; times d (sc - 32) of its 16 (sc: 4 bits of byte
+        # i % 8, low half for i < 8, and 2 bits of byte 8 + i % 4 at 2 (i // 4))
+        nb = raw.shape[0]
+        v = np.arange(256)
+        q = (raw["qs"][:, 32 * (v // 128) + v % 32] >> (2 * ((v % 128) // 32))) & 3
+        h = (raw["hm"][:, v % 32] >> (v // 32)) & 1
+        q = q.astype(np.int32) - 4 * (1 - h.astype(np.int32))
+        i = np.arange(16)
+        sc = raw["sc"].astype(np.int32)
+        lo = (sc[:, i % 8] >> (4 * (i // 8))) & 0xF
+        hi = (sc[:, 8 + i % 4] >> (2 * (i // 4))) & 3
+        dl = raw["d"].astype(np.float32)[:, None] * ((lo | (hi << 4)) - 32).astype(np.float32)
+        return (q.reshape(nb, 16, 16) * dl[:, :, None]).astype(np.float32).reshape(-1)[:count]
+    if t == IQ3_S:
+        # index i (64 a block): qs[i] and bit i % 8 of qh[i // 8]; its grid word gives values
+        # 4 i .. 4 i + 3; value v negative where bit v % 8 of signs[v // 8] is set; times
+        # d (1 + 2 s) of its 32 (s: 4 bits of sc[j // 2], low half for even j)
+        nb = raw.shape[0]
+        i = np.arange(64)
+        idx = raw["qs"].astype(np.int32) | (((raw["qh"][:, i // 8] >> (i % 8)) & 1).astype(np.int32) << 8)
+        g = _iq3_grid("IQ3S_GRID", 512)[idx].reshape(nb, 256).astype(np.float32)
+        v = np.arange(256)
+        sg = (raw["signs"][:, v // 8] >> (v % 8)) & 1
+        j = np.arange(8)
+        s = (raw["sc"][:, j // 2].astype(np.int32) >> (4 * (j % 2))) & 0xF
+        db = raw["d"].astype(np.float32)[:, None] * (1 + 2 * s).astype(np.float32)
+        out = np.where(sg == 1, -g, g).reshape(nb, 8, 32) * db[:, :, None]
+        return out.astype(np.float32).reshape(-1)[:count]
+    if t == Q2_K:
+        # value v: (qs[32 (v // 128) + v % 32] >> 2 ((v % 128) // 32)) & 3; for each 16 d (sc & 15) q - dmin (sc >> 4)
+        nb = raw.shape[0]
+        v = np.arange(256)
+        q = ((raw["qs"][:, 32 * (v // 128) + v % 32] >> (2 * ((v % 128) // 32))) & 3).astype(np.float32)
+        sc = raw["sc"]
+        dl = raw["d"].astype(np.float32)[:, None] * (sc & 15).astype(np.float32)
+        ml = raw["dmin"].astype(np.float32)[:, None] * (sc >> 4).astype(np.float32)
+        return (q.reshape(nb, 16, 16) * dl[:, :, None] - ml[:, :, None]).astype(np.float32).reshape(-1)[:count]
+    if t == IQ2_XXS:
+        from reclank.formats import iq2
+        return iq2.dequant(raw.view(np.uint8).reshape(-1, 66)).astype(np.float32).reshape(-1)[:count]
+    if t in (IQ2_XS, IQ2_S):
+        # 32 entries of 8 values: a grid index (IQ2_XS: 9 bits of qs[e]; IQ2_S: qs[e] and 2 bits of qh[e // 4] at
+        # 2 (e % 4)) and 8 signs (IQ2_XS: the 7 bits qs[e] >> 9 and their parity; IQ2_S: signs[e]); a scale of
+        # 4 bits for each 16 (byte k // 2, low half for even k): d (0.5 + s) / 4
+        nb = raw.shape[0]
+        e = np.arange(32)
+        if t == IQ2_XS:
+            idx = raw["qs"].astype(np.int64) & 511
+            s7 = (raw["qs"].astype(np.int64) >> 9) & 127
+            par = np.array([bin(i).count("1") & 1 for i in range(128)], np.int64)
+            sg = s7 | (par[s7] << 7)
+            g = _iq_grid64("IQ2XS_GRID", 512)[idx]
+        else:
+            idx = raw["qs"].astype(np.int64) | (((raw["qh"][:, e // 4] >> (2 * (e % 4))) & 3).astype(np.int64) << 8)
+            sg = raw["signs"].astype(np.int64)
+            g = _iq_grid64("IQ2S_GRID", 1024)[idx]
+        bits = (sg[:, :, None] >> np.arange(8)) & 1
+        g = np.where(bits == 1, -g.astype(np.float32), g.astype(np.float32))           # (nb, 32, 8)
+        k = np.arange(16)
+        sc = (raw["sc"][:, k // 2] >> (4 * (k % 2))) & 15
+        db = raw["d"].astype(np.float32)[:, None] * (0.5 + sc.astype(np.float32)) * 0.25
+        return (g.reshape(nb, 16, 16) * db[:, :, None]).astype(np.float32).reshape(-1)[:count]
+    if t in (IQ1_S, IQ1_M):
+        # 32 entries of 8 values in -1, 0, 1 (an 11-bit index into IQ1S_GRID) plus a delta of +-1/8, times a scale
+        # (2 s + 1) d. IQ1_S: qs[e] and 3 bits of qh[e // 4] at 3 (e % 4); its 32 values: s the bits 12-14 of
+        # qh[j], the delta - where bit 15 is set. IQ1_M: qs[e] and the nibble of qh[e // 2] (low for even e): 3
+        # bits of index, the delta - by bit 3; s the 3 bits of sc[k // 4] at 3 (k % 4) for each 16 (k); d the top
+        # nibbles of the 4 words of sc.
+        nb = raw.shape[0]
+        e = np.arange(32)
+        if t == IQ1_S:
+            qh = raw["qh"].astype(np.int64)
+            idx = raw["qs"].astype(np.int64) | (((qh[:, e // 4] >> (3 * (e % 4))) & 7) << 8)
+            neg = ((qh[:, e // 4] >> 15) & 1) == 1
+            s16 = ((qh >> 12) & 7)[:, np.arange(16) // 2]
+            d = raw["d"].astype(np.float32)[:, None]
+        else:
+            nib = (raw["qh"][:, e // 2].astype(np.int64) >> (4 * (e % 2))) & 15
+            idx = raw["qs"].astype(np.int64) | ((nib & 7) << 8)
+            neg = (nib & 8) != 0
+            sc = raw["sc"].astype(np.int64)
+            k = np.arange(16)
+            s16 = (sc[:, k // 4] >> (3 * (k % 4))) & 7
+            dbits = ((sc[:, 0] >> 12) | ((sc[:, 1] >> 8) & 0xF0) | ((sc[:, 2] >> 4) & 0xF00) | (sc[:, 3] & 0xF000))
+            d = dbits.astype(np.uint16).view(np.float16).astype(np.float32)[:, None]
+        g = _iq_grid64("IQ1S_GRID", 2048)[idx].view(np.int8).astype(np.float32)        # (nb, 32, 8)
+        g = g + np.where(neg, -0.125, 0.125)[:, :, None]
+        dl = d * (2 * s16 + 1).astype(np.float32)
+        return (g.reshape(nb, 16, 16) * dl[:, :, None]).astype(np.float32).reshape(-1)[:count]
+    if t == IQ3_XXS:
+        # index i (64 a block) gives values 4 i .. 4 i + 3; part j of 32 values has the word ss[j]:
+        # the 7 sign bits of its values 8 l .. 8 l + 7 at 7 l (the 8th their parity), the scale s
+        # in bits 28-31: d (0.5 + s) / 2
+        nb = raw.shape[0]
+        g = _iq3_grid("IQ3XXS_GRID", 256)[raw["qs"].astype(np.int32)].reshape(nb, 8, 32).astype(np.float32)
+        ss = raw["ss"].astype(np.uint32)
+        l = np.arange(4, dtype=np.uint32)
+        s7 = (ss[:, :, None] >> (7 * l)) & 127                                      # (nb, 8, 4)
+        par = np.array([bin(i).count("1") & 1 for i in range(128)], np.uint32)
+        s8 = s7 | (par[s7] << 7)
+        bits = (s8[:, :, :, None] >> np.arange(8, dtype=np.uint32)) & 1             # (nb, 8, 4, 8)
+        db = raw["d"].astype(np.float32)[:, None] * (0.5 + (ss >> 28).astype(np.float32)) * 0.5
+        out = np.where(bits.reshape(nb, 8, 32) == 1, -g, g) * db[:, :, None]
         return out.astype(np.float32).reshape(-1)[:count]
     if t == Q8_0:
         return (raw["qs"].astype(np.float32) * raw["d"].astype(np.float32)[:, None]).reshape(-1)[:count]
@@ -835,9 +1019,12 @@ class GGUF:
         18 bytes: a float16 scale and 16 nibble bytes. The value of a nibble is
         the nibble minus 8. The layout is the same. Thus the function copies no
         data. packed is a view into the file map.
+
+        A Q4X tensor (the weightkeeper's) gives its KQ_Q4X bytes in the same
+        shape and None for the scales (they are in the groups).
         """
         dims, t, _o = self.tensors[self._gguf(hf_name)]
-        if t != Q4_0:
+        if t not in (Q4_0, Q4X):
             raise ValueError("%s is %s, not Q4_0" % (hf_name, _TYPE_NAME.get(t, t)))
         shape = tuple(reversed(dims))
         count = int(np.prod(dims))
@@ -845,6 +1032,8 @@ class GGUF:
         raw = self._blocks(hf_name, 0, nblk)
         groups = shape[-1] // 32
         packed = raw.view(np.uint8).reshape(shape[:-1] + (groups, 18))
+        if t == Q4X:
+            return packed, None
         scales = raw["d"].astype(np.float32).reshape(shape[:-1] + (groups,))
         return packed, np.ascontiguousarray(scales)
 
@@ -855,21 +1044,27 @@ class GGUF:
         large for the memory.
         """
         dims, t, _o = self.tensors[self._gguf(hf_name)]
-        if t != Q4_0 or len(dims) != 3:
+        if t not in (Q4_0, Q4X) or len(dims) != 3:
             raise ValueError("%s is not a 3-D Q4_0 tensor" % hf_name)
         shape = tuple(reversed(dims))          # (experts, out, in)
         nblk_row = shape[-1] // 32
         first = start * shape[1] * nblk_row
         raw = self._blocks(hf_name, first, (stop - start) * shape[1] * nblk_row)
         packed = raw.view(np.uint8).reshape((stop - start, shape[1], nblk_row, 18))
+        if t == Q4X:
+            # (an expert's rows are whole groups of 16: its bytes are its own)
+            return packed, None
         scales = raw["d"].astype(np.float32).reshape((stop - start, shape[1], nblk_row))
         return packed, np.ascontiguousarray(scales)
 
     # ---- the configuration ------------------------------------------------
 
     def text_config(self):
-        """Return a Hugging Face text_config dict from the GGUF metadata."""
-        m = self.meta
+        """Return a Hugging Face text_config dict from the GGUF metadata (the
+        keys of the file's architecture: gemma4, or gemma4-assistant for a
+        drafter)."""
+        a = self.meta.get("general.architecture", "gemma4")
+        m = {("gemma4." + k[len(a) + 1:] if k.startswith(a + ".") else k): v for k, v in self.meta.items()}
         head_kv = np.asarray(m["gemma4.attention.head_count_kv"])
         if head_kv.ndim == 0:
             # The E4B file gives one value for every layer.
@@ -898,7 +1093,8 @@ class GGUF:
             "vocab_size": 262144,
             "max_position_embeddings": int(m["gemma4.context_length"]),
             "sliding_window": int(m["gemma4.attention.sliding_window"]),
-            "final_logit_softcapping": float(m["gemma4.final_logit_softcapping"]),
+            "final_logit_softcapping": (float(m["gemma4.final_logit_softcapping"])
+                                        if "gemma4.final_logit_softcapping" in m else None),
             "attention_k_eq_v": not has_v,
             "num_kv_shared_layers": int(m.get("gemma4.attention.shared_kv_layers", 0) or 0),
             "hidden_size_per_layer_input": int(
@@ -985,6 +1181,10 @@ class GGUF:
 _BPE_PRE = {
     "lfm2": (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|"
              r"\s*[\r\n]+|\s+(?!\S)|\s+", True),
+    # Qwen3.5 to Qwen3.8 (llama.cpp's qwen35: the pattern of their tokenizer.json, NFC; byteshape's
+    # Qwen3.8-27B GGUF files have no tokenizer.json beside them)
+    "qwen35": (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+"
+               r"[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", False, {"type": "NFC"}),
 }
 
 
@@ -1004,7 +1204,7 @@ def bpe_tokenizer_data(g):
                   "merges": g.meta_strings("tokenizer.ggml.merges"), "ignore_merges": pre[1]},
         "added_tokens": [{"content": t, "id": i, "special": True} for i, t in enumerate(tokens)
                          if i < types.size and int(types[i]) in (3, 4)],
-        "normalizer": None,
+        "normalizer": pre[2] if len(pre) > 2 else None,
         "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
             {"type": "Split", "pattern": {"Regex": pre[0]}, "behavior": "Isolated", "invert": False},
             {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]},

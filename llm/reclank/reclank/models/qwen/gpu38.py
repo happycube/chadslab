@@ -176,20 +176,24 @@ class _DevCache4(_DevCache):
 class Qwen4GPU(QwenGPU):
     """Qwen3.8-Flash-Next (a Qwen4CPU) on the GPU; see the module text."""
 
-    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None):
-        self.head_progs = {}
-        self.mtp_progs = {}
-        self.sel_bufs = {}
-        self._qpos_version = -1
-        self._qsa_buf = None        # the scratch of QSA_SELECT (_params)
-        self.mcache = None
+    f20_first = False       # (its kernels read no F20 rows)
+
+    def __init__(self, model, hot_gb=None, counts=None, graph=True, ctx=None, free0=None):
         L = model.cfg.num_hidden_layers
         self.has_mtp = "blk.%d.nextn.eh_proj.weight" % L in model.g.tensors
         self.model = model
         # RQ8_0 experts: the MoE kernels of the GPU rotate the act (Qwen4CPU
         # sets those of the CPU)
         lib().rc_gpu_set_moe_rot(int(getattr(model, "rot_experts", False)))
-        super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph, ctx=ctx)
+        super().__init__(model, hot_gb=hot_gb, counts=counts, graph=graph, ctx=ctx, free0=free0)
+
+    def _device_state(self):
+        super()._device_state()
+        self._qpos_version = -1
+        self._qsa_buf = None        # the scratch of QSA_SELECT (_params)
+
+    def _device_init(self):
+        super()._device_init()
         self.cache_dev = _DevCache4()
         self.cache_dev.before = self._share_before
 
@@ -347,8 +351,10 @@ class Qwen4GPU(QwenGPU):
         Return the input of the head of each token."""
         t = len(tokens)
         size = size or t
+        # (the pool first: _warm_on can free the programs of a prompt, this one too once made; a
+        # part of a prompt keeps them, QwenGPU._warm_on)
+        self._warm_on(prompt=not verify)
         prog, g = self._group(size, verify, fetch)
-        self._warm_on()
         if self.hot_cache is not None:
             self.hot_cache.prepare(wait=fetch)
         if fetch:
@@ -434,8 +440,8 @@ class Qwen4GPU(QwenGPU):
         t = len(ids)
         size = next((s for s in (1, 2, 4, 8, 16, 64, 128, 256) if s >= t), None)
         assert size is not None, "a group of the MTP layer has at most 256 rows"
+        self._warm_on(prompt=size > MT)
         prog, g = self._mtp_group(size)
-        self._warm_on()
         if self.hot_cache is not None:
             self.hot_cache.prepare()
         e, h = prog.names["e"], prog.names["h"]
@@ -706,6 +712,6 @@ def generate_mtp_gpu(dev, prompt, n_new, draft=3, stop=None, stats=None, mtp_cpu
     if stats is not None:
         stats.update(rounds=st["steps"], accepted=st["accepted"], drafted=st["drafts"],
                      in_set=st["in_set"], decode_s=time.time() - t_start, draft=st["draft_s"],
-                     verify=st["verify_s"])
+                     verify=st["verify_s"], by_k=st.get("by_k", {}))
     return out[:n_new]
 

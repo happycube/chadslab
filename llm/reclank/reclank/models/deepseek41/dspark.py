@@ -1,6 +1,10 @@
 """DSpark of DeepSeek V4.1 Flash on the GPU (DEEPSEEK_V41_PLAN.md Phase 5): the
 draft of 5 tokens and the loop of the speculative decoding.
 
+Ported from DeepSeek V4.1 Flash's reference code
+(deepseek-ai/DeepSeek-V4.1-Flash-1017, inference/model.py; MIT License;
+Copyright (c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+
 The drafter (the reference's DSparkBlock, model.py; mtp.0 .. mtp.2 of the
 checkpoint): three blocks with the window attention only (128 positions, the
 rope of the window layers) and 128 routed experts each (top 3, all on the
@@ -51,7 +55,7 @@ STOP, STOP_FLOOR = 0.9, 0.3
 class DSpark:
     """See the module text."""
 
-    def __init__(self, g, where="cpu", stop=None):
+    def __init__(self, g, where="cpu", stop=None, host=None):
         """where: the routed experts of the blocks on the GPU ("gpu": 7.2 GB of
         its memory), or in the RAM of both nodes, run by the teams of the main
         model's parts ("cpu": the GPU's memory for more hot experts of the main
@@ -61,7 +65,8 @@ class DSpark:
         the survival of their prefix (the product of the sigmoids of the
         confidences) is at least stop, and the first under it when its survival
         is at least STOP_FLOOR; 0: the length of the most expected tokens a
-        millisecond (choose)."""
+        millisecond (choose). host: the DSpark of this model before a release of the GPU (its
+        reload: g remade): its experts in RAM ("cpu", "cpu1") kept, not packed again."""
         self.g = g
         self.where = where
         m = g.m
@@ -76,7 +81,7 @@ class DSpark:
         self.rings = [g.cache_rows(m.win, m.head_dim, "w") for _ in range(self.blocks)]
         for r in self.rings:
             g.mirror.add(r)
-        self._experts()
+        self._experts(host)
         self.markov_embed = g._put(self._bf12_values("mtp.%d.markov_head.embed.weight" % (self.blocks - 1)))
         self.progs = {}
         self.scratch = {}           # the arrays of the seed programs (one at a time) share these
@@ -97,7 +102,7 @@ class DSpark:
         bits = cops.kq_bf12_to_bf16(rows, b.shape[0], b.shape[1])
         return (bits.astype(np.uint32) << 16).view(np.float32)
 
-    def _experts(self):
+    def _experts(self, host=None):
         """The routed experts of the blocks, whole, in KQ_MXX: on the GPU (a
         store of E slots for each block, its map the identity), in the RAM of
         both nodes as the main model's cold experts ("cpu": ExpertParts of a
@@ -107,6 +112,9 @@ class DSpark:
         g, src = self.g, self.g.w.src
         H, I = src.hidden, src.inner
         self.stores, self.maps = [], []
+        if self.where in ("cpu", "cpu1") and host is not None and host.where == self.where:
+            self.ram, self.parts, self.part_bufs = host.ram, host.parts, {}
+            return
         if self.where in ("cpu", "cpu1"):
             from reclank.runtime import moe_parts, numa
             if self.where == "cpu":
@@ -155,7 +163,9 @@ class DSpark:
                 host = np.concatenate([w1.reshape(-1), w3.reshape(-1), w2.reshape(-1)])
                 assert host.nbytes == g.per
                 _check(lib().rc_gpu_h2d(buf.ptr + e * g.per, host.ctypes.data, g.per))
-            self.stores.append(ph)
+            # (GP_DS_HOT_MOE's store: the table of each slot's address)
+            tab = buf.ptr + np.arange(self.E, dtype=np.int64) * g.per
+            self.stores.append(tab)
             self.maps.append(np.arange(self.E, dtype=np.int32))
 
     # ---- the programs

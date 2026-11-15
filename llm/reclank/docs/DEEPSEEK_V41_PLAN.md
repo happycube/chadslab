@@ -559,6 +559,30 @@ weightkeeper's segments (ExpertParts.from_desc; the rows form, flag 64), and
 GP_DS_COMBINE adds the de rows in the order of the router. The engram rows
 and the embedding come from the host for now.
 
+**The engram rows from the NVMe** (models/deepseek41/engram_rows.py): each token's
+24 rows of each engram layer (256 codes, 8 scales) are random rows of tables of
+98 GB. Fancy indexing of the shard's map read them by page faults one at a time,
+each reading around it (the device's 128 KB read-ahead): a 1000-token prompt's
+48000 rows 18.5 s cold, 175 KB read from the NVMe a row, the page cache filled
+with rows no one asks for; a server's prompt of new text ran at 67-104 tok/s.
+EngramReader reads them through the page cache straight into the programs'
+arrays, from pools of workers made once on the start CPUs less the parts' teams
+(the server's 21 and 45; csrc/common/rowread.c, cops.RowsPool; the GIL free): by
+io_uring (raw syscalls; 4 rings of 64 for a prompt's rows and 4 for a step's),
+else, when io_uring cannot be set up or with RECLANK_DS_ENGRAM_URING=0, by pread
+(32 workers, 8 for a step). The real 16K prompt's 1.54M reads (2.8 KB from the
+NVMe a read) on those 2 CPUs: io_uring 5.05 s cold and 9.7 CPU-s, 1.19 s warm;
+pread 6.52 s and 12.4 CPU-s, 1.35 s warm; on 47 CPUs 2.84 and 4.03 s (10.9 and 30
+CPU-s: the NVMe's ~540K reads a second; O_DIRECT reads 46% more and as fast
+cold, and gives no reuse). A step's 96 reads 1.19 ms cold and 0.31 warm (pread
+1.79 and 0.32; one read after another 10.1 and 0.23). (The first form's "18 us a
+row" had its workers on the one CPU the calling thread is bound to.) EngramAhead
+reads a prompt's rows on a thread of its own (the hashes once: Hashes.ids needs
+only the ids and the positions, and keeps the ids for the look-back of the groups
+after; the engine starts it for the whole prompt, the lanes' parts and the groups
+take theirs in turn), in chunks of 1024 tokens at most 16K before the group that
+takes them, while the GPU and the parts run the groups before.
+
 scripts/check_dsv41_gpu_step.py, against the CPU model from the same state
 (near): the prompt of 16 tokens, 3 steps: the same experts in every layer,
 the same top token, logits -40 to -43 dB (KL 1e-8 to 4e-4), layer 0 at -110

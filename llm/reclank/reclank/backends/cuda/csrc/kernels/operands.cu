@@ -13,6 +13,25 @@ __device__ __forceinline__ float df(const gp_rec *r, const int64_t *e, int k)
 #define DP(T, k) ((T *)(intptr_t)di(r, e, (k)))
 #define DI(k) ((int)di(r, e, (k)))
 
+/* A GP_KQ_LINEAR record's x, w and out (operands 3, 4 and 9) for a kernel that takes them as pointers: when its
+ * launch gives the record (rp; the pointer arguments null), the kernel reads them there, so a chain's body
+ * (runtime/graphs.cu) runs it for every layer of its kind. */
+#define GG_RP_KQ(rp, re, w, x, out)                                                                  \
+    do {                                                                                             \
+        if ((rp) != NULL) {                                                                          \
+            (x) = (const float *)(intptr_t)di((rp), (re), 3);                                        \
+            (w) = (const uint8_t *)(intptr_t)di((rp), (re), 4);                                      \
+            (out) = (float *)(intptr_t)di((rp), (re), 9);                                            \
+        }                                                                                            \
+    } while (0)
+/* and its factor of every output (operand 10, 1 without it: Super's FP8 tensor scale, the MXFP8 kernels) */
+#define GG_RP_SC(rp, re, sc)                                                                         \
+    do {                                                                                             \
+        if ((rp) != NULL) {                                                                          \
+            (sc) = (rp)->tag[10] != GP_T_NONE ? df((rp), (re), 10) : 1.f;                            \
+        }                                                                                            \
+    } while (0)
+
 /* The pool of HotCache (gpumm.ExpertPool): expert blocks on the GPU in
  * segments of GG_POOL_K blocks that come and go. A slot value KQH_WARM + i is
  * block i: segment i / GG_POOL_K, place i % GG_POOL_K, at the stride of its

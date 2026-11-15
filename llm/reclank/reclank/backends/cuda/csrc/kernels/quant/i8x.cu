@@ -8,7 +8,7 @@
 __host__ __device__ __forceinline__ int kq_i8_type(int type)
 {
     return type == KQ_Q8_R || type == KQ_Q8_0 || type == KQ_Q4_K || type == KQ_Q5_K ||
-           type == KQ_Q6_K || type == KQ_Q4_0;
+           type == KQ_Q6_K || type == KQ_Q4_0 || kq_iq_type(type);
 }
 
 /* kq_row_i8 for NT tokens (t <= NT of them live): the x of token j is at
@@ -194,6 +194,9 @@ __device__ void kq_rows_i8(int type, const uint8_t *w, const float *x, const int
                 }
             }
         }
+    } else if (kq_iq_type(type)) {
+        /* Q3_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ4_XS (kernels/quant/iq.cuh) */
+        kq_rows_iq<NT, HALF>(type, w, xq, xs, cols, t, sum);
     } else {
         const __half *d = (const __half *)(w + cols);
         for (int c = 16 * lane; c < cols; c += HALF ? 256 : 512) {
@@ -420,6 +423,105 @@ __global__ void k_kq_multi_i8(const gp_rec *r, const int64_t *e, const int8_t *x
     } else {
         kq_row_i8_t<NT == 0 ? 1 : NT>(type, w, DP(const float, 0), xq, xs, cols, t,
                                        DP(float, 7 + 4 * m) + row, (size_t)rows);
+    }
+}
+
+/* ---------- the products of a step and a small group of one type ----------
+ * GP_KQ_LINEAR (m < 0), or matrix m of a GP_KQ_MULTI (one launch for each matrix: the matrices of a UD file
+ * have types of their own), of the type FT fixed when the kernel compiles: the K formats Q4_K, Q5_K, Q6_K
+ * (kq_rows_i8) and those of kernels/quant/iq.cuh (kq_rows_iq_t inline). The generic k_kq_linear_i8 holds
+ * the code of all the types in 144 registers: 23% of the warps of an SM, which then wait on the loads of
+ * the weights (a matrix of 17408 x 5120 took 90-100 us in any format, IQ1_S to Q6_K). NT: the tokens (1, 2,
+ * 3, 4; KQ_G8 for 5 to 8). Each token adds its terms in the order of kq_rows_i8: the bits of the generic
+ * kernels, and of a step for a token of a group. RECLANK_GPU_KQ_FT=0: the generic kernels. */
+template <int FT, int NT>
+__global__ void __launch_bounds__(32 * KQ_RPB) k_kq_ft(const gp_rec *r, const int64_t *e, const int8_t *xq,
+                                                      const float *xs, int m)
+{
+    PDL_START();
+    int row = blockIdx.x * KQ_RPB + threadIdx.x / 32;
+    int cols = m < 0 ? DI(7) : DI(1), t = m < 0 ? DI(8) : DI(2), rows = m < 0 ? DI(6) : DI(6 + 4 * m);
+    if (row >= rows) {
+        return;
+    }
+    const uint8_t *w = DP(const uint8_t, m < 0 ? 4 : 4 + 4 * m) + (size_t)row * kq_row_bytes(FT, cols);
+    float *out = DP(float, m < 0 ? 9 : 7 + 4 * m) + row;
+    float res[NT];
+    if constexpr (kq_iq_c(FT)) {
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            res[j] = 0.f;
+        }
+        kq_rows_iq_t<FT, NT, false>(w, xq, xs, cols, t, res);
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            for (int o = 16; o > 0; o >>= 1) {
+                res[j] += __shfl_xor_sync(RC_FULL_MASK, res[j], o);
+            }
+        }
+    } else {
+        kq_rows_i8<NT>(FT, w, DP(const float, m < 0 ? 3 : 0), xq, xs, cols, t, res);
+    }
+    if (threadIdx.x % 32 == 0) {
+        for (int j = 0; j < t && j < NT; ++j) {
+            out[(size_t)j * rows] = res[j];
+        }
+    }
+}
+
+/* The types of k_kq_ft (Q4_0 keeps its kernels: k_kq_linear_i8 FT, the two rows a warp). Q8_0 and Q8_R too:
+ * the small rows of a DeltaNet layer's KQ_MULTI (in_proj_a, in_proj_b) beside its K or IQ matrices, which
+ * otherwise took the generic kernel for all four (8.9 of the 38 ms of a step of Qwen3.8-27B UD-IQ3_XXS). */
+static int kq_ft_type(int type)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_KQ_FT");
+        on = !(v && v[0] == '0');
+    }
+    return on && (type == KQ_Q4_K || type == KQ_Q5_K || type == KQ_Q6_K || type == KQ_Q8_0 || type == KQ_Q8_R ||
+                  kq_iq_type(type));
+}
+
+template <int FT>
+static void kq_ft_launch_t(int64_t t, unsigned grid, cudaStream_t s, const gp_rec *dr, const int64_t *denv,
+                           const int8_t *xq, const float *xs, int m)
+{
+    if (t <= 1) {
+        k_kq_ft<FT, 1><<<grid, 32 * KQ_RPB, 0, s>>>(dr, denv, xq, xs, m);
+    } else if (t == 2) {
+        k_kq_ft<FT, 2><<<grid, 32 * KQ_RPB, 0, s>>>(dr, denv, xq, xs, m);
+    } else if (t == 3) {
+        k_kq_ft<FT, 3><<<grid, 32 * KQ_RPB, 0, s>>>(dr, denv, xq, xs, m);
+    } else if (t == 4) {
+        k_kq_ft<FT, 4><<<grid, 32 * KQ_RPB, 0, s>>>(dr, denv, xq, xs, m);
+    } else {
+        k_kq_ft<FT, KQ_G8><<<grid, 32 * KQ_RPB, 0, s>>>(dr, denv, xq, xs, m);
+    }
+}
+
+/* k_kq_ft of a type of kq_ft_type for t <= KQ_G8 tokens; rows: the rows of the matrix. */
+static void kq_ft_launch(int type, int64_t t, int64_t rows, cudaStream_t s, const gp_rec *dr, const int64_t *denv,
+                         const int8_t *xq, const float *xs, int m)
+{
+    unsigned grid = (unsigned)((rows + KQ_RPB - 1) / KQ_RPB);
+    switch (type) {
+    case KQ_Q4_K: kq_ft_launch_t<KQ_Q4_K>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q5_K: kq_ft_launch_t<KQ_Q5_K>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q6_K: kq_ft_launch_t<KQ_Q6_K>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q8_0: kq_ft_launch_t<KQ_Q8_0>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q8_R: kq_ft_launch_t<KQ_Q8_R>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q2_K: kq_ft_launch_t<KQ_Q2_K>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_Q3_K: kq_ft_launch_t<KQ_Q3_K>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ1_S: kq_ft_launch_t<KQ_IQ1_S>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ1_M: kq_ft_launch_t<KQ_IQ1_M>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ2_XXS: kq_ft_launch_t<KQ_IQ2_XXS>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ2_XS: kq_ft_launch_t<KQ_IQ2_XS>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ2_S: kq_ft_launch_t<KQ_IQ2_S>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ3_XXS: kq_ft_launch_t<KQ_IQ3_XXS>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ3_S: kq_ft_launch_t<KQ_IQ3_S>(t, grid, s, dr, denv, xq, xs, m); break;
+    case KQ_IQ4_NL: kq_ft_launch_t<KQ_IQ4_NL>(t, grid, s, dr, denv, xq, xs, m); break;
+    default: kq_ft_launch_t<KQ_IQ4_XS>(t, grid, s, dr, denv, xq, xs, m); break;
     }
 }
 
@@ -676,6 +778,15 @@ __device__ void kq_dequant8(int type, const uint8_t *w, int cols, int c0, float 
         kq_iq2r_dequant8(w, cols, c0, v);
         return;
     }
+    if (kq_iq_type(type)) {
+        kq_iq_dequant8(type, w, c0, v);
+        return;
+    }
+    if (kq_pr_type(type)) {
+        /* pr_fmt.cuh's rows (a call) */
+        kq_pr_dequant8(type, w, cols, c0, v);
+        return;
+    }
     if (type == KQ_F32) {
         float4 a = *(const float4 *)((const float *)w + c0);
         float4 b = *(const float4 *)((const float *)w + c0 + 4);
@@ -792,10 +903,12 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
     }
     for (int k0 = 0; k0 < cols; k0 += KG_K) {
         float v[8];
-        if (wrow != NULL && type == KQ_NVX) {
+        /* (cols a multiple of 8 past the last 32: zeros past cols) */
+        const bool in = k0 + lc < cols;
+        if (wrow != NULL && in && type == KQ_NVX) {
             int row = r0 + lr;
             kq_dequant8_nvx(W + (size_t)(row & ~15) * rb, row & 15, k0 + lc, v);
-        } else if (wrow != NULL) {
+        } else if (wrow != NULL && in) {
             kq_dequant8(type, wrow, cols, k0 + lc, v);
         } else {
             for (int u = 0; u < 8; ++u) {
@@ -806,7 +919,7 @@ __device__ void kq_tile(int type, const uint8_t *W, size_t rb, int nrows, int r0
         for (int u = 0; u < 8; ++u) {
             Ws[lc + u][lr] = v[u];
         }
-        if (xrow != NULL) {
+        if (xrow != NULL && in) {
             float4 a = *(const float4 *)(xrow + k0 + lc), b = *(const float4 *)(xrow + k0 + lc + 4);
             v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
             v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;

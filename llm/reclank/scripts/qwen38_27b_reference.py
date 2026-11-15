@@ -148,7 +148,8 @@ def main():
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--only", default=None, help="names of prompts, comma separated")
     ap.add_argument("--threads", type=int, default=20)
-    ap.add_argument("--forced", default=None, help="an npz of ids and gen: the logits of those tokens")
+    ap.add_argument("--forced", default=None, help="an npz of ids and gen (or several, comma-separated, one load "
+                    "of the weights): the logits of those tokens")
     a = ap.parse_args()
 
     import torch
@@ -164,11 +165,12 @@ def main():
     model = build(a.model, sh)
     cfg = model.config
 
-    if a.forced:
-        z = np.load(a.forced)
+    for forced in (a.forced.split(",") if a.forced else []):
+        z = np.load(forced)
         toks = z["ids"].tolist() + z["gen"].tolist()
         cache = DynamicCache(config=cfg)
-        rec = {k: [] for k in ("top_ids", "top_vals", "lse", "argmax")}
+        # nxt: the logit of the next token of each row (the loss of the text; the last row: nan)
+        rec = {k: [] for k in ("top_ids", "top_vals", "lse", "argmax", "nxt")}
         t0 = time.time()
         for c0 in range(0, len(toks), 256):
             ch = toks[c0:c0 + 256]
@@ -179,10 +181,17 @@ def main():
             rec["top_vals"].append(tv.numpy())
             rec["lse"].append(torch.logsumexp(lg, dim=-1).numpy())
             rec["argmax"].append(lg.argmax(-1).numpy().astype(np.int32))
-            log("forced: %d of %d rows (%.0f s)" % (c0 + len(ch), len(toks), time.time() - t0))
-        out = os.path.join(a.out, os.path.basename(a.forced)[:-4] + "_ref.npz")
+            nx = np.full(len(ch), np.nan, np.float32)
+            for j in range(len(ch)):
+                if c0 + j + 1 < len(toks):
+                    nx[j] = float(lg[j, toks[c0 + j + 1]])
+            rec["nxt"].append(nx)
+            log("forced %s: %d of %d rows (%.0f s)" % (os.path.basename(forced), c0 + len(ch), len(toks),
+                                                       time.time() - t0))
+        out = os.path.join(a.out, os.path.basename(forced)[:-4] + "_ref.npz")
         np.savez(out, ids=z["ids"], gen=z["gen"], **{k: np.concatenate(v) for k, v in rec.items()})
         log("written %s" % out)
+    if a.forced:
         return
 
     for name, msgs in prompts():

@@ -1,5 +1,8 @@
 /* ---------- the output head ---------- */
 
+/* dequantize_row_q6_K ported from ggml (ggml/src/ggml-quants.c; MIT License; Copyright (c)
+ * 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md. */
+
 /* x (cols), a Q6_K matrix, out (rows). One warp for each row. A Q6_K block
  * holds 256 weights in 210 bytes: ql[128], qh[64], scales[16] (int8), and a
  * float16 scale d. The function dequantize_row_q6_K of ggml gives weight y
@@ -187,6 +190,177 @@ __device__ __forceinline__ float q6m(uint32_t c, uint32_t h)
     constexpr int S = K == 3 ? 16 : 8 * K;
     const float f = __uint_as_float((v & (0x3Fu << S)) | 0x4B000000u);
     return fmaf(f, 1.f / (float)(1u << S), -(8388608.f / (float)(1u << S) + 32.f));
+}
+
+/* The Q6_K head in Q6R rows (gpu35 q6r_rows: the same values; a row of nb blocks is lo, nb x 128 bytes, values 2j
+ * and 2j + 1 the nibbles of byte j; hi, nb x 64, values 4j .. 4j + 3 the 2-bit pairs of byte j; the nb x 16 scales,
+ * a scale a 16 values; the nb float16 d's). A warp for RW rows, lane l for values 8 l .. 8 l + 7 of each block
+ * (one 4-byte and one 2-byte load); each block's values of the RW rows first, then the rows of x one at a time
+ * through the cache (x is not held for all of them: 134 -> 110 registers at RW 4, 2 blocks an SM in place of 1).
+ * The head of Qwen3.8-27B (5120 columns) on the 3090 at 220 W, 1 / 4 / 5 / 7 / 8 rows of x: 3.0 / 3.4 / 3.7 / 4.4 /
+ * 4.8 ms (x held: 3.0 / 5.3 / 5.5 / 6.1 / 6.4; k_q6k_head 4.4 / 7.6 / - / - / 10.9). Each row's sums have one order
+ * for any NX, nx and RW (a verify group's rows get the bits of the steps). NX 0: nx up to 8. */
+template <int RW, int NX>
+__global__ void __launch_bounds__(256) k_q6r_head(const uint8_t *w, const float *x, float *out, int rows, int cols,
+                                                  float cap, int nx)
+{
+    constexpr int NS = NX ? NX : 8;
+    if (NX) {
+        nx = NX;
+    }
+    PDL_START();
+    const int nb = cols / 256, l = threadIdx.x % 32;
+    const int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * RW;
+    const size_t rb = (size_t)nb * 210;
+    float sum[RW][NS];
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        #pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            sum[r][k] = 0.f;
+        }
+    }
+    for (int b = 0; b < nb; ++b) {
+        float wv[RW][8];
+        #pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            /* (a row past the end reads the last; its sums are not written) */
+            const uint8_t *wr = w + (size_t)min(row0 + r, rows - 1) * rb;
+            const uint32_t lo = __ldg((const uint32_t *)(wr + 128 * b + 4 * l));
+            const uint32_t hi = __ldg((const uint16_t *)(wr + (size_t)nb * 128 + 64 * b + 2 * l));
+            const float s = (float)(int8_t)__ldg(wr + (size_t)nb * 192 + 16 * b + l / 2);
+            const float d = __half2float(__ushort_as_half(__ldg((const uint16_t *)(wr + (size_t)nb * 208 + 2 * b))));
+            const float ds = d * s;
+            #pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                wv[r][u] = ds * q6v((int)(((lo >> (4 * u)) & 15) | (((hi >> (2 * u)) & 3) << 4)));
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            if (k < nx) {
+                const float4 *xp = (const float4 *)(x + (size_t)k * cols + 256 * b + 8 * l);
+                const float4 p = __ldg(xp), q = __ldg(xp + 1);
+                const float xv[8] = {p.x, p.y, p.z, p.w, q.x, q.y, q.z, q.w};
+                #pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    float acc = 0.f;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        acc += wv[r][u] * xv[u];
+                    }
+                    sum[r][k] += acc;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int row = row0 + r;
+        #pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            if (k < nx) {
+                float v = sum[r][k];
+                for (int o = 16; o > 0; o >>= 1) {
+                    v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+                }
+                if (l == 0 && row < rows) {
+                    out[(size_t)k * rows + row] = cap > 0.f ? cap * tanhf(v / cap) : v;
+                }
+            }
+        }
+    }
+}
+
+/* x rows to int8 for k_q6r_head_x8: groups of 32 values, a scale a group (max |x| / 127), a warp a group. */
+__global__ void __launch_bounds__(256) k_q6r_qx(const float *x, int8_t *xq, float *xs, int n)
+{
+    PDL_START();
+    const int g = blockIdx.x * 8 + threadIdx.x / 32, l = threadIdx.x % 32;
+    if (g >= n / 32) {
+        return;
+    }
+    const float v = x[(size_t)g * 32 + l];
+    float m = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(RC_FULL_MASK, m, o));
+    }
+    const float sc = m / 127.f;
+    xq[(size_t)g * 32 + l] = (int8_t)(sc > 0.f ? __float2int_rn(v / sc) : 0);
+    if (l == 0) {
+        xs[g] = sc;
+    }
+}
+
+/* A drafter's head (DFlash 2's candidates, DSpark's drafts: their logits choose drafts only, the verify takes
+ * k_q6r_head) on Q6R rows and int8 x (k_q6r_qx): lane l the values 8 l .. 8 l + 7 of each block (4 lanes a group
+ * of x), the 6-bit values as int8 (q - 32), two dp4a a row of x, times d s and the scale of x. RW rows a warp, at
+ * most 8 rows of x. The head of Qwen3.8-27B on the 3090 at 220 W, 7 / 8 rows of x (with k_q6r_qx): 3.6 / 3.8 ms
+ * (k_q6r_head 4.4 / 4.8); against its logits: the largest difference 0.035 (of 5.4), the same top 16 in 98%. */
+template <int RW>
+__global__ void __launch_bounds__(256) k_q6r_head_x8(const uint8_t *w, const int8_t *xq, const float *xs, float *out,
+                                                    int rows, int cols, int nx)
+{
+    PDL_START();
+    const int nb = cols / 256, l = threadIdx.x % 32;
+    const int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * RW;
+    const size_t rb = (size_t)nb * 210;
+    float sum[RW][8];
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            sum[r][k] = 0.f;
+        }
+    }
+    for (int b = 0; b < nb; ++b) {
+        int wa[RW], wb[RW];
+        float ds[RW];
+        #pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const uint8_t *wr = w + (size_t)min(row0 + r, rows - 1) * rb;
+            const uint32_t lo = __ldg((const uint32_t *)(wr + 128 * b + 4 * l));
+            const uint32_t hi = __ldg((const uint16_t *)(wr + (size_t)nb * 128 + 64 * b + 2 * l));
+            const float s = (float)(int8_t)__ldg(wr + (size_t)nb * 192 + 16 * b + l / 2);
+            ds[r] = __half2float(__ushort_as_half(__ldg((const uint16_t *)(wr + (size_t)nb * 208 + 2 * b)))) * s;
+            uint32_t a = 0, c = 0;
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                a |= (((lo >> (4 * u)) & 15) | (((hi >> (2 * u)) & 3) << 4)) << (8 * u);
+                c |= (((lo >> (4 * u + 16)) & 15) | (((hi >> (2 * u + 8)) & 3) << 4)) << (8 * u);
+            }
+            wa[r] = (int)__vsub4(a, 0x20202020u);
+            wb[r] = (int)__vsub4(c, 0x20202020u);
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k < nx) {
+                const int2 xv = __ldg((const int2 *)(xq + (size_t)k * cols + 256 * b + 8 * l));
+                const float sx = __ldg(xs + (size_t)k * (cols / 32) + 8 * b + l / 4);
+                #pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    const int d = rc_dp4a(wb[r], xv.y, rc_dp4a(wa[r], xv.x, 0));
+                    sum[r][k] += ds[r] * sx * (float)d;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int row = row0 + r;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k < nx) {
+                float v = sum[r][k];
+                for (int o = 16; o > 0; o >>= 1) {
+                    v += __shfl_xor_sync(RC_FULL_MASK, v, o);
+                }
+                if (l == 0 && row < rows) {
+                    out[(size_t)k * rows + row] = v;
+                }
+            }
+        }
+    }
 }
 
 /* k_q6k_head_s for a GPU without dp4a (Maxwell), the row staged as there: lane L takes 8 adjacent values

@@ -169,20 +169,22 @@ def _write_raw(name, raw):
 
 
 def log_answer(reasoning, content, calls, pending, raw):
-    """The parts of an answer to the log, and (with RAW_DIR) its raw text to
-    last-answer.txt there."""
+    """The sizes of an answer's parts to the log, and (with RAW_DIR) its raw
+    text to last-answer.txt there and its end to the log: no text of an
+    answer in the log without --debug."""
     _write_raw("last-answer.txt", raw)
-    print('[reclank] answer: reasoning %d chars, content %d chars, %d tool calls, unparsed %d chars; '
-          'end %r' % (reasoning, content, calls, pending, raw[-120:]), file=sys.stderr, flush=True)
+    end = "; end %r" % raw[-120:] if RAW_DIR else ""
+    print('[reclank] answer: reasoning %d chars, content %d chars, %d tool calls, unparsed %d chars%s' % (
+        reasoning, content, calls, pending, end), file=sys.stderr, flush=True)
 
 
 def log_empty(reasoning_chars, raw):
     """An answer with no content and no tool call: (with RAW_DIR) the raw
     text to a file there, and its start and end to the log."""
-    name = _write_raw("empty-%s-%s.txt" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6]),
-                      raw) or "(not written: no --debug)"
-    print('[reclank] empty answer (reasoning %d chars): raw %d chars in %s; start %r; end %r' % (
-        reasoning_chars, len(raw), name, raw[:160], raw[-160:]), file=sys.stderr, flush=True)
+    name = _write_raw("empty-%s-%s.txt" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6]), raw)
+    text = "; start %r; end %r" % (raw[:160], raw[-160:]) if RAW_DIR else ""
+    print('[reclank] empty answer (reasoning %d chars): raw %d chars%s%s' % (
+        reasoning_chars, len(raw), " in %s" % name if name else "", text), file=sys.stderr, flush=True)
 
 
 def usage_of(backend, prompt_ids, out):
@@ -267,7 +269,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(status, {"error": {"message": message, "type": kind, "code": code}})
 
     def _body(self):
-        """The JSON of the body. A Content-Length that is not a number, is
+        """The JSON of the body (_raw_body)."""
+        raw = self._raw_body()
+        return json.loads(raw) if raw.strip() else {}
+
+    def _raw_body(self):
+        """The bytes of the body. A Content-Length that is not a number, is
         negative, or is above the limit (MAX_BODY) gives _BodyError; the
         server does not read such a body and closes the connection."""
         text = self.headers.get("Content-Length")
@@ -282,8 +289,7 @@ class _Handler(BaseHTTPRequestHandler):
         if n > limit:
             self.close_connection = True
             raise _BodyError(413, "the body has %d bytes; the limit is %d" % (n, limit))
-        raw = self.rfile.read(n) if n else b""
-        return json.loads(raw) if raw.strip() else {}
+        return self.rfile.read(n) if n else b""
 
     def _sse_start(self):
         self._sent_at = time.monotonic()        # the keepalive counts from here
@@ -315,6 +321,38 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
+    def _admin(self, path, post):
+        """The GPU sharing's routes (server/gpushare.py): GET /v1/admin/gpu, POST /v1/admin/release
+        and /v1/admin/lock. True when path is one of them (answered)."""
+        if not path.startswith(("/v1/admin/", "/admin/")):
+            return False
+        share = getattr(self.server, "gpu_share", None)
+        name = path.rsplit("/", 1)[-1]
+        if share is None:
+            self._error(404, "this server does not share the GPU (--gpu-peers off, or no GPU)", code="not_found")
+        elif name == "gpu" and not post:
+            self._json(200, share.status())
+        elif name == "release" and post:
+            try:
+                body = self._body()
+            except _BodyError as exc:
+                self._error(exc.status, str(exc))
+                return True
+            except ValueError:
+                body = {}
+            want = body.get("bytes") if isinstance(body, dict) else None
+            self._json(200, share.release(int(want) if isinstance(want, (int, float)) and want > 0 else None))
+        elif name == "lock" and post:
+            try:
+                self._json(200, share.lock(self._body()))
+            except _BodyError as exc:
+                self._error(exc.status, str(exc))
+            except (ValueError, TypeError) as exc:
+                self._error(400, str(exc))
+        else:
+            self._error(404, "unknown path: " + path, code="not_found")
+        return True
+
     # ---- routes ------------------------------------------------------------
 
     def do_OPTIONS(self):
@@ -335,8 +373,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             return
+        if self._admin(path, False):
+            return
         if path in ("/v1/models", "/models"):
-            self._json(200, {"object": "list", "data": [backend.model_info()]})
+            info = backend.model_info()
+            share = getattr(self.server, "gpu_share", None)
+            if share is not None:
+                info = dict(info, gpu_locked=bool(share.models().get(info.get("id"))))
+            self._json(200, {"object": "list", "data": [info]})
         elif path.startswith("/v1/models/") or path.startswith("/models/"):
             self._json(200, backend.model_info(path.rsplit("/", 1)[-1]))
         else:
@@ -347,6 +391,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True       # the body stays unread
             return
         path = urlsplit(self.path).path.rstrip("/")
+        if self._admin(path, True):
+            return
         if path.endswith("/chat/completions"):
             self._chat()
         elif path.endswith("/completions"):
@@ -381,6 +427,9 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._error(400, "prompt failed: %s" % exc)
             return
+        if hasattr(prompt_ids, "options"):
+            # an engine that reads fields of the request (DiffusionGemma: diffusion_drafts)
+            prompt_ids.options = req
         self._run(req, prompt_ids, chat=True)
 
     def _completions(self):
@@ -501,7 +550,12 @@ class _Handler(BaseHTTPRequestHandler):
         tok = backend.tokenizer
         out = []
         finish = "length"
+        self._drafts = []
         for token in self._gen(backend, prompt_ids, max_tokens, sampler, eos):
+            if isinstance(token, dict):
+                # a record between the tokens (DiffusionGemma's drafts): not a token
+                self._drafts.append(token)
+                continue
             out.append(token)
             if token in eos:
                 finish = "stop"
@@ -573,8 +627,11 @@ class _Handler(BaseHTTPRequestHandler):
             obj = "text_completion"
             choice = {"index": 0, "text": text, "logprobs": None,
                       "finish_reason": "stop" if cut else finish}
-        self._json(200, {"id": cid, "object": obj, "created": created,
-                         "model": model_id, "choices": [choice], "usage": usage})
+        body = {"id": cid, "object": obj, "created": created,
+                "model": model_id, "choices": [choice], "usage": usage}
+        if getattr(self, "_drafts", None):
+            body["diffusion_drafts"] = self._drafts
+        self._json(200, body)
 
     def _stream(self, req, prompt_ids, max_tokens, sampler, stops, eos, model_id, chat):
         backend = self.server.backend
@@ -662,6 +719,11 @@ class _Handler(BaseHTTPRequestHandler):
                 if kind == "error":
                     raise value
                 token = value
+                if isinstance(token, dict):
+                    # a record between the tokens (DiffusionGemma's drafts): an event of its own
+                    self._sse({"id": cid, "object": "diffusion.draft", "created": created,
+                               "model": model_id, "draft": token})
+                    continue
                 out.append(token)
                 if token in eos:
                     finish = "stop"
@@ -759,16 +821,18 @@ class _Server(ThreadingHTTPServer):
 
 
 def make_server(backend, host="127.0.0.1", port=8080, quiet=False, api_key=None,
-                cors_origin=None, max_body=None):
+                cors_origin=None, max_body=None, gpu_share=None):
     """Make the HTTP server. Use port 0 for a free port. api_key: the key
     that each request must give (None or "": no check); cors_origin: the
     origin of the CORS headers (None: no CORS headers)."""
-    httpd = _Server((host, port), _Handler)
+    from server import idle
+    httpd = idle.server(_Server, (host, port), _Handler)
     httpd.backend = backend
     httpd.quiet = quiet
     httpd.api_key = api_key or None
     httpd.cors_origin = cors_origin or None
     httpd.max_body = MAX_BODY if max_body is None else max_body
+    httpd.gpu_share = gpu_share
     return httpd
 
 
@@ -782,19 +846,26 @@ def add_http_args(ap):
                          "web page cannot call the server from a browser")
     ap.add_argument("--max-body-mb", type=float, default=MAX_BODY / (1 << 20),
                     help="the largest request body in MB (default %(default)s)")
+    from server.idle import add_idle_args
+    add_idle_args(ap)
 
 
 def serve(backend, host="127.0.0.1", port=8080, quiet=False, api_key=None, cors_origin=None,
-          max_body=None):
-    """Run the HTTP server until the process stops."""
-    httpd = make_server(backend, host, port, quiet, api_key, cors_origin, max_body)
+          max_body=None, gpu_share=None, idle_exit=None):
+    """Run the HTTP server until the process stops (or, with idle_exit, until it is idle that long:
+    server/idle.py; then return EXIT_IDLE). gpu_share: the server's part of the GPU's sharing
+    (server/gpushare.py: started here, with the port bound)."""
+    from server import idle
+    httpd = make_server(backend, host, port, quiet, api_key, cors_origin, max_body, gpu_share)
+    if gpu_share is not None:
+        gpu_share.start()
     where = "http://%s:%d/v1" % (host, httpd.server_address[1])
     print("reclank server %s  model=%s  key %s  CORS %s" % (
         where, backend.model_id, "required" if httpd.api_key else "OFF",
         httpd.cors_origin or "off"), flush=True)
     try:
-        httpd.serve_forever()
+        return idle.serve(httpd, idle_exit)
     except KeyboardInterrupt:
-        pass
+        return 0
     finally:
         httpd.server_close()

@@ -43,8 +43,11 @@ __device__ __forceinline__ void mxf8_step(const uint32_t *q, const float *s, con
 
 template <int R, int NT>
 __global__ void __launch_bounds__(256) k_mxf8_gemv(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                  float *out, float sc)
+                                                  float *out, float sc,
+        const gp_rec *rp, const int64_t *re)
 {
+    GG_RP_KQ(rp, re, w, x, out);
+    GG_RP_SC(rp, re, sc);
     int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
     if (row0 >= rows) {
         return;
@@ -113,8 +116,11 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv(const uint8_t *w, int rows, i
  * k_mxf8_gemv in the same order (the same bits). */
 template <int R, int NT>
 __global__ void __launch_bounds__(256) k_mxf8_gemv_s(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                    float *out, float sc)
+                                                    float *out, float sc,
+        const gp_rec *rp, const int64_t *re)
 {
+    GG_RP_KQ(rp, re, w, x, out);
+    GG_RP_SC(rp, re, sc);
     __shared__ __align__(16) float xsm[NT][512];
     int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
     const bool live = row0 < rows;
@@ -207,8 +213,11 @@ __global__ void __launch_bounds__(256) k_mxf8_gemv_s(const uint8_t *w, int rows,
 #define MXT_BM 64
 #define MXT_BN 32
 __global__ void __launch_bounds__(128) k_mxf8_tc(const uint8_t *w, int rows, int cols, const float *x, int t,
-                                                float *out, float osc)
+                                                float *out, float osc,
+        const gp_rec *rp, const int64_t *re)
 {
+    GG_RP_KQ(rp, re, w, x, out);
+    GG_RP_SC(rp, re, osc);
     __shared__ float tab[256];
     __shared__ float ws[MXT_BM][33];
     __shared__ float xs[MXT_BN][33];
@@ -294,6 +303,298 @@ __global__ void __launch_bounds__(128) k_mxf8_tc(const uint8_t *w, int rows, int
     }
 }
 
+/* k_mxf8_tc's place without the tensor cores (Pascal: Super's dense rows of a prompt group; k_mxf8_gemv took 8 tokens
+ * a pass, every row again for each 8): a block for 64 rows x 64 tokens, a thread 4 x 4 of them in float32; each 32
+ * columns the rows' E4M3 values (a table) and the tokens' bfloat16 x into shared memory (column-major: a thread's 4
+ * rows and 4 tokens one 16-byte load each), the next 32's loaded into registers during these; the sums of each 32
+ * then times the row's scale, as k_mxf8_tc's (the order of the 32 terms its own: not the same bits). */
+#define MXF_BM 64
+#define MXF_BN 64
+__global__ void __launch_bounds__(256) k_mxf8_gemm_f(const uint8_t *w, int rows, int cols, const float *x, int t,
+                                                    float *out, float osc,
+        const gp_rec *rp, const int64_t *re)
+{
+    GG_RP_KQ(rp, re, w, x, out);
+    GG_RP_SC(rp, re, osc);
+    __shared__ float tab[256];
+    __shared__ __align__(16) float ws[32][MXF_BM + 4];
+    __shared__ __align__(16) float xs[32][MXF_BN + 4];
+    __shared__ float sc[MXF_BM];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        tab[i] = e4m3f((uint32_t)i);
+    }
+    const size_t rb = kq_row_bytes(KQ_MXF8, cols);
+    const int r0 = blockIdx.x * MXF_BM, n0 = blockIdx.y * MXF_BN, tid = threadIdx.x, nb = cols / 32;
+    const int tx = tid % 16, ty = tid / 16;                 /* tokens 4 tx .. + 3, rows 4 ty .. + 3 */
+    const int lr = tid / 4, lp = tid % 4;                   /* the loader: a row's (a token's) 8 values lp */
+    const bool rok = r0 + lr < rows, tok = n0 + lr < t;
+    uint2 rq = make_uint2(0, 0);
+    float4 rx0 = make_float4(0.f, 0.f, 0.f, 0.f), rx1 = rx0;
+    uint8_t rsc = 0;
+    auto load = [&](int b) {
+        if (rok) {
+            rq = *(const uint2 *)(w + (size_t)(r0 + lr) * rb + 32 * b + 8 * lp);
+            if (lp == 0) {
+                rsc = w[(size_t)(r0 + lr) * rb + cols + b];
+            }
+        }
+        if (tok) {
+            const float *xp = x + (size_t)(n0 + lr) * cols + 32 * b + 8 * lp;
+            rx0 = *(const float4 *)xp;
+            rx1 = *(const float4 *)(xp + 4);
+        }
+    };
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            acc[i][j] = 0.f;
+    load(0);
+    for (int b = 0; b < nb; ++b) {
+        __syncthreads();
+        {
+            const uint32_t wv[2] = {rq.x, rq.y};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                ws[8 * lp + i][lr] = rok ? tab[(wv[i / 4] >> (8 * (i % 4))) & 255] : 0.f;
+            }
+            const float xv[8] = {rx0.x, rx0.y, rx0.z, rx0.w, rx1.x, rx1.y, rx1.z, rx1.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                xs[8 * lp + i][lr] = tok ? rc_bf16r_k(xv[i]) : 0.f;
+            }
+            if (lp == 0) {
+                sc[lr] = rok ? e8m0f(rsc) : 0.f;
+            }
+        }
+        __syncthreads();
+        if (b + 1 < nb) {
+            load(b + 1);
+        }
+        float part[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                part[i][j] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < 32; ++kk) {
+            const float4 a = *(const float4 *)&ws[kk][4 * ty], bx = *(const float4 *)&xs[kk][4 * tx];
+            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {bx.x, bx.y, bx.z, bx.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    part[i][j] = fmaf(av[i], bv[j], part[i][j]);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float s = sc[4 * ty + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc[i][j] = fmaf(part[i][j], s, acc[i][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int rr = r0 + 4 * ty + i;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int tt = n0 + 4 * tx + j;
+            if (rr < rows && tt < t) {
+                out[(size_t)tt * rows + rr] = rc_bf16r_k(acc[i][j]) * osc;
+            }
+        }
+    }
+}
+
+/* k_mxf8_gemm_f's place on Pascal with dp4a (RECLANK_GPU_MXF8_G8, default on: Super's dense rows of a prompt group,
+ * slight differences): each 32 of a row's E4M3 values (as floats) and of a token's x to int8 by their largest |value|
+ * (127 steps) in the loader, the next step's words in registers while the step at hand is summed (as nm.cu
+ * k_nm_gemm8d); a part's int sum (32 terms) to float by the magic number, times the row's scale (E8M0 times its int8
+ * step) and x's step into the sum; the output rounded to bfloat16 times osc. Against k_mxf8_gemm_f (random rows,
+ * Gaussian x): 0.8% relative RMS, as int8 x of the other int8 products. On the P6000, 4096 tokens: the Mamba in
+ * (18560 x 4096) 133 -> 77 ms (G8R 4, NP 2), out (4096 x 8192) 59 -> 28.5 (G8R 8, NP 1), attention q / o 29.7 -> 14.7. */
+#define MX8_SW(r, w) (NP >= 4 ? (((((w) >> 2) ^ ((r) & 7)) << 2) | ((w) & 3)) \
+                              : (((((w) >> 2) ^ ((r) & (2 * NP - 1))) << 2) | ((w) & 3)))
+__device__ __forceinline__ float mx8_i2f(int c) { return __int_as_float(c + 0x4B400000) - 12582912.f; }
+/* 8 floats to int8 by the largest |value| of the 4 lanes' 32 (lanes 4 apart in tid: a quad), into two words; its step */
+__device__ __forceinline__ float mx8_q8(const float *v, int &w0, int &w1)
+{
+    float m = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) m = fmaxf(m, fabsf(v[i]));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    const float iv = m > 0.f ? 127.f / m : 0.f;
+    uint32_t a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        a |= (uint32_t)(__float2int_rn(v[i] * iv) & 255) << (8 * i);
+        b |= (uint32_t)(__float2int_rn(v[4 + i] * iv) & 255) << (8 * i);
+    }
+    w0 = (int)a; w1 = (int)b;
+    return m * (1.f / 127.f);
+}
+template <int G8R, int G8T, int NP>
+__global__ void __launch_bounds__(256, 2) k_mxf8_g8(const uint8_t *w, int rows, int cols, const float *x, int t, float *out,
+                                                   float osc, const gp_rec *rp, const int64_t *re)
+{
+    GG_RP_KQ(rp, re, w, x, out);
+    GG_RP_SC(rp, re, osc);
+    constexpr int BM = 16 * G8R, BN = 16 * G8T, QW = BM / 64, QX = BN / 64, BK = 32 * NP;
+    __shared__ float tab[256];
+    __shared__ __align__(16) int ws[BM][BK / 4];
+    __shared__ __align__(16) int xs[BN][BK / 4];
+    __shared__ float wsc[BM][NP], xsc[BN][NP];
+    const int tid = threadIdx.x, r0 = blockIdx.x * BM, t0 = blockIdx.y * BN, l = tid % 4, ty = tid / 16, tx = tid % 16;
+    for (int i = tid; i < 256; i += blockDim.x) tab[i] = e4m3f((uint32_t)i);
+    const size_t rb = kq_row_bytes(KQ_MXF8, cols);
+    uint2 rq[QW][NP];
+    uint32_t rsb[QW][NP];
+    float4 rx[QX][NP][2];
+    auto load = [&](int k0) {
+#pragma unroll
+        for (int qq = 0; qq < QW; ++qq) {
+            const int row = r0 + tid / 4 + 64 * qq;
+#pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                const int kk = k0 + 32 * p;
+                rq[qq][p] = make_uint2(0, 0); rsb[qq][p] = 0;
+                if (row < rows && kk < cols) {
+                    const uint8_t *wr = w + (size_t)row * rb;
+                    rq[qq][p] = *(const uint2 *)(wr + kk + 8 * l);
+                    rsb[qq][p] = wr[cols + kk / 32];
+                }
+            }
+        }
+#pragma unroll
+        for (int qq = 0; qq < QX; ++qq) {
+            const int tok = t0 + tid / 4 + 64 * qq;
+#pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                const int kk = k0 + 32 * p;
+                rx[qq][p][0] = rx[qq][p][1] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (tok < t && kk < cols) {
+                    const float *xp = x + (size_t)tok * cols + kk + 8 * l;
+                    rx[qq][p][0] = *(const float4 *)xp;
+                    rx[qq][p][1] = *(const float4 *)(xp + 4);
+                }
+            }
+        }
+    };
+    float acc[G8R][G8T];
+#pragma unroll
+    for (int i = 0; i < G8R; ++i)
+#pragma unroll
+        for (int j = 0; j < G8T; ++j) acc[i][j] = 0.f;
+    load(0);
+    __syncthreads();
+    for (int k0 = 0; k0 < cols; k0 += BK) {
+#pragma unroll
+        for (int qq = 0; qq < QW; ++qq) {
+            const int rr = tid / 4 + 64 * qq;
+#pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                float v[8];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    v[i] = tab[(rq[qq][p].x >> (8 * i)) & 255];
+                    v[4 + i] = tab[(rq[qq][p].y >> (8 * i)) & 255];
+                }
+                int w0, w1;
+                const float st = mx8_q8(v, w0, w1);
+                ws[rr][MX8_SW(rr, 8 * p + 2 * l)] = w0;
+                ws[rr][MX8_SW(rr, 8 * p + 2 * l + 1)] = w1;
+                if (l == 0) wsc[rr][p] = st * e8m0f((uint8_t)rsb[qq][p]);
+            }
+        }
+#pragma unroll
+        for (int qq = 0; qq < QX; ++qq) {
+            const int tt = tid / 4 + 64 * qq;
+#pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                const float v[8] = {rx[qq][p][0].x, rx[qq][p][0].y, rx[qq][p][0].z, rx[qq][p][0].w,
+                                    rx[qq][p][1].x, rx[qq][p][1].y, rx[qq][p][1].z, rx[qq][p][1].w};
+                int w0, w1;
+                const float st = mx8_q8(v, w0, w1);
+                xs[tt][MX8_SW(tt, 8 * p + 2 * l)] = w0;
+                xs[tt][MX8_SW(tt, 8 * p + 2 * l + 1)] = w1;
+                if (l == 0) xsc[tt][p] = st;
+            }
+        }
+        __syncthreads();
+        if (k0 + BK < cols) load(k0 + BK);
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            if (k0 + 32 * p >= cols) break;
+            int4 xa[G8T], xb[G8T];
+            float xc[G8T];
+#pragma unroll
+            for (int j = 0; j < G8T; ++j) {
+                const int tt = tx + 16 * j;
+                xa[j] = *(const int4 *)&xs[tt][MX8_SW(tt, 8 * p)];
+                xb[j] = *(const int4 *)&xs[tt][MX8_SW(tt, 8 * p + 4)];
+                xc[j] = xsc[tt][p];
+            }
+#pragma unroll
+            for (int i = 0; i < G8R; ++i) {
+                const int rw = ty + 16 * i;
+                const int4 a = *(const int4 *)&ws[rw][MX8_SW(rw, 8 * p)];
+                const int4 b = *(const int4 *)&ws[rw][MX8_SW(rw, 8 * p + 4)];
+                const float sw = wsc[rw][p];
+#pragma unroll
+                for (int j = 0; j < G8T; ++j) {
+                    int c = rc_dp4a(a.x, xa[j].x, 0);
+                    c = rc_dp4a(a.y, xa[j].y, c);
+                    c = rc_dp4a(a.z, xa[j].z, c);
+                    c = rc_dp4a(a.w, xa[j].w, c);
+                    c = rc_dp4a(b.x, xb[j].x, c);
+                    c = rc_dp4a(b.y, xb[j].y, c);
+                    c = rc_dp4a(b.z, xb[j].z, c);
+                    c = rc_dp4a(b.w, xb[j].w, c);
+                    acc[i][j] = fmaf(mx8_i2f(c), sw * xc[j], acc[i][j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < G8R; ++i) {
+        const int row = r0 + ty + 16 * i;
+#pragma unroll
+        for (int j = 0; j < G8T; ++j) {
+            const int tok = t0 + tx + 16 * j;
+            if (row < rows && tok < t) out[(size_t)tok * rows + row] = rc_bf16r_k(acc[i][j]) * osc;
+        }
+    }
+}
+
+/* RECLANK_GPU_MXF8_G8=0: Pascal's groups on k_mxf8_gemm_f (float32, as before) */
+static int mxf8_g8_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_MXF8_G8");
+        on = !(v && v[0] == '0');
+    }
+    return on && gg_caps.dp4a && !gg_caps.tc;
+}
+
+/* k_mxf8_gemm_f for the groups of more than 8 tokens without the tensor cores, unless RECLANK_GPU_MXF8_F=0
+ * (k_mxf8_gemv: a measure); 1: on the tensor cores' GPUs too (a check against k_mxf8_tc) */
+static int mxf8_f_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_MXF8_F");
+        on = v ? atoi(v) : 2;
+    }
+    return on == 1 || (on == 2 && !gg_caps.tc);
+}
+
 /* n rows of a KQ_MXF8 matrix as their bfloat16 values (exact) into dst (n x cols): 16 values a
  * thread. */
 __global__ void k_mxf8_to_bf16(const uint8_t *w, int n, int cols, uint16_t *dst)
@@ -361,8 +662,14 @@ static int mxf8_stage_on(void)
 /* sc: a factor of every output after its rounding (Super's FP8 tensor scale: GP_MUL's product, the same bits;
  * 1 for FP4-Local's) */
 static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int cols, int t, float *out, float sc,
-                              uint16_t *w16, size_t w16_n, uint16_t *xb, size_t xb_n, cudaStream_t s)
+                              uint16_t *w16, size_t w16_n, uint16_t *xb, size_t xb_n, cudaStream_t s,
+                              const gp_rec *rp = NULL, const int64_t *re = NULL)
 {
+    /* (rp: the kernels below read x, w and out in the record, GG_RP_KQ; the tensor cores' chunks take them) */
+    const float *xa = rp != NULL ? NULL : x;
+    const uint8_t *wa = rp != NULL ? NULL : w;
+    float *oa = rp != NULL ? NULL : out;
+    const float sca = rp != NULL ? 0.f : sc;     /* (the kernels read it in the record too) */
     if (cols % 128 != 0) {
         return 1;
     }
@@ -386,9 +693,24 @@ static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int co
         k_round_bf16_n<<<(unsigned)((nv + 255) / 256), 256, 0, s>>>(out, nv, sc);
         return 0;
     }
+    if (t > 8 && mxf8_g8_on() && cols % 32 == 0) {
+        if (rows <= 8192) {
+            k_mxf8_g8<8, 4, 1><<<dim3((unsigned)((rows + 127) / 128), (unsigned)((t + 63) / 64)), 256, 0, s>>>(
+                wa, rows, cols, xa, t, oa, sca, rp, re);
+        } else {
+            k_mxf8_g8<4, 4, 2><<<dim3((unsigned)((rows + 63) / 64), (unsigned)((t + 63) / 64)), 256, 0, s>>>(
+                wa, rows, cols, xa, t, oa, sca, rp, re);
+        }
+        return 0;
+    }
+    if (t > 8 && mxf8_f_on() && cols % 32 == 0) {
+        k_mxf8_gemm_f<<<dim3((unsigned)((rows + MXF_BM - 1) / MXF_BM), (unsigned)((t + MXF_BN - 1) / MXF_BN)), 256, 0, s>>>(
+            wa, rows, cols, xa, t, oa, sca, rp, re);
+        return 0;
+    }
     if (t > 8 && gg_caps.tc) {
-        k_mxf8_tc<<<dim3((unsigned)((rows + MXT_BM - 1) / MXT_BM), (unsigned)((t + MXT_BN - 1) / MXT_BN)), 128, 0, s>>>(w, rows, cols, x, t,
-                                                                                              out, sc);
+        k_mxf8_tc<<<dim3((unsigned)((rows + MXT_BM - 1) / MXT_BM), (unsigned)((t + MXT_BN - 1) / MXT_BN)), 128, 0, s>>>(wa, rows, cols, xa, t,
+                                                                                              oa, sca, rp, re);
         return 0;
     }
     /* R rows a warp: 2 where each SM still gets 2 blocks (a 3090, a step: Super's in_proj 18560 x 4096
@@ -400,7 +722,9 @@ static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int co
         rset = v ? atoi(v) : 0;
     }
     const int nsm = gg_caps.sm_count > 0 ? gg_caps.sm_count : 32;
-    int R = rows >= 16 * 2 * nsm ? 2 : 1;
+    /* (Pascal's steps: R 1, the P6000's 15.3-15.4 -> 15.6-15.7 tok/s, the same bits; its verify groups keep R 2:
+     * k_mxf8_gemv_s's x staged for both rows, a round 156 -> 168 ms at R 1) */
+    int R = rows >= 16 * 2 * nsm && (gg_caps.tc || t > 1) ? 2 : 1;
     if (rset == 1 || rset == 2 || rset == 4) {
         R = rset;
     }
@@ -408,9 +732,9 @@ static int mxf8_linear_launch(const float *x, const uint8_t *w, int rows, int co
 #define MXF8_GEMV(RR, NN)                                                                          \
     do {                                                                                           \
         if (NN > 1 && mxf8_stage_on()) {                                                           \
-            k_mxf8_gemv_s<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out, sc);                   \
+            k_mxf8_gemv_s<RR, NN><<<nblk, 256, 0, s>>>(wa, rows, cols, xa, t, oa, sca, rp, re);          \
         } else {                                                                                   \
-            k_mxf8_gemv<RR, NN><<<nblk, 256, 0, s>>>(w, rows, cols, x, t, out, sc);                     \
+            k_mxf8_gemv<RR, NN><<<nblk, 256, 0, s>>>(wa, rows, cols, xa, t, oa, sca, rp, re);            \
         }                                                                                          \
     } while (0)
 #define MXF8_GEMV_T(NN)                                                                            \

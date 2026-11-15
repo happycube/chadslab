@@ -37,7 +37,9 @@ def main():
     ap.add_argument("--tokens", type=int, default=96)
     ap.add_argument("--hot-gb", type=float, default=HOT_GB_DSPARK - VISION_GB,
                     help="the hot experts' GPU memory (default the server's with images)")
-    ap.add_argument("--leave", type=float, default=0.3, help="the GPU memory the ballast leaves free (GB)")
+    ap.add_argument("--leave", type=float, default=0.05,
+                    help="the GPU memory the ballast leaves free (GB; 0.3 left room for every program made again, "
+                         "since rc_gpu_load makes the attention parts only for the programs that use them)")
     a = ap.parse_args()
     t0 = time.time()
     m = DSV41CPU(a.ckpt, exact=False)

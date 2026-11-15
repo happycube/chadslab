@@ -18,7 +18,6 @@
  * One buffer: 48 KB of shared memory at most on Pascal (37 KB here, 45 KB
  * with the int16 form), given by the kernel (sm, KD_SMEM). */
 #define KD_BM 64
-#define KD_Q5K 8                   /* Q5_K: the tiles of dp4a only (kd_format) */
 #define KD_WS 12                   /* the words of a decoded row (8 and 4 of pad) */
 #define KD_AW(X2) (KT_K * (1 + (X2)) + 16)
 #define KD_SMEM(X2) (KD_BM * KD_AW(X2) + KT_BN * KT_RB + KD_BM * 8 * 4 + KT_BN * KD_WS * 4 + \
@@ -30,10 +29,13 @@ __host__ __device__ __forceinline__ int kd_format(int type)
     return type == KQ_Q5_K ? KD_Q5K : kt_format(type);
 }
 
-/* kt_load_w, and KD_Q5K: a step of 128 columns is half a block of 176 bytes;
- * a row of a step holds the head (d, dmin, the 12 bytes of scales), the 32
- * bytes of high bits (all; bit j is sub-block j), and the 64 bytes of low 4
- * bits of the half (112 bytes). */
+/* kd_format, and the formats of the dense rows only (kt_iq_format): GP_KQ_LINEAR of a large group */
+__host__ __device__ __forceinline__ int kd_dense_format(int type)
+{
+    return kd_format(type) >= 0 ? kd_format(type) : kt_iq_format(type);
+}
+
+/* kt_load_w (KD_Q5K there too) */
 template <int F>
 __device__ __forceinline__ void kd_load_w(uint8_t *dst, const uint8_t *wrow, int cols, int k0)
 {
@@ -45,14 +47,6 @@ __device__ __forceinline__ void kd_load_w(uint8_t *dst, const uint8_t *wrow, int
         for (int i = lane; i < 18 * nbk / 4; i += 32) {
             cp_async4(dst + 4 * i, wrow + (size_t)(k0 / 32) * 18 + 4 * i);
         }
-    } else if (F == KD_Q5K) {
-        int lane = threadIdx.x % 32;
-        const uint8_t *blk = wrow + (size_t)(k0 / 256) * 176;
-        if (lane < 3) {
-            cp_async16(dst + 16 * lane, blk + 16 * lane);
-        } else if (lane < 7) {
-            cp_async16(dst + 16 * lane, blk + 48 + 64 * ((k0 / 128) % 2) + 16 * (lane - 3));
-        }
     } else {
         kt_load_w<F>(dst, wrow, cols, k0);
     }
@@ -63,16 +57,7 @@ __device__ __forceinline__ void kd_load_w(uint8_t *dst, const uint8_t *wrow, int
 template <int F>
 __device__ __forceinline__ void kd_frag(const uint8_t *bsb, int n, int bk, int k0, int c, uint32_t *b)
 {
-    if (F == KD_Q5K) {
-        const uint8_t *rp = bsb + n * KT_RB, *qs = rp + 48 + 32 * (bk / 2);
-        int sh = 4 * (bk % 2), sb = 4 * ((k0 / 128) % 2) + bk;
-        uint32_t l0 = (*(const uint32_t *)(qs + 4 * c) >> sh) & 0x0f0f0f0fu;
-        uint32_t l1 = (*(const uint32_t *)(qs + 16 + 4 * c) >> sh) & 0x0f0f0f0fu;
-        uint32_t h0 = (*(const uint32_t *)(rp + 16 + 4 * c) >> sb) & 0x01010101u;
-        uint32_t h1 = (*(const uint32_t *)(rp + 32 + 4 * c) >> sb) & 0x01010101u;
-        b[0] = l0 | (h0 << 4);
-        b[1] = l1 | (h1 << 4);
-    } else if (F == KT_Q4X || F == KT_NVX) {
+    if (F == KT_Q4X || F == KT_NVX) {
         /* the groups of 16 rows: row r of a group is byte lane r % 8 of a
          * word, its low (r < 8) or high 4 bits */
         int r = n % 16, rr = r % 8, sh = 4 * (r / 8);
@@ -102,7 +87,7 @@ __device__ __forceinline__ void kd_frag(const uint8_t *bsb, int n, int bk, int k
         b[0] = __vsub4(l0 | (h0 << 4), 0x20202020u);
         b[1] = __vsub4(l1 | (h1 << 4), 0x20202020u);
     } else {
-        kt_frag<F>(bsb + n * KT_RB, bk, c, b);
+        kt_frag_k<F>(bsb + n * KT_RB, bk, k0, c, b);
     }
 }
 
@@ -129,6 +114,8 @@ __device__ __forceinline__ void kd_scale(const uint8_t *bsb, int n, int bk, int 
     } else if (F == KD_Q5K) {
         kt_scale<KT_Q4K>(bsb + n * KT_RB, bk, k0, dl, mn);     /* the head of Q4_K */
         *dh = *dl;
+    } else if (kt_iq(F) >= 0) {
+        iq_scales<kt_iq(F) >= 0 ? kt_iq(F) : 0>(bsb + n * KT_RB, kt_iq_part<F>(bk, k0), dl, dh);
     } else if (F == KT_Q6K) {
         const uint8_t *rs = bsb + n * KT_RB;
         float d = kq_half(rs + 104);
@@ -148,7 +135,7 @@ __device__ void kt_tile_dp4a(const uint8_t *w, size_t rb, int rows, int n0, int 
                              int mcount, float *out, size_t ostride, uint8_t *sm,
                              const int8_t *xl = NULL)
 {
-    constexpr bool SPLIT = F == KT_NV4 || F == KT_NVX || F == KT_Q6K;
+    constexpr bool SPLIT = kt_split(F);
     constexpr bool MN = F == KT_Q51 || F == KT_Q4K || F == KD_Q5K;
     constexpr int AW = KD_AW(X2);
     int8_t (*as_)[AW] = (int8_t (*)[AW])sm;
@@ -616,6 +603,18 @@ static int moe_q40_mode(void)
         mode = v == NULL || !strcmp(v, "x2") ? 2 : !strcmp(v, "i8") ? 1 : 0;
     }
     return mode;
+}
+
+/* RECLANK_GPU_Q4X_X2=0: the KQ_Q4X experts of GP_MOE_GPU (the tensor cores or dp4a) of a program of float32
+ * products (i8 0, the 26B) on int8 x, not on the int16 form (runner.cu), as before it was their default */
+static int q4x_x2_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECLANK_GPU_Q4X_X2");
+        on = v == NULL || atoi(v) != 0;
+    }
+    return on;
 }
 
 /* GP_MOE_GPU with KQ_Q4X experts on dp4a (k_moe_gemm_q4x). */

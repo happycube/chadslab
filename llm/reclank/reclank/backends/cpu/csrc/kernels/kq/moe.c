@@ -160,6 +160,64 @@ static void kq_rows_bf12_f(const uint8_t *w, size_t rb, int nr, int cols, const 
     }
 }
 
+/* kq_rows_bf12_f in register tiles (act bit 7: DiffusionGemma's canvas, models/dgemma/gpu.py):
+ * four rows decoded once, then four tokens at a time, the two halves of each group of 32 into
+ * one sum of each (row, token) (16 sums, 2 FMAs a load); a token past the last four, and rows
+ * past the last four, as kq_rows_bf12_f. The sums are in another order than kq_rows_bf12_f's
+ * (float32 products of the same values). */
+static void kq_rows_bf12_tile(const uint8_t *w, size_t rb, int nr, int cols, const float *x, size_t xst,
+                              int n, float *out, size_t ost)
+{
+#if defined(__AVX512F__)
+    if (n >= 4 && cols <= 8192 && cols % 32 == 0) {
+        float wf[4][8192] __attribute__((aligned(64)));
+        int i = 0;
+        for (; i + 4 <= nr; i += 4) {
+            for (int a = 0; a < 4; ++a) {
+                kq_bf12_row_f(w + (size_t)(i + a) * rb, cols, wf[a]);
+            }
+            int j = 0;
+            for (; j + 4 <= n; j += 4) {
+                __m512 acc[4][4];
+                for (int a = 0; a < 4; ++a) {
+                    for (int b = 0; b < 4; ++b) {
+                        acc[a][b] = _mm512_setzero_ps();
+                    }
+                }
+                const float *x0 = x + (size_t)j * xst;
+                for (int c = 0; c < cols; c += 16) {
+                    __m512 xv[4];
+                    for (int b = 0; b < 4; ++b) {
+                        xv[b] = _mm512_loadu_ps(x0 + (size_t)b * xst + c);
+                    }
+                    for (int a = 0; a < 4; ++a) {
+                        __m512 wv = _mm512_load_ps(wf[a] + c);
+                        for (int b = 0; b < 4; ++b) {
+                            acc[a][b] = _mm512_fmadd_ps(wv, xv[b], acc[a][b]);
+                        }
+                    }
+                }
+                for (int a = 0; a < 4; ++a) {
+                    for (int b = 0; b < 4; ++b) {
+                        out[(size_t)(j + b) * ost + i + a] = _mm512_reduce_add_ps(acc[a][b]);
+                    }
+                }
+            }
+            for (; j < n; ++j) {
+                for (int a = 0; a < 4; ++a) {
+                    out[(size_t)j * ost + i + a] = kq_dot_bf12_f(wf[a], cols, x + (size_t)j * xst);
+                }
+            }
+        }
+        if (i < nr) {
+            kq_rows_bf12_f(w + (size_t)i * rb, rb, nr - i, cols, x, xst, n, out + i, ost);
+        }
+        return;
+    }
+#endif
+    kq_rows_bf12_f(w, rb, nr, cols, x, xst, n, out, ost);
+}
+
 static int kq_mats_bf12(const int64_t *mats)
 {
     for (int i = 1; i < 12; i += 2) {
@@ -189,6 +247,8 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
      * pair. x16 for the types of kq_x16s_ok (KQ_NVX too: kq_nvx_rows2), as the
      * hot experts of the GPU */
     const int rowsf = (act_flags & 64) != 0;
+    /* bit 7: the BF12 rows in register tiles (kq_rows_bf12_tile; DiffusionGemma) */
+    const int tile12 = (act_flags & 128) != 0;
     for (int i = 1; i < 12; i += 2) {
         if (mats[i - 1] != 0 && !kq_x16s_ok((int)mats[i], i % 6 == 5 ? inner : hidden)) {
             x2 = 0;
@@ -453,8 +513,9 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
             continue;
         }
         if (m.type == KQ_BF12 && (bf12 || exact)) {
-            kq_rows_bf12_f(w + (size_t)r * rb, rb, ngu, hidden, de + (size_t)s0 * hidden,
-                           (size_t)hidden, n, act + (size_t)s0 * 2 * inner + rr, (size_t)2 * inner);
+            (tile12 ? kq_rows_bf12_tile : kq_rows_bf12_f)(w + (size_t)r * rb, rb, ngu, hidden,
+                           de + (size_t)s0 * hidden, (size_t)hidden, n, act + (size_t)s0 * 2 * inner + rr,
+                           (size_t)2 * inner);
             continue;
         }
         if (a4) {
@@ -625,8 +686,9 @@ static void kq_moe_body(const int8_t *hq, const float *hs, const float *hm, cons
             continue;
         }
         if (m.type == KQ_BF12 && (bf12 || exact)) {
-            kq_rows_bf12_f(w + (size_t)r * rb, rb, ndn, inner, act + (size_t)s0 * 2 * inner,
-                           (size_t)2 * inner, n, de + (size_t)s0 * hidden + r, (size_t)hidden);
+            (tile12 ? kq_rows_bf12_tile : kq_rows_bf12_f)(w + (size_t)r * rb, rb, ndn, inner,
+                           act + (size_t)s0 * 2 * inner, (size_t)2 * inner, n, de + (size_t)s0 * hidden + r,
+                           (size_t)hidden);
             continue;
         }
         if (a4) {

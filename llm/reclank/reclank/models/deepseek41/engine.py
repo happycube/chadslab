@@ -447,6 +447,64 @@ class DSEngine(Engine):
         if any(w.lower() in str(exc).lower() for w in FATAL_WORDS):
             self.fatal = exc
 
+    # ---- the device half (the GPU sharing: server/gpushare.py, docs/GPU_SWAP_PLAN.md 3.6)
+    _load = None        # load: (the warm prompt, mtp, lanes, the encoder's reserve, the hot slots after it)
+
+    def can_release_device(self):
+        return self._load is not None
+
+    def release_device(self):
+        """Each lane's context to host memory (RowCache: its points); the device half is then
+        forgotten (runtime.close_all frees it), the host half kept (the parts, the embedding table)."""
+        for e in self.lanes:
+            with e.on():
+                if e.ctxs.live is not None:
+                    e.ctxs._store(e.ctxs.live)
+                    e.ctxs.live = None
+
+    def reload_device(self):
+        """The device half as the load made it: DSV41GPU's (remake: the dense weights uploaded
+        again from the weightkeeper and the stash of their converted forms, the first hot experts),
+        DSpark's (its experts in RAM kept), the warm prompt, lane B, the hot experts grown to the
+        load's count."""
+        from reclank.backends.cuda.runtime import remake
+        from reclank.models.base import reload_lanes
+        from reclank.models.deepseek41.dspark import DSpark
+        warm, mtp, lanes, reserve, slots = self._load
+        t = [time.time()]
+
+        def lap():
+            t.append(time.time())
+            return t[-1] - t[-2]
+        g = self.g = remake(self.g)
+        self.ds = DSpark(g, host=self.ds) if mtp else None
+        self.lane, self.coop = None, False
+        times = ["the GPU half %.1f s" % lap()]
+
+        def make():
+            self._fresh()
+            if self.ds is not None:
+                self.ds.prefill(warm)
+                self.ds.warm()
+            else:
+                g.prefill(warm)
+            self._fresh()
+            times.append("the warm prompt %.1f s" % lap())
+            if lanes > 1:
+                _lanes_up(self, warm)
+                _lanes_warm(self, self.tokenizer, self.enc)
+                times.append("lane B %.1f s" % lap())
+        reload_lanes(self, make)
+        g.reserve_gb = reserve
+        g.n_max = slots
+        g.relax_big()
+        times.append("the hot experts %.1f s" % lap())
+        print("[dsv41] reload: %s (the stash %.2f GB)" % (", ".join(times), sum(
+            v[0].nbytes for v in g.stash.values()) / 1e9), file=sys.stderr, flush=True)
+        sch = getattr(self.worker, "lanes", None)
+        if sch is not None:
+            sch.engines = self.lanes            # (lane B's engine is a new one)
+
     # ---- the state and the contexts (core/session.py, RowCache)
 
     def rows(self):
@@ -592,6 +650,8 @@ class DSEngine(Engine):
                 self._fresh()
             else:
                 self._restore(point, k)
+            # engram's rows of the whole prompt read ahead (its parts and groups take them in turn)
+            self.g.engram_ahead(ids[k:], k, media)
             if k < cut < n:
                 yield from self._prefill_co(ids[k:cut], k, media)
                 self._save(keys[:cut])
@@ -612,6 +672,8 @@ class DSEngine(Engine):
             print("[dsv41] %s: the programs freed (GPU %.2f -> %.2f GB free), the prompt again" % (
                 e, free0 / 1e9, mem_info()[0] / 1e9), file=sys.stderr, flush=True)
             lg, main_last = yield from prefill()
+        # the big groups' programs go and the hot experts take their room back for the answer
+        self.g.relax_big()
         dt = time.time() - t0
         self.last_cached = k
         print("[dsv41] cache hit %d of %d prompt tokens; new %d in %.1f s (%.0f tok/s); %s" % (
@@ -697,6 +759,13 @@ def load(opts, meta, worker=None):
     if int(getattr(opts, "lanes", 1) or 1) > 1:
         _lanes_up(eng, warm)
         _lanes_warm(eng, tok, enc)
+    # the hot experts in the room the programs of the loop and of the small groups leave (beside the image
+    # encoder's): the big groups' programs take theirs at a prompt (gpu.py big_room) and give it back after
+    g.reserve_gb = VISION_GB if images else 0.0
+    if opts.hot_gb is None:
+        g.n_max = g.w.src.E
+    g.relax_big()
+    eng._load = (warm, mtp, int(getattr(opts, "lanes", 1) or 1), g.reserve_gb, g.n_slots)
     from reclank.backends.cpu import cops as _cops
     _cops.team_warn()
     thinking = opts.thinking or "high"

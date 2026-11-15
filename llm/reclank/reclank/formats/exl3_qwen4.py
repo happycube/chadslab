@@ -1,6 +1,11 @@
 """Qwen3.8-Flash-Next from an EXL3 directory of ExLlamaV3 (turboderp/Qwen3.8-Flash-Next-exl3,
 e.g. 5.05bpw_h6_ng6; docs/EXL3_PLAN.md).
 
+Ported from ExLlamaV3 (turboderp-org/exllamav3,
+exllamav3/modules/quant/exl3_lib/ngram_codec.py and
+exllamav3/exllamav3_ext/quant/codebook.cuh; MIT License; Copyright (c) 2025 Turboderp). See
+THIRD_PARTY_NOTICES.md.
+
 EXL3Source is NVFP4Source (reclank/formats/nvfp4_st.py: the GGUF view of a
 checkpoint that reclank/models/qwen/qwen38.py reads) on the tensors of the
 directory (reclank/formats/exl3.py, EXL3Dir):

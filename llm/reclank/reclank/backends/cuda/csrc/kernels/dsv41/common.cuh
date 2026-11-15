@@ -123,11 +123,13 @@ __device__ __forceinline__ ds_krow ds_akey(int m, int nr, int ng, int64_t lo, in
 
 #define DS_STAGE_SLOT0 (1 << 20)
 
-/* The bytes of the expert in slot of map: of store (operand 4), or of the stage (operand 23). */
+/* The bytes of the expert in slot of map: at the address the store's table gives (operand 4: the device
+ * address of each slot, int64; the slots need not be contiguous, so the hot experts give and take slots
+ * with no new program), or of the stage (operand 23). */
 __device__ __forceinline__ const uint8_t *ds_slot_w(const gp_rec *r, const int64_t *e, int slot)
 {
     return slot >= DS_STAGE_SLOT0 ? DP(const uint8_t, 23) + (size_t)(slot - DS_STAGE_SLOT0) * di(r, e, 5)
-                                  : DP(const uint8_t, 4) + (size_t)slot * di(r, e, 5);
+                                  : (const uint8_t *)(intptr_t)DP(const int64_t, 4)[slot];
 }
 
 #define DS_HOT_MAXP 3072

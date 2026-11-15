@@ -13,6 +13,9 @@ template of the next turn writes the earlier answer in another form than
 the model wrote it (Qwen3.6 drops its think part; Qwen3.8 keeps only the
 reasoning_content that the client sends back), so the next prompt differs
 from the cache there.
+
+On a slow card (fewer than SLOW_CARD_SMS SMs: the Quadro P1000) the GPU
+runs the prompts of QwenGPU and the CPU the decode (QwenEngine.cpu_decode).
 """
 from __future__ import annotations
 
@@ -48,12 +51,18 @@ ARCHS = ("qwen35moe", "qwen4exp", "lfm2moe", "qwen35")
 # the prompt of a lane (--lanes 2) in parts of this many tokens, with a pause after each (the other
 # lane decodes between them: server/worker.py)
 LANE_PART = int(os.environ.get("RECLANK_LANE_PART", "4096"))
+# A card of fewer SMs than this (the Quadro P1000: 5) runs the prompts and the CPU the decode
+# (QwenEngine.cpu_decode; RECLANK_QWEN_CPU_DECODE=0 or 1 sets it): Qwen3.6 35B on the P1000 alone
+# decoded 12.5 tok/s, its dense K-quant products 38 ms of a step of 80 (k_kq_multi_i8 at about 25
+# GB/s of the card's 80); the Xeon W-2133 alone 14.8, and the prompts on the P1000 2-4x the CPU's
+SLOW_CARD_SMS = 8
 
 
 def detect(meta):
     # (a checkpoint directory: the original Qwen3.8-Flash-Next, or an EXL3
     # directory of a dense model of the Qwen3.5 architecture, qwen3_5)
-    return meta.get("general.architecture") in ARCHS or meta.get("model_type") in ("qwen4_exp", "qwen3_5")
+    return meta.get("general.architecture") in ARCHS or meta.get("model_type") in ("qwen4_exp", "qwen3_5",
+                                                                                     "qwen3_5_moe")
 
 
 class QwenEngine(Engine):
@@ -82,8 +91,11 @@ class QwenEngine(Engine):
         self.last_cached = 0    # the prompt tokens of the last request that the cache held
         self.last_text = ""
         self.mtp = 0            # --mtp: the drafts of a round (0: no MTP)
+        self.mtp_adapt = None   # RECLANK_MTP_ADAPT: the count of each round from 1 .. mtp (AdaptiveDrafts)
+        self.mtp_stop = 0.0     # the drafts of a round end at this product of their probabilities (0: mtp of them)
         self.h_end = None       # the stream of the model at the last position of the cache
         self.mtp_stats = [0, 0]  # drafts, accepted
+        self.dflash = None      # --drafter: a DFlash 2 or DSpark drafter (DFlash2GPU, DSparkGPU) in place of the MTP layer
         # the think part: the budget, and the words that close it and wrap up
         self.think_budget = 0
         self.wrap_left = 0
@@ -99,6 +111,11 @@ class QwenEngine(Engine):
         self.video_budget = 128
         self.video_frames = 32
         self._media_rows = {}
+        # the decode on the CPU, the prompts on the GPU (a slow card: load). _host_n: the rows of
+        # the cache from 0 that the host arrays hold as the device does (the device's copy is the
+        # true one between the requests: the contexts read it)
+        self.cpu_decode = False
+        self._host_n = 0
         self.last_media = []
         # the lanes (--lanes 2, server/worker.py): coop hands the runs of a generation to the
         # scheduler (DeviceOp); lane is the models.qwen.lanes.Lane of this engine (None: lane A,
@@ -302,6 +319,7 @@ class QwenEngine(Engine):
             self.dev.attach(self.cache)
         self.ids = []
         self.h_end = None
+        self._host_n = 0
 
     # ---- the contexts (core/session.py, RowCache)
 
@@ -368,6 +386,7 @@ class QwenEngine(Engine):
         if ple_ids is not None:
             self.cache.ple_ids = ple_ids.copy()
         self.cache.n = len(keys)
+        self._host_n = 0
         self.ids = list(keys)
         return logits
 
@@ -437,7 +456,8 @@ class QwenEngine(Engine):
         return self.model.logits(h[-1:])[0]
 
     def _mtp_on(self):
-        return self.mtp > 0 and self.dev is not None and getattr(self.dev, "has_mtp", False)
+        return (self.mtp > 0 and self.dev is not None and not self.cpu_decode
+                and (getattr(self.dev, "has_mtp", False) or self.dflash is not None))
 
     def _mtp_rows(self, Hp, ids, pos):
         """The MTP layer on the tokens ids at pos.., with the streams of the
@@ -458,8 +478,13 @@ class QwenEngine(Engine):
 
     def _prompt_mtp_co(self, ids, pos, media=None):
         """_prompt_mtp as a generator (a pause between the parts with coop)."""
+        if self.dflash is not None:
+            # (the DFlash 2 drafter's context: the target's own programs write it; no stream to keep)
+            logits = yield from self._prompt_co(ids, pos, media)
+            return logits, np.zeros(1, np.float32)
         kw = {"media": media} if media else {}
-        hidden = self.dev.cfg.hidden_size * self.dev.cfg.hc_count
+        # (Qwen3.8-Flash: its hyper-connection streams; the models of QwenGPU: one)
+        hidden = self.dev.cfg.hidden_size * getattr(self.dev.cfg, "hc_count", 1)
         h0 = self.h_end if (pos > 0 and self.h_end is not None) else np.zeros(hidden, np.float32)
         logits = None
         step = LANE_PART if self.coop else 4096
@@ -474,6 +499,41 @@ class QwenEngine(Engine):
             self._mtp_rows(Hp, part, pos + c0)
             h0 = H[-1].copy()
         return logits, h0
+
+    # ---- the device half (the GPU sharing: server/gpushare.py, docs/GPU_SWAP_PLAN.md 3.6)
+    _load = None        # load: (opts, lanes, the image encoder's GPU mode)
+
+    def can_release_device(self):
+        """A GPU model with no expert device, and no image encoder whose room is held (reserve,
+        lend)."""
+        return (self.dev is not None and self._load is not None and getattr(self.dev, "xdev", None) is None
+                and not (self.embedder is not None and self._load[2] in ("reserve", "lend"))
+                and self.dflash is None)        # (the DFlash 2 drafter's programs are on the device's Mirror)
+
+    def release_device(self):
+        """Each lane's context to host memory (RowCache: a point at the end of its cache too, so
+        the next turn goes on from it); the device half (dev, lane B) is then forgotten
+        (runtime.close_all frees it), its host half kept for reload_device."""
+        for e in self.lanes:
+            with e.on():
+                if e.cache is not None and e.ids:
+                    e._save(list(e.ids), None, e.h_end)
+                if e.ctxs.live is not None:
+                    e.ctxs._store(e.ctxs.live)
+                    e.ctxs.live = None
+                e.cache, e.ids, e.h_end = None, [], None
+
+    def reload_device(self):
+        """The device half again: a QwenGPU of the host half (remake: the load's plan) and the
+        load's start (_device_up); the contexts come back from host memory with the next prompts."""
+        from reclank.backends.cuda.runtime import remake
+        from reclank.models.base import reload_lanes
+        self.dev = remake(self.dev)
+        self.coop = False
+        reload_lanes(self, lambda: _device_up(self))
+        sch = getattr(self.worker, "lanes", None)
+        if sch is not None:
+            sch.engines = self.lanes            # (lane B's engine is a new one)
 
     def idle(self):
         """Between requests (server/worker.py: no job waits): the expert device's experts by the
@@ -504,6 +564,7 @@ class QwenEngine(Engine):
             self._fresh()
         elif point is not None:
             logits = self._restore(point, keys[:k])
+        self._host_n = min(self._host_n, k)
         # The M-RoPE positions of the prompt (the rows of an image), and of
         # the answer after it (also for a context that came back).
         self.cache.set_rope(MD.mrope_positions(n, spans))
@@ -571,6 +632,10 @@ class QwenEngine(Engine):
                           count, dt, count / max(dt, 1e-9), ac, dr, 100.0 * ac / max(dr, 1),
                           len(self.ids)), file=sys.stderr, flush=True)
             return
+        host = self.cpu_decode and self.dev is not None
+        if host:
+            # the rows of the prompt that the host arrays lack, and the state, to them
+            self.dev.cache_dev.sync(self._host_n, n, up=False)
         try:
             while count < max_tokens:
                 token = sampler.fixed(sampler(logits))
@@ -582,9 +647,15 @@ class QwenEngine(Engine):
                 self.ids.append(token)
                 pos += 1
         finally:
+            if host:
+                # the rows of the answer and the state back to the device
+                self.reserve(pos)
+                self.dev.cache_dev.sync(n, pos, up=True)
+                self._host_n = pos
             dt = time.time() - t0
-            print("[qwen4] decode %d tokens in %.1f s (%.2f tok/s); %d tokens in the cache" % (
-                count, dt, count / max(dt, 1e-9), len(self.ids)), file=sys.stderr, flush=True)
+            print("[qwen4] decode %d tokens in %.1f s (%.2f tok/s%s); %d tokens in the cache" % (
+                count, dt, count / max(dt, 1e-9), " on the CPU" if host else "", len(self.ids)),
+                file=sys.stderr, flush=True)
 
     def _decode_mtp(self, logits, n, max_tokens, sampler, eos_ids):
         """The tokens of the answer with MTP drafts (see the module text):
@@ -604,11 +675,16 @@ class QwenEngine(Engine):
         # the MTP layer runs the rows of the tokens the model keeps; flush:
         # those of all but the last token at the end (the next prompt goes on
         # from there)
-        drafter = QwenMTPDrafter(self.dev, flush_rows=True)
-        drafter.observe([tok], self.h_end.reshape(1, -1), n)
+        if self.dflash is not None:
+            from reclank.models.qwen.dflash2 import DFlash2Drafter
+            drafter = DFlash2Drafter(self.dflash)
+        else:
+            drafter = QwenMTPDrafter(self.dev, flush_rows=True, stop=self.mtp_stop)
+            drafter.observe([tok], self.h_end.reshape(1, -1), n)
         st = {}
         try:
-            yield from stream(QwenTarget(self.dev, on_commit, coop=self.coop), drafter, tok, None, n, self.mtp,
+            yield from stream(QwenTarget(self.dev, on_commit, coop=self.coop), drafter, tok, None, n,
+                              self.mtp_adapt or self.mtp,
                               sampler, eos_ids, max_tokens, st, room=lambda p: self.ctx - p - 2)
         finally:
             self.mtp_stats[0] += st.get("drafts", 0)
@@ -622,10 +698,47 @@ class QwenEngine(Engine):
         return np.asarray(self.dev.logits()).reshape(-1)
 
     def _step(self, token, pos):
-        if self.dev is not None:
+        if self.dev is not None and not self.cpu_decode:
             self.dev.step(token, pos)
             return np.asarray(self.dev.logits()).reshape(-1)
         return self.model.logits(self.model.forward([token], self.cache, start_pos=pos))[0]
+
+
+def _device_up(eng):
+    """The start of the device half (the load; a reload after a release: the same steps, so the
+    same state as a fresh server's): lane B, the cache and the programs of a prompt now (so the first
+    request does not wait for them and a context that does not fit fails here), the MTP layer's
+    programs, a warm pair of the lanes."""
+    opts, nl, _mode = eng._load
+    dev, tok = eng.dev, eng.tokenizer
+    if nl > 1:
+        _lanes_up(eng, opts)
+    eng._fresh()
+    if dev is not None:
+        eng._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
+        eng._fresh()
+        if eng.mtp and eng.dflash is not None:
+            # DFlash 2: its programs and the verify groups of each count (a selector's stop ends rounds early)
+            from reclank.core.speculative import QwenTarget, greedy_pick, stream
+            from reclank.models.qwen.dflash2 import DFlash2Drafter
+            ids = tok.encode("<|im_start|>user\nName three colors.<|im_end|>\n<|im_start|>assistant\n")
+            for k in range(1, eng.mtp + 1):
+                dev.prefill(ids)
+                t0 = int(np.argmax(np.asarray(dev.logits()).reshape(-1)))
+                list(stream(QwenTarget(dev), DFlash2Drafter(eng.dflash), t0, None, len(ids), k, greedy_pick,
+                            (), 16, {}, room=lambda p: dev.cache.max_len - p - 2))
+                eng._fresh()
+        elif eng.mtp and hasattr(dev, "mtp"):
+            # the verify groups and the MTP layer's programs too (built at the first reply with
+            # drafts, it ran at 47.7 tok/s against 62.2 after on FP4-Local)
+            from reclank.models.qwen.gpu38 import generate_mtp_gpu
+            # (each count of AdaptiveDrafts, or of a round that the stop ends early: its verify group's programs)
+            for k in (eng.mtp_adapt.ks if eng.mtp_adapt else range(1, eng.mtp + 1) if eng.mtp_stop > 0 else [eng.mtp]):
+                generate_mtp_gpu(dev, tok.encode("<|im_start|>user\nName three colors.<|im_end|>\n"
+                                                 "<|im_start|>assistant\n"), 32, draft=k)
+                eng._fresh()
+    if nl > 1:
+        _lanes_warm(eng, tok)
 
 
 def _lanes_up(eng, opts):
@@ -729,6 +842,8 @@ def load(opts, meta, worker=None):
         arch = "qwen4exp"
     if os.path.isdir(path) and meta.get("model_type") == "qwen3_5":
         arch = "qwen35"         # an EXL3 directory (Qwen3.8-27B: QwenEXL3Program)
+    if os.path.isdir(path) and meta.get("model_type") == "qwen3_5_moe":
+        arch = "qwen35moe"      # an NVFP4 checkpoint of ModelOpt (Qwen3.6-35B-A3B: QwenGGUFProgram on it)
     template = opts.template or os.path.join(here, "chat_template.jinja")
     text = None
     if not os.path.exists(template):
@@ -791,12 +906,29 @@ def load(opts, meta, worker=None):
         # "lfm2"), and the dense models (qwen35: Qwen3.8-27B, a GGUF of
         # convert_qwen35_dense_gguf.py or an EXL3 directory) with no experts
         from reclank.models.qwen.qwen35 import QwenCache, QwenEXL3Program, QwenGGUFProgram
-        model = QwenEXL3Program(path) if os.path.isdir(path) else QwenGGUFProgram(path)
+        model = QwenEXL3Program(path) if os.path.isdir(path) and arch == "qwen35" else QwenGGUFProgram(path)
         cache_cls = QwenCache
         if gpu:
             from reclank.models.qwen.gpu35 import QwenGPU
+            dfl = None
+            if getattr(opts, "drafter", None) and opts.mtp != 0:
+                # --drafter: the DFlash 2 drafter of the dense model (a GGUF of z-lab's Qwen3.8-27B-DFlash2;
+                # models/qwen/dflash2.py) or its DSpark drafter (a GGUF of convert_dspark_gguf.py from
+                # RedHatAI's; models/qwen/dspark.py): its context written by the model's programs, so made
+                # before them
+                from reclank.models.qwen.dflash2 import DFlash2GPU, is_dflash2
+                from reclank.models.qwen.dspark import DSparkGPU, is_dspark
+                if arch != "qwen35" or not (is_dflash2(opts.drafter) or is_dspark(opts.drafter)):
+                    raise SystemExit("--drafter: a DFlash 2 or DSpark GGUF of the dense Qwen3.8-27B (%s)"
+                                     % opts.drafter)
+                if nl > 1:
+                    raise SystemExit("--drafter: one lane")
+                dfl = (DSparkGPU if is_dspark(opts.drafter) else DFlash2GPU)(opts.drafter, model)
             # LFM2: the hot experts leave room for the cache of ctx tokens
-            dev = QwenGPU(model, hot_gb=opts.hot_gb, ctx=ctx if arch == "lfm2moe" else None)
+            dev = QwenGPU(model, hot_gb=opts.hot_gb, ctx=ctx if arch == "lfm2moe" else None,
+                          mtp=opts.mtp != 0 and dfl is None, dflash=dfl)
+            if dfl is not None:
+                dfl.bind(dev)
     else:
         from reclank.models.qwen.qwen38 import Qwen4Cache, Qwen4CPU
         model, cache_cls = Qwen4CPU(path, experts=opts.experts), Qwen4Cache
@@ -810,6 +942,12 @@ def load(opts, meta, worker=None):
     eng = QwenEngine(model, dev, tok, ctx, cache_cls, contexts=getattr(opts, "contexts", 4),
                      contexts_gb=getattr(opts, "contexts_gb", 16.0))
     eng.worker = worker
+    if arch in ("qwen35moe", "lfm2moe", "qwen35") and dev is not None:
+        # (QwenGPU: its cache is the host QwenCache's arrays, which the CPU's model runs on too)
+        from reclank.backends.cuda.runtime import caps
+        sms = caps().get("sm_count", 0)
+        env = os.environ.get("RECLANK_QWEN_CPU_DECODE")
+        eng.cpu_decode = env == "1" if env else 0 < sms < SLOW_CARD_SMS
     eng.think_budget = max(0, opts.think_budget)
     eng.wrap_left = max(0, opts.wrap_left)
     eng.crash_dir = opts.crash_dir
@@ -823,8 +961,33 @@ def load(opts, meta, worker=None):
     # BF12 verify groups on the tensor cores (k_kq_bf12_tc) and int16
     # experts, team 24 on a hot day: plain 16.2, 1 draft 19.7, 2 drafts
     # 21.4, 3 drafts 22.1 tok/s
-    mtp = 3 if opts.mtp is None else opts.mtp
+    # The dense models (qwen35: Qwen3.8-27B, Unsloth's UD files): up to 6 drafts a round, ending at a product of
+    # their probabilities under 0.8 (speculative.QwenMTPDrafter stop). Tokens a second, the mean of 256 tokens
+    # of code, a story and a summary of 2110 tokens on the 3090 (the plain tokens in each): UD-Q4_K_XL plain
+    # 21.6, 2 / 3 drafts 34.4 / 34.9, stop 0.7 / 0.8 / 0.9 of 6 35.9 / 35.9 / 35.5, AdaptiveDrafts of 1 .. 6
+    # 33.4; UD-IQ3_XXS 27.4, 44.6 / 46.2, 46.9 / 47.2 / 46.7, 43.7. RECLANK_MTP_STOP overrides the stop.
+    from reclank.core.speculative import mtp_stop
+    dense = arch == "qwen35"
+    mtp = (6 if dense else 3) if opts.mtp is None else opts.mtp
     eng.mtp = mtp if getattr(dev, "has_mtp", False) else 0
+    eng.mtp_stop = mtp_stop(0.8 if dense else 0.0)
+    dfl = getattr(dev, "dflash", None)
+    if dfl is not None and hasattr(dfl, "drafts"):
+        # DSpark: the 8 drafts of its block, a round's ending at a product of their confidences under the stop
+        # (RECLANK_DSPARK_STOP; dspark.STOP)
+        eng.dflash = dfl
+        eng.mtp = min(dfl.drafts, dfl.drafts if opts.mtp is None else opts.mtp)
+    elif dfl is not None:
+        # DFlash 2: the 7 slots of its block, the selector's stop 0.5 (RECLANK_DFLASH_STOP; check_dflash2.py on
+        # UD-Q4_K_XL: 0 / 0.3 / 0.5 / 0.75 32.0 / 32.3 / 33.5 / 32.9 tok/s with the Q4_K_M drafter)
+        eng.dflash = dfl
+        eng.mtp = min(dfl.block - 1, 7 if opts.mtp is None else opts.mtp)
+        dfl.stop = float(os.environ.get("RECLANK_DFLASH_STOP") or 0.5)
+    if eng.mtp > 1 and os.environ.get("RECLANK_MTP_ADAPT") == "1":
+        # each round the count of 1 .. --mtp with the most tokens a second (speculative.AdaptiveDrafts: the
+        # acceptance of the recent rounds and the measured time of each count), one for all the replies
+        from reclank.core.speculative import AdaptiveDrafts
+        eng.mtp_adapt = AdaptiveDrafts(range(1, eng.mtp + 1), start=min(2, eng.mtp))
     if opts.mtp and not eng.mtp:
         print("--mtp: the model has no MTP layer on the GPU; plain steps", file=sys.stderr, flush=True)
     if opts.mmproj:
@@ -843,27 +1006,14 @@ def load(opts, meta, worker=None):
         eng.video_frames = opts.video_frames or 32
         print("image encoder %s (%s) in %.0f s" % (
             opts.mmproj, ("GPU, " + mode) if eng.embedder.gpu else "CPU", time.time() - t1), flush=True)
-    if nl > 1:
-        _lanes_up(eng, opts)
-    # the cache and the programs of a prompt now, so the first request does
-    # not wait for them and a context that does not fit fails here
-    eng._fresh()
-    if dev is not None:
-        eng._prompt(tok.encode("<|im_start|>user\nHello<|im_end|>\n") * 160, 0)
-        eng._fresh()
-        if eng.mtp and hasattr(dev, "mtp"):
-            # the verify groups and the MTP layer's programs too (built at the first reply with
-            # drafts, it ran at 47.7 tok/s against 62.2 after on FP4-Local)
-            from reclank.models.qwen.gpu38 import generate_mtp_gpu
-            generate_mtp_gpu(dev, tok.encode("<|im_start|>user\nName three colors.<|im_end|>\n"
-                                             "<|im_start|>assistant\n"), 32, draft=eng.mtp)
-            eng._fresh()
-    if nl > 1:
-        _lanes_warm(eng, tok)
+    eng._load = (opts, nl, mode)
+    _device_up(eng)
     # from here on, an OpenMP team outside the planned ones is reported
-    # (reclank.backends.cpu.cops.team_warn: RECLANK_TEAM_WARN, default 5 threads)
+    # (reclank.backends.cpu.cops.team_warn: RECLANK_TEAM_WARN, default 5 threads); not with
+    # the decode on the CPU, whose teams run while the GPU waits
     from reclank.backends.cpu import cops as _cops
-    _cops.team_warn()
+    if not eng.cpu_decode:
+        _cops.team_warn()
     thinking = opts.thinking or "medium"
     think = {"auto": "medium", "on": "xhigh", "high": "xhigh"}.get(thinking, thinking)
     defaults = {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "max_tokens": 4096,
@@ -876,7 +1026,8 @@ def load(opts, meta, worker=None):
     if arch == "qwen35":
         # Qwen3.8-27B (generation_config.json: 1.0, top_k 20, top_p 0.95)
         defaults.update(temperature=1.0, top_k=20, top_p=0.95, model_id="qwen3.8-27b")
-    print("ready in %.0f s: dense %s, context %d%s%s; thinking %s" % (
+    print("ready in %.0f s: dense %s, context %d%s%s%s; thinking %s" % (
         time.time() - t0, dense_label(model), ctx, " in each of %d lanes" % nl if nl > 1 else "",
-        ", %d hot experts in each layer" % dev.n_slots if dev else "", thinking), flush=True)
+        ", %d hot experts in each layer" % dev.n_slots if dev else "",
+        "; the decode on the CPU (a card of %d SMs)" % sms if eng.cpu_decode else "", thinking), flush=True)
     return eng, defaults

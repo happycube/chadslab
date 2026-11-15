@@ -943,14 +943,14 @@ template <int T>
 static void fdtc_run(int op, dim3 grid, const gp_rec *dr, const int64_t *denv, float *part)
 {
     static int attr = 0;
-    if (!attr) {
+    if (attr != gg_epoch) {
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 1));
         cudaFuncSetAttribute(k_attn_fdtc<T, 8, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 0));
         cudaFuncSetAttribute(k_attn_fdtc<T, 16, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)FT_SMEM(T, 0));
-        attr = 1;
+        attr = gg_epoch;
     }
     if (op == GP_ATTN_QC) {
         k_attn_fdtc<T, 16, 16><<<grid, 256, FT_SMEM(T, 1), gg_stream>>>(dr, denv, part);
@@ -1476,6 +1476,11 @@ k_flash_f32h(const gp_rec *r, const int64_t *e)
     const float *kf = DP(const float, 1) + (size_t)kv * hs;
     const float *vf = DP(const float, 2) + (size_t)kv * hs;
     const size_t frs = kv_rs((size_t)hs, kvh, HD);
+    /* operand 14 = 1: K and V are F20 rows (positions x kvh x f20_row_bytes(HD)), decoded into the tiles
+     * (loads, not cp.async: the same tiles of float32 values) */
+    const bool f20 = r->tag[14] != GP_T_NONE && DI(14) == 1;
+    const size_t rb20 = f20_row_bytes(HD);
+    const uint8_t *k20 = DP(const uint8_t, 1) + (size_t)kv * rb20, *v20 = DP(const uint8_t, 2) + (size_t)kv * rb20;
     bool live0 = j0 + g < t, live1 = j0 + g + 8 < t;
     int64_t p0 = pos + j0 + g, p1 = p0 + 8;
     int64_t e0 = p0, e1 = p1;
@@ -1490,6 +1495,28 @@ k_flash_f32h(const gp_rec *r, const int64_t *e)
     auto load = [&](int stage, int64_t k0) {
         int kn = (int)min((int64_t)FK3, last - k0 + 1);
         float *kd = kbuf + stage * FK3 * D::KLD, *vd = vbuf + stage * FK3 * D::VLD;
+        if (f20) {
+            for (int x = threadIdx.x; x < FK3 * HD / 8; x += blockDim.x) {
+                int a = x / (HD / 8), d = (x % (HD / 8)) * 8;
+                float kk8[8], vv8[8];
+                if (a < kn) {
+                    const size_t ro = (size_t)(k0 + a) * kvh * rb20;
+                    f20_dec8(f20_load8(k20 + ro, HD, d), kk8);
+                    f20_dec8(f20_load8(v20 + ro, HD, d), vv8);
+                } else {
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        kk8[u] = vv8[u] = 0.f;
+                    }
+                }
+                *(float4 *)(kd + a * D::KLD + d) = make_float4(kk8[0], kk8[1], kk8[2], kk8[3]);
+                *(float4 *)(kd + a * D::KLD + d + 4) = make_float4(kk8[4], kk8[5], kk8[6], kk8[7]);
+                *(float4 *)(vd + a * D::VLD + d) = make_float4(vv8[0], vv8[1], vv8[2], vv8[3]);
+                *(float4 *)(vd + a * D::VLD + d + 4) = make_float4(vv8[4], vv8[5], vv8[6], vv8[7]);
+            }
+            cp_async_commit();
+            return;
+        }
         for (int x = threadIdx.x; x < FK3 * HD / 4; x += blockDim.x) {
             int a = x / (HD / 4), d = (x % (HD / 4)) * 4;
             bool ok = a < kn;

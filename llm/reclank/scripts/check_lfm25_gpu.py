@@ -60,7 +60,7 @@ def main():
         model = QwenGGUFProgram(a.gguf)
     cfg = model.cfg
     t0 = time.time()
-    dev = QwenGPU(model, hot_gb=a.hot_gb)
+    dev = QwenGPU(model, hot_gb=a.hot_gb, mtp=False)        # (the steps of the dump: no MTP layer)
     print("QwenGPU: kv form %s, %d hot experts a layer (%.0f s)" % (cfg.kv_form, dev.n_slots, time.time() - t0),
           flush=True)
     tot = {"agree": [], "kl": [], "dmax": []}

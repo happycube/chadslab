@@ -200,6 +200,9 @@ struct attn_d {
     const uint8_t *kt, *vt;      /* tq: the TQ6 cache (tq6x8), q and out rotated */
     int tq;
     const float *cb;             /* tq: the codebook (in shared memory, or tq6_cb_d) */
+    const uint8_t *k20, *v20;    /* f20: the F20 rows of the cache at position 0 (kv_rb bytes a key head) */
+    int f20;
+    size_t kv_rb;
 };
 
 /* GP_ATTN_F32H reads the E4B cache, which has the shape (heads, positions,
@@ -306,6 +309,13 @@ __device__ attn_d attn_get(const gp_rec *r, const int64_t *e)
         a.rstride = kv_rs(a.hstride, a.kvh, a.hd);
         a.k = DP(const float, 1) + (size_t)lo * a.rstride;
         a.v = DP(const float, 2) + (size_t)lo * a.rstride;
+        if (r->tag[14] != GP_T_NONE && DI(14) == 1) {
+            /* operand 14: K and V are F20 rows (positions x kv_heads x f20_row_bytes(head_dim)) */
+            a.f20 = 1;
+            a.kv_rb = f20_row_bytes(a.hd);
+            a.k20 = DP(const uint8_t, 1);
+            a.v20 = DP(const uint8_t, 2);
+        }
     } else {
         a.kp0 = di(r, e, 10);
         a.n = DI(8);
@@ -326,7 +336,11 @@ __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j
                                          float *out)
 {
     size_t o = (size_t)(a.rows ? a.rows[j] : j) * a.rstride + (size_t)kv * a.hstride + i;
-    if (a.tq) {
+    if (a.f20) {
+        /* row a.kp0 + j of key head kv */
+        const uint8_t *w = (key ? a.k20 : a.v20) + ((size_t)(a.kp0 + (a.rows ? a.rows[j] : j)) * a.kvh + kv) * a.kv_rb;
+        f20_dec8(f20_load8(w, a.hd, i), out);
+    } else if (a.tq) {
         tq6x8(key ? a.kt : a.vt, o, out, a.cb);
         float sc = (key ? a.ks : a.vs)[o / 32];
         #pragma unroll
@@ -371,7 +385,29 @@ __device__ __forceinline__ void attn_kv8(const attn_d &a, int key, int kv, int j
  * of a key head come in hg groups of at most ATTN_REP (12 heads of Qwen3.8:
  * 2 groups of 6); block x takes group x % hg of key head x / hg. qb is the
  * first query head of the block. */
-__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int hg)
+/* A verify group of GP_ATTN_F32H as decode steps (operand 13: 1; attn_steps_launch): block z of
+ * the launch takes query z0 + z of the group, at position pos + z0 + z, with the arithmetic of
+ * a step on it (one query, its own window), its scores after those of the queries before it
+ * (qh (pos + t) each) and its parts at z in part. One launch for the queries in place of one
+ * for each. */
+__device__ __forceinline__ void attn_as_step(attn_d &a, const gp_rec *r, const int64_t *e, int q)
+{
+    int64_t p0 = a.p, t = DI(8);
+    a.q += (size_t)q * a.qh * a.hd;
+    a.out += (size_t)q * a.qh * a.hd;
+    a.sc += (size_t)q * a.qh * (size_t)(p0 + t);
+    a.p = p0 + q;
+    int64_t lo = (DI(12) && a.window > 0) ? a.p - a.window + 1 : 0;
+    if (lo < 0) {
+        lo = 0;
+    }
+    a.kp0 = lo;
+    a.n = (int)(a.p + 1 - lo);
+    a.k = DP(const float, 1) + (size_t)lo * a.rstride;
+    a.v = DP(const float, 2) + (size_t)lo * a.rstride;
+}
+
+__global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int hg, int z0 = -1)
 {
     PDL_START();
     __shared__ float qs[ATTN_REP * 512];
@@ -379,6 +415,10 @@ __global__ void k_attn_part(const gp_rec *r, const int64_t *e, float *part, int 
     __shared__ float red[ATTN_REP * 512];
     __shared__ float cbs[64];
     attn_d a = attn_get(r, e);
+    if (z0 >= 0) {
+        attn_as_step(a, r, e, z0 + (int)blockIdx.z);
+        part += (size_t)blockIdx.z * a.qh * ATTN_CHUNKS * (a.hd + 2);
+    }
     if (a.tq) {
         if (threadIdx.x < 64) {
             cbs[threadIdx.x] = tq6_cb_d[threadIdx.x];
@@ -575,11 +615,15 @@ __device__ __forceinline__ int ft_len(int nl, int nb);
  * the chunks of attn_len; else the nb chunks of k_attn_fdtc (ft_len) of the
  * gridDim.x / qh queries of the record, head h of query h / qh (its n +
  * h / qh keys, its chunks), chunk stride nb. */
-__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part, int nb)
+__global__ void k_attn_join(const gp_rec *r, const int64_t *e, const float *part, int nb, int z0 = -1)
 {
     PDL_START();
     __shared__ float w[ATTN_CHUNKS];
     attn_d a = attn_get(r, e);
+    if (z0 >= 0) {
+        attn_as_step(a, r, e, z0 + (int)blockIdx.z);
+        part += (size_t)blockIdx.z * a.qh * ATTN_CHUNKS * (a.hd + 2);
+    }
     int h = blockIdx.x, hd = a.hd;
     int n = a.n, stride = ATTN_CHUNKS, len;
     if (nb > 0) {

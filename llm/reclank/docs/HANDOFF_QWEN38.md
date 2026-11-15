@@ -4,6 +4,12 @@ This file gives the state of the work on Qwen3.8-Flash-Next (qwen4exp). It
 tells what works, the numbers, the files, the open work, and the next steps.
 QWEN38_PLAN.md has the full plan and the history of each phase.
 
+This file describes an early state of the work (the NVFP4 GGUF phase); its
+paths and server notes are out of date. The current state is in
+QWEN38_PLAN.md. The GPU memory of the server's programs (the prompt groups'
+temporaries, the EXL3 group MoE in windows, RECLANK_GPU_E3_WIN, the scratch
+classes) is in PROGRAM_MEMORY.md section 6.
+
 ## 1. The state now
 
 - The work is on master in the repo chadslab. Do not push. Commit with the

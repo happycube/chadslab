@@ -19,7 +19,7 @@ def parser():
     g = ap.add_argument_group("the model")
     g.add_argument("--model", "-m", "--gguf", dest="model", required=True,
                    help="the GGUF file of the model, or a checkpoint directory (DeepSeek V4.1)")
-    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41", "nemotron"), default="auto")
+    g.add_argument("--family", choices=("auto", "gemma4", "qwen", "deepseek41", "nemotron", "dgemma"), default="auto")
     g.add_argument("--tokenizer", "--tok", dest="tokenizer", default=None,
                    help="tokenizer.json (Gemma: the GGUF data by default; Qwen: next to the model)")
     g.add_argument("--template", default=None,
@@ -88,7 +88,11 @@ def parser():
                    help="a request with a smaller max_tokens answers with no think part (0: no rule)")
     g = ap.add_argument_group("MTP")
     g.add_argument("--drafter", default=None, metavar="DIR",
-                   help="Gemma: the assistant model (the MTP drafter)")
+                   help="Gemma: the assistant model (the MTP drafter); Nemotron Bolt on the GPU: the LiLiCorr "
+                        "drafter's directory (7 drafts a round; --mtp 0: off; one lane); Qwen3.8-27B on the GPU: "
+                        "a DFlash 2 GGUF (in place of the MTP layer; 7 drafts, the selector's stop 0.5: "
+                        "RECLANK_DFLASH_STOP; one lane) or a DSpark GGUF (scripts/convert_dspark_gguf.py; 8 "
+                        "drafts, the confidences' stop: RECLANK_DSPARK_STOP)")
     g.add_argument("--mtp", type=int, default=None,
                    help="the drafts of each MTP step (Gemma: 2 with --drafter, 3 with the drafter on "
                         "the GPU and RECLANK_MTP_STOP 0.9, 2 when less than 1.5 GB of the GPU is left after "
@@ -98,12 +102,15 @@ def parser():
     g.add_argument("--mtp-floor", type=float, default=None)
     g = ap.add_argument_group("media")
     g.add_argument("--mmproj", default=None,
-                   help="the media encoder (Gemma: the mmproj GGUF; Qwen3.6: the mmproj GGUF; "
-                        "Qwen3.8: the checkpoint directory; DeepSeek V4.1: in the checkpoint, on "
-                        "unless off)")
-    g.add_argument("--mmproj-q8", choices=("auto", "on", "off"), default=None)
+                   help="the media encoder (Gemma and DiffusionGemma: the mmproj GGUF; "
+                        "Qwen3.6: the mmproj GGUF; Qwen3.8: the checkpoint directory; "
+                        "DeepSeek V4.1: in the checkpoint, on unless off)")
+    g.add_argument("--mmproj-q8", choices=("auto", "on", "off", "bf12"), default=None,
+                   help="the encoder's weights: on Q8_0, off as the mmproj holds them, bf12 BF12 (Gemma: "
+                        "models/gemma4/encoders.py weight_form); auto the model's default")
     g.add_argument("--mmproj-gpu", choices=("auto", "keep", "reserve", "lend", "release", "off"),
-                   default=None, help="Qwen: the encoder on the GPU")
+                   default=None, help="Qwen and DiffusionGemma: the encoder on the GPU; Nemotron: off "
+                        "puts it on the CPU")
     g.add_argument("--image-budget", type=int, default=None)
     g.add_argument("--video-frames", type=int, default=None)
     g.add_argument("--video-budget", type=int, default=None)
@@ -122,4 +129,8 @@ def parser():
     g.add_argument("--crash-dir", default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "reclank-crash"),
                    help="a fatal error (a lost CUDA context) writes a report here ('': none)")
     g.add_argument("--quiet", action="store_true")
+    from server.idle import add_idle_args
+    add_idle_args(g)
+    from server.gpushare import add_gpu_args
+    add_gpu_args(ap.add_argument_group("the GPU shared with the other servers (server/gpushare.py)"), models=False)
     return ap

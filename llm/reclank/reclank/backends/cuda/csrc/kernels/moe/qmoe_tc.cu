@@ -22,7 +22,45 @@
 #define KT_K 128
 #define KT_RB 144                           /* the bytes of a row of w in a step (136 used) */
 enum { KT_Q8R = 0, KT_Q80 = 1, KT_Q51 = 2, KT_Q4K = 3, KT_NV4 = 4, KT_NVX = 5, KT_Q4X = 6, KT_Q6K = 7,
-       KT_Q40 = 9 };           /* (8: KD_Q5K of the dp4a tiles) */
+       KT_Q40 = 9, KT_IQ4NL = 10, KT_IQ4XS = 11, KT_Q3K = 12, KT_IQ3S = 13, KT_IQ3XXS = 14, KT_IQ2XXS = 15,
+       KT_IQ2XS = 16, KT_IQ2S = 17, KT_IQ1S = 18, KT_IQ1M = 19 };
+/* KD_Q5K: Q5_K (the dense rows of the tensor cores and the dp4a tiles; not an expert format). A step of
+ * 128 columns is half a block of 176 bytes; a row of a step holds the head (d, dmin, the 12 bytes of
+ * scales), the 32 bytes of high bits (all; bit j is sub-block j), and the 64 bytes of low 4 bits of the
+ * half (112 bytes). */
+#define KD_Q5K 8
+/* KT_IQ4NL .. KT_IQ1M (kernels/quant/iq.cuh; dense rows only): a row of a step holds the whole block
+ * of 256 values of the step (IQ4_NL: its 4 blocks of 32), as it is; part j of it is 4 h + bk for the
+ * half h of the block (IQ4_NL: bk). Q3_K, IQ2_XS, IQ2_S and IQ1_M have a scale for each 16 (iq_split:
+ * the sums of the two halves, as Q6_K). Q2_K (a min for each 16) has no tiles: the float ones. */
+__host__ __device__ constexpr int kt_iq(int f)
+{
+    return f == KT_IQ4NL ? KQ_IQ4_NL : f == KT_IQ4XS ? KQ_IQ4_XS : f == KT_Q3K ? KQ_Q3_K :
+           f == KT_IQ3S ? KQ_IQ3_S : f == KT_IQ3XXS ? KQ_IQ3_XXS : f == KT_IQ2XXS ? KQ_IQ2_XXS :
+           f == KT_IQ2XS ? KQ_IQ2_XS : f == KT_IQ2S ? KQ_IQ2_S : f == KT_IQ1S ? KQ_IQ1_S : f == KT_IQ1M ? KQ_IQ1_M : -1;
+}
+
+/* the tile format of the dense rows of these types, or -1 */
+__host__ __device__ __forceinline__ int kt_iq_format(int type)
+{
+    return type == KQ_IQ4_NL ? KT_IQ4NL : type == KQ_IQ4_XS ? KT_IQ4XS : type == KQ_Q3_K ? KT_Q3K :
+           type == KQ_IQ3_S ? KT_IQ3S : type == KQ_IQ3_XXS ? KT_IQ3XXS : type == KQ_IQ2_XXS ? KT_IQ2XXS :
+           type == KQ_IQ2_XS ? KT_IQ2XS : type == KQ_IQ2_S ? KT_IQ2S : type == KQ_IQ1_S ? KT_IQ1S :
+           type == KQ_IQ1_M ? KT_IQ1M : -1;
+}
+
+/* a tile format with a scale for each 16 (the sums of the two halves) */
+__host__ __device__ constexpr bool kt_split(int f)
+{
+    return f == KT_NV4 || f == KT_NVX || f == KT_Q6K || (kt_iq(f) >= 0 && iq_split(kt_iq(f)));
+}
+
+/* the part of the block in a row of the step at k0 (kt_iq) */
+template <int F>
+__device__ __forceinline__ int kt_iq_part(int bk, int k0)
+{
+    return F == KT_IQ4NL ? bk : 4 * ((k0 / 128) % 2) + bk;
+}
 /* KT_Q6K (the RQ6_K experts, RQ6_MIX_PLAN.md): a step of 128 columns is half
  * a Q6_K block; a row of a step holds its 64 bytes of low 4 bits, 32 of high
  * 2 bits, 8 int8 scales, and d (106 bytes). Block bk of the step: the
@@ -58,14 +96,27 @@ __host__ __device__ __forceinline__ int kt_format(int type)
 }
 
 /* x (n rows of cols values) to int8, with xs and xsum for each block of 32. */
-__global__ void k_kq_quant_x(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
+__device__ __forceinline__ void kq_quant_x_dev(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
 {
-    PDL_START();
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t bi = tid / 8;
     bool live = bi < blocks;
     float4 v = live ? *(const float4 *)(x + tid * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
     quant8_block(v, live, bi, threadIdx.x % 8, q, xs, xsum);
+}
+
+__global__ void k_kq_quant_x(const float *x, int8_t *q, float *xs, float *xsum, size_t blocks)
+{
+    PDL_START();
+    kq_quant_x_dev(x, q, xs, xsum, blocks);
+}
+
+/* k_kq_quant_x of operand k of a record (a chain's body reads x there: runtime/graphs.cu) */
+__global__ void k_kq_quant_x_rec(const gp_rec *rp, const int64_t *re, int k, int8_t *q, float *xs, float *xsum,
+                                 size_t blocks)
+{
+    PDL_START();
+    kq_quant_x_dev((const float *)(intptr_t)di(rp, re, k), q, xs, xsum, blocks);
 }
 
 /* Copy the bytes of row `row` of w for the step at column k0 to dst. */
@@ -100,6 +151,20 @@ __device__ __forceinline__ void kt_load_w(uint8_t *dst, const uint8_t *wrow, int
             int o = i < 32 ? 64 * h + 2 * i : i < 48 ? 128 + 32 * h + 2 * (i - 32)
                   : i < 52 ? 192 + 8 * h + 2 * (i - 48) : 208;
             *(uint16_t *)(dst + 2 * i) = *(const uint16_t *)(blk + o);
+        }
+    } else if (F == KD_Q5K) {
+        const uint8_t *blk = wrow + (size_t)(k0 / 256) * 176;
+        if (lane < 3) {
+            cp_async16(dst + 16 * lane, blk + 16 * lane);
+        } else if (lane < 7) {
+            cp_async16(dst + 16 * lane, blk + 48 + 64 * ((k0 / 128) % 2) + 16 * (lane - 3));
+        }
+    } else if (kt_iq(F) >= 0) {
+        /* the block of the step (2-aligned: halfword copies, as KT_Q6K) */
+        constexpr int T = kt_iq(F), NB = T == KQ_IQ4_NL ? 72 : iq_bb(T);
+        const uint8_t *src = T == KQ_IQ4_NL ? wrow + (size_t)(k0 / 32) * 18 : wrow + (size_t)(k0 / 256) * NB;
+        for (int i = lane; i < NB / 2; i += 32) {
+            ((uint16_t *)dst)[i] = ((const uint16_t *)src)[i];
         }
     } else if (F == KT_NV4) {
         /* the codes of the 4 blocks (64 bytes, 16-aligned), their 8 scales, the
@@ -160,10 +225,36 @@ __device__ __forceinline__ void kt_frag(const uint8_t *rp, int bk, int c, uint32
     }
 }
 
-/* The scale d and the term mn of block bk of the step at k0 of a row. */
+/* kt_frag for the formats whose words depend on the step (k0): Q5_K's high bits, the parts of kt_iq. */
+template <int F>
+__device__ __forceinline__ void kt_frag_k(const uint8_t *rp, int bk, int k0, int c, uint32_t *b)
+{
+    if constexpr (kt_iq(F) >= 0) {
+        iq_words<kt_iq(F)>(rp, kt_iq_part<F>(bk, k0), c, b);
+    } else if constexpr (F == KD_Q5K) {
+        const uint8_t *qs = rp + 48 + 32 * (bk / 2);
+        int sh = 4 * (bk % 2), sb = 4 * ((k0 / 128) % 2) + bk;
+        uint32_t l0 = (*(const uint32_t *)(qs + 4 * c) >> sh) & 0x0f0f0f0fu;
+        uint32_t l1 = (*(const uint32_t *)(qs + 16 + 4 * c) >> sh) & 0x0f0f0f0fu;
+        uint32_t h0 = (*(const uint32_t *)(rp + 16 + 4 * c) >> sb) & 0x01010101u;
+        uint32_t h1 = (*(const uint32_t *)(rp + 32 + 4 * c) >> sb) & 0x01010101u;
+        b[0] = l0 | (h0 << 4);
+        b[1] = l1 | (h1 << 4);
+    } else {
+        kt_frag<F>(rp, bk, c, b);
+    }
+}
+
+/* The scale d and the term mn of block bk of the step at k0 of a row (KD_Q5K: the head of Q4_K). */
 template <int F>
 __device__ __forceinline__ void kt_scale(const uint8_t *rp, int bk, int k0, float *d, float *mn)
 {
+    if constexpr (kt_iq(F) >= 0) {
+        float d1;
+        iq_scales<kt_iq(F)>(rp, kt_iq_part<F>(bk, k0), d, &d1);
+        *mn = 0.f;
+        return;
+    }
     if (F == KT_Q8R) {
         *d = __half2float(*(const __half *)(rp + 128 + 2 * bk));
         *mn = 0.f;
@@ -347,12 +438,22 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
             }
             continue;
         }
-        if (F == KT_NV4 || F == KT_NVX || F == KT_Q6K) {
+        if (kt_split(F)) {
             #pragma unroll
             for (int bk = 0; bk < 4; ++bk) {
                 uint32_t bf[4][2];
                 float dl[4][2], dh[4][2];
-                if (F == KT_Q6K) {
+                if constexpr (kt_iq(F) >= 0) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        kt_frag_k<F>(bs[b][wn + j * 8 + g], bk, k0, c, bf[j]);
+                        #pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            iq_scales<kt_iq(F)>(bs[b][wn + j * 8 + 2 * c + h], kt_iq_part<F>(bk, k0), &dl[j][h],
+                                                &dh[j][h]);
+                        }
+                    }
+                } else if (F == KT_Q6K) {
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         const uint8_t *rp = bs[b][wn + j * 8 + g];
@@ -454,7 +555,7 @@ __device__ void kt_tile(const uint8_t *w, size_t rb, int rows, int n0, int cols,
             float dw[4][2], mw[4][2];
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                kt_frag<F>(bs[b][wn + j * 8 + g], bk, c, bf[j]);
+                kt_frag_k<F>(bs[b][wn + j * 8 + g], bk, k0, c, bf[j]);
                 kt_scale<F>(bs[b][wn + j * 8 + 2 * c], bk, k0, &dw[j][0], &mw[j][0]);
                 kt_scale<F>(bs[b][wn + j * 8 + 2 * c + 1], bk, k0, &dw[j][1], &mw[j][1]);
             }
@@ -708,12 +809,18 @@ __global__ void __launch_bounds__(256) k_qmoe_gu(const gp_rec *r, const int64_t 
 
 /* rot: as k_kqh_act (the warps cover whole groups: the count is a
  * multiple of 32) */
-__global__ void k_qmoe_act(const gp_rec *r, const int64_t *e, int rot)
+/* wn > 0: the rows of a window of the sort from row w0 (e3_win), act and act2
+ * of its rows */
+__global__ void k_qmoe_act(const gp_rec *r, const int64_t *e, int rot, int w0 = 0, int wn = 0)
 {
     PDL_START();
     int inner = DI(7);
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t)DP(const int, 18)[1] * inner) {
+    int64_t rows = DP(const int, 18)[1];
+    if (wn > 0) {
+        rows = min(rows - w0, (int64_t)wn);
+    }
+    if (i >= rows * inner) {
         return;
     }
     int64_t p = i / inner, c = i % inner;
@@ -743,7 +850,9 @@ __global__ void __launch_bounds__(256) k_qmoe_dn(const gp_rec *r, const int64_t 
             DP(float, 21) + (size_t)p0 * hidden, (size_t)hidden);
 }
 
-__global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
+/* wn > 0: the pairs of the window of the sort [w0, w0 + wn) (de of its rows),
+ * added to the output of the windows before (the first writes it) */
+__global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e, int w0 = 0, int wn = 0)
 {
     PDL_START();
     qmoe_w w = qmoe_work(r, e);
@@ -753,23 +862,71 @@ __global__ void k_qmoe_sum(const gp_rec *r, const int64_t *e)
         return;
     }
     const float *val = DP(const float, 1), *de = DP(const float, 21);
+    const unsigned win = wn > 0 ? (unsigned)wn : 0xffffffffu;
     float acc = 0.f;
     int ps = w.pof[t * k + tok];
     /* no shared expert (sgate null: the copied experts of a mixed group,
      * after its hot experts): only the routed pairs */
     const int noshared = DP(const void, 13) == NULL;
     if (ps >= 0 || noshared) {
-        if (ps >= 0) {
-            acc = de[(size_t)ps * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
+        if (ps >= 0 && (unsigned)(ps - w0) < win) {
+            acc = de[(size_t)(ps - w0) * hidden + c] / (1.f + expf(-DP(const float, 17)[tok]));
         }
         for (int s2 = 0; s2 < k; ++s2) {
             int p = w.pof[tok * k + s2];
-            if (p >= 0) {           /* -1: an expert of the CPU (GP_MOE_PLAN) */
-                acc += val[tok * k + s2] * de[(size_t)p * hidden + c];
+            if (p >= 0 && (unsigned)(p - w0) < win) {       /* -1: an expert of the CPU (GP_MOE_PLAN) */
+                acc += val[tok * k + s2] * de[(size_t)(p - w0) * hidden + c];
             }
         }
     }
-    DP(float, 22)[(size_t)tok * hidden + c] = acc;
+    float *out = DP(float, 22) + (size_t)tok * hidden + c;
+    *out = w0 > 0 ? *out + acc : acc;
+}
+
+/* After k_qmoe_sort_par, for the windows of the sort (e3_win): the pairs of
+ * each routed expert x (block x) in the order of their index q, as
+ * k_qmoe_sort places them (the atomics of k_qmoe_sort_par place them in any
+ * order, and a window's edge in an expert then took other pairs from run to
+ * run, its sum in another order). 1024 threads. */
+__global__ void __launch_bounds__(1024) k_qmoe_place(const gp_rec *r, const int64_t *e)
+{
+    PDL_START();
+    __shared__ int wsum[32];
+    __shared__ int base;
+    int t = DI(3), k = DI(4), x = blockIdx.x;
+    int nr = DI(23);
+    nr = nr > 0 && nr < t ? nr : t;
+    const int *idx = DP(const int, 2);
+    qmoe_w w = qmoe_work(r, e);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (threadIdx.x == 0) {
+        base = w.start[x];
+    }
+    __syncthreads();
+    for (int q0 = 0; q0 < nr * k; q0 += 1024) {
+        int q = q0 + threadIdx.x;
+        int f = q < nr * k && idx[q] == x;
+        unsigned m = __ballot_sync(0xffffffffu, f);
+        if (lane == 0) {
+            wsum[warp] = __popc(m);
+        }
+        __syncthreads();
+        int before = 0, all = 0;
+        for (int v = 0; v < 32; ++v) {
+            before += v < warp ? wsum[v] : 0;
+            all += wsum[v];
+        }
+        if (f) {
+            int pos = base + before + __popc(m & ((1u << lane) - 1));
+            w.ptok[pos] = q / k;
+            w.pof[q] = pos;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            base += all;
+        }
+        __syncthreads();
+    }
 }
 
 

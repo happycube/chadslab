@@ -1,6 +1,9 @@
 /* IQ2_XXS (ggml type 16: the experts of Nemotron 3.5 Bolt, docs/NEMOTRON_BOLT_PLAN.md) on the
  * CPU: the values of a block, and one row on one token against the int8 x of kq_quant_part.
  *
+ * Ported from ggml (ggml/src/ggml-common.h, ggml/src/ggml-quants.c: IQ2_XXS; MIT License;
+ * Copyright (c) 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+ *
  * A block of 256 values is 66 bytes (backends/include/iq2_tables.h has the layout): d, then 8
  * parts of 32 values, each four grid indices (8 unsigned bytes 8, 25 or 43 each) and a uint32
  * of 4 x 7 sign bits and the 4-bit scale s. A part is int8 values (the grid bytes with their

@@ -2,6 +2,9 @@
 reference's forward (inference/model.py) op for op, with the products of
 this runtime (csrc/kernels/kq/mxx.c).
 
+Ported from DeepSeek V4.1 Flash's reference code (deepseek-ai/DeepSeek-V4.1-Flash-1017,
+inference/model.py; MIT License; Copyright (c) 2023 DeepSeek). See THIRD_PARTY_NOTICES.md.
+
 Two modes (DEEPSEEK_V41_PLAN.md 3):
 
 - near (the default): the activations in float32; the bfloat16 matrices as

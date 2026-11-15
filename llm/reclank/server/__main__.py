@@ -1,7 +1,7 @@
 """The server of reclank: python -m server --model PATH [options] (see
 server/options.py). The family of the model comes from the file (the GGUF
-general.architecture): Gemma 4, Qwen3.6, or Qwen3.8; or of a checkpoint directory
-(its config.json): DeepSeek V4.1 Flash."""
+general.architecture): Gemma 4, DiffusionGemma (its BF12 GGUF), Qwen3.6, or Qwen3.8; or of a
+checkpoint directory (its config.json): DeepSeek V4.1 Flash."""
 from __future__ import annotations
 
 import os
@@ -15,7 +15,7 @@ from server.backend import Backend  # noqa: E402
 from server.options import parser  # noqa: E402
 from server.worker import ModelWorker  # noqa: E402
 
-FAMILIES = ("gemma4", "qwen", "deepseek41", "nemotron")
+FAMILIES = ("dgemma", "gemma4", "qwen", "deepseek41", "nemotron")
 
 
 def family_module(name):
@@ -25,6 +25,8 @@ def family_module(name):
         from reclank.models.deepseek41 import engine
     elif name == "nemotron":
         from reclank.models.nemotron import engine
+    elif name == "dgemma":
+        from reclank.models.dgemma import engine
     else:
         from reclank.models.qwen import engine
     return engine
@@ -82,12 +84,33 @@ def build(opts):
     return backend
 
 
+def gpu_used():
+    """The CUDA library loaded in the process (a GPU engine)."""
+    rt = sys.modules.get("reclank.backends.cuda.runtime")
+    return rt is not None and rt._lib is not None
+
+
 def main(argv=None):
     opts = parser().parse_args(argv)
-    backend = build(opts)
-    H.serve(backend, host=opts.host, port=opts.port, quiet=opts.quiet, api_key=opts.api_key,
-            cors_origin=opts.cors_origin, max_body=int(opts.max_body_mb * (1 << 20)))
-    return 0
+    share = None
+    if opts.gpu_peers == "on" and opts.backend != "cpu":
+        # the peers release what they can first: the engines' plans take the free memory
+        from server.gpushare import Share
+        pre = Share(port=opts.port, host=opts.host, api_key=opts.api_key, wait=opts.gpu_wait, quiet=opts.quiet)
+        pre.clear(os.path.basename(opts.model.rstrip("/")))
+        try:
+            backend = build(opts)
+        finally:
+            pre.done()
+        if gpu_used():
+            from server.gpushare import EngineShare
+            share = EngineShare(backend, backend.worker, locked=opts.gpu_lock, port=opts.port, host=opts.host,
+                                api_key=opts.api_key, wait=opts.gpu_wait, hold=opts.gpu_hold, quiet=opts.quiet)
+    else:
+        backend = build(opts)
+    return H.serve(backend, host=opts.host, port=opts.port, quiet=opts.quiet, api_key=opts.api_key,
+                   cors_origin=opts.cors_origin, max_body=int(opts.max_body_mb * (1 << 20)), gpu_share=share,
+                   idle_exit=opts.idle_exit)
 
 
 if __name__ == "__main__":

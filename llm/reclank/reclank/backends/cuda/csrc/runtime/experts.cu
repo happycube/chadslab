@@ -15,7 +15,8 @@ typedef struct {
     const int64_t *ranges;
     int count;
     int f, b;
-    int mode, c0, c1;       /* mode 1: KQ_NV4 rows into NV4T (k_nm_tile_pull; the columns of even / odd ranges) */
+    int mode, c0, c1;       /* mode 1: KQ_NV4 rows into NV4T (k_nm_tile_pull; the columns of even / odd ranges);
+                             * 2: DMA (no pull kernel: Bolt's stage, NemotronGPU.bstage) */
 } gg_job;
 
 static pthread_mutex_t gg_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -28,6 +29,7 @@ static char gg_fetch_why[160];     /* the CUDA error of the first failed copy */
 static cudaEvent_t gg_ready[GG_FETCH_MAX], gg_freeev[2];
 static cudaStream_t gg_copy;
 static int gg_worker_on;
+static int gg_fetch_ep;     /* the epoch of gg_copy and its events (gg_fetch_init) */
 
 /* ---------- the measures of the mixed groups (rc_gpu_mix_stats) ----------
  * While they are on, a run keeps: the bytes and the time of each copy job
@@ -48,11 +50,11 @@ static int gg_ms_kind[GG_MS_MAX];      /* 0: GP_FETCH_WAIT, 1: GP_CPU_JOIN */
 /* on 1: clear the measures and keep them from now on. on 0: stop. */
 extern "C" int rc_gpu_mix_stats_on(int on)
 {
-    if (on && !gg_ms_ev_ok) {
+    if (on && gg_ms_ev_ok != gg_epoch) {
         for (int k = 0; k < 4 * GG_MS_MAX; ++k) {
             CK(cudaEventCreate(&gg_ms_ev[k]));
         }
-        gg_ms_ev_ok = 1;
+        gg_ms_ev_ok = gg_epoch;
     }
     pthread_mutex_lock(&gg_mu);
     gg_ms_copy_bytes = gg_ms_copy_s = 0.0;
@@ -279,6 +281,139 @@ static int gg_h2d_staged(gg_stager *sg, void *dst, const void *src, size_t n, cu
     return 0;
 }
 
+/* ---------- a large upload from pageable memory (a model's host weights: docs/GPU_SWAP_PLAN.md 3.2) ----------
+ * A cudaMemcpyAsync from pageable memory runs at 4.2-4.6 GB/s on the 3090 (the driver's staging).
+ * Here two threads (the caller and a helper on the copy workers' CPU) memcpy chunks of 4 MB into a
+ * ring of GG_BIG_BUFS pinned buffers, each chunk's DMA queued in order on the caller's stream as
+ * soon as it is in its buffer, and the next upload goes on in the ring where this one stopped:
+ * 8.1 GB/s for arrays of 8 MB to 1 GB (the rate of cudaMallocHost's memory; chunks of 16 MB the
+ * same from 32 MB, 4.4-5.0 GB/s below; the helper on the model thread's CPU 5.15). It returns when
+ * the source is read (the last DMAs from the ring may still run), as a pageable copy does. One
+ * upload at a time (a mutex); the ring made again in a new context. Under RECLANK_GPU_BIG_MIN_MB
+ * (8) the plain call; RECLANK_GPU_BIG_CHUNK_MB the chunk; RECLANK_GPU_STAGE=0 the plain call. */
+#define GG_BIG_BUFS 8
+static size_t gg_big_chunk, gg_big_min;     /* RECLANK_GPU_BIG_CHUNK_MB (4), RECLANK_GPU_BIG_MIN_MB (8) */
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dst;
+    size_t n, next, queued, first;          /* first: the ring's buffer of chunk 0 */
+    cudaStream_t st;
+    int bad;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+} gg_big_job;
+static uint8_t *gg_big_buf[GG_BIG_BUFS];
+static cudaEvent_t gg_big_ev[GG_BIG_BUFS];
+static int gg_big_ep;
+static size_t gg_big_cur;                   /* the ring's next buffer (the uploads go on from it) */
+static pthread_mutex_t gg_big_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *gg_big_fill(void *arg)
+{
+    gg_big_job *j = (gg_big_job *)arg;
+    cudaSetDevice(gg_device);
+    size_t S = gg_big_chunk, nch = (j->n + S - 1) / S;
+    for (;;) {
+        pthread_mutex_lock(&j->mu);
+        size_t c = j->next < nch && !j->bad ? j->next++ : nch;
+        /* the buffer's chunk before (c - GG_BIG_BUFS) queued first: its event then marks its DMA */
+        while (c < nch && c >= GG_BIG_BUFS && j->queued <= c - GG_BIG_BUFS && !j->bad) {
+            pthread_cond_wait(&j->cv, &j->mu);
+        }
+        pthread_mutex_unlock(&j->mu);
+        if (c >= nch) {
+            return NULL;
+        }
+        int b = (int)((j->first + c) % GG_BIG_BUFS), bad = j->bad;
+        size_t off = c * S, len = j->n - off < S ? j->n - off : S;
+        if (!bad && cudaEventSynchronize(gg_big_ev[b]) == cudaSuccess) {
+            memcpy(gg_big_buf[b], j->src + off, len);
+        } else {
+            bad = 1;
+        }
+        pthread_mutex_lock(&j->mu);
+        while (j->queued != c && !j->bad) {
+            pthread_cond_wait(&j->cv, &j->mu);
+        }
+        if (bad || j->bad ||
+            cudaMemcpyAsync(j->dst + off, gg_big_buf[b], len, cudaMemcpyHostToDevice, j->st) != cudaSuccess ||
+            cudaEventRecord(gg_big_ev[b], j->st) != cudaSuccess) {
+            j->bad = 1;
+        }
+        j->queued++;
+        pthread_cond_broadcast(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+    }
+}
+
+extern "C" int rc_gpu_h2d_big(void *d, const void *h, size_t n)
+{
+    cudaStream_t st = gg_stream;
+    if (!gg_big_chunk) {
+        const char *v = getenv("RECLANK_GPU_BIG_CHUNK_MB"), *w = getenv("RECLANK_GPU_BIG_MIN_MB");
+        gg_big_min = (size_t)(w ? atof(w) : 8.0) << 20;
+        gg_big_chunk = (size_t)(v ? atof(v) : 4.0) << 20;
+    }
+    if (n < gg_big_min || !gg_stage_on()) {
+        CK(cudaMemcpyAsync(d, h, n, cudaMemcpyHostToDevice, st));
+        return 0;
+    }
+    pthread_mutex_lock(&gg_big_mu);
+    if (gg_big_ep != gg_epoch) {
+        for (int b = 0; b < GG_BIG_BUFS; ++b) {
+            if (cudaMallocHost(&gg_big_buf[b], gg_big_chunk) != cudaSuccess ||
+                cudaEventCreateWithFlags(&gg_big_ev[b], cudaEventDisableTiming) != cudaSuccess) {
+                pthread_mutex_unlock(&gg_big_mu);
+                snprintf(gg_error, sizeof(gg_error), "rc_gpu_h2d_big: the pinned ring: %s",
+                         cudaGetErrorString(cudaGetLastError()));
+                return -1;
+            }
+        }
+        gg_big_ep = gg_epoch;
+        gg_big_cur = 0;
+    }
+    /* (each buffer's event: its last DMA, of an earlier upload maybe on another stream; a new one
+     * not recorded yet, which a sync passes) */
+    gg_big_job j;
+    memset(&j, 0, sizeof(j));
+    j.src = (const uint8_t *)h;
+    j.dst = (uint8_t *)d;
+    j.n = n;
+    j.st = st;
+    j.first = gg_big_cur;
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    /* the helper on the copy workers' CPU (rc_gpu_cpu_roles: kept out of the teams; the model
+     * thread, pinned to its own CPU, would else share that one with it: 5.15 GB/s) */
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    int cc, mc;
+    rc_gpu_cpu_roles(&cc, &mc);
+    if (cc >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cc, &set);
+        pthread_attr_setaffinity_np(&at, sizeof(set), &set);
+    }
+    pthread_t helper;
+    int two = pthread_create(&helper, &at, gg_big_fill, &j) == 0;
+    pthread_attr_destroy(&at);
+    gg_big_fill(&j);
+    if (two) {
+        pthread_join(helper, NULL);
+    }
+    pthread_mutex_destroy(&j.mu);
+    pthread_cond_destroy(&j.cv);
+    gg_big_cur = (j.first + (n + gg_big_chunk - 1) / gg_big_chunk) % GG_BIG_BUFS;
+    pthread_mutex_unlock(&gg_big_mu);
+    if (j.bad) {
+        snprintf(gg_error, sizeof(gg_error), "rc_gpu_h2d_big of %zu bytes: %s", n,
+                 cudaGetErrorString(cudaGetLastError()));
+        return -1;
+    }
+    return 0;
+}
+
 /* RECLANK_GPU_FETCH_PULL (8): the copies of a GP_FETCH job from
  * registered host memory as one kernel of that many blocks of 256 threads
  * that reads the host memory (the map of the pinned experts) and writes the
@@ -381,6 +516,8 @@ static void *gg_worker(void *arg)
     static gg_stager sg;
     static int64_t *prg, *prg_d;
     static int prg_cap;
+    static size_t tp_set;
+    int ep = gg_epoch;
     gg_worker_bind();
     for (;;) {
         pthread_mutex_lock(&gg_mu);
@@ -389,10 +526,18 @@ static void *gg_worker(void *arg)
         }
         gg_job j = gg_jobs[gg_job_head % GG_FETCH_MAX];
         pthread_mutex_unlock(&gg_mu);
+        if (ep != gg_epoch) {
+            /* a new context (rc_gpu_shutdown): the old one's stage, table and attribute went with it */
+            memset(&sg, 0, sizeof(sg));
+            prg_d = NULL;
+            prg_cap = 0;
+            tp_set = 0;
+            ep = gg_epoch;
+        }
         int bad = cudaEventSynchronize(gg_freeev[j.b]) != cudaSuccess;
         double t0 = gg_clock(), nb = 0.0;
         int np_ = -1;
-        if (!bad && (gg_pull_blocks() > 0 || j.mode == 1)) {
+        if (!bad && j.mode != 2 && (gg_pull_blocks() > 0 || j.mode == 1)) {
             if (j.count > prg_cap) {
                 free(prg);
                 cudaFree(prg_d);
@@ -411,8 +556,7 @@ static void *gg_worker(void *arg)
             bad = cudaMemcpyAsync(prg_d, prg, (size_t)np_ * 24, cudaMemcpyHostToDevice, gg_copy) !=
                   cudaSuccess;
             if (!bad && j.mode == 1) {
-                /* (16 rows of the widest matrix in shared memory: opted in once) */
-                static size_t tp_set = 0;
+                /* (16 rows of the widest matrix in shared memory: opted in once a context) */
                 const size_t sm = 16 * kq_row_bytes(KQ_NV4, j.c0 > j.c1 ? j.c0 : j.c1);
                 if (sm > 48 * 1024 && sm > tp_set) {
                     cudaFuncSetAttribute(k_nm_tile_pull, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
@@ -488,12 +632,14 @@ static int gg_cissued[GG_CACHE_JOBS], gg_cid[GG_CACHE_JOBS], gg_cerror;
 static cudaEvent_t gg_cev[GG_CACHE_JOBS];
 static cudaStream_t gg_cstream;
 static int gg_cworker_on;
+static int gg_cache_ep;     /* the epoch of gg_cstream and gg_cev */
 
 static void *gg_cworker(void *arg)
 {
     (void)arg;
     cudaSetDevice(gg_device);
     static gg_stager sg;
+    int ep = gg_epoch;
     gg_worker_bind();
     for (;;) {
         pthread_mutex_lock(&gg_cmu);
@@ -502,6 +648,10 @@ static void *gg_cworker(void *arg)
         }
         gg_cjob j = gg_cjobs[gg_cjob_head % GG_CACHE_JOBS];
         pthread_mutex_unlock(&gg_cmu);
+        if (ep != gg_epoch) {
+            memset(&sg, 0, sizeof(sg));     /* (a new context: the old stage went with the old one) */
+            ep = gg_epoch;
+        }
         int bad = 0;
         for (int k = 0; k < j.count && !bad; ++k) {
             const int64_t *q = j.ranges + 3 * k;

@@ -932,6 +932,51 @@ float32; QWEN_PLAN.md has the forms):
 - The raw keys must stay. A snapshot of the server can start in a block,
   and the key of that block then needs the raw keys before the snapshot.
 
+## The memory of the programs
+
+Measured as in PROGRAM_MEMORY.md (the mirror's copies of each program by name, the free memory and the pool
+around each prompt) on the EXL3 4.05 file from the weightkeeper, the server's engine (two lanes of 163840
+positions, MTP 3 drafts), the RTX 3090. The mixed group of 4096 rows:
+
+    part                                                   before    now
+    the arena (the packed temporaries)                     1.66 GB   0.97 GB
+    H, the n-gram layer's conv input (gn), xn, ple         0.42 GB   0.25 GB
+    the C side's scratches (EXL3 workspace, int8 x)        1.39 GB   0.59 GB
+    the free memory it took in all                         3.47 GB   1.81 GB
+
+- The arena's peak was a DeltaNet layer, not the MoE: compile_qwen4_step gave every product's output the
+  widest row (12288 floats), and beta, alpha (48 columns) and the gate (6144) held 288 KB a row there.
+  Each output is now a temporary of its own columns (own()); gn is a temporary outside a verify group
+  (only commit reads it). 406 -> 236 KB a row, the bits the same.
+- The EXL3 workspace of GP_KQ_GROUP_MOE was sized for all t k + t pairs (int16 x, the parts of gate, up
+  and down: 1.19 GB at 4096 rows), beside act, act2 and de (197 KB a row). The sort runs in windows of at
+  most RECLANK_GPU_E3_WIN rows (12288: the group of 4096 in 4 windows of 11264, of 2048 in 2), each
+  window's products and its sum into the tokens' rows (k_qmoe_sum w0); k_qmoe_place puts each expert's
+  pairs in the order of their index first, so the windows are the same from run to run. The MoE output
+  of a layer differs by 3.3e-8 rms (the order of the sum). Decode rows of the float32 reference (249 rows,
+  its prompts as mixed groups with RECLANK_GPU_MIX_MIN=64 and 4 windows of 704): KL 3.52e-3 before,
+  3.51e-3 with no window, 3.27e-3 with it. (Between the trees on a long prompt the logits differ by a KL of
+  about 2e-3: the GPU/CPU split of a mixed group moves with the free memory, and the routing amplifies it.)
+- After a long prompt the MTP layer's group of 256 rows (the prompt's rows) stayed: packed on the arena
+  of the large programs, and holding the C scratches made for the mixed group (the newest of each kind),
+  it kept 2.9 GB through the decode, and the hot experts that the prompt took (8.68 -> 6.78 GB) never
+  came back. Now the programs of a prompt load with scratches of their own class (rc_gpu_scratch_own 2),
+  and the MTP layer's groups of more than 16 rows and the large arena go with the prompt's programs at
+  the first decode step (warm_short). Those programs stay for the whole prompt: the MTP layer's rows
+  after each part of 4096 tokens had freed the mixed group, made again for the next part.
+
+The pool while decoding after 8K and 16K prompts 13.7 -> 15.4 GB (16.3 at the start; the rest is the
+cache that grew), the experts on the GPU 4.5-5.5K -> 5.1-6.0K. The same requests in turn, each tree in
+its own process, timed alone (two rounds, the same within 2%), before -> now: 8K prompts 483 -> 577 tok/s
+(the second; the first after the start ran 31-97 tok/s in three of four runs of the old tree, 447 in
+the fourth, and 512-524 in all four of the new), 16K 520, 573 -> 610, 660. The decode the
+same: MTP after those prompts 50-55 tok/s, a chat of 256 tokens 64-68, two chats in the lanes
+61-72 tok/s together.
+RECLANK_GPU_PROGRAM_GB 3.0 in place of 4.5 gave 83 hot slots in place of 70 at the start, but the first
+long prompt takes the hot experts back to the same 8.44 GB: the rates the same. Not done (they would save
+memory only while a prompt runs, and all of it comes back at its first decode step): sub-batches of the
+dense part of a group (236 -> about 100 KB a row), bfloat16 intermediates.
+
 ## Full quality: the original bfloat16 checkpoint in the weightkeeper
 
 The weightkeeper (reclank/runtime/weightkeeper.py, the zygote of DeepSeek V4.1

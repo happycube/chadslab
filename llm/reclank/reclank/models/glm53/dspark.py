@@ -1,6 +1,9 @@
 """The DSpark drafter of GLM-5.3-Flash on the GPU (P7 of docs/GLM53_PLAN.md):
 RedHatAI/GLM-5.3-Flash-speculator.dspark-preview, its bfloat16 matrices as BF12.
 
+Ported from speculators (vllm-project/speculators, src/speculators/models/dspark; Apache License
+2.0; by Red Hat). See THIRD_PARTY_NOTICES.md.
+
 The drafter (speculators' DSpark, replayed in scripts/glm53_dspark_reference.py: 4.02 tokens a verify
 step on the trace with these taps):
 

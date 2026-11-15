@@ -87,13 +87,20 @@ __global__ void k_bf12_to_bf16(const uint8_t *w, int n, int cols, uint16_t *dst)
 
 /* As gg_gemm_bf16 for KQ_BF12 rows: k_gemm_bf16_tc<X2, 1> (bf12_fused_on),
  * else chunks of rows (at most w16_n values, a multiple of T2N rows) to
- * bfloat16 rows in the scratch w16 (k_bf12_to_bf16), then gg_gemm_bf16. */
+ * bfloat16 rows in the scratch w16 (k_bf12_to_bf16), then gg_gemm_bf16 (x
+ * converted for the first chunk only). x1: x as one bfloat16 plane (the
+ * program's x1); an X1 product of BF12_CHUNK_T tokens or more takes the chunks
+ * also when fused: the fused kernel decodes each group again in each tile of
+ * tokens (33 times for 4128 tokens), the chunks once: the same bits, less
+ * work (the 3090 is held at its power limit: a 6B DiT's call 2.12 -> 2.00
+ * s). */
 static void gg_gemm_bf12(const float *x, size_t ldx, const int *xrow0, const uint8_t *w, float *out,
                          size_t ldo, const int *orow0, int t, int rows, int cols, uint16_t *xb,
-                         uint16_t *w16, size_t w16_n, cudaStream_t s)
+                         uint16_t *w16, size_t w16_n, cudaStream_t s, int x1 = 0)
 {
-    if (bf12_fused_on()) {
-        gg_gemm_bf16(x, ldx, xrow0, (const uint16_t *)w, out, ldo, orow0, t, rows, cols, xb, s, 1);
+    int chunk = x1 && t >= BF12_CHUNK_T && w16 != NULL && w16_n >= (size_t)cols;
+    if (bf12_fused_on() && !chunk) {
+        gg_gemm_bf16(x, ldx, xrow0, (const uint16_t *)w, out, ldo, orow0, t, rows, cols, xb, s, 1, x1);
         return;
     }
     int step = (int)(w16_n / (size_t)cols);
@@ -103,7 +110,7 @@ static void gg_gemm_bf12(const float *x, size_t ldx, const int *xrow0, const uin
         int n = rows - r0 < step ? rows - r0 : step;
         k_bf12_to_bf16<<<(unsigned)(((int64_t)n * (cols / 16) + 255) / 256), 256, 0, s>>>(
             w + (size_t)r0 * rb, n, cols, w16);
-        gg_gemm_bf16(x, ldx, xrow0, w16, out + r0, ldo, orow0, t, n, cols, xb, s);
+        gg_gemm_bf16(x, ldx, xrow0, w16, out + r0, ldo, orow0, t, n, cols, xb, s, 0, x1, r0 > 0);
     }
 }
 

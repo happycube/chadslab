@@ -285,13 +285,15 @@ __global__ void k_attn_fdt_join(const gp_rec *r, const int64_t *e, const float *
  * ms a layer at 8192 tokens on the GTX 1070). The kernel before (int16
  * only) read q of the 8 heads from shared memory for each key and had 213
  * registers. */
-template <bool KQ8, bool VQ8>
+template <bool KQ8, bool VQ8, int G = 8>
 __global__ void __launch_bounds__(256, 2) k_attn_fdq(const gp_rec *r, const int64_t *e, float *part)
 {
     PDL_START();
-    constexpr int HD = 256, G = 8;
+    /* G: the query heads of a key head (8: Qwen3.5 / 3.6; 6: Qwen3.8-27B, 24 by 4); the warps take 8, the
+     * heads past G read the last head's q and write nothing */
+    constexpr int HD = 256;
     __shared__ float red[6][32][33];
-    __shared__ float wm[4][G], wl[4][G];
+    __shared__ float wm[4][8], wl[4][8];
     const float *aq, *aks, *avs;
     const int16_t *akq, *avq;
     const int8_t *akq8, *avq8;
@@ -321,7 +323,7 @@ __global__ void __launch_bounds__(256, 2) k_attn_fdq(const gp_rec *r, const int6
     float q[4][8];
     #pragma unroll
     for (int hh = 0; hh < 4; ++hh) {
-        const float *qp = aq + ((size_t)kv * G + 4 * hg + hh) * HD + 8 * lane;
+        const float *qp = aq + ((size_t)kv * G + min(4 * hg + hh, G - 1)) * HD + 8 * lane;
         #pragma unroll
         for (int u = 0; u < 8; ++u) {
             q[hh][u] = qp[u];
@@ -413,6 +415,9 @@ __global__ void __launch_bounds__(256, 2) k_attn_fdq(const gp_rec *r, const int6
         #pragma unroll
         for (int hh = 0; hh < 4; ++hh) {
             int h = 4 * hg + hh;
+            if (h >= G) {
+                break;
+            }
             float M = fmaxf(fmaxf(wm[0][h], wm[1][h]), fmaxf(wm[2][h], wm[3][h]));
             float c[4], L = 0.f;
             #pragma unroll

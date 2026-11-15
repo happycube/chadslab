@@ -59,8 +59,42 @@ SKIP = {P.INT4_LINEAR: (2,), P.INT4_MULTI4: (3, 7, 11, 15),
         P.TO_HOST: (1, 4, 7), P.CPU_JOIN: (0,), P.TO_DEV: (0,), P.FETCH: (0,),
         P.CPU_START: (0,), P.SIGNAL: (0, 3, 6, 9, 11), P.AWAIT: (0, 2), P.D2H: (1,), P.H2D: (0,),
         P.CPU_TASK: (0, 1, 2), P.MOE_COMBINE: (5,),     # (MOE_COMBINE: the rows of the CPU, pinned)
+        P.NM_STAGED: (11, 12, 13, 14),            # (its stage's words, pinned, and its buffers)
         P.DS_COMBINE: (3,), P.DS_EMBED: (0,),     # (DS_EMBED: the table in pinned host memory)
-        P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,)}  # (the CPU's sums of its experts, pinned)
+        P.DS_HC_POST: (12,), P.DS_HC_STEP: (2,),  # (the CPU's sums of its experts, pinned)
+        # the counts of the encoders' records: a count of hundreds of millions (a VAE's pixels
+        # times channels at 2048 x 2048) can fall in the host range of an array of the heap,
+        # which the translation took for its address (a launch of ~2^47 blocks: "invalid argument")
+        P.COPY: (2,), P.KQ_LINEAR: (5, 6, 7, 8), P.ENC_LINEAR: (2, 5, 6, 7), P.ENC_RMS: (3, 4),
+        P.ENC_LNORM: (4, 5, 7), P.ENC_GELU: (2, 3), P.ENC_SILU: (2,), P.ENC_SILU_MUL: (3,),
+        P.ENC_MUL_VEC: (3, 4), P.ENC_ADD: (2,), P.ENC_BIAS_CLAMP: (2, 3), P.ENC_GATHER: (3, 4, 5),
+        P.ENC_ROPE1D: (3, 4, 5), P.ENC_ROPE_TAB: (3, 4, 5, 6), P.ENC_ATTN_RANGE: (6, 7, 8, 9),
+        P.ENC_ATTN_X2: (6, 7, 8), P.ENC_ATTN_WIDE: (6, 7, 8), P.ENC_ATTN_TILE: (6, 7, 8),
+        P.ENC_RESIZE: tuple(range(2, 13)), P.ENC_DIBR: (6, 7, 8, 9, 10, 12, 13), P.ENC_PACK_U8: (2,),
+        P.ENC_RESIZE_TAPS: (2, 3, 4, 5, 6, 7, 8, 11), P.ENC_UNPACK_U8: (2,),
+        P.ENC_WARP: tuple(range(5, 14)) + (16,), P.ENC_PRELU: (2, 3), P.ENC_MIX: tuple(range(2, 10)),
+        P.ENC_CONV_MM: (7, 8, 9, 10, 12, 13), P.ENC_RIFE_IN: tuple(range(13, 21)),
+        P.ENC_RIFE_OUT: tuple(range(12, 20)), P.ENC_UNPACK_U8P: (2, 3, 4, 5, 6), P.ENC_PACK_U8C: (2, 3, 4, 5),
+        P.ENC_RESAMPLE_U8: tuple(range(4, 11)), P.ENC_THUMB_U8: tuple(range(9, 14)),
+        P.ENC_CONV3: tuple(range(7, 13)), P.ENC_BF16_PACK: (2, 3), P.ENC_I16_PACK: (2, 3),
+        P.ENC_ATTN_BLOCKS: (5, 6, 7, 8, 9, 10, 11), P.ENC_BLOCK_MASK: tuple(range(8, 15)),
+        P.DG_KV_PUT: (5, 6, 7), P.DG_ATTN: (6, 7, 8, 9), P.DG_SAMPLE: (9, 10, 11),
+        P.DG_MOE: (11, 12, 13, 14, 15), P.DG_SPLIT: (3,)}
+
+
+def _no_numpy_hugepages():
+    """numpy's large arrays without transparent huge pages (madvise): their faults compacted memory directly, and the
+    compaction tried to move the host pages the GPU pins (a weightkeeper's of 4 KB pages, registered): each try
+    failed and flushed the TLBs of every CPU (Super on the 3060 + 1070, a prompt of 1024 tokens 121 -> 172 tok/s, the
+    migrations gone). RECLANK_NUMPY_HUGEPAGE=1 keeps them."""
+    if os.environ.get("RECLANK_NUMPY_HUGEPAGE") == "1":
+        return
+    try:
+        from numpy._core import multiarray as ma
+    except ImportError:
+        from numpy.core import multiarray as ma
+    if hasattr(ma, "_set_madvise_hugepage"):
+        ma._set_madvise_hugepage(False)
 
 
 def lib():
@@ -78,6 +112,7 @@ def lib():
     except Exception as exc:  # no nvcc, or the build failed
         _error = "the GPU library is not available: %s" % exc
         raise RuntimeError(_error) from exc
+    _no_numpy_hugepages()
     vp, sz, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
     L.rc_gpu_last_error.restype = ctypes.c_char_p
     L.rc_gpu_lane.argtypes = [i]
@@ -95,6 +130,7 @@ def lib():
     L.rc_gpu_malloc.restype = vp
     L.rc_gpu_free.argtypes = [vp]
     L.rc_gpu_h2d.argtypes = [vp, vp, sz]
+    L.rc_gpu_h2d_big.argtypes = [vp, vp, sz]
     L.rc_gpu_h2d_rows.argtypes = [i, vp, vp, sz]
     L.rc_gpu_d2h.argtypes = [vp, vp, sz]
     L.rc_gpu_mix_stats_on.argtypes = [i]
@@ -107,6 +143,8 @@ def lib():
     L.rc_gpu_clear_error.argtypes = []
     L.rc_gpu_profile.argtypes = [vp, vp, vp]
     L.rc_gpu_q6k_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
+    L.rc_gpu_q6r_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
+    L.rc_gpu_q6r_head_x8.argtypes = [vp, vp, vp, i, i, i]
     L.rc_gpu_q4_head.argtypes = [vp, vp, vp, i, i, ctypes.c_float, i]
     L.rc_gpu_e3_linear.argtypes = [vp, i, i, i, vp, i, vp, ctypes.c_float]
     L.rc_gpu_e3_linear_x16.argtypes = [vp, i, i, i, vp, i, vp]
@@ -115,6 +153,7 @@ def lib():
     L.rc_gpu_embed_q4.argtypes = [vp, vp, vp, i, ctypes.c_float]
     L.rc_gpu_embed_q4_rows.argtypes = [vp, vp, vp, i, i, ctypes.c_float]
     L.rc_gpu_set_cpu_runner.argtypes = [vp]
+    L.rc_gpu_set_cpu_after.argtypes = [vp]
     L.rc_gpu_host_register_rw.argtypes = [vp, ctypes.c_size_t]
     L.rc_gpu_set_moe_rot.argtypes = [ctypes.c_int]
     L.rc_gpu_set_moe_rot.restype = None
@@ -145,6 +184,9 @@ def lib():
     L.rc_gpu_ko_table.argtypes = [vp, vp, i, i, i]
     L.rc_gpu_zero.argtypes = [vp, sz]
     L.rc_gpu_caps_get.argtypes = [ctypes.POINTER(i), i]
+    L.rc_gpu_shutdown.argtypes = []
+    L.rc_gpu_context_up.argtypes = []
+    L.rc_gpu_epoch.argtypes = [ctypes.POINTER(ctypes.c_double)]
     # The products of a large group: RECLANK_GPU_TC=1 (the default) runs
     # them on the tensor cores with float16 inputs, 8 with int8 inputs (the
     # Q8_0 form: faster, less exact), and 0 with float32 kernels.
@@ -165,6 +207,8 @@ def lib():
             n = int(os.environ.get("OMP_NUM_THREADS", "0") or 0) // 2 if numa.enabled() else 0
         cops._lib.rc_set_task_threads(ctypes.c_int(int(n)))
         L.rc_gpu_set_cpu_runner(ctypes.cast(cops._lib.rc_run_task, ctypes.c_void_p))
+        if hasattr(cops._lib, "rc_er_after"):
+            L.rc_gpu_set_cpu_after(ctypes.cast(cops._lib.rc_er_after, ctypes.c_void_p))
         _place_threads(L)
     _lib = L
     return L
@@ -366,6 +410,14 @@ class Mirror:
                 raise KeyError("host array %#x has no device copy: %s" % (
                     start, ("dropped at:\n" + gone) if gone else "never added to the mirror"))
             a = np.ascontiguousarray(self.arrays[start])
+            q4x = P.ops._Q4X_SELF.get(start)
+            if q4x is not None:
+                # an int4 matrix of the weightkeeper's KQ_Q4X (no Q4_0 copy on the
+                # host; the array is the tensor's bytes): the GPU kernels read its
+                # Q4_0 blocks
+                if a.nbytes != q4x[0]:
+                    raise ValueError("a KQ_Q4X matrix of %d bytes in an array of %d" % (q4x[0], a.nbytes))
+                a = P.ops.q4x_to_q40(a.view(np.uint8).reshape(-1, q4x[1], 18))
             # pinned: the programs hold its address in their code
             b = self.bufs[start] = Buffer(a.nbytes, self.kind, keep=self.keep, pinned=True)
             b.upload(a)
@@ -479,7 +531,8 @@ def _check_scales(prog, done=None):
             continue
         for wk, sk, rk, ck in pairs:
             w, s = args[wk][1], args[sk][1]
-            if not w or w in done:
+            if not w or not s or w in done:
+                # (no scales: a matrix of KQ_Q4X bytes, its float16 scales its only ones)
                 continue
             done.add(w)
             rows, cols = args[rk][1], args[ck][1]
@@ -493,11 +546,54 @@ def _check_scales(prog, done=None):
                                  "float16 scales; the GPU kernels read the float16 scale")
 
 
+# the GPU programs loaded (close_all), and the handles of the C side's programs loaded: a program has no
+# finalizer that unloads it, so the handle of one dropped unclosed stays here (close_all unloads it)
+_LIVE = weakref.WeakSet()
+_HANDLES = set()
+
+
+def close_all():
+    """Free all the device memory of the process (before a release of the context: the GPU
+    sharing, server/gpushare.py): close every GPU program loaded, release every _Runner (its host
+    programs kept), free every Buffer left. The objects that held them must be made again (the
+    engines' reload_device). Return (programs, blocks) freed."""
+    from reclank.backends.cuda.gpumm import mem
+    from reclank.encoders.runtime import RESIDENCY
+    mem().poll(wait=True)
+    for r in list(RESIDENCY.state.keys()):
+        if r.gpu_bytes() > 0:
+            r.release(keep_host=True)
+            RESIDENCY.evicted.add(r)
+    progs = list(_LIVE)
+    for g in progs:
+        g.close()
+    orphans = list(_HANDLES)            # (programs dropped unclosed)
+    for h in orphans:
+        lib().rc_gpu_unload(h)
+    _HANDLES.clear()
+    blocks = list(mem().blocks.values())
+    for b in blocks:
+        b.free()
+    return len(progs) + len(orphans), len(blocks)
+
+
+def remake(obj):
+    """A new object of obj's class with obj's host half (the attributes its __init__ had set before
+    its device half: obj._host_keys) and a new device half (_device_state, _device_init): a reload
+    after close_all, with no attribute of the old device half left (those set later too)."""
+    new = type(obj).__new__(type(obj))
+    new.__dict__.update({k: v for k, v in obj.__dict__.items() if k in obj._host_keys})
+    new._host_keys = obj._host_keys
+    new._device_state()
+    new._device_init()
+    return new
+
+
 class GPUProgram:
     """A Program on the GPU: its records with device addresses, its data, and
     the device buffers of its parameters."""
 
-    def __init__(self, prog, graph=True, mirror=None, tc=True, i8=False, atc=False):
+    def __init__(self, prog, graph=True, mirror=None, tc=True, i8=False, atc=False, x1=False):
         """mirror is the Mirror of an earlier program of the same model. The
         programs then share the device copies of the weights. tc False keeps
         float32 products for the large groups of this program, in place of
@@ -505,7 +601,9 @@ class GPUProgram:
         of the large groups (k_gemm_q8) also with tc False; i8 2 gives them
         the int16 form (k_quant_x2: two int8 planes), and to the KQ_Q4X
         experts of a prompt. atc True runs the
-        attention of the large groups on the tensor cores also with tc False."""
+        attention of the large groups on the tensor cores also with tc False. x1
+        True: x as one bfloat16 plane in the BF12 products of the large groups (8
+        bits of x, about 1.5 times as fast; a precision change by choice)."""
         self.run_blocks = None    # the model's blocks for each run (GpuMem.lock)
         self.fence = 0
         self.prog = prog
@@ -528,7 +626,10 @@ class GPUProgram:
                 if d is not None:
                     code[i]["v"][k] = d
         self.handle = lib().rc_gpu_load(buf.ctypes.data, (1 if graph else 0) | (0 if tc else 2) | (4 if i8 else 0) |
-                                  (8 if atc else 0) | (16 if i8 == 2 else 0))
+                                  (8 if atc else 0) | (16 if i8 == 2 else 0) | (32 if x1 else 0))
+        if self.handle:
+            _LIVE.add(self)
+            _HANDLES.add(self.handle)
         if not self.handle:
             msg = lib().rc_gpu_last_error().decode()
             lib().rc_gpu_clear_error()
@@ -640,7 +741,9 @@ class GPUProgram:
     def close(self):
         if self.handle:
             lib().rc_gpu_unload(self.handle)
+            _HANDLES.discard(self.handle)
             self.handle = None
+            _LIVE.discard(self)
             # who closed it: a run after this is an error that names it
             import traceback
             self.closed_by = "".join(traceback.format_stack(limit=12)[:-1])
@@ -981,8 +1084,13 @@ def expert_host(model, layer):
     gu, dn = w["experts.gate_up_proj"][0], w["experts.down_proj"][0]
     n = gu.shape[0]
     e = P.ops._Q4X_MOE.get(gu.ctypes.data)
-    if e is not None and os.environ.get("RECLANK_GPU_Q4X", "1") != "0" and int8_tiles():
+    only = getattr(model, "_q4x_only", False)
+    if e is not None and (only or os.environ.get("RECLANK_GPU_Q4X", "1") != "0") and int8_tiles():
         return e[0].reshape(n, -1), e[1].reshape(n, -1), True
+    if only:
+        # the weightkeeper's KQ_Q4X experts, no Q4_0 copy: GP_MOE_GPU reads them with int8 products
+        raise RuntimeError("the experts are KQ_Q4X only (the weightkeeper's Q4X): the GPU needs the tensor "
+                           "cores or dp4a (RECLANK_GPU_DP4A); start the weightkeeper with --q4x off for this GPU")
     return gu.reshape(n, -1), dn.reshape(n, -1), False
 
 
@@ -1338,6 +1446,7 @@ class HotCache:
     # (rows x experts) bool, or None: the experts an expert device holds (set in __init__ and by
     # devices.py; here too for the caches made without __init__, as scripts/check_hotcache.py does)
     exclude = None
+    remote = None
 
     def __init__(self, dev, decay=None, max_ins=None, layers=None, top_k=None):
         """layers (or None for a ModelGPU) gives one dict for each layer
@@ -1357,8 +1466,11 @@ class HotCache:
         # (rows x experts) bool, or None: experts another GPU holds (an expert
         # device, devices.py), which the slots do not take: their selections
         # do not count (exclusive caching: the slots go to experts that would
-        # run on the CPU)
+        # run on the CPU). remote: the same experts, for the count of the
+        # pairs on no GPU (cpu_pairs), with exclude or without (the slots
+        # take any expert, and the device runs those of its experts they lack)
         self.exclude = None
+        self.remote = None
         self.top_k = top_k or cfg.top_k_experts
         self.layers = layers if layers is not None else []  # the layers with hot experts
         for layer, (_hot, gu_store, dn_store, slots) in (
@@ -1452,7 +1564,11 @@ class HotCache:
         held = blocks[pool.owner[blocks] >= 0]
         if held.size == 0:
             return
-        self.prepare(wait=True)
+        # the copies that run land (their blocks have owners: in held), and no new ones: prepare's
+        # observe could start a copy into a free block of blocks, which then landed as a warm expert
+        # not in held, its segment went (pool_shrink), and its slot kept the block (the 26B on the RTX
+        # 3060 with an expert device: a prompt's buffers took a segment, GP_MOE_GPU read address 0)
+        self._land(wait=True)
         E = self.score.shape[1]
         changed = set()
         for i in held:
@@ -1644,7 +1760,7 @@ class HotCache:
         R, E = rows.size, self.score.shape[1]
         self.routes[rows] += np.bincount((np.arange(R)[None, :, None] * E + sels)[ok],
                                          minlength=R * E).reshape(R, E)
-        on = self.held[rows] if self.exclude is None else self.held[rows] | self.exclude[rows]
+        on = self.held[rows] if self.remote is None else self.held[rows] | self.remote[rows]
         self.pairs += int(ok.sum())
         self.cpu_pairs += int((ok & ~np.take_along_axis(on[None], np.maximum(sels, 0), axis=2)).sum())
         if self.exclude is not None:

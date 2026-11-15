@@ -1,4 +1,7 @@
 /* ---------- Qwen3.5 on the GGUF formats (QWEN_PLAN.md, phase 4) ----------
+ * The block formats ported from ggml (ggml/src/ggml-common.h, ggml/src/ggml-quants.c;
+ * MIT License; Copyright (c) 2023-2026 The ggml authors). See THIRD_PARTY_NOTICES.md.
+ *
  * The records of compile_qwen_step (reclank/models/qwen/qwen35.py). The products read x
  * in float32: GP_KQ_QUANT does nothing on the GPU, and GP_KQ_LINEAR reads
  * operand 3 (the float rows). The weights are the blocks of the GGUF file
@@ -53,6 +56,9 @@ __host__ __device__ __forceinline__ int bt_shape(int type, int rows, int cols)
 /* KQ_MXF8 (FP4-Local): an MXFP8 row, its cols E4M3 codes, then the E8M0 scale of each 32, zeros to
  * 16 bytes (kernels/quant/mxf8.cu) */
 #define KQ_MXF8 66
+/* KQ_F20: rows of float32 values to 16 significant bits (backends/cpu/csrc/kernels/kq/formats.c; the
+ * float32 dense matrices of an NVFP4 Qwen3.6 on the GPU, models/qwen/gpu35.py QwenGPU.dense) */
+#define KQ_F20 68
 /* Q8_0 in rows for the GPU (reclank/models/qwen/gpu35.py): the int8 values of the
  * row, then the float16 scale of each 32 values, then zeros to a multiple
  * of 16 bytes. Thus the values of each row start at a multiple of 16
@@ -73,6 +79,8 @@ __host__ __device__ __forceinline__ size_t kq_row_bytes(int type, int cols)
            type == KQ_MXF8 ? ((size_t)cols + cols / 32 + 15) / 16 * 16 :
            type == KQ_IQ2_XXS ? (size_t)cols / 256 * 66 :
            type == KQ_IQ2R ? nm_q2_rb(cols) :
+           kq_iq_type(type) ? kq_iq_row_bytes(type, cols) :
+           kq_pr_type(type) ? pr_row_bytes(type, cols) :
            type == KQ_Q4_K ? (size_t)cols / 256 * 144 : type == KQ_Q5_K ? (size_t)cols / 256 * 176 :
            (size_t)cols / 256 * 210;
 }
@@ -460,6 +468,11 @@ __device__ float kq_row_part(int type, const uint8_t *w, const float *x, int col
         }
     } else if (type == KQ_IQ2R) {
         sum = kq_iq2r_part(w, x, cols, part, nparts, lane);
+    } else if (kq_iq_type(type)) {
+        sum = kq_iq_part(type, w, x, cols, part, nparts, lane);
+    } else if (kq_pr_type(type)) {
+        /* (pr_fmt.cuh's rows of a GPU without the tensor cores: a call) */
+        sum = kq_pr_row_part(type, w, x, cols, part, nparts, lane);
     } else if (type == KQ_Q4_K || type == KQ_Q5_K) {
         /* lane l: 4 bytes of the part pair c = l / 8: 4 values of part 2c
          * (the low 4 bits) and 4 of part 2c + 1 (the high 4 bits). */
@@ -811,11 +824,40 @@ __global__ void k_router_topk(const gp_rec *r, const int64_t *e, const gp_rec *r
     }
 }
 
+/* The value of x that an F20 row keeps (rc_kq_f32_to_f20, then the decode): 16 significant bits
+ * (to nearest, ties to even), 0 for more than 15 binades under the largest of the group of 32
+ * (the 32 lanes of the warp: consecutive values) and for -2^(E-15), and for Inf and NaN. */
+__device__ __forceinline__ float f20_value_warp(float x)
+{
+    uint32_t v = __float_as_uint(x);
+    if (((v >> 23) & 255) == 255) {
+        v = 0;
+    } else {
+        v = (uint32_t)(((uint64_t)v + 0x7f + ((v >> 8) & 1)) & 0xffffff00u);
+        if (((v >> 23) & 255) == 255) {
+            v = 0;
+        }
+    }
+    int e = (int)((v >> 23) & 255), E = e;
+    for (int o = 16; o > 0; o >>= 1) {
+        E = max(E, __shfl_xor_sync(RC_FULL_MASK, E, o));
+    }
+    int gap = E - e;
+    if (gap > 15 || (gap == 15 && (v >> 31) && (v & 0x7fffffu) == 0)) {
+        v = 0;
+    }
+    return __uint_as_float(v);
+}
+
 /* GP_ATTN_PREP: qg, kk, vv, qn, kn, cos, sin, K, V, hs, pos, t, nq, nk, hd, rot, eps,
- * scale, qout, gate, kout (gp_attn_prep_body of the CPU; with a null K the
+ * scale, qout, gate, kout[, f20] (gp_attn_prep_body of the CPU; with a null K the
  * key goes to kout, for GP_KV_WRITE; with a null gate, LFM2, qg holds the
  * query alone, hd values a head). One block of hd threads
- * for each (token, head). */
+ * for each (token, head). Operand 21 (or none: 0): 1 (RECLANK_QWEN_KV_F20SIM, a trial of the
+ * quality of F20 rows) the keys and values written to K and V take the values of F20 rows; 2 K and V
+ * are F20 rows (uint8, positions x nk x f20_row_bytes(hd): the F20 form of the first full attention
+ * layer, qwen35.layer_kv_form), the values of form 1; 3 (RECLANK_QWEN_KV_ULPSIM, a control of the
+ * trials) the last bit of each key and value flipped. */
 __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
 {
     PDL_START();
@@ -825,6 +867,8 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
     int64_t hs = di(r, e, 9), pos = di(r, e, 10);
     const float *src, *w;
     float *dst, sc;
+    bool f20 = false;
+    uint8_t *k20 = NULL;
     if (h < nq) {
         if (DP(float, 19) != NULL) {
             src = DP(const float, 0) + ((size_t)j * nq + h) * 2 * hd;
@@ -838,13 +882,21 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
     } else {
         int kh = h - nq;
         src = DP(const float, 1) + ((size_t)j * nk + kh) * hd;
-        if (DP(float, 7) == NULL) {
+        f20 = DP(float, 7) != NULL && r->tag[21] != GP_T_NONE && DI(21) != 0;
+        if (f20 && DI(21) == 2) {
+            /* F20 rows: the value row now, the key row after the rope */
+            const size_t rb = f20_row_bytes(hd), at = ((size_t)(pos + j) * nk + kh) * rb;
+            k20 = DP(uint8_t, 7) + at;
+            f20_store_warp(DP(const float, 2)[((size_t)j * nk + kh) * hd + d], DP(uint8_t, 8) + at, hd, d);
+            dst = NULL;
+        } else if (DP(float, 7) == NULL) {
             dst = DP(float, 20) + ((size_t)j * nk + kh) * hd;
         } else {
             size_t rs = kv_rs((size_t)hs, nk, hd);
             dst = DP(float, 7) + (size_t)kh * hs + (size_t)(pos + j) * rs;
+            const float vv = DP(const float, 2)[((size_t)j * nk + kh) * hd + d];
             DP(float, 8)[(size_t)kh * hs + (size_t)(pos + j) * rs + d] =
-                DP(const float, 2)[((size_t)j * nk + kh) * hd + d];
+                f20 && DI(21) == 3 ? __uint_as_float(__float_as_uint(vv) ^ 1u) : f20 ? f20_value_warp(vv) : vv;
         }
         w = DP(const float, 4);
         sc = 1.f;
@@ -859,12 +911,20 @@ __global__ void k_attn_prep(const gp_rec *r, const int64_t *e)
     ys[d] = y;
     __syncthreads();
     const float *c = DP(const float, 5) + (size_t)j * rot, *sn = DP(const float, 6) + (size_t)j * rot;
+    float o;
     if (d < half) {
-        dst[d] = (ys[d] * c[d] - ys[d + half] * sn[d]) * sc;
+        o = (ys[d] * c[d] - ys[d + half] * sn[d]) * sc;
     } else if (d < rot) {
-        dst[d] = (ys[d] * c[d] + ys[d - half] * sn[d]) * sc;
+        o = (ys[d] * c[d] + ys[d - half] * sn[d]) * sc;
     } else {
-        dst[d] = y * sc;
+        o = y * sc;
+    }
+    if (k20 != NULL) {
+        f20_store_warp(o, k20, hd, d);
+    } else if (f20 && DI(21) == 3) {
+        dst[d] = __uint_as_float(__float_as_uint(o) ^ 1u);
+    } else {
+        dst[d] = f20 ? f20_value_warp(o) : o;
     }
 }
 
