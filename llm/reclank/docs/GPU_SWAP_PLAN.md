@@ -7,25 +7,20 @@ model's outputs the same bits before and after a swap.
 ## 1. What there is now (server/generate.py)
 
 - Every GPU part of every generation model runs through encoders.runtime._Runner:
-  - FLUX.2's text encoder, DiT and VAE (the VAE's encoder of reference images: vae_enc);
-  - SD's CLIP, UNet and VAE;
-  - Qwen-Image;
-  - Wan's DiT and VAE (umT5 is CPU only);
   - Higgs (qwen3.decode, its codec);
-  - ACE-Step.
+  - ACE-Step;
+  - Whisper;
+  - the upscalers (SeedVR2's DiT and VAE, Real-ESRGAN).
 
   _Runner.release(keep_host=True) frees the device copies of the weights (the
   Mirror's Buffers) and every program's scratch, and keeps the host programs.
   The next run uploads the weights again from the host arrays.
 - The swap mechanism therefore exists; the policy around it is ad hoc:
-  - An image request releases the previous image model, unless --keep.
-  - A video job releases the last image model, and Wan releases itself after
-    each video.
+  - Some pipelines release their own parts after a request.
   - **Speech (Higgs) and music (ACE-Step) never release.** Once used, they stay
     on the GPU beside whatever comes next.
-  - Nothing releases speech or music for an image model or a video. Higgs at
-    about 9 GB, plus an image model, plus Wan's 12.5 GB DiT can run out of
-    memory.
+  - Nothing releases speech or music for another model. Higgs at about 9 GB
+    plus a large DiT can run out of memory.
 - Every model named on the command line is loaded into host RAM at start:
   - read from disk;
   - converted (F20/BF12);
@@ -39,19 +34,18 @@ model's outputs the same bits before and after a swap.
 
 | | |
 |---|---|
-| Wan DiT (12.48 GB F20) from disk at start | 34 s (reading 19.7 GB float32 plus the F20 conversion) |
-| A Wan DiT call, warm | 2.0-2.1 s |
+| A 12.5 GB F20 DiT from disk at start | 34 s (reading 19.7 GB float32 plus the F20 conversion) |
 | release(keep_host=True) | 0.33 s |
-| The first call after a release | 5.05 s, plus the text prefix 0.64 s: about **3.6 s of reload**, about 3.5 GB/s |
+| The first call after a release | about **3.6 s of reload** for 12.5 GB, about 3.5 GB/s |
 | Host to device, pageable memory | 4.5 GB/s |
 | Host to device, cudaHostRegister'd | 7.5 GB/s (registering 0.034 s a GB) |
 | Host to device, cudaMallocHost | 8.2 GB/s (allocating 0.63 s a GB) |
 | cudaMalloc + cudaFree of 40 MB | 1 ms |
 
 A swap from host RAM therefore costs seconds, not the tens of seconds of a
-load from disk. A pinned or staged upload would bring Wan's 3.6 s to about
-1.6-1.8 s. Against a 4-minute video or a 5-second image, the bandwidth is
-the smaller win; the policy (what is evicted, and when) is the larger.
+load from disk. A pinned or staged upload would bring the 3.6 s to about
+1.6-1.8 s. Against requests of seconds to minutes, the bandwidth is the
+smaller win; the policy (what is evicted, and when) is the larger.
 
 ## 3. Design
 
@@ -76,17 +70,14 @@ the smaller win; the policy (what is evicted, and when) is the larger.
   request as now.
 - **Pins:** `with Residency.use(*parts):` around a pipeline's call keeps its
   own parts from being evicted by each other mid-request:
-  - FLUX's text encoder is not evicted for its own DiT;
-  - Wan's DiT is still released before its VAE, as now: a part may unpin
-    itself early.
+  - a text encoder is not evicted for its own DiT;
+  - a DiT may be released before its VAE: a part may unpin itself early.
 
   A request runs under server.lock, so the pinned set is that one request's.
 - **Budget:**
   - `--gpu-budget GB` (default: the free memory at start, less the reserve);
-  - `--keep` becomes "pin these models' weights" (a list of ids), not a
-    global flag.
-- The ad-hoc release calls in server/generate.py (last_image, Wan's release
-  after each video) go away. The manager decides; the pipelines say only what
+  - `--pin ID,...` pins whole models' weights.
+- The ad-hoc release calls in server/generate.py go away. The manager decides; the pipelines say only what
   they use.
 - KV caches and saved voices:
   - Higgs's prefix snapshots (save_prefix) are host copies already and survive
@@ -101,7 +92,7 @@ the smaller win; the policy (what is evicted, and when) is the larger.
   reuse the staging of experts.cu (GG_STAGE: two pinned buffers, a memcpy
   into one while the other's DMA runs) for any array over a few MB. That
   gives about 7.5-8 GB/s, with no pinned copy of the model kept in RAM.
-- Optional: cudaHostRegister the host weights of models pinned by --keep.
+- Optional: cudaHostRegister the host weights of pinned models.
   This costs the same RAM but locks it; it is not the default.
 - Prefetch:
   - when a queued request names a model that is not resident and the budget
@@ -118,18 +109,15 @@ the ring where the last stopped: 8.1 GB/s for arrays of 8 MB to 1 GB against
 4.5 for pageable memory (16 MB chunks reach it only from 32 MB arrays; the ring
 starting again at its first buffer at each upload serialized small arrays). The
 generation checks with every runner evicted and the context reset before each
-run (RECLANK_EVICT_ALWAYS=2) print the same numbers; the loads: Wan's DiT
-11.69 GB 2.66 -> 1.55 s, its 720p VAE 11.57 GB 4.32 -> 2.37 s, Qwen-Image's
-DiT 13.79 GB 3.73 -> 2.05 s, Z-Image's 14.82 GB 3.30 -> 1.89 s, FLUX.2's 7.81
-GB 2.09 -> 1.16 s, Higgs's LM 8.40 GB 2.30 -> 1.50 s, SD's UNet 4.49 GB 1.26 ->
-0.91 s; an LLM server's reload too (DiffusionGemma's 23.5 GB 5.43 -> 3.37 s,
+run (RECLANK_EVICT_ALWAYS=2) print the same numbers; the loads: Higgs's LM
+8.40 GB 2.30 -> 1.50 s; an LLM server's reload too (DiffusionGemma's 23.5 GB 5.43 -> 3.37 s,
 the same chat). The prefetch is not built: it pays only when the queued request's model
 fits beside the running one, which on the 24 GB card these models seldom do.
 
 ### 3.3 Host RAM as a tier too (lazy loading)
 
 - Models named on the command line are registered, not loaded: the first
-  request that needs one loads it, as Wan already does with umT5.
+  request that needs one loads it.
 - `--host-budget GB`: over it, the least recently used model's host programs
   and weights are dropped as well. Its next use loads from disk again.
 - **A converted-weights cache**, so that a load from disk does not repeat the
@@ -142,13 +130,14 @@ fits beside the running one, which on the 24 GB card these models seldom do.
     keeps a load from filling a node's page cache (see the page-cache
     stalls).
 
-  Wan's load would go from 34 s to about the time to read 12.5 GB. It needs
+  A 12.5 GB F20 DiT's load would go from 34 s to about the time to read 12.5
+  GB. It needs
   disk space equal to the converted weights and is optional
   (`--convert-cache DIR`).
 
 ### 3.4 Models added and removed at run time (no restart)
 
-- `POST /v1/admin/models {"id", "kind": "flux2|sd|qwen-image|wan|higgs|acestep", "path", options}`
+- `POST /v1/admin/models {"id", "kind": "higgs|acestep|whisper|...", "path", options}`
   registers a model; `DELETE /v1/admin/models/{id}` drops it from all tiers.
 - Both require the API key.
 - `/v1/models` gains each model's residency (`gpu`, `host`, `disk`) and its
@@ -158,8 +147,8 @@ fits beside the running one, which on the 24 GB card these models seldom do.
 ### 3.5 Sharing the GPU with the other servers (later)
 
 The embedding server (8082) and the LLM servers (8081) are other processes
-holding GPU memory. Wan at 720p needs the whole card and cannot run beside the
-embedding server today.
+holding GPU memory. A large job may need the whole card and cannot run beside
+the embedding server today.
 
 - First step: each server gets `POST /v1/admin/release` and a `--gpu-budget`.
   A small arbiter script, or the generation server itself before a job that
@@ -313,8 +302,7 @@ is not part of this: a server with one keeps its context.
    with RECLANK_EVICT_ALWAYS=1 and a context reset before every call: the same
    numbers. **Done:** RECLANK_EVICT_ALWAYS=2 (every runner evicted and the
    context reset before each GPU run, 2 to 45 resets a script, each 0.07-0.09 s,
-   none refused): SD, FLUX.2, Qwen-Image, Z-Image, Wan (dit, vae, a second
-   prompt, all), Higgs and a cloned voice, ACE-Step, Whisper (and its decoder
+   none refused): Higgs and a cloned voice, ACE-Step, Whisper (and its decoder
    and the long form) print the same numbers as without.
 2. The peers, the locks and the admin routes (the generation, embedding and
    LLM servers). Check: a generation job with the embedding server holding the
@@ -322,14 +310,14 @@ is not part of this: a server with one keeps its context.
    again with the same vectors (bytes); with the embedding server locked, it
    keeps its memory and the job fits in the rest or fails at once naming the
    lock; unlocked by the route, the next job gets its room. **Done:** the
-   embedding server (EmbeddingGemma 2, its three towers on the GPU) and the
-   generation server (Wan 2.2 5B), a 720p video (its VAE 22.3 GB): the
-   embedding server released 1.91 GB and its context in 0.20 s, the video the
-   bytes of a fresh server's; the 18 inputs' vectors (texts, audio, images)
-   the same bytes after; locked by the route it kept its 1.59 GB and the video
-   fit in the rest; unlocked, the next video's room came from it again, the same
-   bytes. The asking is best effort: a part's need may be an estimate (the 720p
-   VAE's 24.6 GB, 22.3 real), so with nothing more to give the build tries and
+   embedding server (EmbeddingGemma 2, its three towers on the GPU) released
+   1.91 GB and its context in 0.20 s for a generation job that needed most of
+   the card, the job's output the bytes of a fresh server's; the 18 inputs'
+   vectors (texts, audio, images) the same bytes after; locked by the route it
+   kept its 1.59 GB and the job fit in the rest; unlocked, the next job's room
+   came from it again, the same
+   bytes. The asking is best effort: a part's need may be an estimate (a VAE's
+   24.6 GB, 22.3 real), so with nothing more to give the build tries and
    only the locks (on the known part of the need) fail at once; a build that
    fails after asking names the peers' locks.
 3. The engines, each with `RECLANK_SWAP_ALWAYS=1` (a release and a context
@@ -379,15 +367,14 @@ is not part of this: a server with one keeps its context.
    the first drafted into the old context's address and answered nothing).
    GLM-5.3 has no engine in the server yet (the model and its checks only):
    its release and reload come with its engine.
-4. A session across the servers: an LLM chat, an image, an embedding, music, a
-   video, the LLM chat again (its cache kept), each output the same as alone;
-   the card never over (nvidia-smi sampled). **Done:** the embedding server
-   (EmbeddingGemma 2 on the GPU), the generation server (SD 1.5, ACE-Step,
-   Wan 2.2 5B) and DiffusionGemma (23.5 GB) on one 3090: a chat, an image, the
-   18 embeddings, music, a video, the chat's second turn. Each output the
-   bytes of its server alone (the chat's answers too; its second turn 25
-   tokens from the cache after DiffusionGemma gave its 23.55 GB to SD's UNet in
-   0.57 s and came back in 6.2 s); the card at most 23187 of 24576 MiB. The
+4. A session across the servers: an LLM chat, an embedding, music, the LLM
+   chat again (its cache kept), each output the same as alone; the card never
+   over (nvidia-smi sampled). **Done:** the embedding server (EmbeddingGemma 2
+   on the GPU), the generation server (ACE-Step) and DiffusionGemma (23.5 GB)
+   on one 3090: a chat, the 18 embeddings, music, the chat's second turn. Each
+   output the bytes of its server alone (the chat's answers too; its second
+   turn from the cache after DiffusionGemma gave its 23.55 GB to another
+   model in 0.57 s and came back in 6.2 s); the card at most 23187 of 24576 MiB. The
    embedding server asks its peers to release before its towers' warm-up (as an
    LLM server before its load).
 
@@ -431,7 +418,7 @@ locked.
 ### 3.7 One weightkeeper for every model, shared by every server
 
 Today a weightkeeper holds one checkpoint (runtime/weightkeeper.py: a plugin
-each for DeepSeek V4.1, Qwen3.8's GGUF, EXL3 and FP4-Local, Nemotron, Wan, a
+each for DeepSeek V4.1, Qwen3.8's GGUF, EXL3 and FP4-Local, Nemotron, a
 Gemma 4 GGUF); several run side by side (`--name`), each checks the memory on
 its own, and a server finds the one holding its checkpoint (find). The
 generation and embedding servers keep their models' weights in their own
@@ -453,9 +440,8 @@ memory. With one keeper:
 - **Every model a plugin.** The existing ones, plus the generation and
   embedding models over about 2 GB as their converted rows (F20, BF12: the
   forms their servers make now), so a load is a map, not a read and a
-  conversion: FLUX.2, Qwen-Image (and its text encoder), Z-Image, SD, Higgs,
-  ACE-Step, Whisper, SeedVR2, umT5, EmbeddingGemma 2 and the music towers,
-  DiffusionGemma's BF12 GGUF. The small ones (RIFE, Real-ESRGAN, the depth
+  conversion: Higgs, ACE-Step, Whisper, SeedVR2, EmbeddingGemma 2 and the
+  music towers, DiffusionGemma's BF12 GGUF. The small ones (RIFE, Real-ESRGAN, the depth
   models) stay in their servers.
 - **The host budget lives in the keeper** (phase 3 becomes this):
   `--host-budget GB` (and per node, the GPU's node first) for all entries; for a
@@ -466,8 +452,8 @@ memory. With one keeper:
 - **The converted-weights cache** is the keeper's segments written to disk
   (`--save DIR`: each entry's segments and index, keyed as above); a load finds
   its entry there first and reads it with O_DIRECT (no conversion, no page
-  cache), then the checkpoint. Wan's 866 s ready would be about the time to
-  read 72.9 GB.
+  cache), then the checkpoint: a 72.9 GB entry's 866 s ready would be about
+  the time to read 72.9 GB.
 - **Shared between servers.** Two servers that use one model (a text encoder
   in two pipelines; the same LLM in two servers) map the same entry: one copy
   of its pages. Each process registers its own map with CUDA
@@ -478,7 +464,8 @@ memory. With one keeper:
     pageable 4.5), so 3.6's reloads go faster (part of phase 2's goal);
   - a third tier past 3.6's: an idle server may exit (`--idle-exit S`; the
     context and all its own memory gone) and start again on its next request,
-    attaching in seconds (Wan: 5-19 s against 446 s from the shards);
+    attaching in seconds (5-19 s against 446 s from the shards for a 73 GB
+    entry);
     `scripts/serve_forever.sh` and the peer files (3.6) restart it, a request
     in the meantime waits.
 - **Faults.** The keeper holds no CUDA context and runs no model. A keeper
@@ -579,25 +566,19 @@ before):
    (`RECLANK_KEPT=1`, the default socket or `RECLANK_WEIGHTKEEPER=NAME`): a
    put entry stays in the keeper after its server exits, until a drop or the
    budget takes it, so a keeper does not grow by a server's models unless
-   asked. Wired in where a load converts: Z-Image's DiT (F20), Wan's DiT
-   (F20; not with the A14B's keeper plugin nor the streamed blocks, which
-   `_pack` copies), SeedVR2's DiT (F20; not the 7B's streamed blocks),
-   Qwen-Image's text encoder (BF12). Each model's check (its regression
+   asked. Wired in where a load converts: SeedVR2's DiT (F20; not the 7B's
+   streamed blocks, which `_pack` copies). Each model's check (its regression
    check's arguments) without a keeper, then with one: made and put, mapped,
    and after a new keeper restored from `--save`, the numbers of the run
    without it in every case:
 
    | Model (part)            | Held    | Base    | Mapped | Restored |
    |-------------------------|---------|---------|--------|----------|
-   | Z-Image DiT             | 15.8 GB | 47.3 s  | 0.5 s  | 8.5 s    |
-   | Wan 2.2 TI2V-5B DiT     | 12.8 GB | 38.7 s  | 1.5 s  | 7.9 s    |
    | SeedVR2-3B DiT          | 8.7 GB  | 76.2 s  | 0.0 s  | 4.7 s    |
-   | Qwen-Image text encoder | 10.6 GB | 12.7 s  | 0.4 s  | 5.8 s    |
 
-   Not wired, their loads short or of another shape: SD's UNet (its BF12
-   made after all its convs, 4 s), Whisper's encoder (7.6 s), EmbeddingGemma
-   2 and the music towers (small), FLUX.2, Higgs, ACE-Step and umT5 (no
-   conversion: the checkpoint's bytes as they are), DiffusionGemma (a GGUF:
+   Not wired, their loads short or of another shape: Whisper's encoder
+   (7.6 s), EmbeddingGemma 2 and the music towers (small), Higgs and ACE-Step
+   (no conversion: the checkpoint's bytes as they are), DiffusionGemma (a GGUF:
    the keeper's GGUF plugin's shape). The reloads from registered maps (DMA)
    are not done: a GPU reload still uploads from the maps by the staged path
    (3.2).
@@ -622,9 +603,9 @@ before):
    gave back all of the card, the next request answered in 9.3 s (the start,
    the attach, the GPU's load), the bench's answers and the chat before and
    after the bytes of the server without a keeper; the generation server
-   with Z-Image (its DiT kept, `RECLANK_KEPT=1`): an image of 58.9 s at the
-   first start, the same request after the idle exit 31.6 s (the DiT mapped;
-   the text encoder, not kept, and the image the rest), the same bytes.
+   with a kept DiT (`RECLANK_KEPT=1`): a request of 58.9 s at the first
+   start, the same request after the idle exit 31.6 s (the DiT mapped), the
+   same bytes.
 
 Checks: each plugin's entry the same bytes as its own keeper's (or its
 server's conversion: byte compare) and its model's check the same numbers; two
@@ -639,11 +620,11 @@ outputs.
 
 | Phase | Work | Check |
 |---|---|---|
-| 1 (done) | Residency (3.1): the registry, make_room, pins, the OOM retry, `--gpu-budget`; speech and music evictable; the ad-hoc releases removed | Each model's check script with a forced eviction before every call (`RECLANK_EVICT_ALWAYS=1`): the same bits as without. A server session of image -> speech -> music -> video -> image -> speech, each output the same bits as a fresh server's, the GPU never over budget (nvidia-smi sampled). Unit tests for the LRU order and pins |
+| 1 (done) | Residency (3.1): the registry, make_room, pins, the OOM retry, `--gpu-budget`; speech and music evictable; the ad-hoc releases removed | Each model's check script with a forced eviction before every call (`RECLANK_EVICT_ALWAYS=1`): the same bits as without. A server session of speech -> music -> transcription -> speech, each output the same bits as a fresh server's, the GPU never over budget (nvidia-smi sampled). Unit tests for the LRU order and pins |
 | 1.5 | Every server swaps (3.6): the engines' device halves, the context released, the servers asking each other for room | 3.6's checks: each engine's outputs with a release and a context reset before every request the same as a fresh server's; a session across the servers |
-| 2 (the upload done) | Staged upload (3.2); prefetch | Wan's reload 3.6 s -> under 2 s; the same bits; prefetch not slowing the running request by more than the noise |
+| 2 (the upload done) | Staged upload (3.2); prefetch | A 12.5 GB reload 3.6 s -> under 2 s; the same bits; prefetch not slowing the running request by more than the noise |
 | 3 (steps 1-5 done) | Lazy load, `--host-budget`, the converted-weights cache (3.3), all in the one shared weightkeeper (3.7) | A cold model from the cache: the same F20/BF12 bytes as a conversion (byte compare); load times; RSS within the budget with every model registered |
-| 4 | Admin routes (3.4); release across servers (3.5) | Adding SD 2.0 to a running server and generating; Wan 720p after the embedding server releases, then the embedding server serving again |
+| 4 | Admin routes (3.4); release across servers (3.5) | Adding a model to a running server and serving it; a job that needs the whole card after the embedding server releases, then the embedding server serving again |
 
 Phase 1 is the core and is self-contained: about 1-2 days. Phases 2-4 are
 independent of each other.
@@ -659,14 +640,11 @@ built it differs from 3.1 in three points:
 - The budget refuses only on the known bytes; the first build's estimate of
   its scratch only drives the evictions.
 
---keep stays a flag (the image models' text encoders and VAEs), and --pin ID,...
-pins whole models.
+--pin ID,... pins whole models.
 
 ## 5. Decisions for the user
 
-- The default for `--keep`: today it keeps the text encoders and VAEs of image
-  models on the GPU. Under the manager, the natural default is "no pins, LRU
-  decides", with `--keep ID,...` to pin.
+- The default for pins: "no pins, LRU decides", with `--pin ID,...` to pin.
 - The converted-weights cache writes model-sized files to disk; its default
   location: off unless given. **Decided:** off; written only where a path is
   given.

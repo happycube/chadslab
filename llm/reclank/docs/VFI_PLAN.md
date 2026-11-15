@@ -1,6 +1,6 @@
 # Video frame interpolation (Practical-RIFE 4.25)
 
-Raise a video's frame rate by making the frames between the originals: Wan's 16 and 24 fps clips
+Raise a video's frame rate by making the frames between the originals: 16 and 24 fps clips
 to 48-96 fps, 24 or 30 fps footage to 60, slow motion. reclank/models/vfi (rife.py, video.py,
 ref.py); the route of server/generate.py in server/interpolate.py; scripts/interpolate_video.py
 from the command line. The plan (with its prototype and measurements, sections 1-7) was approved
@@ -121,7 +121,7 @@ Head, IFBlock, IFNet, warplayer.py's grid and grid_sample, the padding of infere
 vsrife 5.7.0's packaging of the same model (PyPI, MIT, read) agrees line for line). Real frames:
 59.94 fps LaserDisc captures (1440 x 1080, video-originated: every frame a distinct temporal sample;
 a hand-held pan, camera shake over leaves, a slow office scene, video effects with trails and
-transparency, a scene cut) and two of our own Wan clips (the 5B's 832 x 480 at 24 fps, the A14B's
+transparency, a scene cut) and two clips of our own (the fox, 832 x 480 at 24 fps; the waves,
 1280 x 720 at 16 fps). scripts/check_rife.py:
 
 | Check | GPU (and the CPU, the same) |
@@ -133,7 +133,7 @@ transparency, a scene cut) and two of our own Wan clips (the 5B's 832 x 480 at 2
 | PSNR against the held-out frames | the reference's to 0.01 dB on every set |
 | scale 0.5 (padded to 128) | 1 - cos 3.6e-12 / 7.8e-12, at most 1 level |
 
-tests/unit/test_vfi.py (our own Wan frames only): the records C and Python against NumPy (the same
+tests/unit/test_vfi.py (our own frames only): the records C and Python against NumPy (the same
 bits), ENC_RESIZE without its strides unchanged, the schedules (factor, 23.976 -> 59.94, a
 variable rate), the cut rule, the video plumbing (ffmpeg in and out, counts, rates, audio), the GPU
 byte path's host halves (probe_plan's BOX passes against PIL, thumbs_of, mean_abs, the deconv
@@ -152,8 +152,8 @@ in levels, the share of pixels more than 8 levels off (analog noise caps all of 
 | shake, leaves | 28.86 dB, 5.3 | 28.99 dB, 5.2 | 25.95 dB | 21.95 dB | 27.35 dB | 27.37 dB |
 | office (slow) | 35.68 dB, 3.1 | 35.70 dB, 3.1 | 35.42 dB | 32.72 dB | 34.82 dB | 34.93 dB |
 | effects (hard) | 26.80 dB, 7.0 | 26.52 dB, 7.3 | 27.02 dB | 25.48 dB | 27.08 dB | 26.71 dB |
-| Wan 5B fox (24 -> 12 -> 24) | 36.40 dB | 36.66 dB | 35.65 dB | 28.50 dB | | |
-| Wan A14B waves (16 -> 8 -> 16) | 29.66 dB | 29.33 dB | 28.48 dB | 27.05 dB | | |
+| our fox (24 -> 12 -> 24) | 36.40 dB | 36.66 dB | 35.65 dB | 28.50 dB | | |
+| our waves (16 -> 8 -> 16) | 29.66 dB | 29.33 dB | 28.48 dB | 27.05 dB | | |
 
 RIFE and FILM tie (within 0.4 dB at 2x); both gain 3-3.5 dB over the blend on camera motion; on
 video effects (glows, trails) neither is a flow and both fall a little below the blend without
@@ -268,8 +268,8 @@ only, to 3840 x 2160 (5 s); every run found the same cuts):
 | 3840 x 2160, x2 | 4.2 | 3.7 | 6.8 | **17.9** |
 
 The server end to end (its jobs one after another; the cut fix -> the speed work): the 1440 x 1080
-clip doubled 15.3 -> 58.1 frames a second; Wan A14B's 1280 x 720 clip (33 frames at 16 fps, the
-programs' builds included) x4 19.3 -> 46.2 and x2 22.3 -> 62.5; the Wan fox (832 x 480) to 60 fps
+clip doubled 15.3 -> 58.1 frames a second; the waves clip (1280 x 720, 33 frames at 16 fps, the
+programs' builds included) x4 19.3 -> 46.2 and x2 22.3 -> 62.5; the fox (832 x 480) to 60 fps
 20.7 -> 34.2. The card's peak during those jobs 3.5 -> 1.9 GiB (no im2col tiles; the full-resolution
 buffer gone). The earlier figures of this section (16.3 and 15.4 frames a second for the 1440 x 1080
 clip, before the cut fix) were measured on a busier machine; the master column is this session's.
@@ -289,7 +289,7 @@ On 12 threads (a quiet machine; scripts/check_rife.py time, the median of 5):
 | 1280 x 720 | 47 ms | 350 ms | ~5 |
 | 1920 x 1080 | 100 ms | 751 ms | ~2.4 |
 
-The Wan fox (832 x 480, 17 frames at 24 fps) doubled by scripts/interpolate_video.py --cpu in 4.3 s
+The fox (832 x 480, 17 frames at 24 fps) doubled by scripts/interpolate_video.py --cpu in 4.3 s
 (8.0 output frames a second, libx264). The torch reference (oneDNN, the same 12 threads) takes
 0.61 s and 1.35 s an output frame at 720p and 1080p: reclank's CPU path is faster on these narrow
 convs. Under another job's load on the same cores the IFNet took 1.6-2.6 s: CPU timings vary with
@@ -331,7 +331,7 @@ end to end the GPU was busy a third of the time. In order of what it gave:
   two threads widen themselves to them (with the byte path
   already in, the 1440 x 1080 x2 job 27 -> 46 frames a second by this fix). The pipes take 1 MiB.
   These helpers are now models/media.py (popen, run, widen, pipe_size), shared with the stereo
-  video, Wan's writer and the video upscales, which lost the same speed (GENERATION_PLAN).
+  video and the video upscales, which lost the same speed (GENERATION_PLAN).
 
 The checks: the output frames' bytes of the speed work against the previous programs and host path
 (RECLANK_RIFE_IM2COL=1) are the same (the md5 of a whole job's raw frames: the 1440 x 1080 clip x2 and
@@ -388,7 +388,7 @@ colours equal the fixed path's.
 
 ## 7. Pipelines
 
-The order for a chain: **Wan -> SeedVR2 (upscale) -> RIFE (interpolate) -> stereo**, each a job,
+The order for a chain: **SeedVR2 (upscale) -> RIFE (interpolate) -> stereo**, each a job,
 chained by `video_id`. Upscale before interpolating (SeedVR2's cost is per frame and large; RIFE's
 in-betweens come from the sharp frames); interpolate before stereo (the depth at the final rate;
 interpolating a side-by-side frame would put a seam in the middle and let the eyes differ).

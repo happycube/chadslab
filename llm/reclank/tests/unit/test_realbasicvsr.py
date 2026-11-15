@@ -3,7 +3,7 @@ in the Python interpreter against vfi/ref.warp (the same bits), its points past 
 unchanged; the k x k im2col index, SPyNet's working size, the official frames' float32. The checks against the
 official network on real footage (outside the repository) are scripts/check_realbasicvsr.py's.
 
-The image and flow: tests/unit/data/vfi_real.npz (test_vfi.py's: a crop of a frame Wan 2.2 TI2V-5B made here and
+The image and flow: tests/unit/data/vfi_real.npz (test_vfi.py's: a crop of a frame of our own clip and
 RIFE's real flow there, the flow times 8 so that some of its points leave the image)."""
 from __future__ import annotations
 

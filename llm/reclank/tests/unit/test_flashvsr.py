@@ -3,7 +3,7 @@ Python interpreter against a NumPy softmax of each row over its listed keys, and
 float32 and float16; the block lists of a mask. The checks against the official pipeline on real footage (outside
 the repository) are scripts/check_flashvsr.py's.
 
-The rows: tests/unit/data/vfi_real.npz's two frames (a clip that Wan 2.2 TI2V-5B made here): 8 x 8 patches of
+The rows: tests/unit/data/vfi_real.npz's two frames (a clip of our own): 8 x 8 patches of
 frame 0 the queries and values, of frame 1 the keys (384 rows of 192 values: two heads of 96)."""
 from __future__ import annotations
 

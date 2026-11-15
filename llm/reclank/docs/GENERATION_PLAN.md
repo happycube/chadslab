@@ -399,7 +399,7 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
   bits). enc_attn_range_x2 emits it for a compiler with attn_f32 (FlashVSR's
   DiT, the depth models) or under RECLANK_GPU_ENC_X2=0 (every
   program; RECLANK_GPU_ENC_TILE=0: ENC_ATTN_RANGE); the other models keep
-  ENC_ATTN_X2. On the 3090 at hd 128 6 to 6.6 x ENC_ATTN_RANGE (Wan 720p's
+  ENC_ATTN_X2. On the 3090 at hd 128 6 to 6.6 x ENC_ATTN_RANGE (a 720p DiT's
   attention 676 ms a block against 4464 ms; ENC_ATTN_X2 605 ms), about 40-46%
   of the card's float32 peak; at hd 64 1.35 x ENC_ATTN_X2's time.
 - **GPU swapping, phase 1 (docs/GPU_SWAP_PLAN.md):** encoders.runtime.Residency
@@ -467,14 +467,14 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
   none of it run), itself checked against the official code run sandboxed in float32 on the CPU
   (bridge_lq: the input the same bits, the posterior rel 3e-7, v 1 - cos 1.6e-11, worst token
   9.7e-9, the decode 97.4 dB). check_seedvr2.py against it (real LQ inputs: a photo 640 x 400
-  JPEG q18 to 1280 x 800; a Wan clip down-scaled to 416 x 240 and H.264 crf 36, 17 frames to
+  JPEG q18 to 1280 x 800; a clip of our own down-scaled to 416 x 240 and H.264 crf 36, 17 frames to
   832 x 480): the resize max 6e-7; the windows and the text RoPE angles the same; the VAE
   92 dB (image and video, GPU and CPU); v 1 - cos 2.3e-9 (GPU F20; worst token 2.4e-6), 1.3e-10
   (CPU float32), video 2e-10 / 8e-11; the output at most 1 level of 255: 78.8 dB (GPU) and 82.8
-  dB (CPU) for the photo, 83.1 / 84.7 dB for the clip; at 720p (a Wan 720p clip down-scaled to 640 x 352, H.264 crf 36, 9 frames to 1280 x 704: v 2.9e-10 / 2.9e-11, the VAE 91.3 dB, the output 87.6 / 89.8 dB). On the 3090: a 1280 x 800 image the DiT 1.9
+  dB (CPU) for the photo, 83.1 / 84.7 dB for the clip; at 720p (a 720p clip of our own down-scaled to 640 x 352, H.264 crf 36, 9 frames to 1280 x 704: v 2.9e-10 / 2.9e-11, the VAE 91.3 dB, the output 87.6 / 89.8 dB). On the 3090: a 1280 x 800 image the DiT 1.9
   s, the VAE 0.6 + 1.2 s, a server request 12-15 s with its programs built; a 4.1 MP image (512 x 684 to 2352 x 1760) a request 40 s (the DiT 12.9 s with its 8.5 GB upload, 7.6 s warm; the VAE 9.3 + 12.2 s, 4.2 + 6.8 warm; the color fix 5 s on the host), 12.1 GiB of the card, 10.1 GiB of host; 832 x 480 x
   17: the DiT 3.8 s, the VAE 7.7 + 19.5 s, a server job 55 s (14.8 GiB of the card); 1280 x 704 x
-  21 (a Wan clip at 640 x 352): 125 s (the encode 35, the DiT 16, the decode 63, the color fix 11
+  21 (a clip of our own at 640 x 352): 125 s (the encode 35, the DiT 16, the decode 63, the color fix 11
   on the host), 21.7 GiB of the card at the peak: video at most 1280 x 720 in float32 for now
   (960p and up: the caches in pinned host memory, a later phase). Real-ESRGAN (RRDBNet x4plus,
   x2plus, anime_6B; SRVGGNetCompact general-x4v3 with the official denoise mix of 0.5, animevideov3)
@@ -672,7 +672,7 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
   GPU, libx264 CRF 16 on the CPU. POST /v1/videos/interpolate (a file or `video_id` of any completed
   /v1/videos job: chains from the upscales, stereo; factor, fps, scene_cuts, scale, slowmo,
   codec, crf), --rife DIR. The reference: scripts/rife_reference.py (torch only, written from the
-  authors' code, not run). Against it on real frames (59.94 fps captures and our own Wan clips, 140
+  authors' code, not run). Against it on real frames (59.94 fps captures and our own clips, 140
   frames of 2x and 4x, CPU and GPU): block 0's input the same bits, each block's flow 1 - cos at
   most 1.1e-10, the output 1 - cos at most 2.2e-10 and at most 1 level of 255 (0.004-0.017 % of the
   values), the PSNR against the held-out frames the reference's to 0.01 dB (2x: 28.95 dB on a fast
@@ -680,7 +680,7 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
   rule: 27 of 27 cuts of its tuning footage, 21 of 26 on new footage (the misses: shots of the same
   framing), 3 false cuts at 2x in 750 s of new footage. On the 3090: an output frame 40 ms (720p), 81 ms (1080p), 191 ms (4K, scale 0.5), a Head
   3-22 ms; a 1440 x 1080 clip doubled at 15 frames a second end to end; the card's peak 2.8 GiB.
-  On 12 CPU threads an output frame 350 ms (720p), 751 ms (1080p). tests/unit/test_vfi.py (our own Wan frames): 10 pass (the model's test with RECLANK_RIFE set).
+  On 12 CPU threads an output frame 350 ms (720p), 751 ms (1080p). tests/unit/test_vfi.py (our own frames): 10 pass (the model's test with RECLANK_RIFE set).
 - **RIFE's scene-cut fix:** models/vfi (video.CutDetector, video.probe_frame, RIFE.prober and
   RIFE.residual). The first rule (thumbnails' SSIM and difference ratio) missed cuts between shots
   of the same framing and repeated frames falsely in video effects and limited animation. Now RIFE
@@ -692,7 +692,7 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
   educational disc of limited animation by eye; thresholds fit on each half of each stretch, the
   midpoints taken): 2x 103 of 107 cuts found with 16 false (the first rule 101, 46), 4x 102 of 102
   with 4 false (97, 39); each half scored with the other half's own fit, 102 of 107 (16 false) and 96 of
-  102 (7 false) (VFI_PLAN section 5); every remaining miss and false cut viewed. tests/unit/test_vfi.py (our own Wan
+  102 (7 false) (VFI_PLAN section 5); every remaining miss and false cut viewed. tests/unit/test_vfi.py (our own
   frames: the rule on real residuals, the probe's residual on the CPU): 11 pass.
 - **RIFE's speed work (VFI_PLAN section 6.3):** float32 throughout, the same bits. On the GPU each
   conv one ENC_CONV_MM (323: the products read the im2col rows through the index; the bias, the
@@ -719,17 +719,17 @@ Phases 1 and 0 can run in either order; phase 2 needs only 1.
 - **ffmpeg and the media threads on all the CPUs (models/media.py):** reclank's OMP_PROC_BIND binds
   the main thread to one CPU when OpenMP starts; the threads made after it and their children
   inherit it, and ffmpeg's libgomp binds again: a stereo video's decoder and writer threads and both
-  ffmpeg processes ran on one CPU, and so did Wan's writer and the upscales' decode, encode and mux
+  ffmpeg processes ran on one CPU, and so did the upscales' decode, encode and mux
   (taskset -p of each thread and child during a run). media.popen / run start a tool on the CPUs of
   the start (RECLANK_START_CPUS) without OMP_PROC_BIND and OMP_PLACES, widen() puts a pipeline's
-  thread on them; RIFE's pipeline (which had them), the stereo video (models/depth/pipeline.py), Wan's
-  write_mp4 and server/upscale.py use them. The encodes convert by the source's colour tags
+  thread on them; RIFE's pipeline (which had them), the stereo video (models/depth/pipeline.py),
+  media.write_mp4 and server/upscale.py use them. The encodes convert by the source's colour tags
   (media.yuv_colors, as RIFE's): the stereo video and the upscales keep their source's matrix and
   range and are tagged (they were BT.601 limited and untagged; an untagged source still is, now
   tagged smpte170m / tv). server/generate.py's audio encodes
   and music's and EmbeddingGemma's decoders keep their own environment (no OMP_PROC_BIND) as before.
   The stereo video of a 600-frame 1440 x 1080 capture (VDA-Small, NVENC) 7.99 -> 12.25 frames a
-  second, its decoded frames the same (the md5 of all 600); Wan's writer (33 frames of 1280 x 720,
+  second, its decoded frames the same (the md5 of all 600); write_mp4 (33 frames of 1280 x 720,
   libx264) 3.14 -> 1.00 s; an upscale's video in and out (300 frames of 1280 x 720) read 6.93 -> 1.98 s,
   write with the source's audio 43.4 -> 5.6 s. libx264's output depends on its thread count: with
   ffmpeg held to one CPU the new code's decoded frames are the old ones' (md5), on twelve the same

@@ -6,12 +6,12 @@ probe_plan, thumbs_of, mean_abs, the deconv scatter), and Practical-RIFE 4.25 on
 torch reference and on the GPU against its previous programs (with RECLANK_RIFE=the folder of
 flownet.safetensors; skipped without it; the GPU's test marked gpu).
 
-tests/unit/data/vfi_real.npz holds only our own content: "frames" two frames of a clip that Wan 2.2
-TI2V-5B made here (a fox in snow, frames 2 and 10 of 17 at 24 fps, Lanczos-downscaled from 832 x 480
+tests/unit/data/vfi_real.npz holds only our own content: "frames" two frames of a clip made here
+(a fox in snow, frames 2 and 10 of 17 at 24 fps, Lanczos-downscaled from 832 x 480
 to 208 x 120); "out_05", "out_025" scripts/rife_reference.py's output at t 0.5 and 0.25 (pad 64);
 "flow" and "mask" its last flow (4 channels) and mask over rows 24:88, columns 40:168 of the padded
 frame (the real values for the records); "probe" the scene-cut test's probe frames (long side 320) of
-frames 2 and 10 of the fox and of a frame of a Wan 2.2 T2V-A14B clip made here (waves at sunset,
+frames 2 and 10 of the fox and of a frame of another clip made here (waves at sunset,
 1280 x 720, resized to 832 x 480), "probe_rd" RIFE's residual and raw difference of the two pairs,
 "th32", "thgrey" the thumbnails of the three frames. The checks on real footage (outside the
 repository) are scripts/check_rife.py's."""
