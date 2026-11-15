@@ -319,15 +319,14 @@ static inline int gp_op_known(int op)
     case GP_ENC_ATTN_RANGE: case GP_ENC_GATHER: case GP_ENC_ATTN_BIAS:
     case GP_ENC_GATHER_MM: case GP_ENC_ATTN_X2: case GP_ENC_SCATTER: case GP_ENC_ATTN_KV:
     case GP_ENC_ROPE_TAB: case GP_ENC_GNORM: case GP_ENC_SNAKE: case GP_ENC_ELU:
-    case GP_ENC_ATTN_WIDE: case GP_ENC_ATTN_TILE: case GP_ENC_RESIZE:
-    case GP_ENC_DIBR: case GP_ENC_PACK_U8: case GP_ENC_RESIZE_TAPS: case GP_ENC_UNPACK_U8:
-    case GP_ENC_WARP: case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM:
-    case GP_ENC_RIFE_IN: case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P:
-    case GP_ENC_PACK_U8C: case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE:
-    case GP_NM_PULL: case GP_NM_STAGED: case GP_ENC_CONV3: case GP_DG_KV_PUT:
-    case GP_DG_ATTN: case GP_DG_MOE: case GP_DG_SPLIT: case GP_DG_SAMPLE:
-    case GP_ENC_BF16_PACK: case GP_ENC_I16_PACK: case GP_ENC_ATTN_BLOCKS:
-    case GP_ENC_BLOCK_MASK:
+    case GP_ENC_ATTN_WIDE: case GP_ENC_ATTN_TILE: case GP_ENC_RESIZE: case GP_ENC_DIBR:
+    case GP_ENC_PACK_U8: case GP_ENC_RESIZE_TAPS: case GP_ENC_UNPACK_U8: case GP_ENC_WARP:
+    case GP_ENC_PRELU: case GP_ENC_MIX: case GP_ENC_CONV_MM: case GP_ENC_RIFE_IN:
+    case GP_ENC_RIFE_OUT: case GP_ENC_UNPACK_U8P: case GP_ENC_PACK_U8C:
+    case GP_ENC_RESAMPLE_U8: case GP_ENC_THUMB_U8: case GP_NM_TAKE: case GP_NM_PULL:
+    case GP_NM_STAGED: case GP_ENC_CONV3: case GP_DG_KV_PUT: case GP_DG_ATTN:
+    case GP_DG_MOE: case GP_DG_SPLIT: case GP_DG_SAMPLE: case GP_ENC_BF16_PACK:
+    case GP_ENC_I16_PACK: case GP_ENC_ATTN_BLOCKS: case GP_ENC_BLOCK_MASK:
         return 1;
     default:
         return 0;
