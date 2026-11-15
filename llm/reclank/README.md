@@ -85,22 +85,49 @@ python -m reclank.setup --model gemma4-26b
 python -m reclank.setup --assume-ram 16 --assume-vram 0    # another machine
 ```
 
-3. Get a GGUF model file. Good first models are Gemma 4 26B-A4B
-   (the Unsloth UD-Q4_K_XL file) and LFM2.5-24B-A2B (the LiquidAI
-   QAD Q4_0 file). Keep model files out of this folder.
-
-4. Start the server:
+3. Get a model. Good first models are Gemma 4 26B-A4B (the Unsloth
+   UD-Q4_K_XL file) and LFM2.5-24B-A2B (the LiquidAI QAD Q4_0 file).
+   The setup downloads one into `~/models` (`RECLANK_MODELS` sets
+   another folder). Keep model files out of this folder.
 
 ```sh
-python -m server --model ~/models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf --port 8080
+python -m reclank.setup --model gemma4-26b --download
 ```
 
-   Gemma runs on the CPU by default. Add `--backend cuda` to use an
-   NVIDIA GPU. Qwen and LFM use the GPU by default. Add `--backend cpu`
-   to keep them on the CPU.
+4. Start the server with `start.sh`, by the model's id or by its file:
+
+```sh
+./start.sh gemma4-26b                 # an id of the setup report
+./start.sh ~/models/some-model.gguf   # or any model file or folder
+./start.sh                            # the models downloaded here
+```
+
+   It uses the GPU when the model fits the card and the CPU otherwise.
+   `--gpu` or `--cpu` picks one. It prints the command it runs, and
+   it passes any argument it does not know to the server, for example
+   `--ctx 32768`. Other options:
+
+| Option | What it does |
+|---|---|
+| `-d` | Run in the background. It waits until the server is ready, then prints the PID and the log. |
+| `--stop` | Stop the reclank server on the port. |
+| `--restart` | Stop the server on the port first. |
+| `--port N`, `--host H` | Default port 8080 for chat, 8082 for embeddings, 8084 for generation. Default host 127.0.0.1. |
+| `--dry-run` | Print the command and start nothing. |
+| `--keeper` | Start the weightkeeper first, for the models that need one. |
+| `--help` | Every option and setting. |
+
+   `start.sh` uses the active venv, else `.venv` here. `PY=...` picks
+   another Python. Settings for this machine, such as `CUDA_HOME`, go in
+   `~/.config/reclank/env`, which it reads first.
 
    The first start builds the kernels. The C build takes about a minute.
    The CUDA build takes some minutes.
+
+   `python -m server --model FILE` is the server itself. Gemma runs on
+   the CPU by default there. Add `--backend cuda` to use an NVIDIA GPU.
+   Qwen and LFM use the GPU by default. Add `--backend cpu` to keep them
+   on the CPU.
 
 5. Send a chat request:
 
@@ -123,7 +150,10 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-   Set your own key with `--api-key`. Stop the server with Ctrl-C.
+   Set your own key with `KEY=secret ./start.sh ...`, or put it on the
+   first line of `~/.config/reclank/api_key`. The server itself takes
+   `--api-key`. Stop the server with Ctrl-C, or with `./start.sh --stop`
+   when it runs in the background.
 
 A large model such as DeepSeek V4.1 Flash needs more steps. See "The
 server" and "Weightkeeper".
@@ -173,6 +203,7 @@ place. `scripts/convert_nvfp4_gguf.py` and
 
     reclank/
     ├── README.md          This file.
+    ├── start.sh           Start a server: ./start.sh MODEL (./start.sh --help).
     ├── docs/              Plans and notes. See "Documentation".
     ├── reclank/           The package.
     │   ├── settings.py    The RECLANK_* settings. The old NP_GEMMA_* names still work.
@@ -229,7 +260,8 @@ That load takes minutes. A later load takes seconds.
 
 One server runs every family. It uses only the Python standard library.
 It finds the family from the GGUF architecture or from the `config.json`
-of a checkpoint folder.
+of a checkpoint folder. `./start.sh` (Quick start) builds this command
+for you.
 
 ```sh
 python -m server --model MODEL.gguf --ctx 98304 --port 8081

@@ -249,15 +249,22 @@ def download_cmd(model, root, hf="hf"):
     return " ".join(_q(c) for c in cmd)
 
 
+def serve_argv(model, root, mode, port=None):
+    """The server of the model in mode (gpu or cpu): (env, args), the
+    environment it needs and the arguments after the python executable."""
+    d = os.path.join(root, model.dir)
+    args = (model.args + " " + (model.gpu_args if mode == "gpu" else model.cpu_args)).split()
+    args = ["-m", MODULES[model.server]] + [a.replace("{d}", d) for a in args]
+    env = {"OMP_NUM_THREADS": "1"} if mode == "gpu" else {}
+    return env, args + ["--port", str(port or PORTS[model.server])]
+
+
 def serve_cmd(model, root, mode):
     """The command line of the server of the model in mode (gpu or cpu)."""
-    d = os.path.join(root, model.dir)
-    args = model.args + " " + (model.gpu_args if mode == "gpu" else model.cpu_args)
-    args = " ".join(_q(a.replace("{d}", d)) for a in args.split())
-    env = "OMP_NUM_THREADS=1 " if mode == "gpu" else ""
+    env, args = serve_argv(model, root, mode)
+    env = "".join("%s=%s " % kv for kv in env.items())
     py = sys.executable or "python3"
-    return "cd %s && %sPYTHONPATH=. %s -m %s %s --port %d" % (_q(ROOT), env, _q(py), MODULES[model.server],
-                                                             args, PORTS[model.server])
+    return "cd %s && %sPYTHONPATH=. %s %s" % (_q(ROOT), env, _q(py), " ".join(_q(a) for a in args))
 
 
 def request_cmd(model):

@@ -36,7 +36,8 @@ reclank/                  the package
                           several at once by --name, each its own socket)
   encoders/               the media encoders (vision, audio)
   setup/                  python -m reclank.setup: the machine, the model table
-                          (catalog.py: a Model an entry), the first-use guide
+                          (catalog.py: a Model an entry), the first-use guide;
+                          start.py: ./start.sh, a server by a table id or a file
   models/<family>/        the model code; engine.py is the server interface
                           (models/base.py); keep*.py the weightkeeper plugins
   backends/
@@ -50,6 +51,7 @@ reclank/                  the package
     cuda/csrc/runtime/    runner.cu (the opcode switch), graphs, copies
     cuda/csrc/kernels/    the kernels by subject (gemm, attn, moe, quant,
                           nemotron, ...); reclank_cuda.cu includes them all
+start.sh                  the top-level start: ./start.sh MODEL (reclank/setup/start.py)
 server/                   the one OpenAI-compatible server (an engine a family)
 scripts/                  check_* (correctness), bench_* (speed),
                           profile_*, convert_*, study_*

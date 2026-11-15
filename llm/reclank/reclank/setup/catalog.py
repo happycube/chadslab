@@ -53,6 +53,7 @@ class Model:
     model_id: str = ""        # the "model" of a request to a server of several
     commercial: bool = True   # False: the license is research or non-commercial
     first: int = 0            # the order of a first model (1 first; 0 never)
+    keeper: bool = False      # its experts come from scripts/weightkeeper.py, started first
     notes: list = field(default_factory=list)
 
 
@@ -107,6 +108,7 @@ MODELS = [
           gpu=Need(56, 22, "measured: the weightkeeper 45 GB (the experts on both nodes), the server 10 GB; on "
                    "the card the dense matrices and the head, then hot experts"),
           args="--model {d} --mmproj {d}", gpu_args="--backend cuda",
+          keeper=True,
           notes=["start the weightkeeper first: python scripts/weightkeeper.py {d}"]),
     Model("lfm25-24b", "LFM2.5-24B-A2B (QAD Q4_0)", "chat",
           "LiquidAI/LFM2.5-24B-A2B-GGUF", "LFM2.5-24B-A2B-GGUF", 13.58, "LFM Open License v1.0",
@@ -154,12 +156,14 @@ MODELS = [
           gpu=Need(110, 22, "docs/FP4LOCAL_PLAN.md 4 (a node's 68 GB of experts, the 30.7 GB n-gram table, "
                    "9 GB; 176 GB with a copy on each of two nodes)", est=True),
           args="--model {d} --ctx 262144 --mmproj {d} --mmproj-gpu lend", gpu_args="--backend cuda",
+          keeper=True,
           notes=["start the weightkeeper first: python scripts/weightkeeper.py {d}"]),
     Model("deepseek41", "DeepSeek V4.1 Flash", "chat",
           "deepseek-ai/DeepSeek-V4.1-Flash-1017", "DeepSeek-V4.1-Flash-1017", 510.31, "MIT",
           gpu=Need(300, 22, "docs/DEEPSEEK_V41_PLAN.md 4.1 (experts 288.8 GB in RAM; the 203 GB engram "
                    "tables read in place from the disk; dense 7.5 + head 2.6 + hot experts on 24 GB)", est=True),
           args="--model {d} --mmproj {d}", gpu_args="--backend cuda",
+          keeper=True,
           notes=["start the weightkeeper first: python scripts/weightkeeper.py {d}",
                  "keep the checkpoint on an NVMe disk: the engram rows are read from it each token"]),
     Model("glm53-flash", "GLM-5.3-Flash (EXL3 4.05 bpw)", "chat",
